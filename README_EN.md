@@ -1,6 +1,6 @@
 # JobsFlow
 
-[中文](README.md) · [English](README_EN.md)
+[繁體中文](README.md) · [简体中文](README_ZH-CN.md) · [English](README_EN.md)
 
 ## Find the right roles. Write like the role. Apply with confidence.
 
@@ -11,55 +11,35 @@ and how to tailor the application without giving up final control.
 
 ## 🆕 Latest update · 2026-08-06
 
-This update centralizes JD experience parsing. Ranges such as `2 to 5 years`,
-`3-5 years`, and `2至5年相关经验` now use the **lower bound** for eligibility
-scoring while retaining the full range for display and review. Lower-bound
-phrases such as `5+ years` and `at least 3 years` keep their original meaning.
-The scorer and job assessment now share the same deterministic parser, so the
-score and downstream gap explanation cannot disagree. `up to / 不超过 X 年`
-remains an upper-bound expression and is not treated as a JD minimum; common
-Chinese forms such as `5年工作经验` remain supported, while date text is not
-mistaken for experience.
+- **More reliable parsing:** JD experience ranges use the lower bound for
+  eligibility (for example, `3–5 years` is checked against 3). The scorer and
+  job assessment share one deterministic parser, including `5+`, `up to`, and
+  common Chinese forms.
+- **Faster retrieval:** scored artifacts and URL-keyed JD cache entries are
+  reused; portal workers, Playwright browser/context, and transient failures
+  are reused or short-cached. Sheets syncs only new or changed rows. First
+  fetches remain subject to network latency, rate limits, and CAPTCHA.
 
-This prevents candidates from being penalized by the upper end of a JD range.
-For example, a candidate with three years of experience facing `3–5 years` is
-checked against the minimum of three years rather than being capped as if five
-years were mandatory. Regression tests cover English and Chinese ranges, `+`
-suffixes, Chinese experience wording, and date exclusion.
+**Recall and choice are separate:** missing/short teasers are rescued instead
+of being silently dropped. Scan depth controls network cost (economy/balanced/
+coverage ≈10/20/40); retention selects 3.0/3.3/3.5. Missing full JDs stay
+visible as `待审-JD不足` / `provisional_needs_jd`, and changing retention does
+not fetch again.
 
-The same update also adds several speed improvements without changing the workflow: two-pass scoring reuses scored artifacts and the URL-keyed JD cache; LinkedIn details are fetched serially by one long-lived Bun worker; Playwright deep fetches reuse one browser/context per scoring cycle and short-cache WAF, CAPTCHA, and timeout failures; Google Sheets pushes append new rows and update only changed rows with local formatting. First-time fetches remain subject to portal latency, rate limits, and CAPTCHA; a schema change triggers one safe full sync.
+**More controlled materials:** per-job manifests, dependency fingerprints, and
+validation reduce rerun rework and catch recruiter-name leaks before sending.
 
-Two-pass scoring also closes a recall gap where a portal card with no teaser
-could receive a low title-only score and never reach the full JD. The former
-single 3.3 control is now split in two. **Scan depth** controls cost: economy
-allows about 10, balanced 20 and coverage 40 cache-miss network detail fetches.
-**Retention preference** controls the user's shortlist: loose 3.0, standard
-3.3 or selective 3.5. Pass 1 keeps 3.3 only as an internal direct-routing line;
-valid cache hits, missing/short teasers and gray-band candidates are still
-rescued. Cache hits consume no network budget. Jobs without a full JD remain
-visible as `待审-JD不足` / `provisional_needs_jd`. Changing retention re-filters
-the saved deep scores and does not reopen a portal.
-
-Materials now also use a repeatable per-job Manifest: the job ID derives the package tier, JD keywords and recruiter-safe outbound filenames, while dependency fingerprints and explicit overrides survive reruns. Real JD/profile/lane changes mark old artifacts stale. A single validation report checks recruiter-name leaks, tier routing, incomplete sentences, Chinese residue in English materials, employer naming and the Cover Letter page limit before sending.
-
-Role titles now have an explicit contract as well: `role_display` retains the
-posting title, while a slash-separated `A/B` title yields one recommended
-primary role plus alternatives. Outbound materials use one primary role by
-default; inspect or confirm an ambiguous choice with
-`python3 -m tools.job_materials role show` and `role choose`. Parentheses that carry a
-real business area or specialism remain intact—for example, `Paralegal
-(Corporate Funds)`—while only obvious location, work-arrangement, contract or
-identifier metadata parentheses are removed from the material-facing title.
-Filename sanitisation does not introduce a short dash or comma, and it never
-silently combines multiple roles into a new title.
+`A/B` titles use one primary role by default; business parentheses stay intact,
+and recruiter names stay out of outbound filenames. Use `role show`/`role choose`
+when a title is ambiguous.
 
 ## 🆕 Update · 2026-08-03
 
-The scan path now uses **portal-level parallel workers with serial queries inside each portal**. LinkedIn, JobsDB, and CTgoodjobs each run one worker, so the three portals can be searched at the same time while each portal keeps its original query order and pacing.
-
-Each worker stays alive for the duration of one scan and reuses the portal process. CTgoodjobs session headers are resolved once when its worker starts, reducing repeated Bun startup, network handshakes, and session bootstrap work. The `/scan` syntax and materials workflow are unchanged: run `/scan temp` or `/scan daily` as usual. The latest uncertainty-aware pass-1 policy is described in the 2026-08-06 update above.
-
-This update targets scan wait time. Actual speed still depends on network latency, portal responses, rate limits/CAPTCHA, and retries. The base scan is deterministic and does not require an external LLM, so model capability does not change the worker parallelism. Workers exit after each scan so stale sessions are not kept indefinitely.
+The three portals now run in parallel workers, while queries within each portal
+remain serial and keep their original pacing. Each worker reuses its portal
+process and CTgoodjobs session for one scan, reducing startup and handshake
+overhead. `/scan temp` and `/scan daily` are unchanged; actual speed still
+depends on network latency, portal responses, rate limits/CAPTCHA, and retries.
 
 - **Fewer wrong applications and fewer silent misses:** pass 1 schedules work;
   the full JD determines the final score, while insufficient-JD rows stay visible.
