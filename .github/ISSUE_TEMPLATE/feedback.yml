@@ -1,0 +1,14 @@
+name: 反馈 Feedback
+description: 想说什么就说，自由输入
+title: ""
+labels: ["feedback"]
+body:
+  - type: textarea
+    id: message
+    attributes:
+      label: 反馈内容
+      description: 自由输入，任何问题、建议或想法都可以。
+      placeholder: 写下你想说的…
+      render: markdown
+    validations:
+      required: true

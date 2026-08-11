@@ -21,6 +21,12 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
   <img alt="privacy" src="https://img.shields.io/badge/%E9%BB%98%E8%AE%A4-%E6%9C%AC%E5%9C%B0%E4%BC%98%E5%85%88-555?style=flat-square">
 </p>
 
+<p align="center">
+  <a href="https://github.com/mixxmax/jobsflow/issues/new?template=feedback.yml">
+    <img alt="feedback" src="https://img.shields.io/badge/💬%20%E5%9B%9E%E9%A5%8B-%E5%AF%AB%E4%B8%8B%E4%BD%A0%E6%83%B3%E8%AA%AA%E7%9A%84-1F4E79?style=flat-square">
+  </a>
+</p>
+
 </div>
 
 ---
