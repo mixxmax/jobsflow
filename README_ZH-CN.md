@@ -21,18 +21,19 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
   <img alt="privacy" src="https://img.shields.io/badge/%E9%BB%98%E8%AE%A4-%E6%9C%AC%E5%9C%B0%E4%BC%98%E5%85%88-555?style=flat-square">
 </p>
 
-<p align="center">
-  <a href="https://github.com/mixxmax/jobsflow/issues/new?template=feedback.yml">
-    <img alt="feedback" src="https://img.shields.io/badge/💬%20%E5%8F%8D%E9%A6%88-%E5%86%99%E4%B8%8B%E4%BD%A0%E6%83%B3%E8%AF%B4%E7%9A%84-1F4E79?style=flat-square">
-  </a>
-</p>
-
 </div>
 
 ---
 
-> JobsFlow 是一套**在你电脑上跑的求职流水线**：用已有简历定范围找岗、排出优先顺序、管住投递状态、按岗位出齐材料，并每天跟上新职位。  
-> 默认本地优先，也不会替你自动点「提交」。只有你显式使用 Google Sheets 或外部 LLM 时，相关数据才会发送到对应服务；启用前请确认隐私政策与权限。
+<p align="center">
+  <a href="https://github.com/mixxmax/jobsflow/issues/new?template=feedback.yml">
+    <img alt="feedback" src="https://img.shields.io/badge/%E2%9C%8D%EF%B8%8F%20%E5%86%99%E4%B8%8B%E4%BD%A0%E7%9A%84%E5%8F%8D%E9%A6%88-1F4E79?style=for-the-badge">
+  </a>
+  <br>
+  <sub>你的反馈，开发者会直接收到</sub>
+</p>
+
+---
 
 ## 🆕 最新更新 · 2026-08-06
 

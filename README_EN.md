@@ -4,16 +4,22 @@
 
 ## Find the right roles. Write like the role. Apply with confidence.
 
-<p align="center">
-  <a href="https://github.com/mixxmax/jobsflow/issues/new?template=feedback.yml">
-    <img alt="feedback" src="https://img.shields.io/badge/💬%20Feedback-Write%20anything-1F4E79?style=flat-square">
-  </a>
-</p>
-
 JobsFlow connects job search, company research, JD analysis, tailored CVs,
 cover letters, and application review in one local-first workflow. It is not
 just an AI resume writer: it helps you decide what to apply for, why you fit,
 and how to tailor the application without giving up final control.
+
+---
+
+<p align="center">
+  <a href="https://github.com/mixxmax/jobsflow/issues/new?template=feedback.yml">
+    <img alt="feedback" src="https://img.shields.io/badge/%E2%9C%8D%EF%B8%8F%20Write%20your%20feedback-1F4E79?style=for-the-badge">
+  </a>
+  <br>
+  <sub>Your feedback goes directly to the developer</sub>
+</p>
+
+---
 
 ## 🆕 Latest update · 2026-08-06
 
