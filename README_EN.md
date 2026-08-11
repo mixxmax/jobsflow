@@ -11,11 +11,10 @@ and how to tailor the application without giving up final control.
 
 ---
 
+<h2 align="center">
+  <a href="https://github.com/mixxmax/jobsflow/issues/new?template=feedback.yml">✍️ Write your feedback</a>
+</h2>
 <p align="center">
-  <a href="https://github.com/mixxmax/jobsflow/issues/new?template=feedback.yml">
-    <img alt="feedback" src="https://img.shields.io/badge/%E2%9C%8D%EF%B8%8F%20Write%20your%20feedback-1F4E79?style=for-the-badge">
-  </a>
-  <br>
   <sub>Your feedback goes directly to the developer</sub>
 </p>
 

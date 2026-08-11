@@ -25,11 +25,10 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 
 ---
 
+<h2 align="center">
+  <a href="https://github.com/mixxmax/jobsflow/issues/new?template=feedback.yml">✍️ 写下你的反馈</a>
+</h2>
 <p align="center">
-  <a href="https://github.com/mixxmax/jobsflow/issues/new?template=feedback.yml">
-    <img alt="feedback" src="https://img.shields.io/badge/%E2%9C%8D%EF%B8%8F%20%E5%86%99%E4%B8%8B%E4%BD%A0%E7%9A%84%E5%8F%8D%E9%A6%88-1F4E79?style=for-the-badge">
-  </a>
-  <br>
   <sub>你的反馈，开发者会直接收到</sub>
 </p>
 
