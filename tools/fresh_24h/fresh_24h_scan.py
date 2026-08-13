@@ -536,6 +536,13 @@ def apply_rules(hit: JobHit, cfg: dict[str, Any]) -> None:
             hit.reject_reason = f"noise_title:{pat}"
             return
 
+    # 公司黑名单（private config）：用户指定不再拉取的单位
+    for pat in cfg.get("company_blacklist") or []:
+        if re.search(pat, f"{hit.company}\n{hit.title}", re.I):
+            hit.decision = "reject"
+            hit.reject_reason = f"company_blacklist:{pat}"
+            return
+
     relevance_keywords = [
         str(value)
         for value in (
@@ -595,6 +602,24 @@ def load_tracker_keys(tracker_path: Path) -> tuple[set[str], set[str], list[str]
             ct.add(company_title_key(row.get("公司") or "", row.get("职位") or ""))
             if row.get("岗位编号"):
                 ids.append(row["岗位编号"])
+    # 并入 push 入表注册表（entered_ids.json）：今天入表但尚未写回主表 CSV
+    # 的职位也属"已入表"，扫描不得重复报新（与主表 CSV 同等去重）。
+    reg_path = tracker_path.parent / "entered_ids.json"
+    if reg_path.exists():
+        try:
+            reg = json.loads(reg_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            reg = None
+        entries = (reg or {}).get("entries") or {}
+        for _jid, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            u = normalize_url(str(entry.get("url") or ""))
+            if u:
+                urls.add(u)
+                m = re.search(r"/(\d{8,})(?:/|$)", u)
+                if m:
+                    urls.add(m.group(1))
     return urls, ct, ids, rows
 
 
