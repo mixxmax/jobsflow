@@ -38,10 +38,22 @@ Wired into `two_pass_score.deep_enrich_hit` for JobsDB / CT / LinkedIn fallback 
 - Env `PORTAL_JD_BROWSER=0` disables browser deep.
 - Env `PORTAL_JD_STORAGE_STATE=~/.config/jobsearch/storage_state_<portal>.json` for cookies;
   the browser also checks the portal-specific default path automatically.
-- If a detail page shows WAF verification, use `--headed --save-storage-state <path>`
-  once for manual verification; the saved state is reused and must remain under the
-  user home directory.
-- Env `PORTAL_JD_CHANNEL=chrome` to use system Chrome channel.
+- **Challenge / 429 / WAF never auto-retry and never overwrite saved session
+  state.** Only `timeout` retries (default 2, `--retry 0` disables).
+- Two consecutive JobsDB challenges open a persisted portal circuit breaker
+  (`JobSearch_2026/02_Tracker/portal_state/jobsdb_circuit.json`); later
+  uncached detail requests fail soft as `paste_needed` until the cooldown or a
+  manual recovery. A 429 is honoured via its `Retry-After` value.
+- Manual recovery (human verification) uses the explicit interactive mode:
+  `--headed --interactive-verification [--user-data-dir <dir>]`. The
+  interactive path bypasses the breaker, waits independent of TTY, and only
+  saves state after a real JD validates. Recovery state stays under the user
+  home directory.
+- `--diagnostics-dir <dir>` writes a sanitized JSON (URL hash only — never
+  cookies or headers).
+- Env `PORTAL_JD_CHANNEL=chrome` to use system Chrome channel;
+  `PORTAL_JD_JOBSDB_PROFILE_DIR` enables a dedicated persistent profile for
+  scan sessions (optional, must be under home).
 
 ## Extends to JobsDB + CTgoodjobs?
 

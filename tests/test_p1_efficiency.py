@@ -110,7 +110,9 @@ def test_failure_cache_short_circuits_repeated_waf(monkeypatch, tmp_path):
     assert second.fail_reason == "waf"
     assert second.failure_cached == 1
     assert second.attempts == 0
-    assert len(calls) == 2
+    # waf/challenge is no longer auto-retried: first call attempts once,
+    # second call is served by the failure cache with zero network attempts.
+    assert len(calls) == 1
 
 
 def test_browser_session_pool_reuses_one_session_per_portal(monkeypatch):

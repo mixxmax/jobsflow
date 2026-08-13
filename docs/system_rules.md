@@ -120,11 +120,19 @@ Their actual queries and relevance rules are candidate- and profession-specific.
   (default: 60 days, at least 100 non-whitespace characters) is reused with no
   network request. A successful deep retrieval is written immediately to
   `02_Tracker/jds/cache/<sha256(url)[:16]>.json`.
-- Browser detail fallback retries WAF, timeout and empty-content failures within
-  a bounded attempt budget. It reuses the private portal-specific storage state
-  under `~/.config/jobsearch/` when present; manual verification is supported
-  through `--headed --save-storage-state`, and cookie files never belong in the
-  repository or tracker output.
+- Browser detail fallback never auto-retries challenge, WAF or 429 results and
+  never overwrites a saved valid session on them; only `timeout` retries within
+  a bounded attempt budget. Two consecutive JobsDB challenges open a persisted
+  portal circuit breaker (`02_Tracker/portal_state/jobsdb_circuit.json`);
+  uncached detail requests then degrade to `paste_needed` until the cooldown
+  (429 honours the response `Retry-After`) or a manual recovery. The scan
+  budget is one JobsDB detail navigation at a time, at least 15 s apart, at
+  most 10 per scan. Manual verification is explicit and independent of TTY:
+  `--headed --interactive-verification [--user-data-dir <dir>]`, and state is
+  saved only after a real JD validates. Cookie files never belong in the
+  repository or tracker output; rows record JD depth as
+  `full`/`cache`/`teaser`/`paste_needed`, and a teaser is never treated as a
+  full JD.
 - Deep position profiling creates a separate `position_profile` task containing
   the cached JD, company/role context and lane labels. Its completed verdict may
   set the lane and a sourced-or-explicitly-unverified `company_brief`; otherwise

@@ -227,7 +227,7 @@ def test_two_pass_rescues_a_low_initial_score_from_zero_cost_jd_cache(tmp_path):
     assert len(rows) == 1
     assert rows[0]["初评分数"] == "2.50"
     assert rows[0]["深评分数"] == "3.40"
-    assert rows[0]["JD深度"] == "deep"
+    assert rows[0]["JD深度"] == "cache"
     assert rows[0]["评估状态"] in {"ready", "pending"}
     assert meta["pass1_rescued"] == 1
     assert meta["deep_cache_hits"] == 1
@@ -320,7 +320,7 @@ def test_two_pass_rescues_gray_band_score_even_when_teaser_is_not_short(
     assert len(rows) == 1
     assert rows[0]["初评分数"] == "2.95"
     assert float(rows[0]["深评分数"]) >= 3.3
-    assert rows[0]["JD深度"] == "deep"
+    assert rows[0]["JD深度"] == "full"
     assert meta["retrieval_floor"] == 2.95
     assert meta["pass1_rescued"] == 1
     assert meta["deep_network_attempted"] == 1

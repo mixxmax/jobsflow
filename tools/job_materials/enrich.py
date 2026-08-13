@@ -280,9 +280,17 @@ def enrich_package(package: Path, root: Path, repo: Path = REPO) -> list[str]:
 
         # Playwright body when available
         try:
-            from tools.fresh_24h.portal_jd_browser import fetch_jd_body  # type: ignore
+            from tools.fresh_24h.portal_jd_browser import (  # type: ignore
+                default_circuit_state_path,
+                fetch_jd_body,
+            )
 
-            fres = fetch_jd_body(canon, cache_root=repo)
+            fres = fetch_jd_body(
+                canon,
+                cache_root=repo,
+                circuit_state_path=default_circuit_state_path(repo),
+                reset_budget=True,
+            )
             if fres.ok and fres.text and len(fres.text) > 200:
                 write_jd(
                     root,

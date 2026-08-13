@@ -80,9 +80,20 @@ PASS_EXTRA = [
     "深评分数",
     "深评等级",
     "深评理由",
-    "JD深度",  # teaser | deep | paste_needed
+    "JD深度",  # full | cache | teaser | paste_needed | teaser_unavailable | teaser_capped
     "评估状态",  # ready | pending | below_current_retention | provisional_needs_jd
 ]
+
+# Internal depth labels used inside run_two_pass / deep_enrich_hit.  The
+# tracker column uses the external vocabulary above; `deep` means "a full JD
+# was obtained (fetch or cache)" internally.  Labels that are already part of
+# the external vocabulary (teaser_unavailable, teaser_capped) pass through.
+_INTERNAL_TO_EXTERNAL_DEPTH = {
+    "deep": "full",
+    "teaser": "teaser",
+    "teaser_fallback": "teaser",
+    "paste_needed": "paste_needed",
+}
 
 SCORED_ARTIFACT_SCHEMA_VERSION = 3
 
@@ -520,6 +531,7 @@ def deep_enrich_hit(h: dict, *, repo: Path, use_browser: bool = True) -> tuple[s
         h["_enrich"] = {
             "mode": "cache",
             "ok": True,
+            "depth": "cache",
             "cache_key": cached_meta.get("cache_key"),
             "source": cached_meta.get("source", "cache"),
             "desc_len": len(cached_text),
@@ -593,17 +605,28 @@ def deep_enrich_hit(h: dict, *, repo: Path, use_browser: bool = True) -> tuple[s
         browser_session = h.get("_browser_session")
         if browser_session is not None:
             fetch_kwargs["session"] = browser_session
+        circuit = h.get("_browser_fetch_circuit")
+        if circuit is not None:
+            fetch_kwargs["circuit"] = circuit
+        if "jobsdb.com" in portal_host:
+            # Scan policy: one attempt per URL with a tighter per-attempt
+            # timeout.  Repetition is the portal breaker's and failure cache's
+            # job, not per-URL auto-retries.
+            fetch_kwargs["retry"] = 0
+            fetch_kwargs["timeout_ms"] = 25000
         fres = fetch_jd_body(url, **fetch_kwargs)
         if fres.ok and fres.text:
             h["_enrich"] = {
                 "mode": "browser",
                 "ok": True,
+                "depth": "full",
                 "portal": fres.portal,
                 "selector": fres.selector,
                 "desc_len": fres.chars,
                 "attempts": fres.attempts,
                 "retried": fres.retried,
                 "last_reason": fres.last_reason,
+                "session_mode": fres.session_mode,
             }
             h["teaser"] = fres.text[:3000]
             h["_deep_jd_full"] = fres.text
@@ -621,11 +644,22 @@ def deep_enrich_hit(h: dict, *, repo: Path, use_browser: bool = True) -> tuple[s
             "ok": False,
             "portal": getattr(fres, "portal", None),
             "fail_reason": getattr(fres, "fail_reason", None),
+            "detail_reason": getattr(fres, "detail_reason", None),
             "attempts": getattr(fres, "attempts", None),
             "retried": getattr(fres, "retried", None),
             "last_reason": getattr(fres, "last_reason", None),
+            "failure_cached": getattr(fres, "failure_cached", 0),
+            "circuit_state": getattr(fres, "circuit_state", None),
+            "retry_not_before": getattr(fres, "retry_not_before", None),
+            "recommended_action": getattr(fres, "recommended_action", None),
+            "state_saved": getattr(fres, "state_saved", False),
+            "session_mode": getattr(fres, "session_mode", "snapshot"),
             "url": url,
         }
+        if getattr(fres, "detail_reason", None) in {"circuit_open", "budget_exhausted"}:
+            # Portal-wide stop or budget stop: the row is teaser-level and the
+            # materials path must ask the user to paste the full JD.
+            return h.get("teaser") or "", "paste_needed"
         return h.get("teaser") or "", "teaser_fallback"
 
     return h.get("teaser") or "", "teaser"
@@ -690,6 +724,14 @@ def run_two_pass(
         "linkedin_batch_attempted": 0,
         "linkedin_batch_ok": 0,
         "linkedin_batch_worker": "not_needed",
+        "jobsdb_detail_requests": 0,
+        "jobsdb_cache_hits": 0,
+        "jobsdb_detail_success": 0,
+        "jobsdb_challenge_count": 0,
+        "jobsdb_rate_limited_count": 0,
+        "jobsdb_degraded_count": 0,
+        "enrich_errors": [],
+        "jobsdb_detail_status": None,
     }
 
     # Keep one profile fingerprint for every assessment in this run.  The
@@ -870,172 +912,255 @@ def run_two_pass(
                 )
 
     try:
-        from portal_jd_browser import BrowserSessionPool  # type: ignore
+        from portal_jd_browser import (  # type: ignore
+            BrowserSessionPool,
+            PortalCircuitBreaker,
+            default_circuit_state_path,
+            reset_portal_budget,
+        )
 
         browser_pool = BrowserSessionPool()
+        # P4: one persisted JobsDB portal breaker per scan, and a fresh
+        # per-scan request budget.  Any unexpected breaker failure must never
+        # abort scoring.
+        try:
+            jobsdb_circuit = PortalCircuitBreaker(
+                portal="jobsdb", state_path=default_circuit_state_path(repo)
+            )
+            reset_portal_budget("jobsdb")
+        except (OSError, ValueError, TypeError):
+            jobsdb_circuit = None
     except ImportError:
         browser_pool = None
+        jobsdb_circuit = None
 
     draft_rows: list[dict] = []
     network_processed = 0
-    for h, sc1 in gated:
-        teaser2 = h.get("teaser") or ""
-        depth = "teaser"
-        cache_available = bool(h.pop("_pass1_cache_hit", False))
-        network_selected = id(h) in selected_network_ids
-        portal_host = str(h.get("url") or "").casefold()
-        ct_without_cache = "ctgoodjobs.hk" in portal_host and not cache_available
-        if ct_without_cache:
-            depth = "teaser_unavailable"
-            meta["deep_unavailable"] += 1
-        elif cache_available or network_selected:
-            meta["deep_attempted"] += 1
-            if network_selected:
-                meta["deep_network_attempted"] += 1
-                network_processed += 1
-            li_job_id = extract_linkedin_job_id(str(h.get("url") or "")) or ""
-            if li_job_id in linkedin_batch:
-                h["_linkedin_batch_result"] = linkedin_batch[li_job_id]
-                h["_linkedin_batch_used"] = True
-            if browser_pool is not None:
-                session = browser_pool.session_for(str(h.get("url") or ""))
-                if session is not None:
-                    h["_browser_session"] = session
-            text2, depth = deep_enrich_hit(h, repo=repo)
-            h.pop("_browser_session", None)
-            h.pop("_linkedin_batch_used", None)
+    try:
+        for h, sc1 in gated:
+            teaser2 = h.get("teaser") or ""
+            depth = "teaser"
+            cache_available = bool(h.pop("_pass1_cache_hit", False))
+            network_selected = id(h) in selected_network_ids
+            portal_host = str(h.get("url") or "").casefold()
+            ct_without_cache = "ctgoodjobs.hk" in portal_host and not cache_available
+            if ct_without_cache:
+                depth = "teaser_unavailable"
+                meta["deep_unavailable"] += 1
+            elif cache_available or network_selected:
+                meta["deep_attempted"] += 1
+                if network_selected:
+                    meta["deep_network_attempted"] += 1
+                    network_processed += 1
+                li_job_id = extract_linkedin_job_id(str(h.get("url") or "")) or ""
+                if li_job_id in linkedin_batch:
+                    h["_linkedin_batch_result"] = linkedin_batch[li_job_id]
+                    h["_linkedin_batch_used"] = True
+                if browser_pool is not None:
+                    session = browser_pool.session_for(str(h.get("url") or ""))
+                    if session is not None:
+                        h["_browser_session"] = session
+                if jobsdb_circuit is not None and "jobsdb.com" in portal_host:
+                    h["_browser_fetch_circuit"] = jobsdb_circuit
+                try:
+                    text2, depth = deep_enrich_hit(h, repo=repo)
+                except Exception as exc:  # a failed row must never abort the scan
+                    meta["enrich_errors"].append(
+                        {
+                            "title": h.get("title"),
+                            "company": h.get("company"),
+                            "error": str(exc)[:200],
+                        }
+                    )
+                    h["_enrich"] = {
+                        "mode": "browser",
+                        "ok": False,
+                        "error": str(exc)[:200],
+                    }
+                    text2, depth = h.get("teaser") or "", "teaser_fallback"
+                h.pop("_browser_session", None)
+                h.pop("_browser_fetch_circuit", None)
+                h.pop("_linkedin_batch_used", None)
+                if depth == "deep":
+                    meta["deep_ok"] += 1
+                    teaser2 = text2
+                    h["teaser"] = text2[:3000]  # keep for 简述 context
+                    deep_url = normalize_job_url(
+                        str(h.get("url") or ""), source=str(h.get("source") or "")
+                    )
+                    deep_text = str(h.get("_deep_jd_full") or text2 or "")
+                    if deep_url and deep_text:
+                        meta["jd_fingerprints"][deep_url] = jd_fingerprint(deep_text)
+                enrich = h.get("_enrich") or {}
+                enrich_mode = str(enrich.get("mode") or "")
+                if enrich_mode == "cache":
+                    meta["deep_cache_hits"] += 1
+                if "jobsdb.com" in portal_host:
+                    if enrich_mode == "cache":
+                        meta["jobsdb_cache_hits"] += 1
+                    else:
+                        meta["jobsdb_detail_requests"] += 1
+                        if depth == "deep" and enrich_mode == "browser":
+                            meta["jobsdb_detail_success"] += 1
+                        if enrich.get("fail_reason") == "challenge":
+                            meta["jobsdb_challenge_count"] += 1
+                        elif enrich.get("fail_reason") == "rate_limited":
+                            meta["jobsdb_rate_limited_count"] += 1
+                        if enrich.get("detail_reason") in {
+                            "circuit_open",
+                            "budget_exhausted",
+                        }:
+                            meta["jobsdb_degraded_count"] += 1
+                network_attempted = enrich_mode not in {
+                    "cache",
+                    "ctgoodjobs_skip_browser",
+                    "teaser",
+                    "deep_batch",
+                }
+                if (
+                    sleep_s > 0
+                    and network_attempted
+                    and network_processed < len(selected_network)
+                ):
+                    time.sleep(sleep_s)
+            else:
+                depth = "teaser_capped"
+
+            # Only claim deep JD in reason/confidence when enrich actually returned deep text
+            sc2 = score_hit(
+                h,
+                teaser2,
+                jd_depth="deep" if depth == "deep" else "teaser",
+                repo=repo,
+                profile=scoring_profile,
+                jd_full=h.get("_deep_jd_full") if depth == "deep" else None,
+            )
+            h["_sc2"] = sc2
+            h["_jd_depth"] = depth
             if depth == "deep":
-                meta["deep_ok"] += 1
-                teaser2 = text2
-                h["teaser"] = text2[:3000]  # keep for 简述 context
-                deep_url = normalize_job_url(
-                    str(h.get("url") or ""), source=str(h.get("source") or "")
+                _record_score_distribution(meta["deep_score_distribution"], sc2.score)
+
+            # A hard language mismatch is a veto independent of the numeric score
+            # or a caller's custom min_final threshold. Never emit it to the
+            # tracker/Sheets result set.
+            if getattr(sc2, "language_gate", "") == "FAIL":
+                record_assessment(
+                    h,
+                    score=sc2,
+                    pass1=sc1,
+                    pass2=sc2,
+                    depth=depth,
+                    status="language_gate_failed",
                 )
-                deep_text = str(h.get("_deep_jd_full") or text2 or "")
-                if deep_url and deep_text:
-                    meta["jd_fingerprints"][deep_url] = jd_fingerprint(deep_text)
-            enrich_mode = str((h.get("_enrich") or {}).get("mode") or "")
-            if enrich_mode == "cache":
-                meta["deep_cache_hits"] += 1
-            network_attempted = enrich_mode not in {
-                "cache",
-                "ctgoodjobs_skip_browser",
-                "teaser",
-                "deep_batch",
-            }
-            if (
-                sleep_s > 0
-                and network_attempted
-                and network_processed < len(selected_network)
-            ):
-                time.sleep(sleep_s)
-        else:
-            depth = "teaser_capped"
+                meta["language_gate_failed"] += 1
+                if len(meta["language_gate_dropped"]) < 15:
+                    meta["language_gate_dropped"].append(
+                        {
+                            "title": h.get("title"),
+                            "company": h.get("company"),
+                            "note": sc2.language_note,
+                        }
+                    )
+                continue
 
-        # Only claim deep JD in reason/confidence when enrich actually returned deep text
-        sc2 = score_hit(
-            h,
-            teaser2,
-            jd_depth="deep" if depth == "deep" else "teaser",
-            repo=repo,
-            profile=scoring_profile,
-            jd_full=h.get("_deep_jd_full") if depth == "deep" else None,
-        )
-        h["_sc2"] = sc2
-        h["_jd_depth"] = depth
-        if depth == "deep":
-            _record_score_distribution(meta["deep_score_distribution"], sc2.score)
-
-        # A hard language mismatch is a veto independent of the numeric score
-        # or a caller's custom min_final threshold. Never emit it to the
-        # tracker/Sheets result set.
-        if getattr(sc2, "language_gate", "") == "FAIL":
+            below_final = sc2.score < min_final
+            provisional = depth != "deep"
+            if provisional:
+                assessment_status = "provisional_needs_jd"
+            elif getattr(sc2, "semantic_pending_count", 0):
+                assessment_status = "pending"
+            else:
+                assessment_status = "ready"
+            if provisional:
+                row_status = "provisional_needs_jd"
+            elif below_final:
+                row_status = "below_current_retention"
+            else:
+                row_status = assessment_status
             record_assessment(
                 h,
                 score=sc2,
                 pass1=sc1,
                 pass2=sc2,
                 depth=depth,
-                status="language_gate_failed",
+                status=assessment_status,
             )
-            meta["language_gate_failed"] += 1
-            if len(meta["language_gate_dropped"]) < 15:
-                meta["language_gate_dropped"].append(
+            if below_final and not provisional:
+                meta["dropped_final"].append(
                     {
                         "title": h.get("title"),
                         "company": h.get("company"),
-                        "note": sc2.language_note,
+                        "pass1": sc1.score,
+                        "pass2": sc2.score,
+                        "depth": depth,
                     }
                 )
-            continue
+                if drop_below_final:
+                    continue
 
-        below_final = sc2.score < min_final
-        provisional = depth != "deep"
-        if provisional:
-            assessment_status = "provisional_needs_jd"
-        elif getattr(sc2, "semantic_pending_count", 0):
-            assessment_status = "pending"
-        else:
-            assessment_status = "ready"
-        if provisional:
-            row_status = "provisional_needs_jd"
-        elif below_final:
-            row_status = "below_current_retention"
-        else:
-            row_status = assessment_status
-        record_assessment(
-            h,
-            score=sc2,
-            pass1=sc1,
-            pass2=sc2,
-            depth=depth,
-            status=assessment_status,
-        )
-        if below_final and not provisional:
-            meta["dropped_final"].append(
-                {
-                    "title": h.get("title"),
-                    "company": h.get("company"),
-                    "pass1": sc1.score,
-                    "pass2": sc2.score,
-                    "depth": depth,
-                }
-            )
-            if drop_below_final:
-                continue
+            # Row uses pass-2 as CareerOps* (what you rank on in sheet)
+            cells = build_tracker_row("TMP", 0, h, sc2)
+            row = dict(zip(SHEET_HEADERS, cells))
+            row["简历版本"] = sc2.resume_ver
+            row["_deep_jd_full"] = h.get("_deep_jd_full", "")
+            row["_deep_jd_url"] = h.get("url", "")
+            row["CareerOps分数"] = f"{sc2.score:.2f}"
+            row["CareerOps等级"] = sc2.grade
+            row["CareerOps理由"] = sc2.reason
+            row["初评分数"] = f"{sc1.score:.2f}"
+            row["初评等级"] = sc1.grade
+            row["初评理由"] = (sc1.reason or "")[:200]
+            row["深评分数"] = f"{sc2.score:.2f}"
+            row["深评等级"] = sc2.grade
+            row["深评理由"] = (sc2.reason or "")[:200]
+            enrich_depth = str((h.get("_enrich") or {}).get("depth") or "")
+            if enrich_depth in {"cache", "full"}:
+                row["JD深度"] = enrich_depth
+            else:
+                # Labels already in the external vocabulary pass through.
+                row["JD深度"] = _INTERNAL_TO_EXTERNAL_DEPTH.get(depth, depth)
+            row["评估状态"] = row_status
+            if provisional:
+                row["_provisional_needs_jd"] = True
+                meta["provisional_needs_jd"] += 1
+            elif below_final:
+                row["_below_final"] = True
+            else:
+                meta["final_kept"] += 1
+            if depth == "deep":
+                conf = row.get("置信度") or sc2.confidence
+                if conf in {"低", "中"}:
+                    row["置信度"] = "中高" if conf == "中" else "中"
+            draft_rows.append(row)
+    finally:
+        if browser_pool is not None:
+            browser_pool.close()
 
-        # Row uses pass-2 as CareerOps* (what you rank on in sheet)
-        cells = build_tracker_row("TMP", 0, h, sc2)
-        row = dict(zip(SHEET_HEADERS, cells))
-        row["简历版本"] = sc2.resume_ver
-        row["_deep_jd_full"] = h.get("_deep_jd_full", "")
-        row["_deep_jd_url"] = h.get("url", "")
-        row["CareerOps分数"] = f"{sc2.score:.2f}"
-        row["CareerOps等级"] = sc2.grade
-        row["CareerOps理由"] = sc2.reason
-        row["初评分数"] = f"{sc1.score:.2f}"
-        row["初评等级"] = sc1.grade
-        row["初评理由"] = (sc1.reason or "")[:200]
-        row["深评分数"] = f"{sc2.score:.2f}"
-        row["深评等级"] = sc2.grade
-        row["深评理由"] = (sc2.reason or "")[:200]
-        row["JD深度"] = depth
-        row["评估状态"] = row_status
-        if provisional:
-            row["_provisional_needs_jd"] = True
-            meta["provisional_needs_jd"] += 1
-        elif below_final:
-            row["_below_final"] = True
-        else:
-            meta["final_kept"] += 1
-        if depth == "deep":
-            conf = row.get("置信度") or sc2.confidence
-            if conf in {"低", "中"}:
-                row["置信度"] = "中高" if conf == "中" else "中"
-        draft_rows.append(row)
-
-    if browser_pool is not None:
-        browser_pool.close()
+    if jobsdb_circuit is not None:
+        snapshot = jobsdb_circuit.snapshot()
+        retry_not_before = snapshot.get("retry_not_before")
+        meta["jobsdb_detail_status"] = {
+            "portal": "jobsdb",
+            "jd_cache_hits": meta["jobsdb_cache_hits"],
+            "detail_requests": meta["jobsdb_detail_requests"],
+            "detail_success": meta["jobsdb_detail_success"],
+            "challenge_count": meta["jobsdb_challenge_count"],
+            "rate_limited_count": meta["jobsdb_rate_limited_count"],
+            "degraded_count": meta["jobsdb_degraded_count"],
+            "circuit_state": snapshot.get("state"),
+            "retry_not_before": (
+                datetime.fromtimestamp(
+                    float(retry_not_before), tz=timezone.utc
+                ).isoformat(timespec="seconds")
+                if retry_not_before
+                else None
+            ),
+            "recommended_action": (
+                "wait_or_manual_verify"
+                if snapshot.get("state") in {"open", "half_open"}
+                else "none"
+            ),
+        }
 
     draft_rows.sort(
         key=lambda r: -float(r.get("深评分数") or r.get("CareerOps分数") or 0)
@@ -1324,6 +1449,30 @@ def main(argv: list[str] | None = None) -> int:
         f"network={meta['deep_network_attempted']}/{meta['deep_network_selected']} "
         f"budget_exhausted={meta['deep_budget_exhausted']} ok={meta['deep_ok']}"
     )
+    jobsdb_status = meta.get("jobsdb_detail_status")
+    if jobsdb_status:
+        retry_info = jobsdb_status.get("retry_not_before") or "n/a"
+        print(
+            f"jobsdb detail: requests={jobsdb_status.get('detail_requests')} "
+            f"cache_hits={jobsdb_status.get('jd_cache_hits')} "
+            f"success={jobsdb_status.get('detail_success')} "
+            f"challenge={jobsdb_status.get('challenge_count')} "
+            f"degraded={jobsdb_status.get('degraded_count')} "
+            f"circuit={jobsdb_status.get('circuit_state')} "
+            f"retry_not_before={retry_info}"
+        )
+        if jobsdb_status.get("recommended_action") == "wait_or_manual_verify":
+            print(
+                "jobsdb: 详情深取已暂停（熔断）；列表结果和缓存仍可使用，"
+                f"冷却至 {retry_info}，或运行人工验证恢复。",
+                file=sys.stderr,
+            )
+    if meta.get("enrich_errors"):
+        print(
+            f"WARNING: enrich errors={len(meta['enrich_errors'])} "
+            f"(rows degraded to teaser)",
+            file=sys.stderr,
+        )
     n_below = len(meta["dropped_final"])
     print(
         f"final kept={meta['final_kept']} provisional={meta['provisional_needs_jd']} "

@@ -69,17 +69,30 @@ JobsDB、CTgoodjobs 和 LinkedIn 详情页默认使用无头 Chrome，并会尝�
 python3 tools/fresh_24h/portal_jd_browser.py \
   --url '<job-detail-url>' \
   --headed \
-  --save-storage-state ~/.config/jobsearch/storage_state_jobsdb.json
+  --interactive-verification \
+  [--user-data-dir ~/.config/jobsearch/browser_profiles/jobsdb]
 ```
 
-在浏览器窗口中人工完成一次验证后关闭窗口；后续抓取会复用该会话。可用
-`--storage-state` 或 `PORTAL_JD_STORAGE_STATE` 覆盖读取路径，`--channel` 或
-`PORTAL_JD_CHANNEL` 覆盖浏览器通道。Cookie/session 文件属于敏感数据，必须放在
-用户主目录下，禁止写入仓库、CSV、日志或报告。
+`--interactive-verification` 必须与 `--headed` 同用；它在浏览器窗口中等待
+人工完成验证，与是否 TTY 无关，且只有页面出现真实职位详情后才会保存会话
+（`content_validated=true` / `state_saved=true`）。可用 `--storage-state` 或
+`PORTAL_JD_STORAGE_STATE` 覆盖读取路径，`--channel` 或 `PORTAL_JD_CHANNEL`
+覆盖浏览器通道。Cookie/session 文件属于敏感数据，必须放在用户主目录下，
+禁止写入仓库、CSV、日志或报告。
 
-详情页默认对 `waf`、`timeout`、`empty` 失败自动重试 2 次；可用
-`--retry 0` 关闭，或用 `--retry-delay` 调整间隔。成功抓取会自动写入
-`02_Tracker/jds/cache/<sha256(url)[:16]>.json`，`--out` 仍可同时生成 Markdown。
+**失败与熔断纪律**：`challenge`/`waf`/429 绝不自动重试，也绝不覆盖已保存的
+有效会话；只有 `timeout` 按 `--retry`（默认 2，`--retry 0` 关闭）自动重试，
+间隔用 `--retry-delay`。两个不同 JobsDB URL 连续 Challenge 会打开门户级熔断
+（持久化于 `02_Tracker/portal_state/jobsdb_circuit.json`），此后未缓存详情请求
+直接降级为 `paste_needed`，直到冷却结束或人工恢复；429 以响应 `Retry-After`
+为冷却下限。单轮预算默认：每 15 秒最多 1 次、每轮最多 10 次 JobsDB 详情请求
+（`PORTAL_JD_MIN_INTERVAL_SECONDS` / `PORTAL_JD_MAX_REQUESTS_PER_SCAN` 可覆盖）。
+
+成功抓取会自动写入 `02_Tracker/jds/cache/<sha256(url)[:16]>.json`，`--out` 仍
+可同时生成 Markdown。`--diagnostics-dir` 输出脱敏诊断（仅 URL hash，不含
+cookie/请求头）。两段评分行的 `JD深度` 取值：`full`（浏览器深取）/
+`cache`（URL 缓存命中）/ `teaser`（仅摘要）/ `paste_needed`（熔断或预算停止，
+材料需粘贴 JD）。
 
 ## Batch and identifiers
 

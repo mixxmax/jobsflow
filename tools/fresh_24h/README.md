@@ -63,13 +63,22 @@ labeled as a full JD.
 
 ### Reliable detail fetch
 
-The Playwright detail fallback retries `waf`, `timeout` and `empty` failures
-twice by default (`--retry 0` disables retries; `--retry-delay` controls the
-interval). It reuses the private portal-specific state at
-`~/.config/jobsearch/storage_state_<portal>.json` when present. For a first-time
-human verification, use `--headed --save-storage-state <path>`; keep that cookie
-file under the user home directory and out of the repository. Successful CLI
-fetches write the same URL-keyed JD cache used by two-pass scoring.
+The Playwright detail fallback never auto-retries `challenge`/`waf`/429
+failures and never overwrites a saved valid session on them; only `timeout`
+retries (`--retry`, default 2; `--retry-delay`). Two consecutive JobsDB
+challenges open a persisted portal circuit breaker under
+`02_Tracker/portal_state/jobsdb_circuit.json` — later uncached detail requests
+degrade to `paste_needed` until the cooldown (429 uses the response
+`Retry-After`) or a manual recovery. The scan budget defaults to one JobsDB
+detail navigation at a time, at least 15 s apart, at most 10 per scan. Manual
+recovery is explicit: `--headed --interactive-verification
+[--user-data-dir <dir>]` waits for human verification independent of TTY and
+saves state only after a real JD validates. Rows record JD depth as
+`full`/`cache`/`teaser`/`paste_needed`. Cookie files stay under the user home
+directory and out of the repository; `--diagnostics-dir` writes a sanitized
+record (URL hash only). See `AGENT_REFRESH.md` and
+`docs/JobsDB_Playwright_Cloudflare深取恢复与可靠性技术手册_2026-08-13.md` §15
+for the runbook.
 
 ## Rules
 
