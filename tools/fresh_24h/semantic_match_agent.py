@@ -56,6 +56,48 @@ def _load(key: str) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _persist_verdict(key: str, verdict: dict) -> None:
+    """Write the verdict to done/ and remove the pending task.
+
+    Raises SystemExit(2) with an explicit message if either step fails, so a
+    batch `complete` never looks successful without the verdict being durable
+    on disk (the re-run scoring step depends on the done/ file).
+    """
+    done = done_dir()
+    done.mkdir(parents=True, exist_ok=True)
+    done_file = done / f"{key}.json"
+    pending_file = pending_dir() / f"{key}.json"
+    try:
+        atomic_write_json(done_file, verdict)
+    except OSError as exc:
+        print(
+            f"ERROR: failed to write verdict {done_file}: {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
+    if not done_file.is_file():
+        print(
+            f"ERROR: verdict file missing after write: {done_file}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    try:
+        pending_file.unlink(missing_ok=True)
+    except OSError as exc:
+        print(
+            f"ERROR: verdict written but pending task could not be removed "
+            f"({pending_file}): {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
+    if pending_file.exists():
+        print(
+            f"ERROR: verdict written but pending task still exists: {pending_file}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
 def cmd_list() -> int:
     pending = pending_dir()
     if not pending.exists():
@@ -145,8 +187,7 @@ def cmd_complete(
         }
         if task == "position_profile" and company_brief:
             verdict["company_brief"] = company_brief
-        atomic_write_json(done / f"{key}.json", verdict)
-        (pending_dir() / f"{key}.json").unlink(missing_ok=True)
+        _persist_verdict(key, verdict)
         extra = f" company_brief={verdict.get('company_brief', '')[:30]}..." if verdict.get("company_brief") else ""
         print(f"completed {key}: lane={verdict['letter']} ({verdict['lane_label']}){extra}")
         print("Re-run scoring to pick up the lane verdict.")
@@ -167,8 +208,7 @@ def cmd_complete(
         "calibration_level": (t.get("semantic_profile") or {}).get("upper_bound_level", "medium"),
         "note": note,
     }
-    atomic_write_json(done / f"{key}.json", verdict)
-    (pending_dir() / f"{key}.json").unlink(missing_ok=True)
+    _persist_verdict(key, verdict)
     print(f"completed {key}: resume_match={verdict['resume_match']}")
     print("Re-run scoring to pick up the verdict (e.g. two_pass_score.py).")
     return 0
