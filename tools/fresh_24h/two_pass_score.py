@@ -1158,6 +1158,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Output scored CSV (default: *_twopass_scored.csv)",
     )
+    ap.add_argument(
+        "--only-keys",
+        default=None,
+        help=(
+            "Comma-separated URL job IDs (or SCAN-xxx ids) to re-score only; "
+            "all other rows are copied through untouched from the previous "
+            "scored artifact.  Local re-run after semantic verdicts without "
+            "re-fetching the whole window."
+        ),
+    )
     args = ap.parse_args(argv)
 
     repo = args.repo.resolve()
@@ -1169,6 +1179,27 @@ def main(argv: list[str] | None = None) -> int:
 
     scoring_profile = load_scoring_profile(repo)
     hits = load_hits(csv_path)
+    only_keys: set[str] | None = None
+    if args.only_keys:
+        only_keys = {k.strip() for k in args.only_keys.split(",") if k.strip()}
+        kept = []
+        for h in hits:
+            u = str(h.get("url") or "")
+            m = re.search(r"(?:/|-)(\d{8,})(?:/|$|\?|&)", u)
+            key = m.group(1) if m else u
+            scan_id = str(h.get("scan_id") or "")
+            if key in only_keys or scan_id in only_keys:
+                kept.append(h)
+        if not kept:
+            print(
+                f"ERROR: --only-keys matched no rows (keys={sorted(only_keys)})",
+                file=sys.stderr,
+            )
+            return 2
+        dropped = len(hits) - len(kept)
+        hits = kept
+        if dropped:
+            print(f"  --only-keys: kept {len(hits)} row(s), skipped {dropped} other row(s)")
     preferences = load_workflow_preferences(repo)
     if args.scan_depth or args.retention:
         try:
@@ -1257,7 +1288,12 @@ def main(argv: list[str] | None = None) -> int:
     out = args.out
     if out is None:
         stem = csv_path.stem
-        out = csv_path.with_name(f"{stem}_twopass_scored.csv")
+        if only_keys:
+            # --only-keys re-scores a subset; never overwrite the full-window
+            # scored artifact.  Write a sidecar file instead.
+            out = csv_path.with_name(f"{stem}_only_keys_scored.csv")
+        else:
+            out = csv_path.with_name(f"{stem}_twopass_scored.csv")
     else:
         out = out.expanduser().resolve()
     write_csv(out, rows, repo=repo)
