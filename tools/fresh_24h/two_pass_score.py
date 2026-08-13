@@ -268,9 +268,12 @@ def select_rows_for_retention(
     for raw in rows:
         row = dict(raw)
         depth = str(row.get("JD深度") or "")
+        # External depth vocabulary: full/cache = a real JD was obtained;
+        # everything else is teaser-level and stays in the review tier.
+        has_full_jd = depth in {"deep", "full", "cache"}
         provisional = (
             str(row.get("评估状态") or "") == "provisional_needs_jd"
-            or depth != "deep"
+            or not has_full_jd
         )
         if provisional:
             row["评估状态"] = "provisional_needs_jd"
@@ -352,6 +355,27 @@ def normalize_hits_urls(hits: list[dict]) -> None:
         normalize_hit_url(h)
 
 
+def _row_match_keys(row: dict) -> set[str]:
+    """All tokens that can select one row with --only-keys.
+
+    A row matches a user key by its scan_id, its URL job ID (8+ digit run) or
+    the full URL.  The same set is used to drop replaced rows from the
+    previous scored artifact, so a re-scored row keyed by SCAN-xxx also
+    displaces its old twin that only carried the URL job ID (and vice versa).
+    """
+    keys: set[str] = set()
+    scan_id = str(row.get("scan_id") or "").strip()
+    if scan_id:
+        keys.add(scan_id)
+    url = str(row.get("url") or row.get("链接") or "").strip()
+    match = re.search(r"(?:/|-)(\d{8,})(?:/|$|\?|&)", url)
+    if match:
+        keys.add(match.group(1))
+    if url:
+        keys.add(url)
+    return keys
+
+
 def load_hits(csv_path: Path) -> list[dict]:
     with csv_path.open(encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -374,6 +398,9 @@ def load_hits(csv_path: Path) -> list[dict]:
                     "posted_at": r.get("发布日期") or r.get("posted_at") or "",
                     "track_hint": r.get("简历版本") or r.get("track_hint") or "F",
                     "soft_flags": r.get("soft_flags") or "",
+                    # scan_id is the partial-rerun key emitted by the scan stage;
+                    # it must survive so --only-keys SCAN-xxx can select rows.
+                    "scan_id": r.get("scan_id") or "",
                 }
             )
         normalize_hits_urls(hits)
@@ -627,6 +654,13 @@ def deep_enrich_hit(h: dict, *, repo: Path, use_browser: bool = True) -> tuple[s
                 "retried": fres.retried,
                 "last_reason": fres.last_reason,
                 "session_mode": fres.session_mode,
+                "headless": fres.headless,
+                "browser_channel": fres.browser_channel,
+                "browser_version": fres.browser_version,
+                "content_validated": fres.content_validated,
+                "fail_reason": fres.fail_reason,
+                "detail_reason": fres.detail_reason,
+                "failure_cached": fres.failure_cached,
             }
             h["teaser"] = fres.text[:3000]
             h["_deep_jd_full"] = fres.text
@@ -649,6 +683,10 @@ def deep_enrich_hit(h: dict, *, repo: Path, use_browser: bool = True) -> tuple[s
             "retried": getattr(fres, "retried", None),
             "last_reason": getattr(fres, "last_reason", None),
             "failure_cached": getattr(fres, "failure_cached", 0),
+            "content_validated": getattr(fres, "content_validated", False),
+            "headless": getattr(fres, "headless", None),
+            "browser_channel": getattr(fres, "browser_channel", None),
+            "browser_version": getattr(fres, "browser_version", None),
             "circuit_state": getattr(fres, "circuit_state", None),
             "retry_not_before": getattr(fres, "retry_not_before", None),
             "recommended_action": getattr(fres, "recommended_action", None),
@@ -730,6 +768,7 @@ def run_two_pass(
         "jobsdb_challenge_count": 0,
         "jobsdb_rate_limited_count": 0,
         "jobsdb_degraded_count": 0,
+        "jobsdb_failure_cache_hits": 0,
         "enrich_errors": [],
         "jobsdb_detail_status": None,
     }
@@ -999,7 +1038,12 @@ def run_two_pass(
                     if enrich_mode == "cache":
                         meta["jobsdb_cache_hits"] += 1
                     else:
-                        meta["jobsdb_detail_requests"] += 1
+                        # Actual browser navigations only (includes real timeout
+                        # retries). Breaker/budget/failure-cache stops navigate
+                        # zero times and must not inflate the request count.
+                        meta["jobsdb_detail_requests"] += int(
+                            enrich.get("attempts") or 0
+                        )
                         if depth == "deep" and enrich_mode == "browser":
                             meta["jobsdb_detail_success"] += 1
                         if enrich.get("fail_reason") == "challenge":
@@ -1011,6 +1055,8 @@ def run_two_pass(
                             "budget_exhausted",
                         }:
                             meta["jobsdb_degraded_count"] += 1
+                        if enrich.get("failure_cached"):
+                            meta["jobsdb_failure_cache_hits"] += 1
                 network_attempted = enrich_mode not in {
                     "cache",
                     "ctgoodjobs_skip_browser",
@@ -1147,6 +1193,7 @@ def run_two_pass(
             "challenge_count": meta["jobsdb_challenge_count"],
             "rate_limited_count": meta["jobsdb_rate_limited_count"],
             "degraded_count": meta["jobsdb_degraded_count"],
+            "failure_cache_hits": meta["jobsdb_failure_cache_hits"],
             "circuit_state": snapshot.get("state"),
             "retry_not_before": (
                 datetime.fromtimestamp(
@@ -1289,8 +1336,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Comma-separated URL job IDs (or SCAN-xxx ids) to re-score only; "
             "all other rows are copied through untouched from the previous "
-            "scored artifact.  Local re-run after semantic verdicts without "
-            "re-fetching the whole window."
+            "full scored artifact.  Local re-run after semantic verdicts "
+            "without re-fetching the whole window.  Writes a partial "
+            "*_only_keys_scored.csv sidecar (never reusable as a full artifact)."
         ),
     )
     args = ap.parse_args(argv)
@@ -1305,16 +1353,10 @@ def main(argv: list[str] | None = None) -> int:
     scoring_profile = load_scoring_profile(repo)
     hits = load_hits(csv_path)
     only_keys: set[str] | None = None
+    preserved: list[dict] = []
     if args.only_keys:
         only_keys = {k.strip() for k in args.only_keys.split(",") if k.strip()}
-        kept = []
-        for h in hits:
-            u = str(h.get("url") or "")
-            m = re.search(r"(?:/|-)(\d{8,})(?:/|$|\?|&)", u)
-            key = m.group(1) if m else u
-            scan_id = str(h.get("scan_id") or "")
-            if key in only_keys or scan_id in only_keys:
-                kept.append(h)
+        kept = [h for h in hits if _row_match_keys(h) & only_keys]
         if not kept:
             print(
                 f"ERROR: --only-keys matched no rows (keys={sorted(only_keys)})",
@@ -1325,6 +1367,42 @@ def main(argv: list[str] | None = None) -> int:
         hits = kept
         if dropped:
             print(f"  --only-keys: kept {len(hits)} row(s), skipped {dropped} other row(s)")
+        # Preserve untouched rows from the previous full scored artifact (same
+        # stem + "_twopass_scored.csv") so a partial re-run never shrinks the
+        # CSV.  Rows whose scan_id / URL job ID / URL intersect the re-scored
+        # set are replaced, never duplicated.
+        prev_path = scored_artifact_path(csv_path)
+        should_read_previous = prev_path.exists()
+        if args.out:
+            should_read_previous = should_read_previous and (
+                prev_path.resolve() != Path(args.out).expanduser().resolve()
+            )
+        if should_read_previous:
+            try:
+                prev_rows = _load_csv_rows(prev_path)
+                kept_keys: set[str] = set()
+                for h in kept:
+                    kept_keys |= _row_match_keys(h)
+                preserved = [
+                    row for row in prev_rows if not (_row_match_keys(row) & kept_keys)
+                ]
+                if preserved:
+                    print(
+                        f"  --only-keys: preserved {len(preserved)} untouched row(s) "
+                        f"from {prev_path.name}"
+                    )
+            except OSError as exc:
+                print(
+                    f"WARNING: could not read previous scored artifact "
+                    f"({prev_path}): {exc}",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                "  --only-keys: no previous full scored artifact — output will "
+                "contain only the re-scored rows (partial artifact)",
+                file=sys.stderr,
+            )
     preferences = load_workflow_preferences(repo)
     if args.scan_depth or args.retention:
         try:
@@ -1421,6 +1499,9 @@ def main(argv: list[str] | None = None) -> int:
             out = csv_path.with_name(f"{stem}_twopass_scored.csv")
     else:
         out = out.expanduser().resolve()
+    if args.only_keys and preserved:
+        # Partial re-runs keep untouched rows from the previous full artifact.
+        rows = preserved + rows
     write_csv(out, rows, repo=repo)
 
     meta_path = out.with_suffix(".json")
@@ -1433,7 +1514,9 @@ def main(argv: list[str] | None = None) -> int:
         max_deep=max_deep,
         jd_fingerprints=meta.get("jd_fingerprints") or {},
         repo=repo,
-        contains_all_deep_scores=not args.hide_below_final,
+        # A --only-keys sidecar never carries the full window's deep scores;
+        # marking it partial keeps it out of artifact-reuse consumers.
+        contains_all_deep_scores=not args.hide_below_final and not only_keys,
     )
     atomic_write_json(meta_path, meta)
 

@@ -179,3 +179,116 @@ def test_cli_interactive_verification_requires_headed(monkeypatch, tmp_path):
                 "--interactive-verification",
             ]
         )
+
+
+class _FakeCliSession:
+    """Session stand-in for CLI lifecycle tests: records close() calls."""
+
+    closed = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def close(self):
+        _FakeCliSession.closed.append(self)
+
+
+def _manual_cli_args(tmp_path, **extra):
+    args = [
+        "--url",
+        "https://hk.jobsdb.com/job/123",
+        "--user-data-dir",
+        str(tmp_path / "profile"),
+    ]
+    for key, value in extra.items():
+        args.append(f"--{key.replace('_', '-')}")
+        if value is not None:
+            args.append(str(value))
+    return args
+
+
+def test_cli_session_closed_on_success_and_failure_and_exception(monkeypatch, tmp_path):
+    monkeypatch.setattr(browser, "REPO", tmp_path)
+    monkeypatch.setattr(browser, "JdBrowserSession", _FakeCliSession)
+    monkeypatch.setenv("JOBSEARCH_ROOT", str(tmp_path))
+    _FakeCliSession.closed = []
+
+    monkeypatch.setattr(browser, "fetch_jd_body", lambda *args, **kwargs: _success())
+    assert browser.main(_manual_cli_args(tmp_path)) == 0
+    assert len(_FakeCliSession.closed) == 1
+
+    monkeypatch.setattr(browser, "fetch_jd_body", lambda *args, **kwargs: _failure("challenge"))
+    assert browser.main(_manual_cli_args(tmp_path)) == 1
+    assert len(_FakeCliSession.closed) == 2
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("output formatting exploded")
+
+    monkeypatch.setattr(browser, "fetch_jd_body", boom)
+    with pytest.raises(RuntimeError):
+        browser.main(_manual_cli_args(tmp_path))
+    assert len(_FakeCliSession.closed) == 3
+
+
+def test_manual_recovery_success_reconciles_persisted_breaker(monkeypatch, tmp_path):
+    monkeypatch.setattr(browser, "REPO", tmp_path)
+    monkeypatch.setenv("JOBSEARCH_ROOT", str(tmp_path))
+    monkeypatch.setattr(browser, "JdBrowserSession", _FakeCliSession)
+
+    state_path = browser.default_circuit_state_path()
+    breaker = browser.PortalCircuitBreaker(portal="jobsdb", state_path=state_path)
+    breaker.record_challenge()
+    breaker.record_challenge()
+    assert breaker.state == "open"
+
+    def fake_manual_fetch(url, **kwargs):
+        result = _success()
+        result.content_validated = True
+        return result
+
+    monkeypatch.setattr(browser, "fetch_jd_body", fake_manual_fetch)
+    assert browser.main(_manual_cli_args(tmp_path)) == 0
+
+    reopened = browser.PortalCircuitBreaker(portal="jobsdb", state_path=state_path)
+    assert reopened.state == "closed"
+    assert reopened.allow_fetch() is True
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["last_reason"] == "manual_recovery_success"
+
+
+def test_manual_recovery_failure_never_reconciles_breaker(monkeypatch, tmp_path):
+    monkeypatch.setattr(browser, "REPO", tmp_path)
+    monkeypatch.setenv("JOBSEARCH_ROOT", str(tmp_path))
+    monkeypatch.setattr(browser, "JdBrowserSession", _FakeCliSession)
+
+    state_path = browser.default_circuit_state_path()
+    breaker = browser.PortalCircuitBreaker(portal="jobsdb", state_path=state_path)
+    breaker.record_challenge()
+    breaker.record_challenge()
+    assert breaker.state == "open"
+
+    monkeypatch.setattr(
+        browser, "fetch_jd_body", lambda *args, **kwargs: _failure("challenge")
+    )
+    assert browser.main(_manual_cli_args(tmp_path)) == 1
+
+    reopened = browser.PortalCircuitBreaker(portal="jobsdb", state_path=state_path)
+    assert reopened.state != "closed"
+    assert reopened.allow_fetch() is False
+
+
+def test_manual_recovery_ignores_stale_failure_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(browser, "REPO", tmp_path)
+    monkeypatch.setenv("JOBSEARCH_ROOT", str(tmp_path))
+    captured = {}
+
+    def fake_fetch(url, **kwargs):
+        captured.update(kwargs)
+        return _failure("challenge")
+
+    monkeypatch.setattr(browser, "fetch_jd_body", fake_fetch)
+    monkeypatch.setattr(browser, "JdBrowserSession", _FakeCliSession)
+    browser.main(_manual_cli_args(tmp_path))
+    # A manual recovery attempt must ignore the recent-failure cache so the
+    # user can actually retry after a challenge.
+    assert captured.get("failure_cache") is False

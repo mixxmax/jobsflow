@@ -762,11 +762,16 @@ python3 -m pytest -q \
   "challenge_count": 2,
   "rate_limited_count": 0,
   "degraded_count": 9,
+  "failure_cache_hits": 1,
   "circuit_state": "open",
   "retry_not_before": "2026-08-13T18:30:00+08:00",
   "recommended_action": "wait_or_manual_verify"
 }
 ```
+
+`detail_requests` 只统计真实浏览器导航次数（含 timeout 自动重试的每次真实导航）；
+熔断拦截、请求预算拦截、失败缓存拦截都发生 0 次导航，只计入各自的
+`degraded_count` / `failure_cache_hits`，不得计入 `detail_requests`。
 
 用户提示必须说明事实，不制造确定性：
 
@@ -806,7 +811,17 @@ python3 -m pytest -q \
 - [x] 两段评分准确记录 `full/cache/teaser/paste_needed`；
 - [x] 日志与诊断文件不含 cookie 或代理凭据；
 - [x] 原有测试和新增恢复测试全部通过；
-- [x] 用户文档与 CLI help 已同步。
+- [x] 用户文档与 CLI help 已同步；
+- [x] 生产调用链接线（2026-08-14 收口）：两段评分、材料管线与 CLI 全部走
+  `fetch_jd_body` 编排路径（`retry=0`/持久熔断/预算/失败缓存），不再有绕行；
+- [x] CLI 自建 session 在成功、失败与异常下均关闭并释放 profile 锁；
+- [x] 人工 headed/persistent 恢复绕过旧熔断与失败缓存；只有
+  `ok=true` 且 `content_validated=true` 的真实 JD 才关闭持久熔断，
+  Challenge/429/超时/空壳不关闭；
+- [x] 材料管线在熔断/Challenge/429/预算/失败缓存停止后写 paste-needed stub
+  并终止，不再追加 structured 详情请求；仅普通本地错误保留 fallback；
+- [x] `detail_requests` 只计真实导航次数（含真实重试）；拦截计 0 次导航；
+- [x] 诊断记录实际 channel/version/headless/session 模式，不含 cookie 或完整 URL。
 
 ### 18.2 不应作为本地发布阻塞项的外部结果
 

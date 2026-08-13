@@ -14,6 +14,12 @@
 
 ## 流程
 
+0. 先走统一网关。`/apply` 只验证并等待用户确认，**绝不自动提交**：
+
+```bash
+python3 -m tools.workflow apply --job-id C0-005
+```
+
 1. 按 `.claude/commands/materials.md` 完成 application preflight、完整 JD、来源化公司快查（如有可靠来源）、A–F 基础版事实核验和差异化定制。
 2. 展示 fit、真实缺口、公司/JD 定制重点，并让用户确认是否继续完成材料。
 3. 只有 `application_preflight.ready_for_apply=true` 且
@@ -31,6 +37,11 @@
 9. 运行 `python3 -m tools.job_materials validate --package <路径>`，读取
    `materials_validation.json` / `.md`，确认岗位编号层级、猎头/雇主边界、英文材料语言、
    残缺句、雇主名称和 Cover Letter 页数均通过。该命令只报告问题，不自动改写用户 DOCX。
+   在 `JobSearch_2026` 私人线内，材料全程按 `.claude/commands/materials.md` 的三段门禁
+   执行（pre-draft → 独立审计 → pre-pdf → final）；本步之前必须已通过 `pre-pdf`，
+   本步之后运行 `python3 JobSearch_2026/scripts/materials_quality_trial.py verify
+   --job-id <ID> --stage final`，只有 `PRIVATE MATERIALS GATE PASSED (final)` 才可
+   进入下一步。
 10. 向用户列出最终文件、研究来源、关键差异化、事实缺口和验证结果。未获得用户明确授权，不自动向网站提交。
 
 ## 已确认事实回写

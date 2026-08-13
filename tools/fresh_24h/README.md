@@ -73,10 +73,16 @@ degrade to `paste_needed` until the cooldown (429 uses the response
 detail navigation at a time, at least 15 s apart, at most 10 per scan. Manual
 recovery is explicit: `--headed --interactive-verification
 [--user-data-dir <dir>]` waits for human verification independent of TTY and
-saves state only after a real JD validates. Rows record JD depth as
-`full`/`cache`/`teaser`/`paste_needed`. Cookie files stay under the user home
+saves state only after a real JD validates. A validated manual JD also closes
+the persisted breaker (`last_reason=manual_recovery_success`); challenge, 429,
+timeout and empty pages never close it. Rows record JD depth as
+`full`/`cache`/`teaser`/`paste_needed`. `jobsdb_detail_status.detail_requests`
+counts only real browser navigations (including real timeout retries);
+breaker, budget and failure-cache stops navigate zero times and never inflate
+it. Cookie files stay under the user home
 directory and out of the repository; `--diagnostics-dir` writes a sanitized
-record (URL hash only). See `AGENT_REFRESH.md` and
+record (URL hash only, plus channel/version/headless session facts). See
+`AGENT_REFRESH.md` and
 `docs/JobsDB_Playwright_Cloudflare深取恢复与可靠性技术手册_2026-08-13.md` §15
 for the runbook.
 

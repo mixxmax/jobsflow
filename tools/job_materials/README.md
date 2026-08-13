@@ -14,6 +14,10 @@ never create application materials.
   a transfer hypothesis only; it is never valid wording for completed experience.
 - High-quality tailoring requires the full JD. If cache, structured retrieval and
   bounded browser fallback remain shallow, use `jd set` to paste the text.
+- After a JobsDB challenge, 429, breaker-open, budget cap or recent-failure-cache
+  stop, the materials path writes a paste-needed stub and makes no further
+  automated detail request in that cycle; only an ordinary local browser error
+  keeps the structured-CLI fallback.
 - Tailoring may select, reorder and conservatively rephrase verified evidence. It
   may not invent responsibilities, metrics, qualifications, company facts or
   candidate motivation.

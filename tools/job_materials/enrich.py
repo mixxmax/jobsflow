@@ -187,6 +187,27 @@ def _stub_jd(canon: str, host_label: str) -> str:
     )
 
 
+# Browser outcomes after which the materials path must not contact JobsDB
+# again in the same cycle.  Only ordinary local errors (import/runtime) keep
+# the structured-CLI fallback.
+MATERIALS_TERMINAL_STOPS = {
+    "circuit_open",
+    "challenge",
+    "rate_limited",
+    "blocked",
+    "budget_exhausted",
+}
+
+
+def _materials_terminal_stop(fres: object) -> bool:
+    """True when a browser result says: stop, ask the user to paste the JD."""
+    if getattr(fres, "failure_cached", 0):
+        return True
+    reason = str(getattr(fres, "fail_reason", "") or "").strip().lower()
+    detail = str(getattr(fres, "detail_reason", "") or "").strip().lower()
+    return reason in MATERIALS_TERMINAL_STOPS or detail in MATERIALS_TERMINAL_STOPS
+
+
 def enrich_package(package: Path, root: Path, repo: Path = REPO) -> list[str]:
     notes = []
     for c in normalize_url_in_snapshot(package):
@@ -285,10 +306,14 @@ def enrich_package(package: Path, root: Path, repo: Path = REPO) -> list[str]:
                 fetch_jd_body,
             )
 
+            # Materials policy: never auto-retry JobsDB.  One attempt per call;
+            # repetition is the portal breaker's and failure cache's job.
             fres = fetch_jd_body(
                 canon,
                 cache_root=repo,
                 circuit_state_path=default_circuit_state_path(repo),
+                retry=0,
+                retry_delay=0,
                 reset_budget=True,
             )
             if fres.ok and fres.text and len(fres.text) > 200:
@@ -306,6 +331,30 @@ def enrich_package(package: Path, root: Path, repo: Path = REPO) -> list[str]:
                     _sv_cache(canon, fres.text, source=f"browser_{fres.portal}", root=repo)
                 except Exception:
                     pass
+                return notes
+            if _materials_terminal_stop(fres):
+                # The browser layer already decided the portal must not be
+                # contacted again this cycle (breaker open, challenge, 429,
+                # budget cap or recent-failure cache).  Stub + paste is the
+                # terminal path — never fire a second detail request through
+                # the structured CLI.
+                notes.append(
+                    f"browser JD stopped ({getattr(fres, 'fail_reason', '?')}/"
+                    f"{getattr(fres, 'detail_reason', '?')}) — paste needed. "
+                    f"URL: {canon}"
+                )
+                write_jd(
+                    root,
+                    package,
+                    _stub_jd(canon, "jobsdb"),
+                    url=canon,
+                    source="jobsdb_url_only",
+                )
+                notes.append("wrote JD stub (url only) — materials need paste")
+                notes.append(
+                    "paste full JD: python3 -m tools.job_materials jd set "
+                    "--package DIR --file jd.txt"
+                )
                 return notes
             notes.append(
                 f"browser JD failed ({getattr(fres, 'fail_reason', '?')}) — "

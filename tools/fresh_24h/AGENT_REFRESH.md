@@ -89,10 +89,15 @@ python3 tools/fresh_24h/portal_jd_browser.py \
 （`PORTAL_JD_MIN_INTERVAL_SECONDS` / `PORTAL_JD_MAX_REQUESTS_PER_SCAN` 可覆盖）。
 
 成功抓取会自动写入 `02_Tracker/jds/cache/<sha256(url)[:16]>.json`，`--out` 仍
-可同时生成 Markdown。`--diagnostics-dir` 输出脱敏诊断（仅 URL hash，不含
-cookie/请求头）。两段评分行的 `JD深度` 取值：`full`（浏览器深取）/
-`cache`（URL 缓存命中）/ `teaser`（仅摘要）/ `paste_needed`（熔断或预算停止，
-材料需粘贴 JD）。
+可同时生成 Markdown。`--diagnostics-dir` 输出脱敏诊断（仅 URL hash + channel/version/
+headless 会话事实，不含 cookie/请求头）。两段评分行的 `JD深度` 取值：
+`full`（浏览器深取）/ `cache`（URL 缓存命中）/ `teaser`（仅摘要）/
+`paste_needed`（熔断、预算或失败缓存停止，材料需粘贴 JD）。材料管线在
+熔断/Challenge/429/预算/失败缓存停止后直接写 paste-needed stub 并终止，
+不会再追加 structured 详情请求；只有普通本地错误才保留该 fallback。
+`jobsdb_detail_status.detail_requests` 只计真实导航次数（含真实 timeout
+重试），拦截一律计 0 次。人工 headed/persistent 恢复取得
+`content_validated=true` 的真实 JD 后会自动关闭持久熔断。
 
 ## Batch and identifiers
 

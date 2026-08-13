@@ -8,6 +8,12 @@
 
 目标是生成“有来源、岗位间明显不同、但不编造”的 CV 与 Cover Letter。扫描阶段绝不自动生成材料。
 
+先走统一网关，只生成当前步骤的任务包（不归档、不发送、不漫游私人目录）：
+
+```bash
+python3 -m tools.workflow materials --job-id C0-005
+```
+
 ## 1. 定位岗位并补全 JD
 
 ```bash
@@ -151,6 +157,24 @@ python3 -m tools.job_materials pipeline --job-id C0-005 --lane C
 
 没有 URL 支持的公司信息不得写成事实；没有用户真实偏好支持的“兴趣”不得编造。
 
+### 私人线三段门禁（JobSearch_2026）
+
+在 `JobSearch_2026` 私人线内执行时，pipeline 完成后、写正文前必须落盘并过闸：
+
+```bash
+python3 JobSearch_2026/scripts/materials_quality_trial.py init --job-id <ID>
+# 执行 Agent 完整阅读三份必读协议后，用 record 写入规划片段
+# （匹配分类、需求-证据矩阵、claim ledger、差异化、gaps、禁止声明、证据分配），
+# 然后：
+python3 JobSearch_2026/scripts/materials_quality_trial.py verify --job-id <ID> --stage pre-draft
+```
+
+`pre-draft` 未通过不得起草 DOCX/邮件。独立审计写回后、首次 PDF 前运行
+`verify --job-id <ID> --stage pre-pdf`；最终投递前运行
+`verify --job-id <ID> --stage final`。批量制作使用
+`JobSearch_2026/scripts/batch_materials.py`（两阶段：先起草+审计请求，审计写回
+后重跑才出 PDF）。
+
 ## 3. 定制 CV
 
 读取 `tailor_plan.md` 与事实核验通过的 A–F 基础版，只在已有事实内重排和重述：
@@ -214,5 +238,8 @@ role_industry_match → evidence → close。必须读取该槽位的 `mode`、`
   `materials_validation.json` / `.md`；它统一检查层级路由、猎头名称外泄、残缺句、
   英文材料中文残留、核实雇主名称和 Cover Letter 一页限制，但不会自动改写用户 DOCX
 - 如已获得 PDF 的纯文本抽取，可运行 `python3 -m tools.job_materials llmo audit --file extracted.txt --kind cv`；输出是内部解析 QA 指标，不是 ATS 分数
+- 私人线内：独立审计写回后运行 `verify --stage pre-pdf`，PDF 与普通 validate
+  完成后运行 `verify --stage final`；只有 `PRIVATE MATERIALS GATE PASSED (final)`
+  才可声称可直接投递
 
 最终向用户报告：材料包路径、JD 来源、公司研究来源、两份材料的差异化重点、未核实项、PDF/缓存状态。

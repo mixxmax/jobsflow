@@ -662,10 +662,147 @@ def test_two_pass_circuit_stops_third_url_and_cache_still_wins(monkeypatch, tmp_
     status = meta["jobsdb_detail_status"]
     assert status is not None
     assert status["circuit_state"] == "open"
+    # detail_requests counts real navigations only: the two challenges
+    # navigated; the circuit-stopped row and the cache hit navigated zero
+    # times and must not inflate the counter.
+    assert status["detail_requests"] == 2
+    assert status["detail_success"] == 0
     assert status["challenge_count"] == 2
     assert status["degraded_count"] == 1
     assert status["jd_cache_hits"] == 1
+    assert status["failure_cache_hits"] == 0
     assert status["recommended_action"] == "wait_or_manual_verify"
+
+
+def test_two_pass_counts_retry_attempts_as_real_navigations(monkeypatch, tmp_path):
+    """One URL with two timeout attempts must count as two detail requests."""
+    import portal_jd_browser as short_browser  # noqa: E402
+
+    monkeypatch.setattr(short_browser.BrowserSessionPool, "session_for", lambda self, url: None)
+
+    def fake_fetch(url, **kwargs):
+        return browser.JdFetchResult(
+            ok=False,
+            url=url,
+            portal="jobsdb",
+            fail_reason="timeout",
+            detail_reason="timeout",
+            attempts=2,
+            retried=1,
+            last_reason="timeout",
+        )
+
+    monkeypatch.setattr(short_browser, "fetch_jd_body", fake_fetch)
+    monkeypatch.setattr(
+        two_pass_score, "score_hit", lambda h, teaser, **kwargs: _fake_score_result(3.5)
+    )
+
+    rows, meta = two_pass_score.run_two_pass(
+        [
+            {
+                "title": "Slow",
+                "company": "A",
+                "source": "jobsdb",
+                "url": "https://hk.jobsdb.com/job/101",
+                "teaser": "operations",
+            }
+        ],
+        repo=tmp_path,
+        gate_pass1=3.3,
+        min_final=0.0,
+        max_deep=10,
+        sleep_s=0.0,
+        drop_below_final=False,
+    )
+    assert len(rows) == 1
+    status = meta["jobsdb_detail_status"]
+    assert status["detail_requests"] == 2
+    assert status["detail_success"] == 0
+    assert status["degraded_count"] == 0
+
+
+def test_two_pass_budget_stop_navigates_zero_times(monkeypatch, tmp_path):
+    """A budget-capped row contributes zero detail requests and one degraded."""
+    import portal_jd_browser as short_browser  # noqa: E402
+
+    monkeypatch.setattr(short_browser.BrowserSessionPool, "session_for", lambda self, url: None)
+    monkeypatch.setenv("PORTAL_JD_MAX_REQUESTS_PER_SCAN", "1")
+    short_browser.reset_portal_budget("jobsdb")
+
+    def fake_once(url, **kwargs):
+        return browser.JdFetchResult(
+            ok=False,
+            url=url,
+            portal="jobsdb",
+            fail_reason="challenge",
+            detail_reason="challenge",
+            attempts=1,
+        )
+
+    # Patch the inner fetch so the real fetch_jd_body budget/breaker still runs.
+    monkeypatch.setattr(short_browser, "_fetch_jd_body_once", fake_once)
+    monkeypatch.setattr(
+        two_pass_score, "score_hit", lambda h, teaser, **kwargs: _fake_score_result(3.5)
+    )
+
+    hits = [
+        {
+            "title": f"Row {n}",
+            "company": "A",
+            "source": "jobsdb",
+            "url": f"https://hk.jobsdb.com/job/2{n:02d}",
+            "teaser": "operations",
+        }
+        for n in range(2)
+    ]
+    rows, meta = two_pass_score.run_two_pass(
+        hits,
+        repo=tmp_path,
+        gate_pass1=3.3,
+        min_final=0.0,
+        max_deep=10,
+        sleep_s=0.0,
+        drop_below_final=False,
+    )
+    assert len(rows) == 2
+    status = meta["jobsdb_detail_status"]
+    assert status["detail_requests"] == 1
+    assert status["challenge_count"] == 1
+    assert status["degraded_count"] == 1  # budget_exhausted, zero navigation
+
+
+def test_failure_cache_stop_records_zero_requests_and_one_cache_hit(monkeypatch, tmp_path):
+    """A recent-failure cache stop must not look like a fresh detail request."""
+    url = "https://hk.jobsdb.com/job/303"
+    browser._save_failure(url, "challenge", tmp_path)
+
+    hit = {"url": url, "teaser": "operations"}
+    text, depth = two_pass_score.deep_enrich_hit(hit, repo=tmp_path)
+
+    assert depth == "teaser_fallback"
+    enrich = hit["_enrich"]
+    assert enrich["failure_cached"] == 1
+    assert enrich["attempts"] == 0
+
+    import portal_jd_browser as short_browser  # noqa: E402
+
+    monkeypatch.setattr(short_browser.BrowserSessionPool, "session_for", lambda self, url: None)
+    monkeypatch.setattr(
+        two_pass_score, "score_hit", lambda h, teaser, **kwargs: _fake_score_result(3.5)
+    )
+    rows, meta = two_pass_score.run_two_pass(
+        [{"title": "Cached Fail", "company": "A", "source": "jobsdb",
+          "url": url, "teaser": "operations"}],
+        repo=tmp_path,
+        gate_pass1=3.3,
+        min_final=0.0,
+        max_deep=10,
+        sleep_s=0.0,
+        drop_below_final=False,
+    )
+    status = meta["jobsdb_detail_status"]
+    assert status["detail_requests"] == 0
+    assert status["failure_cache_hits"] == 1
 
 
 def test_success_cache_precedes_open_circuit_in_enrich(monkeypatch, tmp_path):

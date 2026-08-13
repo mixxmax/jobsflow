@@ -219,3 +219,99 @@ def test_clean_clone_selected_job_to_materials_pipeline(tmp_path, monkeypatch):
     assert manifest["artifacts"]["resume"]["status"] == "plan_ready"
     assert json.loads((package / "application_preflight.json").read_text(encoding="utf-8"))["ready_for_apply"]
     assert "develop, implement and monitor" in read_jd(package, root)
+
+
+# ---------------------------------------------------------------------------
+# JobsDB materials terminal stop: after the browser layer says stop, the
+# materials path must never fire a second detail request.
+# ---------------------------------------------------------------------------
+
+def _terminal_result(fail_reason="challenge", detail_reason=None, failure_cached=0):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        ok=False,
+        portal="jobsdb",
+        text="",
+        chars=0,
+        fail_reason=fail_reason,
+        detail_reason=detail_reason or fail_reason,
+        failure_cached=failure_cached,
+    )
+
+
+@pytest.mark.parametrize(
+    "fail_reason,detail_reason,failure_cached",
+    [
+        ("challenge", "challenge", 0),
+        ("rate_limited", "rate_limited", 0),
+        ("degraded", "circuit_open", 0),
+        ("degraded", "budget_exhausted", 0),
+        ("challenge", None, 1),
+    ],
+)
+def test_materials_terminal_stops_never_hit_structured_fallback(
+    tmp_path, monkeypatch, fail_reason, detail_reason, failure_cached
+):
+    from tools.job_materials.jd_store import read_jd
+
+    root = tmp_path / "JobSearch_2026"
+    package = root / "01_Masters" / "A_core" / "核心" / "A0-060_未投_Acme"
+    _write_snapshot(package, url="https://hk.jobsdb.com/job/65432101")
+
+    def unexpected_structured(*args, **kwargs):
+        pytest.fail("structured JobsDB detail must not run after a terminal browser stop")
+
+    monkeypatch.setattr(enrich, "try_jobsdb_structured", unexpected_structured)
+    monkeypatch.setattr(
+        "tools.fresh_24h.portal_jd_browser.fetch_jd_body",
+        lambda *args, **kwargs: _terminal_result(
+            fail_reason, detail_reason, failure_cached
+        ),
+    )
+
+    notes = enrich.enrich_package(package, root, repo=tmp_path)
+    body = read_jd(package, root)
+    assert "Paste full JD below this line" in body
+    assert any("paste needed" in note for note in notes)
+
+
+def test_materials_ordinary_browser_error_still_allows_structured_fallback(
+    tmp_path, monkeypatch
+):
+    from tools.job_materials.jd_store import read_jd
+
+    root = tmp_path / "JobSearch_2026"
+    package = root / "01_Masters" / "A_core" / "核心" / "A0-061_未投_Acme"
+    _write_snapshot(package, url="https://hk.jobsdb.com/job/65432102")
+
+    monkeypatch.setattr(
+        "tools.fresh_24h.portal_jd_browser.fetch_jd_body",
+        lambda *args, **kwargs: _terminal_result("error", "error"),
+    )
+    monkeypatch.setattr(
+        enrich,
+        "try_jobsdb_structured",
+        lambda canon, repo=None: ("structured teaser body", {"ok": True, "teaser_len": 12}),
+    )
+
+    notes = enrich.enrich_package(package, root, repo=tmp_path)
+    assert "structured teaser body" in read_jd(package, root)
+    assert any("structured fields saved" in note for note in notes)
+
+
+def test_materials_jobsdb_browser_uses_single_attempt(tmp_path, monkeypatch):
+    root = tmp_path / "JobSearch_2026"
+    package = root / "01_Masters" / "A_core" / "核心" / "A0-062_未投_Acme"
+    _write_snapshot(package, url="https://hk.jobsdb.com/job/65432103")
+    captured = {}
+
+    def capture(url, **kwargs):
+        captured.update(kwargs)
+        return _terminal_result("challenge")
+
+    monkeypatch.setattr("tools.fresh_24h.portal_jd_browser.fetch_jd_body", capture)
+    enrich.enrich_package(package, root, repo=tmp_path)
+
+    assert captured.get("retry") == 0
+    assert captured.get("retry_delay") == 0

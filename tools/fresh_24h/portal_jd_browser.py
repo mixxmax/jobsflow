@@ -128,6 +128,9 @@ class JdFetchResult:
     cf_ray: str | None = None
     content_validated: bool = False
     session_mode: str = "snapshot"
+    headless: bool | None = None
+    browser_channel: str | None = None
+    browser_version: str | None = None
     circuit_state: str | None = None
     retry_not_before: float | None = None
     recommended_action: str | None = None
@@ -420,6 +423,32 @@ class PortalCircuitBreaker:
             self._record.reopen_count = 0
         self._record.last_reason = "success"
         self._record.retry_not_before = 0.0
+        self._save()
+
+    def reconcile_success(self) -> None:
+        """Close a persisted breaker after manual recovery produced a real JD.
+
+        The manual (interactive/persistent) path bypasses the breaker, so this
+        instance never owned the half-open probe.  Clear a stale probe marker
+        left by a dead owner, then close the circuit and reset the counters.
+        Only call this with a validated result — the caller checks ok and
+        content_validated before reconciling.
+        """
+        self._release_probe()
+        if self._probe_path is not None and self._probe_path.is_file():
+            try:
+                owner_pid = int(self._probe_path.read_text(encoding="ascii").strip())
+                if not _pid_alive(owner_pid):
+                    self._probe_path.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pass
+        self._record.half_open_probe_active = False
+        self._record.state = "closed"
+        self._record.opened_at = None
+        self._record.consecutive_challenges = 0
+        self._record.reopen_count = 0
+        self._record.retry_not_before = 0.0
+        self._record.last_reason = "manual_recovery_success"
         self._save()
 
     def _open(self, *, reason: str, cooldown: float | None = None) -> None:
@@ -1019,6 +1048,26 @@ class BrowserSessionPool:
         self._sessions.clear()
 
 
+def _stamp_session_meta(result: JdFetchResult, session: "JdBrowserSession") -> None:
+    """Attach sanitized browser facts (no cookies/headers) to a fetch result.
+
+    Single source of truth for channel/version/headless observability so the
+    scan and materials paths report the same fields as the standalone CLI.
+    Never reads storage state or page content.
+    """
+    result.headless = session.headless
+    result.browser_channel = session.channel or None
+    result.session_mode = session._session_mode_label()
+    try:
+        browser = session._browser
+        if browser is None and session.context is not None:
+            browser = getattr(session.context, "browser", None)
+        if browser is not None:
+            result.browser_version = getattr(browser, "version", None)
+    except Exception:
+        pass
+
+
 def _fetch_jd_body_once(
     url: str,
     *,
@@ -1044,13 +1093,15 @@ def _fetch_jd_body_once(
             verification_timeout_seconds=verification_timeout_seconds,
             user_data_dir=user_data_dir,
         ) as session:
-            return session.fetch_once(
+            result = session.fetch_once(
                 url,
                 timeout_ms=timeout_ms,
                 max_chars=max_chars,
                 save_storage_state=save_storage_state,
                 signal_file=signal_file,
             )
+            _stamp_session_meta(result, session)
+            return result
     except ImportError:
         return JdFetchResult(
             ok=False,
@@ -1383,6 +1434,7 @@ def fetch_jd_body(
                     save_storage_state=save_path,
                     signal_file=signal_file,
                 )
+                _stamp_session_meta(result, session)
             else:
                 result = _fetch_jd_body_once(
                     raw,
@@ -1470,6 +1522,9 @@ def _write_sanitized_diagnostics(path: Path, result: JdFetchResult, url: str) ->
         "retry_after_seconds": result.retry_after_seconds,
         "content_validated": result.content_validated,
         "session_mode": result.session_mode,
+        "headless": result.headless,
+        "browser_channel": result.browser_channel,
+        "browser_version": result.browser_version,
         "state_saved": result.state_saved,
         "circuit_state": result.circuit_state,
         "retry_not_before": result.retry_not_before,
@@ -1575,79 +1630,96 @@ def main(argv: list[str] | None = None) -> int:
             user_data_dir=args.user_data_dir,
         )
 
+    manual_recovery = args.interactive_verification or args.user_data_dir is not None
+
     # The interactive/persistent path is the manual recovery path: it must
     # never be blocked by the persisted breaker or a stale failure cache.
     circuit_path = None
-    if not args.interactive_verification and args.user_data_dir is None:
+    if not manual_recovery:
         circuit_path = default_circuit_state_path()
 
-    res = fetch_jd_body(
-        args.url,
-        headless=not args.headed,
-        timeout_ms=args.timeout_ms,
-        storage_state=args.storage_state,
-        channel=args.channel,
-        retry=args.retry,
-        retry_delay=args.retry_delay,
-        save_storage_state=args.save_storage_state,
-        session=session,
-        failure_cache=not args.no_failure_cache,
-        circuit_state_path=circuit_path,
-        signal_file=args.signal_file,
-        reset_budget=True,
-    )
-
-    if args.diagnostics_dir:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        key = hashlib.sha256(args.url.encode("utf-8")).hexdigest()[:16]
-        _write_sanitized_diagnostics(
-            Path(args.diagnostics_dir) / f"portal_jd_{stamp}_{key}.json", res, args.url
+    try:
+        res = fetch_jd_body(
+            args.url,
+            headless=not args.headed,
+            timeout_ms=args.timeout_ms,
+            storage_state=args.storage_state,
+            channel=args.channel,
+            retry=args.retry,
+            retry_delay=args.retry_delay,
+            save_storage_state=args.save_storage_state,
+            session=session,
+            failure_cache=not args.no_failure_cache and not manual_recovery,
+            circuit_state_path=circuit_path,
+            signal_file=args.signal_file,
+            reset_budget=True,
         )
 
-    if args.json:
-        print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
-    else:
-        status = "OK" if res.ok else f"FAIL ({res.fail_reason})"
-        print(f"{status} portal={res.portal} jd_chars={res.chars} sel={res.selector}")
-        print(f"url={res.url}")
-        print(
-            f"content_validated={str(res.content_validated).lower()} "
-            f"session_mode={res.session_mode} "
-            f"state_saved={str(res.state_saved).lower()} "
-            f"circuit_state={res.circuit_state or 'n/a'} "
-            f"recommended_action={res.recommended_action or 'n/a'}"
-        )
-        if res.retry_not_before:
-            deadline = datetime.fromtimestamp(res.retry_not_before, tz=timezone.utc)
-            print(f"retry_not_before={deadline.isoformat(timespec='seconds')}")
-        if res.ok:
-            print("---")
-            print(res.text[:2000])
-            if len(res.text) > 2000:
-                print(f"… ({res.chars} chars total)")
+        if manual_recovery and res.ok and res.content_validated:
+            # A validated manual JD proves the portal is reachable again:
+            # close the persisted breaker so the next scan can fetch normally.
+            # Challenge/429/timeout/empty results never close it.
+            PortalCircuitBreaker(
+                portal=detect_portal(args.url),
+                state_path=default_circuit_state_path(),
+            ).reconcile_success()
+
+        if args.diagnostics_dir:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            key = hashlib.sha256(args.url.encode("utf-8")).hexdigest()[:16]
+            _write_sanitized_diagnostics(
+                Path(args.diagnostics_dir) / f"portal_jd_{stamp}_{key}.json", res, args.url
+            )
+
+        if args.json:
+            print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
         else:
-            print(res.text[:400] if res.text else "")
-            if res.fail_reason in {"challenge", "waf"}:
-                print(
-                    "提示：如持续被拦截，请使用 "
-                    "--headed --interactive-verification [--user-data-dir <dir>] "
-                    "完成一次人工验证后重试。"
-                )
+            status = "OK" if res.ok else f"FAIL ({res.fail_reason})"
+            print(f"{status} portal={res.portal} jd_chars={res.chars} sel={res.selector}")
+            print(f"url={res.url}")
+            print(
+                f"content_validated={str(res.content_validated).lower()} "
+                f"session_mode={res.session_mode} "
+                f"state_saved={str(res.state_saved).lower()} "
+                f"circuit_state={res.circuit_state or 'n/a'} "
+                f"recommended_action={res.recommended_action or 'n/a'}"
+            )
+            if res.retry_not_before:
+                deadline = datetime.fromtimestamp(res.retry_not_before, tz=timezone.utc)
+                print(f"retry_not_before={deadline.isoformat(timespec='seconds')}")
+            if res.ok:
+                print("---")
+                print(res.text[:2000])
+                if len(res.text) > 2000:
+                    print(f"… ({res.chars} chars total)")
+            else:
+                print(res.text[:400] if res.text else "")
+                if res.fail_reason in {"challenge", "waf"}:
+                    print(
+                        "提示：如持续被拦截，请使用 "
+                        "--headed --interactive-verification [--user-data-dir <dir>] "
+                        "完成一次人工验证后重试。"
+                    )
 
-    if args.out and res.ok:
-        args.out = args.out.expanduser().resolve()
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(
-            f"# JD — {res.title or res.url}\n\n"
-            f"- url: {res.url}\n"
-            f"- portal: {res.portal}\n"
-            f"- selector: {res.selector}\n\n"
-            f"{res.text}\n",
-            encoding="utf-8",
-        )
-        print(f"wrote {args.out}")
+        if args.out and res.ok:
+            args.out = args.out.expanduser().resolve()
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(
+                f"# JD — {res.title or res.url}\n\n"
+                f"- url: {res.url}\n"
+                f"- portal: {res.portal}\n"
+                f"- selector: {res.selector}\n\n"
+                f"{res.text}\n",
+                encoding="utf-8",
+            )
+            print(f"wrote {args.out}")
 
-    return 0 if res.ok else 1
+        return 0 if res.ok else 1
+    finally:
+        # The CLI owns this session; release the browser and any profile lock
+        # on success, failure and exception alike.
+        if session is not None:
+            session.close()
 
 
 if __name__ == "__main__":
