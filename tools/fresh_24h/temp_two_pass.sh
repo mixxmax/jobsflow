@@ -15,6 +15,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+if [[ -f "$ROOT/JobSearch_2026/00_Profile/queries.json" ]]; then
+  export JOBSEARCH_ROOT="$ROOT/JobSearch_2026"
+fi
 ARG="${1:-temp}"
 PASS1_GATE="${PASS1_GATE:-${GATE:-3.3}}"
 MODE=""
@@ -39,12 +42,16 @@ else
 fi
 
 echo "=== 1) Scan (${MODE}${HOURS:+ hours=$ARG}) ==="
-python3 tools/fresh_24h/fresh_24h_scan.py --mode "$MODE" $HOURS
+python3 tools/fresh_24h/fresh_24h_scan.py --mode "$MODE" $HOURS --no-record
 
 echo ""
 echo "=== 2) Two-pass score (internal gate=$PASS1_GATE + configured depth/retention) ==="
 echo "    Cache hits use zero network budget; preferences come from private setup/intent"
 python3 tools/fresh_24h/two_pass_score.py --gate "$PASS1_GATE"
+
+echo ""
+echo "=== 3) Commit refresh cursor after scored artifact ==="
+python3 -c "from pathlib import Path; from tools.workflow.refresh_commit import commit_refresh_after_score; raise SystemExit(0 if commit_refresh_after_score(workspace=Path('JobSearch_2026'), mode='$MODE') is not None else 2)"
 
 echo ""
 echo "Done. Open JobSearch_2026/02_Tracker/*_twopass_scored.csv"

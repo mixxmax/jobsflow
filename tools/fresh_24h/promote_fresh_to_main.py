@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Promote all rows from a fresh_24h_* tab into 核心/一级/二级 + 全部清单, then clear fresh.
+"""Promote all rows from a fresh_24h_* tab into 核心/一级/二级 + 全部清单.
+
+Promote merges into the main trackers and always keeps the fresh tab.
+Clearing or archiving fresh is a separate confirmed action:
+
+  python3 -m tools.workflow archive preview --fresh-title fresh_24h_YYYY-MM-DD
+  python3 -m tools.workflow archive confirm --proposal-id <id>
 
 Usage:
   export GOOGLE_APPLICATION_CREDENTIALS=...
   export GSHEET_ID=$GSHEET_ID
   python3 tools/fresh_24h/promote_fresh_to_main.py
   python3 tools/fresh_24h/promote_fresh_to_main.py --fresh-title fresh_24h_2026-07-28
-
-After this, fresh holds headers only until the next temp/daily push.
 """
 
 from __future__ import annotations
@@ -22,10 +26,17 @@ from pathlib import Path
 import gspread
 from google.oauth2.service_account import Credentials
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from careerops_quickscore import SHEET_HEADERS as FRESH_HEADERS  # noqa: E402
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_HERE))
 from two_pass_score import PASS_EXTRA  # noqa: E402
 from push_to_gsheet import replace_sheet_values_safely  # noqa: E402
+from tools.workflow.fresh_policy import (  # noqa: E402
+    decide_promote_fresh_retention,
+    should_clear_fresh_after_promote,
+)
 
 TIER_SHEETS = {
     "核心": "核心(B-C级)",
@@ -235,13 +246,45 @@ def merge_rows(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], 
     return existing, added, updated
 
 
-def main(argv=None) -> int:
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Promote fresh_24h rows into main tier sheets")
     ap.add_argument("--sheet-id", default=os.environ.get("GSHEET_ID"))
     ap.add_argument("--credentials", default=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
     ap.add_argument("--fresh-title", default="fresh_24h_2026-07-28")
-    ap.add_argument("--keep-fresh-rows", action="store_true", help="Do not clear fresh tab")
-    args = ap.parse_args(argv)
+    ap.add_argument(
+        "--keep-fresh-rows",
+        action="store_true",
+        help="Compatibility no-op: fresh rows are always kept (FRESH-001)",
+    )
+    ap.add_argument(
+        "--clear-fresh",
+        action="store_true",
+        help="Refused. Use python3 -m tools.workflow archive preview/confirm",
+    )
+    return ap.parse_args(argv)
+
+
+def should_clear_fresh(args=None, **_kwargs) -> bool:
+    """Low-level default is keep. Confirmation lives on the archive action."""
+    return should_clear_fresh_after_promote(
+        clear_fresh=bool(getattr(args, "clear_fresh", False)),
+        keep_fresh_rows=bool(getattr(args, "keep_fresh_rows", False)),
+    )
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    if decide_promote_fresh_retention(
+        clear_fresh=bool(args.clear_fresh),
+        keep_fresh_rows=bool(args.keep_fresh_rows),
+    ) == "refuse_clear":
+        print(
+            "ERROR: FRESH-002: clearing fresh is not a promote side-effect. "
+            "Use: python3 -m tools.workflow archive preview --fresh-title "
+            f"{args.fresh_title}",
+            file=sys.stderr,
+        )
+        return 2
 
     if not args.sheet_id or not args.credentials:
         print("ERROR: GSHEET_ID and GOOGLE_APPLICATION_CREDENTIALS required", file=sys.stderr)
@@ -285,49 +328,7 @@ def main(argv=None) -> int:
     all_existing, added_all, upd_all = merge_rows(all_existing, fresh_main)
     total_all = rewrite_sheet(sh, ws_all, all_existing, existing_header=hdr_all)
     print(f"{ALL_TITLE}: +{added_all} status↑{upd_all} total={total_all}")
-
-    if not args.keep_fresh_rows:
-        replace_sheet_values_safely(
-            fresh_ws,
-            [list(FRESH_HEADERS)],
-            min_rows=50,
-            min_cols=35,
-        )
-        try:
-            fresh_ws.freeze(rows=1)
-        except Exception:
-            pass
-        try:
-            sh.batch_update(
-                {
-                    "requests": [
-                        {
-                            "repeatCell": {
-                                "range": {
-                                    "sheetId": fresh_ws.id,
-                                    "startRowIndex": 0,
-                                    "endRowIndex": 50,
-                                    "startColumnIndex": 0,
-                                    "endColumnIndex": len(FRESH_HEADERS),
-                                },
-                                "cell": {
-                                    "userEnteredFormat": {
-                                        "backgroundColor": {
-                                            "red": 1,
-                                            "green": 1,
-                                            "blue": 1,
-                                        }
-                                    }
-                                },
-                                "fields": "userEnteredFormat.backgroundColor",
-                            }
-                        }
-                    ]
-                }
-            )
-        except Exception as e:
-            print(f"format warn: {e}")
-        print(f"cleared {args.fresh_title} to header only")
+    print(f"kept {args.fresh_title} ({len(fresh_main)} rows) — archive requires confirmation")
 
     if unknown:
         print("unknown tier (not moved):")

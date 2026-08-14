@@ -1,50 +1,24 @@
-# /push - 推送到 Google Sheets
+# /push - 推送到 fresh
 
-把评分结果推送到 Google Sheets 的 fresh_24h tab。
-
-## 用法
-
-```
-/push                        # 使用已确认的扫描深度和保留偏好
-/push --retention selective  # 临时使用精选 3.5
-/push --min-score 3.5        # 兼容的数值化最终保留线覆盖
-/push --scan-depth economy   # 临时使用节能网络预算
-/push --mode daily           # 日更模式
-/push --local-only           # 不使用 Google Sheets，更新本地主 CSV
-```
-
-深评若有未完成的语义任务，`/push` 和 `--local-only` 默认会停止，并列出任务键。
-先执行 `semantic_match_agent.py list/show/complete`，再重跑评分；只有明确的诊断场景
-才使用 `--allow-pending-semantic` 覆盖闸门。
-
-## 执行步骤
-
-1. 推送：
+只调用统一入口：
 
 ```bash
-python3 tools/fresh_24h/push_to_gsheet.py --also-local --mode temp
+python3 -m tools.workflow push --run-id <id>
+python3 -m tools.workflow push --run-id <id> --backend csv   # 本地 CSV 降级/离线
+python3 -m tools.workflow push --run-id <id> --local-only   # 同上，兼容别名
+python3 -m tools.workflow push --allow-pending-semantic   # 仅诊断，会留审计
+python3 -m tools.workflow push --dry-run
+
+# 同步状态与显式恢复
+python3 -m tools.workflow sync status --fresh-title <title>
+python3 -m tools.workflow sync reconcile --fresh-title <title> --backend auto
+python3 -m tools.workflow sync pull --fresh-title <title> --dry-run
+python3 -m tools.workflow sync pull --fresh-title <title> --confirm
+python3 -m tools.workflow sync retry --operation-id <sync-id> --fresh-title <title>
 ```
 
-如果 setup 选择了本地 CSV 或暂时没有 Google 凭据：
+不要再直接运行 `push_to_gsheet.py`。网关读取已完成 scan run：semantic pending 默认阻断。成功后验证写入行数再提交 `pushed_to_fresh`。
 
-```bash
-python3 tools/fresh_24h/push_to_gsheet.py --local-only --mode temp
-```
+`auto` 在已配置 `GSHEET_ID` 与凭据时使用真实 Google Sheets，否则使用私人工作区的持久化 CSV；`file` 只用于合成夹具。向用户报告网关 JSON：目标 tab、backend、写入行数、pending 标记、postconditions、blockers。
 
-`--local-only` 会把完整 JD 深评达到最终门槛的岗位，以及明确标记为
-`待审-JD不足` 的 provisional 岗位合并进
-`JobSearch_2026/02_Tracker/hk_apply_list_YYYY-MM-DD.csv`，保留批次标记和状态，
-不会尝试连接 Google Sheets。待审项不属于最终排名，需用户先看岗位或补充 JD；
-初评标题分数不会冒充最终判断。
-
-2. 向用户报告：
-   - 写入了哪个 tab
-   - 总行数、本轮新增数、较早入表数
-   - 批次号和入表时间
-   - Google Sheet 链接
-
-## 合并规则
-
-- 如果 tab 已存在：旧批「本轮新增」从「是」改为「否」，去掉米色底；新行标「是」+ 米色底
-- 如果 tab 不存在：新建 tab
-- 排序：本轮新增=是 置顶，然后按分数降序
+Tracker 同步采用本地 ledger 为事实源、CSV/Sheets 为投影。远端发生变化时不会静默覆盖，先运行 `sync reconcile`；失败操作保存在本地 operation ledger，可用 `sync retry` 重放。`sync pull` 只在用户明确确认后把已知用户字段（状态、备注、跟进）导入本地，系统评分和 JD 字段不会从 Sheets 反向覆盖本地事实。

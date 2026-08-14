@@ -315,6 +315,9 @@ def enrich_package(package: Path, root: Path, repo: Path = REPO) -> list[str]:
                 retry=0,
                 retry_delay=0,
                 reset_budget=True,
+                workspace=(repo / "JobSearch_2026")
+                if (repo / "JobSearch_2026" / "00_Profile" / "queries.json").is_file()
+                else repo,
             )
             if fres.ok and fres.text and len(fres.text) > 200:
                 write_jd(

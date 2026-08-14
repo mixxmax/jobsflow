@@ -20,37 +20,27 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-08-06
+## 🆕 Latest update · 2026-08-14
 
-- **More reliable parsing:** JD experience ranges use the lower bound for
-  eligibility (for example, `3–5 years` is checked against 3). The scorer and
-  job assessment share one deterministic parser, including `5+`, `up to`, and
-  common Chinese forms.
-- **Faster retrieval:** scored artifacts and URL-keyed JD cache entries are
-  reused; portal workers, Playwright browser/context, and transient failures
-  are reused or short-cached. Sheets syncs only new or changed rows. First
-  fetches remain subject to network latency, rate limits, and CAPTCHA.
-
-**Recall and choice are separate:** missing/short teasers are rescued instead
-of being silently dropped. Scan depth controls network cost (economy/balanced/
-coverage ≈10/20/40); retention selects 3.0/3.3/3.5. Missing full JDs stay
-visible as `待审-JD不足` / `provisional_needs_jd`, and changing retention does
-not fetch again.
-
-**More controlled materials:** per-job manifests, dependency fingerprints, and
-validation reduce rerun rework and catch recruiter-name leaks before sending.
-
-`A/B` titles use one primary role by default; business parentheses stay intact,
-and recruiter names stay out of outbound filenames. Use `role show`/`role choose`
-when a title is ambiguous.
-
-## 🆕 Update · 2026-08-03
-
-The three portals now run in parallel workers, while queries within each portal
-remain serial and keep their original pacing. Each worker reuses its portal
-process and CTgoodjobs session for one scan, reducing startup and handshake
-overhead. `/scan temp` and `/scan daily` are unchanged; actual speed still
-depends on network latency, portal responses, rate limits/CAPTCHA, and retries.
+- **A code-governed workflow instead of model self-discipline:** the unified
+  gateway, policy registry, state machine, task packets, and postconditions now
+  guard `/scan → /push → /materials → /apply`. Scans do not generate materials,
+  archives require preview/confirmation, and `/apply` never submits.
+- **Recall, ranking, and cost are separate:** URL-keyed JD cache is checked
+  first; missing/short teasers and gray-band roles are rescued; deep retrieval
+  follows the economy/balanced/coverage budget. Full JD text drives deep scoring,
+  while unavailable text stays visible as `待审-JD不足` or
+  `provisional_needs_jd` instead of disappearing silently.
+- **Auditable materials:** JD, profile, assessment, and evidence mapping form a
+  structured task packet. CV, cover letter, and email share one factual boundary;
+  content audit, PDF/attachment checks, and hash gates block incomplete output.
+- **Local-first tracker sync:** the local ledger is the source of truth and a
+  local CSV is a complete usable tracker. Google Sheets is an optional
+  projection; failed syncs are replayable, remote changes are reconciled, and
+  user fields enter through an explicit `sync pull`.
+- **Better for models with limited capability:** models handle bounded semantic
+  judgment and wording, while salary, language, qualification, state changes,
+  evidence binding, and high-impact side effects remain deterministic.
 
 - **Fewer wrong applications and fewer silent misses:** pass 1 schedules work;
   the full JD determines the final score, while insufficient-JD rows stay visible.

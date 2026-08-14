@@ -530,7 +530,14 @@ def _load_cache(url: str, repo: Path) -> tuple[str | None, dict]:
         return None, {}
 
 
-def deep_enrich_hit(h: dict, *, repo: Path, use_browser: bool = True) -> tuple[str, str]:
+def deep_enrich_hit(
+    h: dict,
+    *,
+    repo: Path,
+    use_browser: bool = True,
+    cache_first: bool = True,
+    jobsdb_retry: int = 0,
+) -> tuple[str, str]:
     """
     Return (text_for_pass2, depth_label).
 
@@ -553,7 +560,7 @@ def deep_enrich_hit(h: dict, *, repo: Path, use_browser: bool = True) -> tuple[s
     # The URL cache is the first and cheapest source for every portal.  This
     # must run before the CT browser policy so a user-pasted or previously
     # fetched full JD is still reusable without any new network request.
-    cached_text, cached_meta = _load_cache(url, repo)
+    cached_text, cached_meta = _load_cache(url, repo) if cache_first else (None, {})
     if cached_text:
         h["_enrich"] = {
             "mode": "cache",
@@ -639,7 +646,7 @@ def deep_enrich_hit(h: dict, *, repo: Path, use_browser: bool = True) -> tuple[s
             # Scan policy: one attempt per URL with a tighter per-attempt
             # timeout.  Repetition is the portal breaker's and failure cache's
             # job, not per-URL auto-retries.
-            fetch_kwargs["retry"] = 0
+            fetch_kwargs["retry"] = max(0, int(jobsdb_retry))
             fetch_kwargs["timeout_ms"] = 25000
         fres = fetch_jd_body(url, **fetch_kwargs)
         if fres.ok and fres.text:
@@ -701,6 +708,33 @@ def deep_enrich_hit(h: dict, *, repo: Path, use_browser: bool = True) -> tuple[s
         return h.get("teaser") or "", "teaser_fallback"
 
     return h.get("teaser") or "", "teaser"
+
+
+def _run_deep_enrich(
+    hit: dict,
+    *,
+    repo: Path,
+    cache_first: bool,
+    jobsdb_retry: int,
+) -> tuple[str, str]:
+    """Call the policy-aware enrich seam while keeping old test/plugin hooks.
+
+    A few private integrations monkeypatch the historical ``(hit, *, repo)``
+    signature.  Only an unexpected-keyword TypeError is treated as that
+    compatibility case; real errors still propagate to the row-level failure
+    handler below.
+    """
+    try:
+        return deep_enrich_hit(
+            hit,
+            repo=repo,
+            cache_first=cache_first,
+            jobsdb_retry=jobsdb_retry,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return deep_enrich_hit(hit, repo=repo)
 
 
 def run_two_pass(
@@ -950,6 +984,8 @@ def run_two_pass(
                     1 for item in batch_results.values() if getattr(item, "ok", False)
                 )
 
+    jobsdb_retry = 0
+    jobsdb_cache_first = True
     try:
         from portal_jd_browser import (  # type: ignore
             BrowserSessionPool,
@@ -963,10 +999,39 @@ def run_two_pass(
         # per-scan request budget.  Any unexpected breaker failure must never
         # abort scoring.
         try:
-            jobsdb_circuit = PortalCircuitBreaker(
-                portal="jobsdb", state_path=default_circuit_state_path(repo)
+            from tools.workflow.portal_policy import (
+                apply_jobsdb_config_to_runtime,
+                jobsdb_runtime_config,
+                resolve_workspace_profile,
             )
+
+            # ``repo`` is the public repository root for both product and
+            # private runs.  Resolve the profile from the actual runtime
+            # workspace (or its JobSearch_2026 child), otherwise a private
+            # line silently receives the product's looser threshold.
+            raw_workspace_hint = os.environ.get("JOBSEARCH_ROOT")
+            workspace_hint = Path(raw_workspace_hint) if raw_workspace_hint else repo
+            jobsdb_profile = resolve_workspace_profile(workspace_hint)
+            jobsdb_config = jobsdb_runtime_config(jobsdb_profile)
+            # Reset the per-scan counter first.  Applying policy before the
+            # reset would silently discard min-interval/max-request values and
+            # recreate an environment-default budget on the first fetch.
             reset_portal_budget("jobsdb")
+            apply_jobsdb_config_to_runtime(jobsdb_config)
+            jobsdb_retry = int(jobsdb_config.get("max_challenge_retries") or 0)
+            jobsdb_cache_first = bool(jobsdb_config.get("cache_first", True))
+            jobsdb_circuit = PortalCircuitBreaker(
+                portal="jobsdb",
+                challenge_threshold=int(jobsdb_config["challenge_threshold"]),
+                state_path=default_circuit_state_path(repo),
+            )
+            meta["jobsdb_policy"] = {
+                "profile": jobsdb_profile,
+                "challenge_threshold": jobsdb_config["challenge_threshold"],
+                "max_challenge_retries": jobsdb_config["max_challenge_retries"],
+                "cache_first": jobsdb_config["cache_first"],
+                "max_requests_per_scan": jobsdb_config["max_requests_per_scan"],
+            }
         except (OSError, ValueError, TypeError):
             jobsdb_circuit = None
     except ImportError:
@@ -1002,7 +1067,12 @@ def run_two_pass(
                 if jobsdb_circuit is not None and "jobsdb.com" in portal_host:
                     h["_browser_fetch_circuit"] = jobsdb_circuit
                 try:
-                    text2, depth = deep_enrich_hit(h, repo=repo)
+                    text2, depth = _run_deep_enrich(
+                        h,
+                        repo=repo,
+                        cache_first=jobsdb_cache_first,
+                        jobsdb_retry=jobsdb_retry,
+                    )
                 except Exception as exc:  # a failed row must never abort the scan
                     meta["enrich_errors"].append(
                         {

@@ -1,0 +1,182 @@
+{
+  "policy_version": "2026-08-14",
+  "schema_version": 1,
+  "rules": [
+    {
+      "rule_id": "FRESH-001",
+      "domain": "archive",
+      "statement": "Scan, push and promote write or merge into fresh; they never archive or clear it.",
+      "level": "MUST",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_fresh_lifecycle.py", "test_workflow_orchestrator.py"]
+    },
+    {
+      "rule_id": "FRESH-002",
+      "domain": "archive",
+      "statement": "Fresh may be archived or cleared only after an explicit, unexpired confirmation whose digest still matches.",
+      "level": "MUST_NOT",
+      "autonomy": "A3",
+      "enforcement": "user_confirmation",
+      "failure_status": "blocked",
+      "override_policy": "user_confirmed",
+      "tests": ["test_fresh_lifecycle.py"]
+    },
+    {
+      "rule_id": "SCAN-001",
+      "domain": "scan",
+      "statement": "Scanning must not generate application materials.",
+      "level": "MUST_NOT",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_workflow_orchestrator.py"]
+    },
+    {
+      "rule_id": "PUSH-001",
+      "domain": "push",
+      "statement": "Formal push is blocked while semantic tasks are pending unless a diagnostic override is explicit.",
+      "level": "MUST",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "diagnostic_only",
+      "tests": ["test_workflow_orchestrator.py"]
+    },
+    {
+      "rule_id": "INTENT-001",
+      "domain": "intent",
+      "statement": "Intent changes require preview then confirm; casual chat is not authorization.",
+      "level": "MUST",
+      "autonomy": "A3",
+      "enforcement": "user_confirmation",
+      "failure_status": "blocked",
+      "override_policy": "user_confirmed",
+      "tests": ["test_intent_update.py"]
+    },
+    {
+      "rule_id": "MAT-001",
+      "domain": "materials",
+      "statement": "Materials generation must read the current input contract; missing JD, facts, assessment or preflight blocks the matching state.",
+      "level": "MUST",
+      "autonomy": "A0",
+      "enforcement": "schema",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_materials_compiled_sop.py"]
+    },
+    {
+      "rule_id": "MAT-002",
+      "domain": "materials",
+      "statement": "Every outbound claim must bind a known evidence ID; forbidden claims cannot enter outbound text.",
+      "level": "MUST",
+      "autonomy": "A1",
+      "enforcement": "schema",
+      "failure_status": "failed",
+      "override_policy": "none",
+      "tests": ["test_materials_compiled_sop.py"]
+    },
+    {
+      "rule_id": "MAT-003",
+      "domain": "materials",
+      "statement": "A transferable or stretch assessment must not be written as a direct claim.",
+      "level": "MUST_NOT",
+      "autonomy": "A1",
+      "enforcement": "model_validator",
+      "failure_status": "failed",
+      "override_policy": "none",
+      "tests": ["test_materials_compiled_sop.py"]
+    },
+    {
+      "rule_id": "MAT-004",
+      "domain": "materials",
+      "statement": "apply_ready is computed by the state machine; any P0 or P1 finding blocks it.",
+      "level": "MUST_NOT",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_materials_compiled_sop.py"]
+    },
+    {
+      "rule_id": "PORTAL-JDB-001",
+      "domain": "portal",
+      "statement": "JobsDB uses the URL-keyed JD cache before any network fetch.",
+      "level": "MUST",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "degraded",
+      "override_policy": "none",
+      "tests": ["test_portal_jd_recovery.py"]
+    },
+    {
+      "rule_id": "PORTAL-JDB-002",
+      "domain": "portal",
+      "statement": "WAF or Challenge must not auto-retry densely; the model cannot change retry or threshold parameters.",
+      "level": "MUST_NOT",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "degraded",
+      "override_policy": "diagnostic_only",
+      "tests": ["test_workflow_portal_policy.py"]
+    },
+    {
+      "rule_id": "PORTAL-JDB-003",
+      "domain": "portal",
+      "statement": "After the configured challenge threshold the portal circuit opens and uncached JobsDB rows degrade to teaser/paste_needed.",
+      "level": "MUST",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "degraded",
+      "override_policy": "diagnostic_only",
+      "tests": ["test_portal_jd_recovery.py", "test_workflow_portal_policy.py"]
+    },
+    {
+      "rule_id": "APPLY-001",
+      "domain": "apply",
+      "statement": "/apply never submits an application.",
+      "level": "MUST_NOT",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_workflow_orchestrator.py"]
+    },
+    {
+      "rule_id": "SYNC-001",
+      "domain": "sync",
+      "statement": "Tracker projections are written through one operation ledger, guarded by a snapshot precondition and read-back digest.",
+      "level": "MUST",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "needs_reconcile",
+      "override_policy": "none",
+      "tests": ["test_sync_coordinator.py"]
+    },
+    {
+      "rule_id": "SYNC-002",
+      "domain": "sync",
+      "statement": "A remote projection change must not be silently overwritten; reconcile reports the conflict.",
+      "level": "MUST_NOT",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_sync_coordinator.py"]
+    },
+    {
+      "rule_id": "SYNC-003",
+      "domain": "sync",
+      "statement": "Remote user-field changes enter the local ledger only through an explicit pull/import action.",
+      "level": "MUST",
+      "autonomy": "A3",
+      "enforcement": "user_confirmation",
+      "failure_status": "blocked",
+      "override_policy": "user_confirmed",
+      "tests": ["test_sync_coordinator.py"]
+    }
+  ]
+}

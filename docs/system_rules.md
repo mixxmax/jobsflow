@@ -96,6 +96,10 @@ Their actual queries and relevance rules are candidate- and profession-specific.
 | Assess | Persist structured strengths/gaps with JD/profile hashes under the private tracker |
 | Materials | Never auto-generate during scan |
 
+- Promote copies matching rows into the main trackers and **keeps** the
+  fresh tab. Archiving or clearing fresh is an A3 action:
+  `python3 -m tools.workflow archive preview` then `archive confirm`.
+  `/scan`, `/push`, `/materials` and `/apply` must not archive, send or delete.
 - Preview means no sheet push and `--no-record`.
 - Do not claim full-JD analysis when only a teaser is available.
 - Never hard-reject an information-poor card solely because its title-only
@@ -173,6 +177,29 @@ Their actual queries and relevance rules are candidate- and profession-specific.
 - Agent tasks are executable as `list -> show -> complete` and must not ask a
   lower-capability model to rediscover a portal, reinterpret fetch status, or
   invent missing evidence.
+
+## 4.1 Tracker synchronization and storage ownership
+
+- The private local tracker ledger under `02_Tracker/workflow/ledger/` is the
+  source of truth for fresh tracker rows. CSV and Google Sheets are projections;
+  JD cache, assessments, materials and candidate facts never move into Sheets.
+- All projection writes go through the workflow sync coordinator. Each write
+  has an operation ID, source/target digest precondition, atomic local ledger
+  update, remote read-back verification and a durable operation record under
+  `02_Tracker/workflow/sync_operations/`.
+- A changed remote projection is never silently overwritten. Reconciliation
+  writes a diff report under `02_Tracker/workflow/sync_conflicts/`; failed
+  operations remain replayable and do not claim success.
+- System-owned fields (identity, URL, scores, JD depth, assessment and fetch
+  metadata) are not imported from a remote projection. User-owned fields
+  (status, notes and follow-up fields) can enter the local ledger only through
+  an explicit `sync pull` preview/confirm operation.
+- A successful projection stores its last verified snapshot under
+  `02_Tracker/workflow/projections/`. This is a concurrency baseline, not a
+  second source of truth.
+- Refresh cursors remain independent from tracker projection success: a scan
+  commits its cursor only after its scored artifact is present and hashed, and
+  a temporary Sheets outage is recoverable through sync replay.
 
 ## 5. Materials
 

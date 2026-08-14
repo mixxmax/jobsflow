@@ -228,10 +228,20 @@ def record_refresh(
     new_count: int,
     candidates_csv: str | None = None,
     sheet_title: str | None = None,
+    completed_through: str | None = None,
     path: Path | None = None,
 ) -> dict[str, Any]:
     """Mark a successful refresh (call only after scan wrote outputs)."""
-    ran = to_iso(now_utc())
+    # The cursor is a watermark for the scan window, not the wall-clock time
+    # at which a potentially long scoring pass happened to finish.  Otherwise
+    # a 20-minute deep-score run can hide jobs published during those 20
+    # minutes.  Keep the old current-time behavior for legacy callers that do
+    # not provide a scan-window end.
+    watermark = parse_iso(completed_through) if completed_through else None
+    previous = parse_iso(state.get("last_refresh_at"))
+    if watermark is not None and previous is not None and watermark < previous:
+        watermark = previous
+    ran = to_iso(watermark or now_utc())
     entry = {
         "at": ran,
         "mode": mode,
@@ -240,6 +250,7 @@ def record_refresh(
         "new_count": new_count,
         "candidates_csv": candidates_csv,
         "sheet_title": sheet_title,
+        "completed_through": ran if completed_through else None,
     }
     hist = list(state.get("history") or [])
     hist.append(entry)

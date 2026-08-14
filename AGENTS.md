@@ -13,6 +13,10 @@ All agents (Claude, Cursor, Codex, etc.) must read and obey:
 | `/apply` | 验证材料并进入投递确认（不自动提交） | 材料完成后 |
 | `/intent` | 预览、确认并增量修改求职意向、扫描深度或保留偏好 | 求职方向或成本/清单偏好变化时 |
 
+High-level commands go through `python3 -m tools.workflow <action>` first.
+That gateway enforces policy, confirmation and side-effect boundaries. The
+existing scripts remain the adapters that actually scan, push or draft.
+
 ## /scan 模式
 
 ```
@@ -32,6 +36,7 @@ See `docs/system_rules.md` for:
 - Uncertainty-aware two-pass scoring: internal pass-1 routing, user scan-depth budget, and independent loose/standard/selective final retention
 - Materials decoupled from scan (never auto-generate CV during scan)
 - Intent changes require a preview and explicit confirmation; `/intent add` and `/intent replace` update only the private workspace
+- Tracker sync uses the local ledger as the source of truth; CSV/Sheets are verified projections, and remote changes require reconcile or explicit pull
 
 ## Tracker defaults
 
@@ -44,6 +49,9 @@ See `docs/tracker_defaults.md` for:
 
 | File | Purpose |
 |------|---------|
+| `python3 -m tools.workflow` | Unified gateway: scan/push/promote/materials/apply/archive |
+| `tools/workflow/` | Policy registry, state machine, confirmations, task packets |
+| `tools/workflow/sync.py` | Local tracker ledger, CSV/Sheets projections, reconcile/pull/replay |
 | `tools/fresh_24h/temp_two_pass.sh` | One-command scan + score |
 | `tools/fresh_24h/push_to_gsheet.py` | Push to Google Sheets |
 | `tools/fresh_24h/queries.json` | Industry-neutral setup-required template |

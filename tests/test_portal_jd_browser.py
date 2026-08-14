@@ -292,3 +292,21 @@ def test_manual_recovery_ignores_stale_failure_cache(monkeypatch, tmp_path):
     # A manual recovery attempt must ignore the recent-failure cache so the
     # user can actually retry after a challenge.
     assert captured.get("failure_cache") is False
+
+
+def test_session_init_script_is_applied_only_when_configured():
+    class _FakeContext:
+        def __init__(self):
+            self.scripts = []
+
+        def add_init_script(self, script):
+            self.scripts.append(script)
+
+    ctx = _FakeContext()
+    session = browser.JdBrowserSession(portal="jobsdb", init_script="js();")
+    session._apply_init_script(ctx)
+    assert ctx.scripts == ["js();"]
+
+    plain = browser.JdBrowserSession(portal="jobsdb")
+    plain._apply_init_script(ctx)
+    assert ctx.scripts == ["js();"]  # no second injection without a script

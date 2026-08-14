@@ -76,6 +76,7 @@ from tools.job_materials.manifest import (  # noqa: E402
 )
 from tools.job_materials.role_titles import build_role_title_contract  # noqa: E402
 from tools.job_materials.publisher import snapshot_context  # noqa: E402
+from tools.workflow.materials_state import compute_apply_ready  # noqa: E402
 from tools.job_materials.tailor import (  # noqa: E402
     build_tailored_payload,
     package_quality_exit_code,
@@ -380,6 +381,14 @@ def cmd_tailor(args: argparse.Namespace) -> int:
     if package is None or not package.is_dir():
         print(f"not a package dir: {package}", file=sys.stderr)
         return 2
+    from tools.workflow.plan_gate import PlanGateError, packet_started, require_validated_plan
+
+    if packet_started(package):
+        try:
+            require_validated_plan(package)
+        except PlanGateError:
+            print("validated materials plan missing — refuse drafting (MAT-001)", file=sys.stderr)
+            return 2
     title, company = _parse_title_company(package)
     publisher_context = snapshot_context(package)
     lane = (args.lane or "").upper()
@@ -804,6 +813,11 @@ def cmd_validate(args: argparse.Namespace) -> int:
         "package": str(package.resolve()),
         "status": "passed" if not errors else "failed",
         "errors": errors,
+        "apply_ready": compute_apply_ready(
+            p0_count=len(errors),
+            p1_count=0,
+            files_ok=not errors,
+        ),
         "contract": {
             "role": role,
             "verified_employer": company,
