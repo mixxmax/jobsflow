@@ -571,7 +571,6 @@ class JdBrowserSession:
         interactive_verification: bool = False,
         verification_timeout_seconds: int = 600,
         user_data_dir: str | Path | None = None,
-        init_script: str | None = None,
     ) -> None:
         self.portal = portal
         self.headless = headless
@@ -582,10 +581,6 @@ class JdBrowserSession:
         self.interactive_verification = bool(interactive_verification)
         self.verification_timeout_seconds = int(verification_timeout_seconds)
         self.user_data_dir = Path(user_data_dir).expanduser() if user_data_dir else None
-        # Optional JS injected before every page script (manual verification
-        # experiments, e.g. masking navigator.webdriver). Never applied to the
-        # automated scan path.
-        self.init_script = str(init_script) if init_script else None
         self._playwright = None
         self._browser = None
         self.context = None
@@ -648,15 +643,10 @@ class JdBrowserSession:
             self.context = self._playwright.chromium.launch_persistent_context(
                 str(user_data), **kwargs
             )
-            self._apply_init_script(self.context)
             return None  # persistent context owns the browser lifecycle
         except Exception:
             self._release_profile_lock()
             raise
-
-    def _apply_init_script(self, context) -> None:
-        if self.init_script and context is not None:
-            context.add_init_script(self.init_script)
 
     def _make_context(self):
         """Build the browser context. C3: no hard-coded user agent."""
@@ -667,9 +657,7 @@ class JdBrowserSession:
         state = resolve_storage_state(self.storage_state, self.portal)
         if state:
             context_kwargs["storage_state"] = str(Path(state).expanduser())
-        context = self._browser.new_context(**context_kwargs)
-        self._apply_init_script(context)
-        return context
+        return self._browser.new_context(**context_kwargs)
 
     def _release_profile_lock(self) -> None:
         if not self._profile_lock_owned or self._profile_lock_path is None:
@@ -1621,15 +1609,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Dedicated persistent browser profile directory (recovery mode)",
     )
     ap.add_argument(
-        "--init-script",
-        default=None,
-        help=(
-            "JS injected before every page script in the manual verification "
-            "window (e.g. mask navigator.webdriver). Never applied to the "
-            "automated scan path."
-        ),
-    )
-    ap.add_argument(
         "--verification-signal-file",
         "--signal-file",
         dest="signal_file",
@@ -1665,7 +1644,6 @@ def main(argv: list[str] | None = None) -> int:
             interactive_verification=args.interactive_verification,
             verification_timeout_seconds=args.verification_timeout_seconds,
             user_data_dir=args.user_data_dir,
-            init_script=args.init_script,
         )
 
     manual_recovery = args.interactive_verification or args.user_data_dir is not None
