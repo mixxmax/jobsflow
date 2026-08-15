@@ -20,7 +20,7 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-08-14
+## 🆕 Latest update · 2026-08-15
 
 - **A code-governed workflow instead of model self-discipline:** the unified
   gateway, policy registry, state machine, task packets, and postconditions now
@@ -32,9 +32,20 @@ and how to tailor the application without giving up final control.
   follows the economy/balanced/coverage budget. Full JD text drives deep scoring,
   while unavailable text stays visible as `待审-JD不足` or
   `provisional_needs_jd` instead of disappearing silently.
-- **Auditable materials:** JD, profile, assessment, and evidence mapping form a
-  structured task packet. CV, cover letter, and email share one factual boundary;
-  content audit, PDF/attachment checks, and hash gates block incomplete output.
+- **Audit CV/CL content before producing files:** the main model first saves a
+  structured canonical CV/CL. JobsFlow then automatically dispatches a child
+  agent in an independent context with only the cached JD, full CV/CL, and a
+  compact rule pack. It checks JD coverage, STAR structure, LLMO evidence
+  placement, cross-material consistency, fragments, and template residue. The
+  child agent does not inspect email, DOCX/PDF, or layout and cannot edit the
+  materials. The same model may audit in a separate context; no specific model
+  provider is required.
+- **Bounded repairs and one fixed output path:** the child agent returns
+  block-addressed findings, the main model repairs only affected content, and
+  the independent audit verifies it again. Each job is capped at three audits;
+  a repeated unresolved finding trips a circuit breaker for human review. Only
+  approved content is rendered from the matching lane DOCX master and converted
+  to PDF; deterministic checks own page count, text layer, filenames, and metadata.
 - **Local-first tracker sync:** the local ledger is the source of truth and a
   local CSV is a complete usable tracker. Google Sheets is an optional
   projection; failed syncs are replayable, remote changes are reconciled, and
