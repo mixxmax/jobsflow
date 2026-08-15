@@ -151,4 +151,12 @@ def artifact_drift(stored: dict[str, str], live: dict[str, str]) -> list[str]:
         actual = live.get(key)
         if expected and (not actual or actual != expected):
             drifted.append(key)
+    # A newly introduced outbound-looking file is also drift.  Otherwise an
+    # actor can add cv.txt after approval and make another consumer select it
+    # without changing any frozen file.  An empty manifest is the legitimate
+    # first-generation case and is frozen only after all gates pass.
+    if stored:
+        for key in live:
+            if key not in stored and (key.startswith("file:") or key in {"cv_docx", "cv_pdf", "cv_txt", "cl_docx", "cl_pdf", "cl_txt", "email"}):
+                drifted.append(key)
     return drifted

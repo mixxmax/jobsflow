@@ -17,6 +17,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -63,6 +64,34 @@ def conversion_cache_hit(docx: Path, pdf: Path, *, engine: str) -> bool:
         return False
 
 
+def _require_fixed_material_render_chain(docx: Path) -> None:
+    """Prevent a model from converting a plain-text package DOCX directly.
+
+    Lane application packages must be rendered by ``tools.workflow`` from a
+    canonical draft and a lane master.  Generic DOCX/PDF conversion remains
+    available for unrelated documents and the master files themselves, but a
+    package containing ``job_manifest.json`` is a product artifact boundary.
+    """
+
+    package = Path(docx).parent
+    if not (package / "job_manifest.json").is_file():
+        return
+    receipt = package / "materials_render_receipt.json"
+    try:
+        value = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        value = {}
+    if not (
+        str(value.get("renderer_version") or "").startswith("canonical-template-docx-")
+        and isinstance(value.get("template_sha256"), dict)
+        and isinstance(value.get("template_paths"), dict)
+    ):
+        raise RuntimeError(
+            "fixed_material_entry_required: package DOCX/PDF must be produced by "
+            "python3 -m tools.workflow materials render/pdf from the lane master"
+        )
+
+
 def find_soffice() -> str | None:
     candidates = [
         Path("/Applications/LibreOffice.app/Contents/MacOS/soffice"),
@@ -83,27 +112,28 @@ def convert_libreoffice(docx: Path, pdf: Path) -> bool:
     if not soffice:
         return False
     outdir = pdf.parent
-    # User profile in /tmp avoids first-run GUI and lock conflicts
-    profile = Path("/tmp/lo_pdf_profile")
-    profile.mkdir(parents=True, exist_ok=True)
-    env_profile = f"file://{profile}"
-    subprocess.check_call(
-        [
-            soffice,
-            "--headless",
-            "--nologo",
-            "--nofirststartwizard",
-            "--norestore",
-            f"-env:UserInstallation={env_profile}",
-            "--convert-to",
-            "pdf:writer_pdf_Export",
-            "--outdir",
-            str(outdir),
-            str(docx),
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # Every conversion gets an isolated profile.  A shared /tmp profile makes
+    # parallel CV/CL or multi-job conversion serialize on LibreOffice's lock
+    # and can silently attach to the wrong process.
+    with tempfile.TemporaryDirectory(prefix="jobsflow-lo-") as profile_dir:
+        env_profile = Path(profile_dir).resolve().as_uri()
+        subprocess.check_call(
+            [
+                soffice,
+                "--headless",
+                "--nologo",
+                "--nofirststartwizard",
+                "--norestore",
+                f"-env:UserInstallation={env_profile}",
+                "--convert-to",
+                "pdf:writer_pdf_Export",
+                "--outdir",
+                str(outdir),
+                str(docx),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     produced = outdir / (docx.stem + ".pdf")
     if produced.exists() and produced != pdf:
         produced.replace(pdf)
@@ -237,11 +267,24 @@ def convert(
     *,
     engine: str = "libreoffice",
     force: bool = False,
+    sanitize_metadata: bool = True,
 ) -> Path:
     """Convert DOCX → PDF. engine: auto | libreoffice | spire."""
     docx = docx.resolve()
     pdf = (pdf or docx.with_suffix(".pdf")).resolve()
     engine = (engine or "libreoffice").lower()
+    _require_fixed_material_render_chain(docx)
+    if sanitize_metadata:
+        # Core properties are not CV/CL content and are therefore safe to
+        # normalize before export.  This removes template residue early while
+        # the semantic audit remains bound to normalized document text.
+        try:
+            from tools.workflow.materials_metadata import sanitize_docx_metadata
+
+            sanitize_docx_metadata(docx, title=docx.stem)
+        except Exception as exc:
+            raise RuntimeError(f"DOCX metadata normalization failed: {exc}") from exc
+
     if not force and conversion_cache_hit(docx, pdf, engine=engine):
         print(f"OK cached (source unchanged): {pdf}")
         return pdf
@@ -267,12 +310,18 @@ def convert(
     raise RuntimeError(f"No headless converter available for {docx}")
 
 
-def convert_package_dir(d: Path, *, engine: str = "libreoffice", force: bool = False) -> None:
+def convert_package_dir(
+    d: Path,
+    *,
+    engine: str = "libreoffice",
+    force: bool = False,
+    sanitize_metadata: bool = True,
+) -> None:
     files = sorted(d.glob("*CV.docx")) + sorted(d.glob("*Cover Letter.docx"))
     if not files:
         files = [p for p in sorted(d.glob("*.docx")) if not p.name.startswith("~$")]
     for f in files:
-        convert(f, engine=engine, force=force)
+        convert(f, engine=engine, force=force, sanitize_metadata=sanitize_metadata)
 
 
 def main(argv=None) -> int:
@@ -292,14 +341,24 @@ def main(argv=None) -> int:
         action="store_true",
         help="Rebuild even when DOCX content and conversion policy are unchanged.",
     )
+    ap.add_argument(
+        "--preserve-metadata",
+        action="store_true",
+        help="Do not normalize DOCX core properties before export (not recommended for outbound materials).",
+    )
     args = ap.parse_args(argv)
 
     if args.package_dir:
-        convert_package_dir(args.package_dir, engine=args.engine, force=args.force)
+        convert_package_dir(
+            args.package_dir,
+            engine=args.engine,
+            force=args.force,
+            sanitize_metadata=not args.preserve_metadata,
+        )
         return 0
     if not args.docx:
         ap.error("docx or --package-dir required")
-    convert(args.docx, engine=args.engine, force=args.force)
+    convert(args.docx, engine=args.engine, force=args.force, sanitize_metadata=not args.preserve_metadata)
     return 0
 
 

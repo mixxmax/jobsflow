@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import csv
 import os
 import subprocess
 import sys
@@ -52,6 +53,33 @@ def write_run_record(
     run_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(run_dir / "run.json", meta)
     return meta
+
+
+def _preview_rows(scored_path: Path) -> list[dict[str, str]]:
+    """Expose a review-safe job list without leaking durable tracker IDs."""
+
+    if not scored_path.is_file():
+        return []
+    rows: list[dict[str, str]] = []
+    try:
+        with scored_path.open(encoding="utf-8-sig", newline="") as handle:
+            source_rows = csv.DictReader(handle)
+            for row in source_rows:
+                rows.append(
+                    {
+                        "岗位编号": "",
+                        "职位": str(row.get("职位") or row.get("title") or ""),
+                        "公司": str(row.get("公司") or row.get("company") or ""),
+                        "链接": str(row.get("链接") or row.get("url") or ""),
+                        "lane": str(row.get("简历版本") or row.get("lane") or row.get("track_hint") or ""),
+                        "层级": str(row.get("层级") or row.get("tier") or ""),
+                        "分数": str(row.get("CareerOps分数") or row.get("final_score") or ""),
+                        "JD状态": str(row.get("评估状态") or row.get("JD深度") or ""),
+                    }
+                )
+    except (OSError, UnicodeError, csv.Error):
+        return []
+    return rows
 
 
 def _python() -> str:
@@ -165,6 +193,7 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
         run_id=run_id,
         run=meta,
         scored_path=meta["scored_path"],
+        preview_rows=_preview_rows(scored),
     )
 
 
@@ -216,10 +245,14 @@ def _execute_fixture(workspace: Path | None, payload: dict[str, Any], mode: str)
     day = date.today().isoformat()
     scored = [
         {
-            "岗位编号": job.get("job_id") or f"C0-{idx:03d}",
+            # Fixtures follow the product contract too: scan results have no
+            # persistent job number. IDs are assigned only by confirmed push.
+            "岗位编号": "",
             "职位": job.get("title") or "Role",
             "公司": job.get("company") or "Acme",
             "链接": job.get("url") or f"https://example.test/job/{idx}",
+            "简历版本": job.get("lane") or job.get("track_hint") or "",
+            "层级": job.get("tier") or "",
             "CareerOps分数": str(job.get("score") or "4.0"),
             "评估状态": job.get("status") or "",
         }
@@ -227,9 +260,10 @@ def _execute_fixture(workspace: Path | None, payload: dict[str, Any], mode: str)
     ]
     csv_path = workspace / "02_Tracker" / f"fresh_24h_{day}_twopass_scored.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["岗位编号,职位,公司,链接,CareerOps分数,评估状态"]
+    fields = ["岗位编号", "职位", "公司", "链接", "简历版本", "层级", "CareerOps分数", "评估状态"]
+    lines = [",".join(fields)]
     for row in scored:
-        lines.append(",".join(row[k] for k in ["岗位编号", "职位", "公司", "链接", "CareerOps分数", "评估状态"]))
+        lines.append(",".join(str(row.get(k) or "") for k in fields))
     atomic_write_text(csv_path, "\n".join(lines) + "\n")
     pending = [job for job in jobs if job.get("semantic_pending")]
     meta = write_run_record(
@@ -238,7 +272,9 @@ def _execute_fixture(workspace: Path | None, payload: dict[str, Any], mode: str)
         mode=mode,
         scored_path=csv_path,
         semantic_pending_rows=len(pending),
-        semantic_pending_tasks=[str(job.get("job_id") or "") for job in pending],
+        semantic_pending_tasks=[
+            str(job.get("job_id") or job.get("url") or "") for job in pending
+        ],
         extra={"job_count": len(jobs)},
     )
     return result(
@@ -251,6 +287,7 @@ def _execute_fixture(workspace: Path | None, payload: dict[str, Any], mode: str)
         run_id=run_id,
         run=meta,
         scored_path=meta["scored_path"],
+        preview_rows=_preview_rows(csv_path),
     )
 
 

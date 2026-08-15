@@ -53,6 +53,8 @@ config.personal.json
 tmp/
 *.tmp
 *.zip
+.worktrees/
+.codex-worktrees/
 
 # === Editor / IDE ===
 .obsidian/

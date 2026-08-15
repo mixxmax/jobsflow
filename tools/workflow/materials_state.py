@@ -13,6 +13,30 @@ HASH_INVALIDATION = {
     "template": ("pdf", "format"),
 }
 
+# Content review policy is deliberately separate from the generic workflow
+# state machine.  It is consumed by the resumable materials orchestrator and
+# keeps P2 advice from becoming an accidental release blocker.
+MAX_AUDIT_ATTEMPTS = 3
+MAX_REPEAT_FINDING = 2
+BLOCKING_AUDIT_SEVERITIES = ("P0", "P1")
+
+
+def audit_gate_status(
+    *,
+    open_counts: dict[str, int] | None = None,
+    attempts: int = 0,
+    repeated_finding: bool = False,
+) -> str:
+    counts = open_counts or {}
+    blockers = sum(int(counts.get(key, 0) or 0) for key in BLOCKING_AUDIT_SEVERITIES)
+    if repeated_finding and blockers:
+        return "audit_loop_detected"
+    if blockers and int(attempts) >= MAX_AUDIT_ATTEMPTS:
+        return "audit_review_required"
+    if blockers:
+        return "repair_required"
+    return "passed"
+
 
 def compute_apply_ready(
     *,

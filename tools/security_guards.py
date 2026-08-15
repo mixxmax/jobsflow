@@ -19,6 +19,10 @@ Checks:
 3. .agents/**/package.json — no npm/bun lifecycle scripts (preinstall,
    install, postinstall, prepare, prepack) and no trustedDependencies.
    Catches code execution smuggled into `bun install`.
+4. Private runtime executable compatibility files — when an ignored runtime
+   exists locally, they must be reviewed thin delegates to ``tools.workflow``.
+   Catches a second scanner, renderer or materials pipeline growing inside one
+   user's ignored instance.
 
 Stdlib only. Exit 0 on success, 1 with a failure list otherwise.
 """
@@ -132,6 +136,32 @@ FORBIDDEN_LEGACY_PRODUCT_PATHS = {
     ".claude/skills/job-scraper/SKILL.md",
     ".claude/skills/job-scraper/search-queries.md",
     "tools/fresh_24h/cv_temu_baseline_export.py",
+}
+
+# A runtime instance may retain these old filenames as bookmarks, but their
+# contents must delegate to the single product implementation.  Tests and JSON
+# job inputs are inert runtime artifacts and are outside this executable-file
+# boundary.
+REVIEWED_RUNTIME_DELEGATES = {
+    "auto_materials_audit.py",
+    "batch_materials.py",
+    "materials_audit_response.py",
+    "materials_memory.py",
+    "materials_quality_trial.py",
+    "private_temp_two_pass.sh",
+}
+
+FORBIDDEN_RUNTIME_IMPLEMENTATION_TOKENS = {
+    "connect_over_cdp",
+    "remote-debugging-port",
+    "sync_playwright",
+    "2captcha",
+    "aws-waf-token",
+    "cf_clearance",
+    "save_jd_cache",
+    "from docx import",
+    "import gspread",
+    "urllib.request",
 }
 
 
@@ -278,18 +308,54 @@ def check_product_source_hygiene() -> None:
                 )
 
 
+def check_runtime_instance_boundary() -> None:
+    """Prevent an ignored runtime instance from becoming a second code line."""
+
+    scripts = ROOT / "JobSearch_2026" / "scripts"
+    if not scripts.is_dir():
+        return
+    for path in sorted(scripts.iterdir()):
+        if not path.is_file() or path.suffix.casefold() not in {".py", ".sh"}:
+            continue
+        if path.name.startswith("test_"):
+            continue
+        relpath = path.relative_to(ROOT)
+        if path.name not in REVIEWED_RUNTIME_DELEGATES:
+            errors.append(
+                f"{relpath}: runtime instance script is not a reviewed thin delegate; "
+                "implement behavior in tools/ and call it through python3 -m tools.workflow"
+            )
+            continue
+        try:
+            folded = path.read_text(encoding="utf-8").casefold()
+        except OSError as exc:
+            errors.append(f"{relpath}: runtime delegate unreadable: {exc}")
+            continue
+        if "tools.workflow" not in folded:
+            errors.append(
+                f"{relpath}: reviewed runtime delegate no longer calls the product workflow"
+            )
+        for token in sorted(FORBIDDEN_RUNTIME_IMPLEMENTATION_TOKENS):
+            if token.casefold() in folded:
+                errors.append(
+                    f"{relpath}: runtime thin delegate contains private implementation token "
+                    f"{token!r}; move the implementation to the product line"
+                )
+
+
 def main() -> int:
     check_permissions()
     check_gitignore()
     check_package_manifests()
     check_public_templates()
     check_product_source_hygiene()
+    check_runtime_instance_boundary()
     if errors:
         print(f"security_guards: {len(errors)} failure(s)")
         for err in errors:
             print(f"  - {err}")
         return 1
-    print("security_guards: OK (permissions allowlist, gitignore rules, package manifests)")
+    print("security_guards: OK (permissions, privacy ignores, package manifests, runtime boundary)")
     return 0
 
 

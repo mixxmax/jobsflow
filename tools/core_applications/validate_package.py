@@ -154,7 +154,16 @@ def _required_paths(package_dir: Path) -> tuple[list[Path], list[str]]:
 
 
 _RESIDUAL_SENTENCE_RE = re.compile(
-    r"\b(?:support|assist|coordinate|manage)\s*[.,]",
+    # Do not flag valid list punctuation such as ``litigation support,
+    # investigations and compliance``.  Only a verb left with no object (or
+    # a comma stranded at the end of a line) is a residual fragment.
+    r"\b(?:support|assist|coordinate|manage)\s+\.(?=\s|$)|"
+    r"\b(?:support|assist|coordinate|manage)\s*,\s*(?=$|\n)",
+    re.IGNORECASE,
+)
+_EMAIL_TEMPLATE_RE = re.compile(
+    r"The role's focus on\s+my\s+[^.\n]{1,240}\s+"
+    r"(?:matches|aligns with)\s+my\b",
     re.IGNORECASE,
 )
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
@@ -324,6 +333,10 @@ def validate_manifest_contract(
             for match in _RESIDUAL_SENTENCE_RE.finditer(text):
                 errors.append(f"{path.name}: residual incomplete sentence near {match.group(0)!r}")
                 break
+            if path.name.casefold() == "application_email.txt" and (
+                "[jd anchor:" in text.casefold() or _EMAIL_TEMPLATE_RE.search(text)
+            ):
+                errors.append(f"{path.name}: legacy JD-anchor sentence remains")
             if language.startswith("en") and _CJK_RE.search(text):
                 errors.append(f"{path.name}: Chinese characters found in English outbound material")
 

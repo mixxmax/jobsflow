@@ -5,7 +5,16 @@
 **Authority:** Cross-platform forced procedure for every agent and script.
 **Architecture:** `docs/adr/001-workflow-boundaries.md`
 
-## 1. Product and private workspace are separate
+## 1. One product implementation; isolated runtime data
+
+- `tools/`, command documentation and product tests are the single code and
+  policy source. There is no separate private implementation or private SOP.
+- `JobSearch_2026/` is one runtime instance of that product: it directly calls
+  product modules and holds only personal configuration, caches, ledgers and
+  generated artifacts. Runtime compatibility scripts must be thin delegates.
+- GitHub/cloud is a versioned snapshot of the same product implementation with
+  runtime data excluded. Product modules must never import runtime scripts or
+  depend on the literal directory name `JobSearch_2026`.
 
 - Tracked source is a cross-industry product. It must not contain a real
   candidate's identity, employment history, target companies or personal search
@@ -27,14 +36,22 @@
 - Use LibreOffice headless first. A supported fallback is allowed only when
   LibreOffice is unavailable and its output passes the same checks.
 - Never automate WPS menus or accessibility clicks.
-- Preserve normal glyph proportions. Adjust paragraph spacing and content
-  density; do not stretch text.
+- Preserve normal glyph proportions. The drafting model should first use
+  truthful, JD-relevant evidence to avoid an unusually sparse page; the fixed
+  renderer may then add bounded inter-block spacing when the tailored draft is
+  shorter than its lane master. Never stretch text, add generic filler, or
+  edit the PDF directly.
 - Use clean filenames without dates or internal version tokens.
 - Verify: one page, expected contact details from the private profile, no
   watermark, no missing glyphs, and no stale conversion cache.
 
+Application packages must use the fixed product chain; models may not choose a
+direct converter or a blank-document renderer:
+
 ```bash
-python3 tools/fresh_24h/docx_to_pdf.py path/to/file.docx --engine libreoffice
+python3 -m tools.workflow materials render --job-id <id>
+python3 -m tools.workflow materials pdf --job-id <id>
+python3 -m tools.workflow format --job-id <id>
 ```
 
 ## 3. Setup and personalized schema
@@ -101,6 +118,13 @@ Their actual queries and relevance rules are candidate- and profession-specific.
   `python3 -m tools.workflow archive preview` then `archive confirm`.
   `/scan`, `/push`, `/materials` and `/apply` must not archive, send or delete.
 - Preview means no sheet push and `--no-record`.
+- A scan preview has no persistent `岗位编号`; it exposes lane, tier, score,
+  URL and JD status. `SCAN-xxx`/`preview-*` keys are internal correlation keys
+  only and must not be shown as job IDs or accepted by materials.
+- Tracker entry is a two-step action: workflow `push` first creates a
+  digest-bound, write-free proposal; only the same run's unexpired proposal
+  with explicit user confirmation may assign a persistent ID and write CSV or
+  Google Sheets. A model must never infer entry permission from scan completion.
 - Do not claim full-JD analysis when only a teaser is available.
 - Never hard-reject an information-poor card solely because its title-only
   pass-1 score is below 3.3. If deep text cannot be obtained within policy or
@@ -183,10 +207,24 @@ Their actual queries and relevance rules are candidate- and profession-specific.
 - The private local tracker ledger under `02_Tracker/workflow/ledger/` is the
   source of truth for fresh tracker rows. CSV and Google Sheets are projections;
   JD cache, assessments, materials and candidate facts never move into Sheets.
-- All projection writes go through the workflow sync coordinator. Each write
-  has an operation ID, source/target digest precondition, atomic local ledger
-  update, remote read-back verification and a durable operation record under
-  `02_Tracker/workflow/sync_operations/`.
+- All projection writes go through the workflow sync coordinator. The normal
+  additive Google Sheets path inserts the confirmed batch only; it does not
+  clear or rewrite the whole tab. Each write has an operation ID, a local
+  ledger update and a durable operation record under
+  `02_Tracker/workflow/sync_operations/`. Full remote read-back remains the
+  fallback for schema migrations, updates or reconciliation; the local ledger
+  remains authoritative for ordinary entry.
+- **Entry presentation is a code-level invariant, not a model preference.**
+  After an explicit `/push` confirmation, the new batch is inserted directly
+  below the header (row 2), marked `本轮新增=是` with a batch ID and entry time,
+  and highlighted beige in Google Sheets. Every prior batch is demoted to
+  `本轮新增=否` / `较早入表` and its old highlight is cleared. Local CSV uses
+  the same ordering and markers. A model may not append a confirmed batch to
+  the bottom or choose a different visual convention.
+- Persistent job numbers are allocated from the workspace-local
+  `02_Tracker/workflow/id_counters.json`, one latest sequence per lane/tier
+  prefix (for example `C0`). The counter is advanced only after explicit entry
+  confirmation. A preview may show proposed numbers but never consumes them.
 - A changed remote projection is never silently overwritten. Reconciliation
   writes a diff report under `02_Tracker/workflow/sync_conflicts/`; failed
   operations remain replayable and do not claim success.
@@ -216,6 +254,11 @@ python3 -m tools.job_materials pipeline --package "..." --lane A
   reliable source is available, use JD-only/role context rather than guessing.
 - Build a JD requirement map and connect every customized claim to verified résumé
   evidence. Unrelated evidence does not count.
+- Keep stable user-confirmed profile facts (for example GPA, education and work
+  history) in the private fact store with stable IDs. A user-confirmed fact needs
+  traceability to that ID, not a new external citation for every job. Model-derived
+  claims remain bounded by the normal evidence requirement and may not promote
+  themselves into baseline facts.
 - Emit stable evidence IDs, requirement coverage states (`covered`, `partial`,
   `uncovered`, `prohibited_to_claim`) and one cross-material contract for CV,
   cover letter and application email. The same evidence ID and numeric fact must
@@ -263,11 +306,86 @@ python3 -m tools.job_materials pipeline --package "..." --lane A
   contract. Generated fields may be rebuilt; confirmed wording belongs in its
   `overrides` object and must survive reruns. JD, profile, company-research or
   lane changes invalidate generated artifacts through dependency fingerprints.
+- Package creation is an explicit entry-boundary side effect of confirmed
+  `/push`, not a materials-time convenience. The product creates
+  `01_Masters/<lane-folder>/<tier>/<job_id>_未投_<company>/` and a
+  `package_binding.json`; the durable ID prefix, tracker lane, manifest lane,
+  tier and directory must agree. `/materials` never creates, moves or selects a
+  package by model preference, and a mismatch is fail-closed.
+- Every outbound DOCX is rendered from the lane's validated `master_*.docx` and
+  `cl_master_*.docx` through the single workflow renderer. A blank-document or
+  direct-text conversion has no valid render receipt and cannot pass the format
+  gate or be converted by the package PDF adapter.
+- CV/CL must not proactively disclose missing or weak qualifications. If a JD
+  mentions a language the profile does not list, omit that language rather than
+  writing a negative sentence such as “Cantonese is not declared in my language
+  profile”; this is a blocking hygiene check in the host and in the CV/CL
+  semantic rule pack.
+- An unsupported JD anchor is recorded only as the internal plan disposition
+  `intentionally_omitted`. It satisfies the coverage decision without creating
+  outbound gap prose; `HYG-001` takes precedence over `MAP-001`, and the child
+  auditor may not request a negative disclosure as a repair.
 - Before a package is sent, run the manifest-aware release gate:
   `python3 -m tools.job_materials validate --package <path>`. It checks the
   recruiter/employer boundary, ID-to-tier routing, outbound language residue,
   incomplete sentences and the Cover Letter page budget. The gate reports
   failures; it does not silently rewrite user-owned DOCX files.
+
+### 5.1 Materials orchestrator v2
+
+The material lifecycle is a finite, resumable run. A compact, versioned audit
+rule pack and a canonical CV/CL draft are created before rendering. A validated
+`materials_plan.v1` may contain prose under `draft`; the host assigns canonical
+block IDs and placement metadata. Models therefore do not hand-assemble
+canonical hashes or bypass the fixed renderer. User-confirmed profile facts are
+accepted as stable inputs; the semantic audit is not an authorization ledger
+and does not reject a real fact merely because it lacks a separate evidence ID.
+An optional mechanical factcheck may report numerical discrepancies separately.
+The independent child receives only the JD, CV/CL text, placement metadata and
+compact rules; it never receives Email, PDF/DOCX/format data, filenames,
+metadata, lane/scoring context, or the private evidence/profile store.
+
+Canonical CV/CL blocks carry `section`, `experience_id`, `priority` and
+`jd_anchor_ids`. The child uses these fields to check STAR-shaped experience
+bullets, high-priority JD duty coverage, evidence ordering, and LLMO placement
+in the summary/Core Expertise/first experience bullets and Cover Letter opening.
+This remains a CV/CL content audit only; Email, PDF and format checks stay
+deterministic and outside the child scope.
+
+The child audits CV and Cover Letter content only: target-role positioning, JD
+mapping, STAR bullets, LLMO evidence placement, cross-material consistency,
+Cover Letter differentiation and output hygiene. It never audits Email, PDF
+page count/text layer, DOCX styles/fonts, filenames, metadata or other format
+production details. P0/P1 findings block; P2 is advisory and never blocks PDF
+by itself. The child reports `content_gate`; it does not certify PDF readiness.
+After the child passes, the host renders the canonical content through the
+fixed DOCX templates, converts to PDF, and runs deterministic page/text-layer,
+filename and metadata checks. The host computes PDF/format `ready_for_pdf` and
+final `apply_ready`; a model-provided boolean is never trusted. The run allows
+at most three audit attempts and stops with `audit_loop_detected` or
+`audit_review_required` when the same finding repeats or the budget is reached.
+After drafting, the gateway automatically creates the child task and does not
+ask the user to approve dispatch. A configured model-neutral command may be
+run with `audit --strict --auto-audit`; otherwise the host model launches a
+separate context from the task packet and submits its JSON result.
+
+Use the resumable public seam when recovering a material run:
+
+```bash
+python3 -m tools.workflow materials status --job-id <JOB-ID>
+python3 -m tools.workflow materials reset --job-id <JOB-ID> --scope audit
+python3 -m tools.workflow materials reset --job-id <JOB-ID> --scope audit --confirm-reset
+```
+
+Reset archives the old run under the package `.history/`; it does not silently
+delete a previous audit. It also rewinds the matching per-job materials entity
+state to the exact plan boundary, so a reset cannot leave the package and state
+machine out of sync. Metadata-only changes use a separate metadata hash and
+do not trigger a new semantic audit when the metadata passes the deterministic
+metadata gate. A change to normalized CV/CL text, JD, memory lessons or audit
+rules invalidates the semantic result. Findings are copied to a
+privacy-preserving lessons ledger for later runs; the ledger stores patterns
+and repairs, never candidate facts or document text.
 
 ## 6. Final checks
 

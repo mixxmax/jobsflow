@@ -19,8 +19,8 @@ ACTION_RULES: dict[str, dict[str, Any]] = {
     },
     "push": {
         "autonomy": "A0",
-        "rule_ids": ["PUSH-001", "FRESH-001", "SYNC-001"],
-        "requires_confirmation": False,
+        "rule_ids": ["PUSH-001", "FRESH-001", "SYNC-001", "SYNC-004"],
+        "requires_confirmation": True,
     },
     "promote": {
         "autonomy": "A0",
@@ -129,6 +129,16 @@ def decide(request: ActionRequest) -> PolicyDecision:
             requires_confirmation=True,
             autonomy_level=spec["autonomy"],
             next_action="sync_pull_confirm",
+        )
+    if needs_confirm and request.action == "push" and not confirmation_id:
+        # A push without a proposal is a review-only preview.  The adapter
+        # creates the digest-bound proposal; only the second call can write.
+        return PolicyDecision(
+            allowed=True,
+            rule_ids=list(spec["rule_ids"]),
+            requires_confirmation=True,
+            autonomy_level=spec["autonomy"],
+            next_action="push_confirm",
         )
     if needs_confirm and not confirmation_id:
         return PolicyDecision(

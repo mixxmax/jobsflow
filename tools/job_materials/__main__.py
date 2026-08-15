@@ -65,7 +65,7 @@ from tools.job_materials.jd_store import (  # noqa: E402
 from tools.job_materials.build_jobs_json import build_jobs_json  # noqa: E402
 from tools.job_materials.llmo import audit_plain_text  # noqa: E402
 from tools.job_materials.paths import LANES, jobsearch_root  # noqa: E402
-from tools.job_materials.packages import resolve_package  # noqa: E402
+from tools.job_materials.packages import validate_package_binding  # noqa: E402
 from tools.job_materials.manifest import (  # noqa: E402
     build_job_manifest,
     load_job_manifest,
@@ -107,29 +107,57 @@ from tools.io_utils import atomic_write_json, atomic_write_text  # noqa: E402
 
 
 def _pkg(path: str | None, *, job_id: str | None = None) -> Path | None:
-    """Resolve --package path or create a package from a local tracker row."""
+    """Resolve a bound package; never silently route by a model-supplied lane."""
     if path:
         p = Path(path).expanduser()
         if not p.is_absolute():
             p = (Path.cwd() / p).resolve()
+        manifest = load_job_manifest(p)
+        bound_id = str(manifest.get("job_id") or package_id_from_path(p) or "").strip()
+        under_masters = False
+        try:
+            p.resolve().relative_to((jobsearch_root() / "01_Masters").resolve())
+            under_masters = True
+        except ValueError:
+            under_masters = False
+        if manifest and bound_id and under_masters:
+            binding_errors = validate_package_binding(jobsearch_root(), p, bound_id)
+            if binding_errors:
+                print(
+                    "ERROR: package path is not the lane/tier route fixed at entry: "
+                    + ", ".join(binding_errors),
+                    file=sys.stderr,
+                )
+                return None
         return p
     if job_id:
         masters_root = (jobsearch_root() / "01_Masters").resolve()
-        try:
-            package = resolve_package(jobsearch_root(), job_id)
-        except LookupError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
+        matches = sorted(
+            path
+            for path in masters_root.rglob(f"{str(job_id).strip()}_*")
+            if path.is_dir()
+        ) if masters_root.is_dir() else []
+        if not matches:
             print(
-                "Run /push --local-only (or --also-local) and append the selected "
-                "row to a local tracker before /materials.",
+                "ERROR: package_missing — packages are created only by confirmed "
+                "/push; /materials and legacy helpers cannot create one on demand.",
                 file=sys.stderr,
             )
             return None
+        package = matches[0]
         try:
             package.resolve().relative_to(masters_root)
         except ValueError:
             print(
                 f"ERROR: package resolution escaped 01_Masters: {package}",
+                file=sys.stderr,
+            )
+            return None
+        binding_errors = validate_package_binding(jobsearch_root(), package, job_id)
+        if binding_errors:
+            print(
+                "ERROR: package path is not the lane/tier route fixed at entry: "
+                + ", ".join(binding_errors),
                 file=sys.stderr,
             )
             return None
@@ -185,6 +213,14 @@ def _ensure_material_manifest(
             company,
         )
     )
+    research_path = package / "company_research.json"
+    research: dict[str, Any] = {}
+    if research_path.is_file():
+        try:
+            loaded = json.loads(research_path.read_text(encoding="utf-8"))
+            research = loaded if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            research = {}
     publisher_type = (
         _meaningful(snapshot.get("publisher_type"), previous_job.get("publisher_type"), "unknown")
     )
@@ -193,6 +229,18 @@ def _ensure_material_manifest(
         snapshot.get("employer"),
         previous_job.get("employer_name"),
     )
+    research_publisher = _meaningful(research.get("publisher_name"))
+    research_type = _meaningful(research.get("publisher_type"))
+    research_employer = _meaningful(research.get("employer_name"))
+    research_company = _meaningful(research.get("company"), research.get("company_out"))
+    if research_publisher:
+        publisher_name = research_publisher
+    if research_type:
+        publisher_type = research_type
+    if research_employer:
+        employer_name = research_employer
+    if research_company:
+        company = research_company
     row = {
         "岗位编号": package_id_from_path(package),
         "职位": title,
@@ -264,9 +312,10 @@ def _known_application_answers(package: Path) -> dict[str, str]:
 
 def _print_pdf_next_steps(package: Path) -> None:
     print("")
-    print("== next (PDF export — after you edit DOCX from master) ==")
-    print(f"  python3 tools/fresh_24h/docx_to_pdf.py '{package}/<CV>.docx' --engine libreoffice")
-    print(f"  python3 tools/fresh_24h/docx_to_pdf.py '{package}/<Cover Letter>.docx' --engine libreoffice")
+    print("== next (fixed product materials chain) ==")
+    print("  python3 -m tools.workflow materials render --job-id <id>")
+    print("  python3 -m tools.workflow materials pdf --job-id <id>")
+    print("  python3 -m tools.workflow format --job-id <id>")
     print("  Handbook: JobSearch_2026/03_Applications/二级及部分一级岗位定制材料技术手册_2026-07-28.md")
     print("  Rules:    JobSearch_2026/03_Applications/系统规则_PDF与检索_强制遵守.md")
 
@@ -654,6 +703,24 @@ def cmd_company(args: argparse.Namespace) -> int:
         print(f"invalid company research JSON: {exc}", file=sys.stderr)
         return 2
     saved = save_company_research(package, value, root=jobsearch_root())
+    # Company research is an input contract, not a side note.  Propagate its
+    # confirmed publisher/employer boundary immediately so the public
+    # materials loader never sees a stale ``unknown`` manifest between
+    # ``company set`` and a later pipeline refresh.
+    manifest = load_job_manifest(package)
+    if manifest:
+        job = dict(manifest.get("job") or {})
+        for key in ("publisher_type", "publisher_name", "employer_name", "company_out"):
+            value = str(saved.get(key) or "").strip()
+            if value:
+                job[key] = value.casefold() if key == "publisher_type" else value
+        manifest["job"] = job
+        outbound = dict(manifest.get("outbound") or {})
+        if job.get("company_out"):
+            outbound["company_name"] = job["company_out"]
+        outbound["publisher_name_omitted"] = job.get("publisher_type") == "recruiter"
+        manifest["outbound"] = outbound
+        write_job_manifest(package, manifest)
     print(
         f"Wrote {package / 'company_research.json'} "
         f"({len(saved.get('verified_signals') or [])} sourced signals)"
@@ -983,7 +1050,7 @@ def main(argv: list[str] | None = None) -> int:
             "  • Never auto-runs on /scan / push_to_gsheet / temp_two_pass.\n"
             "  • pipeline writes tailor_plan + materials_status + base_master_ref;\n"
             "    exit ≠ 0 if base factcheck failed or JD stub/shallow.\n"
-            "  • PDF export is manual: docx_to_pdf (LibreOffice headless).\n"
+            "  • Application DOCX/PDF uses the fixed tools.workflow lane-master renderer.\n"
             "  • resume parse grafts apply-bot PDF→text into 00_Profile/resume_runtime/.\n"
         ),
     )

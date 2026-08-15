@@ -74,7 +74,7 @@ def test_missing_inputs_cannot_enter_planning():
     assert report["apply_ready"] is False
 
 
-def test_unknown_evidence_id_is_rejected():
+def test_unregistered_evidence_is_not_a_plan_gate_failure_in_v2():
     packet = _packet(
         claim_ledger=[
             {
@@ -87,11 +87,11 @@ def test_unknown_evidence_id_is_rejected():
         ]
     )
     report = validate_materials_packet(packet)
-    assert any(item["code"] == "unknown_evidence_id" for item in report["errors"])
-    assert report["apply_ready"] is False
+    assert not any(item["code"] == "unknown_evidence_id" for item in report["errors"])
+    assert report["apply_ready"] is True
 
 
-def test_transferable_written_as_direct_fails():
+def test_transferable_wording_is_not_reclassified_by_the_plan_gate():
     packet = _packet(
         claim_ledger=[
             {
@@ -104,9 +104,9 @@ def test_transferable_written_as_direct_fails():
         ]
     )
     report = validate_materials_packet(packet)
-    assert any(item["code"] == "transferable_upgraded_to_direct" for item in report["errors"])
-    assert any(item["rule_id"] == "MAT-003" for item in report["errors"])
-    assert report["apply_ready"] is False
+    assert not any(item["code"] == "transferable_upgraded_to_direct" for item in report["errors"])
+    assert not any(item["rule_id"] == "MAT-003" for item in report["errors"])
+    assert report["apply_ready"] is True
 
 
 def test_recruiter_name_in_filename_or_cl_fails():
@@ -135,7 +135,18 @@ def test_cross_material_number_or_language_mismatch_fails():
     report = validate_materials_packet(packet)
     codes = {item["code"] for item in report["errors"]}
     assert "language_inconsistent" in codes
-    assert "numbers_inconsistent" in codes
+    assert "numbers_inconsistent" not in codes  # CV may contain additional evidence-dense numbers
+
+
+def test_cross_material_number_not_supported_by_cv_fails():
+    packet = _packet(
+        outbound={
+            **_packet()["outbound"],
+            "numbers": {"cv": ["7.5"], "cl": ["7.5", "9"], "email": ["7.5"]},
+        }
+    )
+    report = validate_materials_packet(packet)
+    assert "numbers_inconsistent" in {item["code"] for item in report["errors"]}
 
 
 def test_missing_required_attachment_fails():

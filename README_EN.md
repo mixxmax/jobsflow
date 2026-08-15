@@ -24,7 +24,8 @@ and how to tailor the application without giving up final control.
 
 - **A code-governed workflow instead of model self-discipline:** the unified
   gateway, policy registry, state machine, task packets, and postconditions now
-  guard `/scan → /push → /materials → /apply`. Scans do not generate materials,
+  guard `/scan → /push → /materials → /apply`. Scans show lane/score only—no
+  tracker write or persistent job ID; `/push` requires preview/confirmation,
   archives require preview/confirmation, and `/apply` never submits.
 - **Recall, ranking, and cost are separate:** URL-keyed JD cache is checked
   first; missing/short teasers and gray-band roles are rescued; deep retrieval
@@ -38,6 +39,10 @@ and how to tailor the application without giving up final control.
   local CSV is a complete usable tracker. Google Sheets is an optional
   projection; failed syncs are replayable, remote changes are reconciled, and
   user fields enter through an explicit `sync pull`.
+- **Deterministic entry presentation:** after the user confirms `/push`, the
+  newest batch is inserted directly below the header, marked as the current
+  batch and highlighted beige; older rows are demoted to the earlier-entry
+  state. This is a code-level invariant, not a model-selected convention.
 - **Better for models with limited capability:** models handle bounded semantic
   judgment and wording, while salary, language, qualification, state changes,
   evidence binding, and high-impact side effects remain deterministic.
@@ -77,7 +82,8 @@ Then use:
 
 ```text
 /scan
-/push (or /push --local-only for a CSV-only tracker)
+/push (preview only; confirm the proposal before writing)
+/push --confirm <proposal-id> (or --local-only --confirm for CSV-only)
 /materials C0-005 C
 /apply C0-005 C
 ```
@@ -108,7 +114,8 @@ confirm`. Retention changes reuse the existing deep-score artifact.
 
 ```text
 CV + intent → setup → search → quick score → JD deep read
-           → company research → tailored CV/cover letter → your approval
+           → lane/tier preview → your review → confirmed tracker entry
+           → persistent job ID → tailored CV/cover letter → your approval
 ```
 
 ### Our LLMO strategy
@@ -156,7 +163,11 @@ Every deep pass: check URL cache first (hit = zero network requests) │
                   lane + company_brief                          upper_only / none + score
                               └────────────────────────┬────────────────────┘
                                                        ▼
-                         deterministic caps, eligibility, IDs, tracker write
+                         deterministic caps, eligibility, lane/tier preview
+                                                │
+                                  user reviews and confirms entry
+                                                │
+                                  assign persistent ID + write tracker
 ```
 
 The position-profile and resume-match tasks consume the JD fetched during the
@@ -263,10 +274,20 @@ model memory and not an ATS-score promise:
 - the CV, cover letter and application email share one evidence graph and the same numeric facts;
 - parseability is protected with selectable single-column text, standard sections and contact details outside images/text boxes/headers/footers;
 - QA metrics are internal engineering indicators, never an official ATS score or hiring prediction.
+- The main model first saves canonical CV/CL content with stable block IDs. JobsFlow then launches a compact independent audit over the full JD/CV/CL, internal coverage dispositions and compiled rules—never the long manuals, fact store, email, DOCX/PDF or layout. Unsupported requirements are marked `intentionally_omitted` internally and never turned into negative applicant disclosures. P0/P1 repairs can touch only finding-targeted blocks; DOCX/PDF are rendered after content passes. Each job has a three-audit cap, and the same unresolved finding trips a circuit breaker on its second appearance.
+- Audit patterns are retained as privacy-preserving production lessons, so later jobs in the same role family can avoid repeated mistakes.
 
 This gives models with different capability levels an executable boundary: the model
 reorders and rephrases mapped evidence instead of having to infer the whole JD or
 fill unsupported gaps.
+
+Material entry and formatting are not model choices. Only confirmed `/push` creates
+the bound `01_Masters/<lane>/<tier>/<job_id>_未投_<company>/` package; `/materials`
+may write only inside it. CV/CL content goes through the single `tools.workflow`
+renderer, which loads the lane DOCX master before PDF conversion. A missing template
+or binding receipt blocks the run—plain text cannot be renamed as a DOCX. CV/CL also
+omit unlisted qualifications rather than volunteering negative disclosures such as
+“Cantonese is not declared in my language profile.”
 
 ## Sources
 
@@ -308,9 +329,17 @@ JobSearch_2026/
 | Match score, priority and application status | — | ✓ |
 | Material versions and change history | ✓ | Link only, if useful |
 
-Each job ID connects the tracker row to its material package. You can back up the
-whole private workspace, review why a decision was made, and use local CSV without
-Google Sheets; Sheets is an optional tracker sync, not a CV or cover-letter store.
+Scan previews contain the role, lane, tier, score, URL and JD status, but no
+persistent job ID and no tracker write. Only an explicit, digest-bound `/push`
+confirmation assigns the persistent ID and writes the selected rows to local CSV
+or Google Sheets. Each entered job ID then connects the tracker row to its
+material package. Sheets is an optional tracker sync, not a CV or cover-letter
+store.
+
+For an explicit entry, the confirmed batch is always placed at the top of the
+fresh tab (row 2), marked `本轮新增=是` with its batch and entry time, and
+highlighted beige in Google Sheets. Older batches are automatically marked
+`本轮新增=否` / `较早入表`; the model cannot change this ordering or styling.
 
 Each package also has a private `job_manifest.json` hand-off contract. JobsFlow
 regenerates role/JD keywords, safe filenames and dependency fingerprints there,
@@ -340,9 +369,11 @@ The default workflow is local-first. Data leaves the machine only when you expli
 Google Sheets is not a job source; it is an optional tracker-sync destination. Local CSV tracking works without it.
 LinkedIn accepts a user-specified location; the current JobsDB and CTgoodjobs integrations target Hong Kong; FreeHire covers multiple markets but its strongest filtering is currently technical roles.
 
-The public source is the product line. A user's résumé, queries, job descriptions,
-scores, and application tracker belong to the separate private `JobSearch_2026/`
-workspace and are ignored by default. `/setup` generates industry-aware directions,
+JobsFlow has one product implementation, rule set and state machine. `JobSearch_2026/`
+is not a separate private code or policy line; it is one local runtime instance of the
+product, holding a user's résumé, queries, job descriptions, scores, tracker and generated
+artifacts. Runtime data is Git-ignored, while GitHub publishes the same product code and
+empty templates without personal data. `/setup` generates industry-aware directions,
 tracker headers, scoring weights, and material priorities from that user's intent;
 legal/compliance is not a built-in default.
 

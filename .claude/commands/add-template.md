@@ -1,8 +1,9 @@
 # /add-template — Register a private DOCX layout
 
-`/apply` uses a copy of the selected lane's DOCX master and exports it with
-LibreOffice headless. This command records a user's preferred layout without
-editing tracked product files or introducing a second LaTeX-only workflow.
+`/apply` uses the selected lane's DOCX master through the one product renderer
+and exports it with LibreOffice headless. This command records a user's
+preferred layout without editing tracked product files or introducing a second
+LaTeX-only workflow; models cannot choose a parallel rendering path.
 
 `$ARGUMENTS` may contain `--list`, `--use <name>`, a template path, or nothing.
 
@@ -47,7 +48,7 @@ master.
    - **Engine:** LibreOffice headless
    - **Page target:** exactly 1 A4 page
    - **Fonts:** <system or document-embedded font>
-   - **Status:** private reference; copy into a selected job package before editing
+   - **Status:** private reference; loaded by the fixed renderer for a selected package
 
    ## Style rules
 
@@ -59,12 +60,12 @@ master.
    ```
 
 6. Validate a copy in a scratch package: open the DOCX, replace placeholders
-   with dummy content, run `docx_to_pdf.py --engine libreoffice`, then check that
+   with dummy content, run the fixed `tools.workflow materials render/pdf` chain, then check that
    the PDF has one page and a readable text layer. If it overflows, adjust
    spacing or content; never stretch glyphs or hide overflow by overlaying pages.
-7. On `/apply`, copy the private template into the selected package, tailor only
-   verified evidence, and export after the content is final. Report the template
-   name and the PDF checks to the user.
+7. On `/apply`, the product renderer loads the selected lane template into the
+   bound package, applies only verified evidence, and exports after content is
+   final. Report the template name and PDF checks to the user.
 
 ## `--use <name>`
 

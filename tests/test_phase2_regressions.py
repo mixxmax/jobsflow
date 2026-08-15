@@ -60,7 +60,7 @@ def test_jd_edit_invalidates_previous_apply_ready(tmp_path):
     assert "stale_input_used" in second["blockers"]
 
 
-def test_transferable_written_as_direct_is_rejected_before_validated_plan(tmp_path):
+def test_transferable_wording_is_not_an_authorization_gate_before_validated_plan(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws, with_plan=False, with_outbound=False)
     plan = {
@@ -79,9 +79,9 @@ def test_transferable_written_as_direct_is_rejected_before_validated_plan(tmp_pa
         ],
     }
     out = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "model_plan": plan})
-    assert out.get("evaluation", {}).get("status") != "accepted"
-    assert out["status"] in {"repair", "review_required", "blocked", "failed"}
-    assert not (package / "materials_plan.validated.json").exists()
+    assert out.get("evaluation", {}).get("status") == "accepted"
+    assert out["status"] == "succeeded"
+    assert (package / "materials_plan.validated.json").exists()
 
 
 def test_apply_from_idle_does_not_walk_unexecuted_phases(tmp_path):

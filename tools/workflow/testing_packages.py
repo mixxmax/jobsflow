@@ -63,6 +63,10 @@ def build_workspace(root: Path) -> Path:
     (ws / "01_Masters" / "C_track" / "核心").mkdir(parents=True)
     (ws / "02_Tracker" / "job_assessments").mkdir(parents=True)
     atomic_write_json(ws / "00_Profile" / "queries.json", {"schema_version": 2, "setup_required": False})
+    # Materials rendering must never silently fall back to a generic
+    # ``Candidate`` filename.  Keep the synthetic fixture explicit so tests
+    # exercise the same confirmed-name gate as a real runtime.
+    atomic_write_json(ws / "00_Profile" / "config.personal.json", {"candidate_name": "Test Candidate"})
     atomic_write_json(
         ws / "00_Profile" / "fact_evidence.json",
         {
@@ -73,20 +77,180 @@ def build_workspace(root: Path) -> Path:
             "forbidden_claims": ["admitted as a solicitor"],
         },
     )
+    _write_test_lane_templates(ws)
     return ws
+
+
+def _write_test_lane_templates(ws: Path) -> None:
+    """Create explicit lane masters for synthetic workspaces.
+
+    Tests must exercise the same invariant as a real workspace: the renderer
+    receives a lane master and may not silently fall back to a blank document.
+    These are deliberately small style-bearing DOCX fixtures, not product
+    templates or candidate data.
+    """
+
+    from docx import Document
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Pt, RGBColor
+
+    lane = ws / "01_Masters" / "C_track"
+    cv_path = lane / "master_C_test_v1.docx"
+    cl_path = lane / "cl_master_C_test_v1.docx"
+
+    def add_style(document, name: str, size: float, *, bold: bool = False) -> None:
+        styles = document.styles
+        style = styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+        style.base_style = styles["Normal"]
+        style.font.name = "Arial"
+        style.font.size = Pt(size)
+        style.font.bold = bold
+        style.paragraph_format.space_after = Pt(2)
+        style.paragraph_format.line_spacing = 1.0
+
+    cv = Document()
+    add_style(cv, "Resume Section", 11, bold=True)
+    add_style(cv, "Job Heading", 10, bold=True)
+    add_style(cv, "Resume Bullet", 9.5)
+    add_style(cv, "Compact Line", 9.5)
+
+    def format_run(run, *, size: float, bold: bool = False, color: str = "1C1C1C") -> None:
+        run.font.name = "Arial"
+        run.font.size = Pt(size)
+        run.bold = bold
+        run.font.color.rgb = RGBColor.from_string(color)
+
+    title = cv.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    format_run(title.add_run("Test Candidate"), size=20.5, bold=True, color="17365D")
+    contact = cv.add_paragraph()
+    contact.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    format_run(contact.add_run("Hong Kong | test@example.test"), size=9, bold=True, color="4B4B4B")
+    summary = cv.add_paragraph()
+    format_run(summary.add_run("Summary prototype"), size=9.5)
+    section = cv.add_paragraph(style="Resume Section")
+    format_run(section.add_run("PROFESSIONAL SUMMARY"), size=11, bold=True, color="17365D")
+    compact = cv.add_paragraph(style="Compact Line")
+    format_run(compact.add_run("Core label"), size=8.5, bold=True, color="17365D")
+    format_run(compact.add_run(" - core evidence"), size=8.5)
+    heading = cv.add_paragraph(style="Job Heading")
+    tabs = heading.paragraph_format.tab_stops
+    tabs.add_tab_stop(Inches(6.0))
+    format_run(heading.add_run("Role | Company"), size=9.5, bold=True)
+    format_run(heading.add_run("\t2026"), size=9.5, bold=True, color="4B4B4B")
+    bullet = cv.add_paragraph(style="Resume Bullet")
+    num_pr = OxmlElement("w:numPr")
+    ilvl = OxmlElement("w:ilvl")
+    ilvl.set(qn("w:val"), "0")
+    num_id = OxmlElement("w:numId")
+    num_id.set(qn("w:val"), "1")
+    num_pr.append(ilvl)
+    num_pr.append(num_id)
+    bullet._p.get_or_add_pPr().append(num_pr)
+    format_run(bullet.add_run("A measurable action and result."), size=9.5)
+    cv.save(cv_path)
+
+    cl = Document()
+    add_style(cl, "Letter Body", 11)
+    add_style(cl, "Letter Bullet", 10.5)
+    add_style(cl, "Letter Compact", 10.5)
+    title = cl.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    format_run(title.add_run("Test Candidate"), size=20.5, bold=True, color="17365D")
+    contact = cl.add_paragraph()
+    contact.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    format_run(contact.add_run("Hong Kong | test@example.test"), size=9, bold=True, color="4B4B4B")
+    compact = cl.add_paragraph(style="Letter Compact")
+    format_run(compact.add_run("[Date]"), size=10.5)
+    subject = cl.add_paragraph()
+    format_run(subject.add_run("Re: Application for [Role]"), size=11, bold=True, color="17365D")
+    body = cl.add_paragraph(style="Letter Body")
+    format_run(body.add_run("Dear Hiring Manager,"), size=11)
+    letter_bullet = cl.add_paragraph(style="Letter Bullet")
+    format_run(letter_bullet.add_run("Evidence: "), size=10.5, bold=True, color="17365D")
+    format_run(letter_bullet.add_run("Supported the relevant work."), size=10.5)
+    cl.save(cl_path)
 
 
 def prepare_package_for_apply(ws: Path, job_id: str = "C0-001") -> None:
     """Drive a synthetic package through the public workflow gates."""
     from tools.workflow.engine import dispatch
+    from tools.workflow.materials_renderer import expected_filenames
 
     package = ws / "01_Masters" / "C_track" / "核心" / f"{job_id}_未投_Acme"
     plan = json.loads((package / "materials_plan.validated.json").read_text(encoding="utf-8"))
     assert dispatch("materials", workspace=ws, payload={"job_id": job_id, "model_plan": plan})["status"] == "succeeded"
-    assert dispatch("materials", workspace=ws, payload={"job_id": job_id, "stage": "drafting"})["status"] == "succeeded"
-    assert dispatch("audit", workspace=ws, payload={"job_id": job_id})["status"] == "succeeded"
+    drafted = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": job_id, "canonical_draft": canonical_fixture(job_id)},
+    )
+    assert drafted["status"] == "succeeded"
+    task = drafted["audit_task_packet"]
+    passed = {
+        "job_id": job_id,
+        "audit_scope": "jd_mapping_and_presentation",
+        "audit_input_fingerprint": task["audit_input_fingerprint"],
+        "auditor_context_id": task["auditor_context_id"],
+        "counts": {"P0": 0, "P1": 0, "P2": 0},
+        "findings": [],
+    }
+    assert dispatch("audit", workspace=ws, payload={"job_id": job_id, "audit_result": passed})["status"] == "succeeded"
+    assert dispatch("materials", workspace=ws, payload={"job_id": job_id, "stage": "render"})["status"] == "succeeded"
+    names = expected_filenames(package, ws)
+    cv_text = "Paralegal contract review operations experience with accurate records and reliable stakeholder support."
+    cl_text = "Application for Paralegal at Acme with evidence based contract review support and operational value."
+    write_minimal_pdf(package / names["cv_pdf"], cv_text)
+    write_minimal_pdf(package / names["cl_pdf"], cl_text)
     assert dispatch("materials", workspace=ws, payload={"job_id": job_id, "stage": "pdf_generated"})["status"] == "succeeded"
     assert dispatch("format", workspace=ws, payload={"job_id": job_id})["status"] == "succeeded"
+
+
+def canonical_fixture(job_id: str = "C0-001") -> dict:
+    """Complete structured text used by synthetic workflow tests."""
+
+    return {
+        "schema_version": 1,
+        "artifact_type": "jobsflow_canonical_cv_cl",
+        "job_id": job_id,
+        "cv": {
+            "blocks": [
+                {"id": "cv-heading", "type": "heading", "text": "Paralegal", "claim_ids": []},
+                {
+                    "id": "cv-summary",
+                    "type": "paragraph",
+                    "text": "Paralegal candidate bringing careful contract review support, reliable records management, bilingual coordination, IELTS 7.5 English and evidence based operational follow through for busy legal and business teams.",
+                    "claim_ids": ["C1"],
+                },
+                {
+                    "id": "cv-evidence-1",
+                    "type": "bullet",
+                    "text": "Reviewed vendor contracts in an adjacent payments setting and maintained clear checklists for accurate stakeholder follow up.",
+                    "claim_ids": ["C1"],
+                },
+            ]
+        },
+        "cover_letter": {
+            "blocks": [
+                {
+                    "id": "cl-opening",
+                    "type": "paragraph",
+                    "text": "I am applying for the Paralegal role at Acme. Its focus on vendor contract review is relevant to my adjacent payments experience and disciplined document support.",
+                    "claim_ids": ["C1"],
+                },
+                {
+                    "id": "cl-evidence-1",
+                    "type": "paragraph",
+                    "text": "I have reviewed vendor contracts and maintained practical checklists, and my IELTS 7.5 English supports accurate records, responsive coordination and dependable operational support without overstating ownership.",
+                    "claim_ids": ["C1"],
+                },
+                {"id": "cl-signoff", "type": "signoff", "text": "Yours sincerely,\nCandidate", "claim_ids": []},
+            ]
+        },
+    }
 
 
 def build_package(

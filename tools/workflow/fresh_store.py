@@ -1,4 +1,4 @@
-"""Fresh tab stores. Memory and file fixtures only; Sheets stays unauthorized."""
+"""Fresh tab stores. Local ledger is authoritative; Sheets is an optional projection."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from typing import Any, Protocol
 
 from tools.io_utils import atomic_write_json, atomic_write_stream
 from tools.job_urls import normalize_job_url
+from tools.spreadsheet_safety import neutralize_spreadsheet_formula
+from tools.fresh_24h.batch_mark import BEIGE_RGB, demote_previous_batch
 
 
 def rows_digest(rows: list[dict[str, Any]], *, title: str = "", headers: list[str] | None = None) -> str:
@@ -22,6 +24,172 @@ def rows_digest(rows: list[dict[str, Any]], *, title: str = "", headers: list[st
         default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _fresh_row_key(row: dict[str, Any]) -> str | None:
+    """Stable key shared by the append-only Sheets idempotency check."""
+
+    jid = str(row.get("岗位编号") or row.get("job_id") or "").strip()
+    if jid:
+        return f"id:{jid}"
+    url = normalize_job_url(str(row.get("链接") or row.get("url") or "").strip())
+    if url:
+        return f"url:{url}"
+    return None
+
+
+def _entry_batch_snapshot(current: "FreshSnapshot", rows: list[dict[str, Any]]) -> "FreshSnapshot":
+    """Build the post-entry order and metadata without mutating *current*."""
+
+    existing = [dict(row) for row in current.rows]
+    if rows and any((row.get("本轮新增") or "") == "是" for row in rows):
+        demote_previous_batch(existing)
+    merged = [dict(row) for row in rows] + existing
+    if any("行号" in row for row in merged):
+        for row_number, row in enumerate(merged, start=2):
+            row["行号"] = str(row_number)
+    return FreshSnapshot(
+        title=current.title,
+        headers=_headers_for_rows(merged, current.headers),
+        rows=merged,
+    )
+
+
+def _already_inserted(current: "FreshSnapshot", rows: list[dict[str, Any]]) -> bool:
+    """Detect a retry after the remote insert succeeded but the client timed out."""
+
+    current_by_key = {
+        _fresh_row_key(row): row
+        for row in current.rows
+        if _fresh_row_key(row)
+    }
+    return bool(rows) and all(
+        _fresh_row_key(row) in current_by_key
+        and all(
+            current_by_key[_fresh_row_key(row)].get(header, "") == row.get(header, "")
+            for header in current.headers
+        )
+        for row in rows
+    )
+
+
+def _column_letter(index: int) -> str:
+    result = ""
+    number = index + 1
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _sheet_row_values(row: dict[str, Any], headers: list[str]) -> list[Any]:
+    return [neutralize_spreadsheet_formula(row.get(header, "")) for header in headers]
+
+
+def _update_gsheet_rows(
+    ws: Any,
+    *,
+    headers: list[str],
+    previous_rows: list[dict[str, Any]],
+    updated_rows: list[dict[str, Any]],
+    inserted_count: int,
+) -> list[int]:
+    """Update only old rows whose batch metadata changed after insertion."""
+
+    changed = [
+        index
+        for index, (before, after) in enumerate(zip(previous_rows, updated_rows))
+        if before != after
+    ]
+    if not changed:
+        return []
+    end_col = _column_letter(len(headers) - 1)
+    updates = [
+        {
+            "range": f"A{index + 2 + inserted_count}:{end_col}{index + 2 + inserted_count}",
+            "values": [_sheet_row_values(updated_rows[index], headers)],
+        }
+        for index in changed
+    ]
+    if hasattr(ws, "batch_update"):
+        ws.batch_update(updates, raw=False, value_input_option="RAW")
+    else:
+        for item in updates:
+            ws.update(item["range"], item["values"], value_input_option="RAW")
+    return changed
+
+
+def _format_entry_rows(
+    ws: Any,
+    *,
+    headers: list[str],
+    total_rows: int,
+    inserted_count: int = 0,
+    demoted_indices: list[int] | None = None,
+) -> bool:
+    """Apply the tracker contract: newest batch beige, older rows white."""
+
+    spreadsheet = getattr(ws, "spreadsheet", None)
+    if spreadsheet is None or not hasattr(spreadsheet, "batch_update"):
+        return False
+    sheet_id = getattr(ws, "id", None)
+    if sheet_id is None:
+        return False
+    end_col = len(headers)
+    requests: list[dict[str, Any]] = []
+    if total_rows:
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": total_rows + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": end_col,
+                    },
+                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            }
+        )
+    if inserted_count:
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": inserted_count + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": end_col,
+                    },
+                    "cell": {"userEnteredFormat": {"backgroundColor": BEIGE_RGB}},
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            }
+        )
+    for old_index in demoted_indices or []:
+        row_index = old_index + inserted_count + 1
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": row_index,
+                        "endRowIndex": row_index + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": end_col,
+                    },
+                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            }
+        )
+    if not requests:
+        return False
+    spreadsheet.batch_update({"requests": requests})
+    return True
 
 
 @dataclass
@@ -230,6 +398,28 @@ class FileFreshStore:
         if self.read_active().digest != snapshot.digest:
             raise SnapshotConflict("projection_readback_digest_mismatch")
 
+    def append_rows_if_digest(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        headers: list[str],
+        expected_digest: str,
+    ) -> FreshSnapshot:
+        current = self.read_active()
+        if current.digest != expected_digest:
+            if _already_inserted(current, rows):
+                return current
+            raise SnapshotConflict("remote_snapshot_changed")
+        if not rows:
+            return current
+        after = _entry_batch_snapshot(current, rows)
+        if list(headers) != list(after.headers):
+            after.headers = _headers_for_rows(after.rows, headers)
+        self._write_active(after)
+        if self.read_active().digest != after.digest:
+            raise SnapshotConflict("projection_readback_digest_mismatch")
+        return after
+
     def merge_incoming(self, incoming: list[dict[str, Any]]) -> dict[str, int]:
         current = self.read_active()
         merged, added = merge_fresh_rows(current.rows, incoming)
@@ -352,6 +542,27 @@ class LocalCsvFreshStore:
         self._write_active(snapshot)
         if self.read_active().digest != snapshot.digest:
             raise SnapshotConflict("projection_readback_digest_mismatch")
+
+    def append_rows_if_digest(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        headers: list[str],
+        expected_digest: str,
+    ) -> FreshSnapshot:
+        current = self.read_active()
+        if current.digest != expected_digest:
+            if _already_inserted(current, rows):
+                return current
+            raise SnapshotConflict("remote_snapshot_changed")
+        if not rows:
+            return current
+        after = _entry_batch_snapshot(current, rows)
+        after.headers = _headers_for_rows(after.rows, headers)
+        self._write_active(after)
+        if self.read_active().digest != after.digest:
+            raise SnapshotConflict("projection_readback_digest_mismatch")
+        return after
 
     def merge_incoming(self, incoming: list[dict[str, Any]]) -> dict[str, int]:
         current = self.read_active()
@@ -504,6 +715,11 @@ class GSheetFreshStore:
         return self.read_active().digest
 
     def replace_active(self, snapshot: FreshSnapshot) -> None:
+        """Replace the tab only for schema/non-additive migration paths.
+
+        Ordinary confirmed additions use ``append_rows_if_digest`` and never
+        call this method.
+        """
         ws = self._ensure_worksheet(snapshot.headers)
         headers = _headers_for_rows(snapshot.rows, snapshot.headers)
         values = [headers] + [[row.get(key, "") for key in headers] for row in snapshot.rows]
@@ -512,6 +728,20 @@ class GSheetFreshStore:
         try:
             ws.resize(rows=max(len(values), 2), cols=max(len(headers), 1))
         except Exception:
+            pass
+        # Full replacement is reserved for migrations/reconciliation, but it
+        # still has to preserve the same presentation contract as the fast
+        # append path: only the current explicit-entry batch is beige.
+        try:
+            _format_entry_rows(
+                ws,
+                headers=headers,
+                total_rows=len(snapshot.rows),
+                inserted_count=sum(1 for row in snapshot.rows if (row.get("本轮新增") or "") == "是"),
+            )
+        except Exception:
+            # Formatting must never turn a successful value write into an
+            # ambiguous data retry.  The next reconciliation can retry it.
             pass
 
     def replace_active_if_digest(self, snapshot: FreshSnapshot, expected_digest: str) -> None:
@@ -524,9 +754,98 @@ class GSheetFreshStore:
         if self.read_active().digest != snapshot.digest:
             raise SnapshotConflict("projection_readback_digest_mismatch")
 
+    def append_rows_if_digest(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        headers: list[str],
+        expected_digest: str,
+    ) -> FreshSnapshot:
+        """Insert a new batch without clearing or rewriting the whole tab.
+
+        The local ledger is authoritative.  We still perform one precondition
+        read so an obvious concurrent edit is not silently overwritten, but we
+        do not perform a second full-sheet readback after the insert.  If a
+        retry finds that the same rows are already present, it is treated as an
+        idempotent success; this covers a timeout after Google accepted the
+        request.
+        """
+
+        current = self.read_active()
+        if current.digest != expected_digest:
+            if _already_inserted(current, rows):
+                return current
+            raise SnapshotConflict("remote_snapshot_changed")
+
+        current_headers = list(current.headers)
+        if list(headers) != current_headers:
+            raise SnapshotConflict("gsheet_headers_changed")
+        if not rows:
+            return current
+
+        values = [
+            [neutralize_spreadsheet_formula(row.get(header, "")) for header in current_headers]
+            for row in rows
+        ]
+        ws = self._ensure_worksheet(current_headers)
+        # Row 2 keeps the newest explicit-entry batch above older fresh rows,
+        # matching the established tracker presentation contract.
+        ws.insert_rows(
+            values,
+            row=2,
+            value_input_option="RAW",
+            inherit_from_before=False,
+        )
+        after = _entry_batch_snapshot(current, rows)
+        # Keep the existing sheet schema exactly stable on the append path.
+        after.headers = list(current_headers)
+        demoted = [
+            index
+            for index, (before, after_row) in enumerate(zip(current.rows, after.rows[len(rows):]))
+            if before != after_row
+        ]
+        if demoted:
+            _update_gsheet_rows(
+                ws,
+                headers=current_headers,
+                previous_rows=current.rows,
+                updated_rows=after.rows[len(rows):],
+                inserted_count=len(rows),
+            )
+        try:
+            _format_entry_rows(
+                ws,
+                headers=current_headers,
+                total_rows=len(after.rows),
+                inserted_count=len(rows),
+                demoted_indices=demoted,
+            )
+        except Exception:
+            # Values have already been inserted.  Keep the operation
+            # idempotent and let a later reconciliation retry formatting.
+            pass
+        return after
+
     def merge_incoming(self, incoming: list[dict[str, Any]]) -> dict[str, int]:
         current = self.read_active()
         merged, added = merge_fresh_rows(current.rows, incoming)
+        if added:
+            existing_keys = {
+                _fresh_row_key(row) for row in current.rows if _fresh_row_key(row)
+            }
+            new_rows = [
+                dict(row)
+                for row in incoming
+                if _fresh_row_key(row) and _fresh_row_key(row) not in existing_keys
+            ]
+            headers = _headers_for_rows(current.rows, current.headers)
+            if len(new_rows) == added and _headers_for_rows(merged, current.headers) == headers:
+                self.append_rows_if_digest(
+                    new_rows,
+                    headers=headers,
+                    expected_digest=current.digest,
+                )
+                return {"added": added, "kept": len(merged) - added, "total": len(merged)}
         self.replace_active(
             FreshSnapshot(
                 title=self.title,

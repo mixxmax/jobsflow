@@ -1293,9 +1293,8 @@ def write_base_master_ref(
         f"cv_master: {master.resolve() if master else ''}",
         f"cl_master: {cl.resolve() if cl else ''}",
         "",
-        "Copy from these masters into this package, then apply tailor_plan.md emphasis.",
-        "PDF: tools/fresh_24h/docx_to_pdf.py <CV.docx> --engine libreoffice",
-        "     tools/fresh_24h/docx_to_pdf.py <CL.docx> --engine libreoffice",
+        "The product renderer loads these masters automatically; do not copy/edit or convert them directly.",
+        "Use: python3 -m tools.workflow materials render/pdf --job-id <id>",
         "",
     ]
     out = package / "base_master_ref.txt"
@@ -1364,12 +1363,10 @@ def write_materials_status(
     else:
         next_steps.append("JD depth looks usable; review tailor_plan.md emphasis only (no freestyle invent)")
     next_steps += [
-        "Apply summary / skills order / bullets from tailor_plan into a **copy** of the lane master DOCX (see base_master_ref.txt)",
+        "Submit canonical CV/CL text to the fixed workflow; the system applies the lane master automatically (see base_master_ref.txt)",
         "Use the generated outbound filenames; never replace the verified employer with a recruiter/agency name",
         "Do **not** invent employers, titles, or metrics beyond fact-checked base + profile",
-        "Export PDF (LibreOffice headless):",
-        f"  `python3 tools/fresh_24h/docx_to_pdf.py '{package}/<Your CV>.docx' --engine libreoffice`",
-        f"  `python3 tools/fresh_24h/docx_to_pdf.py '{package}/<Cover Letter>.docx' --engine libreoffice`",
+        "Export PDF only through the fixed workflow: `python3 -m tools.workflow materials pdf --job-id <id>`",
         "Handbook: `JobSearch_2026/03_Applications/二级及部分一级岗位定制材料技术手册_2026-07-28.md`",
         "Optional: `python3 tools/core_applications/validate_package.py` if package is under core layout",
     ]

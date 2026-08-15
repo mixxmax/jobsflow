@@ -33,6 +33,24 @@ MAX_ITERATIONS = 8
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?。！？])\s+")
 
 
+def _require_fixed_material_entry(docx_path: Path) -> None:
+    """Reject direct mutation of an application-package DOCX.
+
+    The legacy compressor predates the canonical-content -> lane-master
+    renderer.  Allowing it to edit a package DOCX would bypass the audit
+    binding and let a model choose a second formatting entry point.  It is
+    still useful for unrelated documents, but JobsFlow packages must be
+    shortened in canonical text and rendered again through ``tools.workflow``.
+    """
+
+    package = Path(docx_path).parent
+    if (package / "job_manifest.json").is_file():
+        raise RuntimeError(
+            "fixed_material_entry_required: package DOCX must be regenerated "
+            "from canonical CV/CL through python3 -m tools.workflow materials render"
+        )
+
+
 def _pdf_pages(pdf: Path) -> int:
     try:
         return len(PdfReader(str(pdf)).pages)
@@ -126,6 +144,7 @@ def _protected(paragraph, index: int, total: int) -> bool:
 
 def auto_compress(docx_path: Path, max_pages: int = 1, dry_run: bool = False) -> int:
     docx_path = Path(docx_path).resolve()
+    _require_fixed_material_entry(docx_path)
     doc = Document(str(docx_path))
     with tempfile.TemporaryDirectory() as tmp:
         pdf = _export_pdf(docx_path, Path(tmp))

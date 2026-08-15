@@ -1,7 +1,9 @@
 # job_materials — on-demand, company/JD-aware materials
 
-This pipeline runs only after a user selects a job. Search and sheet updates
-never create application materials.
+This compatibility pipeline runs only after a user selects a job. Search and
+sheet updates never create application materials. The product materials entry
+is `python3 -m tools.workflow`; this module may prepare JD/company/plan inputs
+but it is not an alternative DOCX/PDF renderer.
 
 ## Quality boundary
 
@@ -36,19 +38,20 @@ PKG='JobSearch_2026/01_Masters/A_core/核心/A0-005_未投_Example'
 python3 -m tools.job_materials pipeline --package "$PKG" --lane A
 ```
 
-You may resolve a selected job directly from a local tracker row; the first
-`--job-id` call creates the package and `job_snapshot.md` automatically under
-`01_Masters/<direction>/<tier>/`. It does not invent a JD. If the JD is missing,
-address the selected row directly (the package is created or reused):
+The confirmed `/push` boundary creates the package and `job_snapshot.md`
+automatically under `01_Masters/<lane-folder>/<tier>/`, writes
+`package_binding.json`, and rejects a lane/ID mismatch. `/materials` only uses
+that existing bound package; it never creates or relocates one. It does not
+invent a JD. If the JD is missing, paste it into the already-created package:
 
 ```bash
 python3 -m tools.job_materials jd set \
   --job-id A0-005 --file ./jd.txt
 ```
 
-The same package creation happens for `/materials <job-id>` and `/apply <job-id>`
-when the row exists in a local main CSV or scored local export. If no local row is
-available, run `/push --local-only` (or `/push --also-local`) first.
+If no local row/package is available, run `/push --local-only` (or the confirmed
+CSV/Sheets push) first. A preview does not create a package; only confirmation
+does.
 
 ## Manifest、批量初稿与可重复生成
 
@@ -241,14 +244,15 @@ omit the optional role/industry-match slot and remain eligible for `/apply`.
 
 ## PDF
 
-After editing package copies of the DOCX masters:
+Do not copy/edit a master or call the converter directly. Use the one fixed
+workflow chain, which loads the lane master styles, renders canonical CV/CL,
+and then converts both files:
 
 ```bash
-python3 tools/fresh_24h/docx_to_pdf.py \
-  'path/to/CV.docx' --engine libreoffice
-python3 tools/fresh_24h/docx_to_pdf.py \
-  'path/to/Cover Letter.docx' --engine libreoffice
+python3 -m tools.workflow materials render --job-id <id>
+python3 -m tools.workflow materials pdf --job-id <id>
+python3 -m tools.workflow format --job-id <id>
 ```
 
-Both PDFs must pass the one-page, text-layer, font and stale-cache checks in
-`docs/system_rules.md`.
+Both PDFs must pass the one-page, text-layer, filename, metadata and template
+binding checks in `docs/system_rules.md`.

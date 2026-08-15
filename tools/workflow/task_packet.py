@@ -10,8 +10,9 @@ from tools.workflow.materials_schema import (
     COVERAGE_STATES,
     MATERIALS_PLAN_SCHEMA,
     MATCH_TYPES,
+    validate_plan_shape,
 )
-from tools.workflow.materials_validator import validate_plan_claims
+from tools.workflow.materials_rules import build_rule_pack
 from tools.workflow.policy import rules_for
 
 
@@ -32,6 +33,12 @@ def build_task_packet(
     if not isinstance(assessment, dict):
         assessment = {"value": assessment}
     company_research = ctx.get("company_research") or {}
+    profile_fact_ids = {
+        str(item)
+        for item in (ctx.get("profile_fact_ids") or inputs.get("profile_fact_ids") or [])
+        if str(item)
+    }
+    rule_pack = build_rule_pack()
     research_status = (
         "verified"
         if company_research.get("sources")
@@ -40,7 +47,7 @@ def build_task_packet(
         or (company_research.get("quality") or {}).get("ready_for_tailoring")
         else "jd_only_or_generic"
     )
-    return {
+    packet = {
         "task_type": task_type,
         "autonomy_level": "A1_A2",
         "rule_ids": rule_ids,
@@ -52,6 +59,7 @@ def build_task_packet(
         "assessment_gaps": list(assessment.get("gaps") or []),
         "preflight": inputs.get("preflight") or ctx.get("preflight"),
         "jd_excerpt": jd_text[:4000],
+        "jd_text": jd_text,
         "duties": list(ctx.get("duties") or []),
         "requirements": list(ctx.get("requirements") or []),
         "anchors": list(ctx.get("anchors") or []),
@@ -62,6 +70,11 @@ def build_task_packet(
             for node in (evidence_nodes or ctx.get("evidence_nodes") or [])
             if isinstance(node, dict) and node.get("id")
         ],
+        "profile_fact_ids": sorted(profile_fact_ids),
+        "profile_fact_policy": {
+            "user_confirmed": "stable profile fact ID is sufficient; no external URL is required",
+            "derived": "must cite an approved evidence ID and cannot be treated as a baseline fact",
+        },
         "forbidden_claims": list(forbidden_claims or ctx.get("forbidden_claims") or []),
         "publisher_type": ctx.get("publisher_type") or "unknown",
         "publisher_name": ctx.get("publisher_name") or "",
@@ -70,8 +83,34 @@ def build_task_packet(
         "company_research": company_research,
         "company_research_status": research_status,
         "page_budget": {"cv": 1, "cover_letter": 1},
+        "layout_contract": {
+            "source": "selected lane master DOCX; never choose a different renderer",
+            "goal": "Keep the one-page output visually balanced when the tailored text is shorter or denser than the master.",
+            "underfill_action": [
+                "First add one or two concise, JD-relevant details supported by confirmed profile facts, without padding or invention.",
+                "If the truthful draft remains shorter, let the fixed renderer add bounded inter-block spacing; do not stretch glyphs or change template fonts/colours.",
+            ],
+            "overfill_action": "Tighten or reorder existing truthful wording before any format conversion; never silently create a second page.",
+            "forbidden": ["generic filler", "invented facts", "font stretching", "manual PDF editing", "alternate DOCX entry point"],
+        },
         "required_output_schema": MATERIALS_PLAN_SCHEMA["name"],
+        "draft_seed_schema": {
+            "optional": True,
+            "purpose": "Provide prose and placement metadata only; the host assigns canonical block IDs.",
+            "cv": {"heading": "string", "summary": "string", "bullets": [{"text": "string", "section": "experience", "priority": 1, "jd_anchor_ids": ["JD-001"]}]},
+            "cover_letter": {"opening": "string", "paragraphs": ["string"], "signoff": "string"},
+            "fallback": "If omitted, the host requests a complete canonical CV/CL draft before rendering.",
+        },
+        "materials_audit_rules": rule_pack,
+        "materials_lessons": list(ctx.get("materials_lessons") or []),
+        "materials_lessons_policy": "quality warnings only; never treat a lesson as candidate evidence",
         "allowed_coverage_states": sorted(COVERAGE_STATES),
+        "coverage_disposition_contract": {
+            "field": "coverage_dispositions",
+            "allowed": ["direct", "transferable", "intentionally_omitted"],
+            "internal_only": ["intentionally_omitted"],
+            "instruction": "Classify unsupported high-priority JD anchors internally; never render a missing qualification or negative disclosure in CV/CL.",
+        },
         "allowed_claim_kinds": sorted(CLAIM_KINDS),
         "allowed_match_types": sorted(MATCH_TYPES),
         "stop_if": ["stale_input", "missing_full_jd", "unresolved_hard_requirement"],
@@ -79,6 +118,7 @@ def build_task_packet(
         "example_is_not_candidate_fact": True,
         "stale_reasons": list(ctx.get("stale_reasons") or []),
     }
+    return packet
 
 
 def evaluate_model_output(
@@ -130,49 +170,24 @@ def evaluate_model_output(
             "fields": missing,
             "publish": False,
         }
-    known = set(packet.get("evidence_ids") or [])
-    unknown = []
-    for claim in data.get("claim_ledger") or []:
-        if isinstance(claim, dict) and claim.get("evidence_id") not in known:
-            unknown.append(claim.get("evidence_id"))
-    if unknown:
-        if "semantic" in previous:
+    shape_errors = validate_plan_shape(data)
+    if shape_errors:
+        if "schema" in previous:
             return {
                 "status": "needs_capable_model_or_human_review",
-                "code": "unknown_evidence_id",
+                "code": "plan_schema_invalid",
+                "errors": shape_errors,
                 "publish": False,
             }
         return {
             "status": "repair",
-            "repair_kind": "semantic",
-            "code": "unknown_evidence_id",
-            "fields": ["claim_ledger"],
+            "repair_kind": "schema",
+            "code": "plan_schema_invalid",
+            "errors": shape_errors,
             "publish": False,
         }
-    semantic_packet = dict(packet)
-    semantic_packet["claim_ledger"] = data.get("claim_ledger") or []
-    semantic_packet["match_type"] = data.get("match_type") or (packet.get("assessment") or {}).get("match_type")
-    if isinstance(semantic_packet.get("assessment"), dict):
-        semantic_packet["assessment"] = {
-            **semantic_packet["assessment"],
-            "match_type": semantic_packet["match_type"],
-        }
-    semantic_errors = validate_plan_claims(semantic_packet)
-    if semantic_errors:
-        code = str(semantic_errors[0].get("code") or "semantic_violation")
-        if "semantic" in previous:
-            return {
-                "status": "needs_capable_model_or_human_review",
-                "code": code,
-                "publish": False,
-                "errors": semantic_errors,
-            }
-        return {
-            "status": "repair",
-            "repair_kind": "semantic",
-            "code": code,
-            "fields": ["claim_ledger"],
-            "publish": False,
-            "errors": semantic_errors,
-        }
+    # v2 deliberately does not validate claim/evidence authorization here.
+    # The main production model owns factual correctness; the independent
+    # child audits JD mapping and presentation after canonical CV/CL text is
+    # produced.  Keep only the structural plan gate in this layer.
     return {"status": "accepted", "data": data, "publish": False}

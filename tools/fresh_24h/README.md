@@ -25,20 +25,28 @@ python3 tools/fresh_24h/validate_queries.py \
 
 ```bash
 ./tools/fresh_24h/temp_two_pass.sh temp
-python3 tools/fresh_24h/push_to_gsheet.py \
-  --also-local --mode temp
+python3 -m tools.workflow push --run-id <scan-run-id>
+# Review the proposal, then confirm it explicitly:
+python3 -m tools.workflow push --run-id <scan-run-id> --confirm <proposal-id>
 ```
 
 Local-only tracking (no Google credentials):
 
 ```bash
-python3 tools/fresh_24h/push_to_gsheet.py \
-  --local-only --mode temp
+python3 -m tools.workflow push --run-id <scan-run-id> --local-only
+python3 -m tools.workflow push --run-id <scan-run-id> --local-only --confirm <proposal-id>
 ```
 
-This merges scored rows into the main local
-`JobSearch_2026/02_Tracker/hk_apply_list_YYYY-MM-DD.csv`, including batch and
-status fields. Google Sheets remains an optional sync destination.
+The first workflow push command is write-free and assigns no permanent job IDs.
+Only the second command, with the same unexpired proposal, merges selected
+scored rows into the local CSV or optional Google Sheets projection. Permanent
+IDs are assigned at that boundary. Direct legacy tracker-writing scripts are
+disabled.
+
+For Google Sheets, the local workflow ledger is authoritative. Normal additive
+entry inserts the confirmed batch in one bulk operation and keeps older rows;
+it does not clear and rewrite the whole tab. Full replacement is reserved for
+schema migration, system-field updates or an explicit reconciliation.
 
 Deep rows expose `语义匹配来源`, `语义待处理数` and pending task keys. A scan
 preview may show a conservatively capped `pending_fallback`, but formal push

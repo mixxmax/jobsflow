@@ -23,10 +23,12 @@ JobSearch_2026/02_Tracker/hk_apply_list_YYYY-MM-DD.csv
 
 | Phase | Does | Does NOT |
 |-------|------|----------|
-| **Search + two-pass** | Scan -> pass-1 scheduling/rescue -> cached/bounded deep -> final gate -> sheet/review | Auto-tailor CV / auto-generate packages |
+| **Search + two-pass** | Scan -> pass-1 scheduling/rescue -> cached/bounded deep -> final gate -> review-only preview; confirmed workflow push writes the tracker | Auto-write a tracker, auto-tailor CV / auto-generate packages |
 | **Materials** | Only after user picks a package -> `job_materials` | Decoupled from scan |
 
-Implementation: `tools/fresh_24h/two_pass_score.py`, `temp_two_pass.sh`, `push_to_gsheet.py`; materials: `tools/job_materials/`.
+Implementation: `tools/fresh_24h/two_pass_score.py`, `temp_two_pass.sh`, and
+`tools/workflow/` (the legacy direct writer is disabled); materials:
+`tools/job_materials/`.
 
 The base columns are industry-neutral. `/setup` may add up to eight validated
 fields that matter for the user's target profession or constraints. Model
@@ -44,8 +46,9 @@ an explicit migration.
 4 Deep JD         -> cache first (zero network budget); bounded network fetches next
 5 Pass-2          -> Full-JD rescore; persist every deep score for later re-filtering
 6 Retention       -> Loose 3.0 / standard 3.3 / selective 3.5, chosen by user
-7 Sheet/review    -> Selected rows rank normally; unfetched rows = 待审-JD不足
-8 Materials       -> Only when user picks a job - never auto
+7 Review preview  -> Show lane/tier/score/URL/JD status; no permanent ID or tracker write
+8 Confirmed entry -> Only after explicit user confirmation, assign IDs and write the run
+9 Materials       -> Only when user picks an entered job - never auto
 ```
 
 **Pass 1 and final retention are independent.** Pass 1 uses 3.3 only as an
@@ -53,7 +56,9 @@ internal direct-routing line, plus a derived rescue floor and information-qualit
 rescue. Network cost comes from scan depth: economy ~10, balanced ~20, coverage
 ~40 cache-miss fetches. The final list uses loose 3.0, standard 3.3 or selective
 3.5. Changing that final preference reuses saved deep scores.
-Legacy single-pass: `--legacy-single-pass` (shallow enrich + custom min, old default 3.0).
+The legacy direct writers (`fresh_24h_scan.py --append-tracker` and
+`push_to_gsheet.py`) are disabled. Use `python3 -m tools.workflow push` for a
+write-free proposal, then confirm its proposal ID.
 
 > **Honesty:** JobsDB/CT pass-2 is often **teaser + URL fix**, not full JD. Use `job_materials jd set` to paste full text for materials.
 
@@ -73,8 +78,10 @@ State file: `fresh_refresh_state.json`
 ./tools/fresh_24h/fresh_24h_scan.sh --show-state
 ./tools/fresh_24h/temp_two_pass.sh temp          # temp + two-pass (default)
 
-# Push to Google Sheet (uses private balanced/standard defaults for legacy configs)
-python3 tools/fresh_24h/push_to_gsheet.py --also-local --mode temp
+# Review-only entry proposal (does not write or assign permanent IDs)
+python3 -m tools.workflow push --run-id <scan-run-id>
+# After the user explicitly confirms the proposal:
+python3 -m tools.workflow push --run-id <scan-run-id> --confirm <proposal-id>
 ```
 
 See `tools/fresh_24h/README.md` and `tools/fresh_24h/AGENT_REFRESH.md`.
@@ -103,11 +110,11 @@ python3 -m tools.job_materials pipeline \
 
 ## Job ID Allocation Rule (避免重复编号)
 
-岗位编号格式 `{A-F}{0-2}-{NNN}`。新入表编号**必须接续全表已有编号的最后一个数字**，禁止重复。
+岗位编号格式 `{A-G}{0-3}-{NNN}`。新入表编号**必须接续当前台账快照已有编号的最后一个数字**，禁止重复。
 
-- **基线来源**：所有主 tracker tab（全部清单 / 核心 / 一级 / 二级 / 已剔除）**以及所有 `fresh_24h_*` tab** 中该前缀的最大编号。任何一个 tab 分配过的编号都算入基线。
-- **禁止跳过 fresh tab**：`push_to_gsheet.py` 的基线统计必须包含 `fresh_24h_*` tab（`_baseline_max_from_gsheet` 不再跳过 `fresh_` 开头的工作表），否则下次推送会复用已分配编号导致撞号。
-- **实现**：`tools/fresh_24h/job_id.py` 的 `max_prefix_from_ids` / `allocate_ids`；调用方负责传入覆盖全部工作表的 `baseline_max`。
+- **入表时才分配**：扫描预览不产生岗位编号；确认入表时，`tools/workflow/id_allocation.py` 从工作区本地的 `02_Tracker/workflow/id_counters.json` 读取每个 lane/层级前缀的最新编号，必要时以本地台账引导初始化，保留同 URL 的已有正式编号，再由 `tools/fresh_24h/job_id.py` 的 `allocate_ids` 分配新编号。确认后才推进计数器，Google Sheets 不再作为编号计数器。
+- **实现**：`tools/workflow/adapters/push.py` 先生成摘要绑定的 proposal，确认后才推进本地计数器并调用 `SyncCoordinator` 写入 CSV 或 Google Sheets。Google Sheets 普通新增走批量插入；表头迁移、更新或冲突才走受保护的全量路径。
+- **入表展示是固定协议**：确认入表的新批次必须位于表头下第一行（第 2 行），写入 `本轮新增=是`、批次和入表时间，并在 Google Sheets 使用米色底；旧批次自动变为 `本轮新增=否`、`较早入表` 并清除旧米色。此规则由代码执行，不由模型决定。
 - **已发现的历史撞号**（2026-08-01 核查）：fresh_24h_2026-07-31 与 fresh_24h_2026-08-01 之间部分编号重复（如 F1-013、B1-029、C1-023），源于旧版基线跳过 fresh tab。修复代码后，新推送不再产生此类重复；存量冲突需人工合并或重编号。
 
 ---
@@ -133,12 +140,12 @@ python3 -m tools.job_materials pipeline \
   python3 tools/fresh_24h/semantic_match_agent.py complete <key> --score 4.0 --note "..."
   ```
   `complete` 写入 `semantic_matches/done/<key>.json`，删除 pending。
-- **回填**：重跑评分（`two_pass_score.py` 或 `push_to_gsheet.py`）时读取 done 里的 `resume_match` 覆盖词频分，并在 reason 中标注「语义简历匹配(letter)：...」。
+- **回填**：重跑评分（`two_pass_score.py`）时读取 done 里的 `resume_match` 覆盖词频分，并在 reason 中标注「语义简历匹配(letter)：...」。
 - **状态可见**：输出列 `语义匹配来源` 会标记 `done`、`pending_fallback`、
   `keyword_fallback` 或 `not_applicable`，并同时记录 `语义待处理数` 与任务键。
 - **保守兜底**：无 done 文件时可以在扫描预览中使用关键词分，但标记为
   `pending_fallback`，默认上限为 4.0，不再伪装成已完成的 5.0 语义判断。
-- **推送闸门**：正式 `push_to_gsheet.py`（包括 `--local-only`）默认拒绝含
+- **推送闸门**：统一 workflow `push`（包括 `--local-only`）默认拒绝含
   pending 任务的行；先执行 `list → show → complete` 并重跑评分。只有明确的
   `--allow-pending-semantic` 诊断覆盖才会继续入表。
 - **画像分层**：`facts_anchor` 是可作为经历陈述的事实基线；`capability_upper` 只能用于可迁移潜力判断，不能写成已做过的实操经验。

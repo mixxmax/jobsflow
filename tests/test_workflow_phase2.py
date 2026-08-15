@@ -56,12 +56,12 @@ def test_compliant_package_can_reach_apply_ready(tmp_path):
     assert out["status"] == "succeeded"
 
 
-def test_transferable_as_direct_blocks_apply(tmp_path):
+def test_transferable_as_direct_is_not_an_apply_blocker_without_other_failures(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws, transferable_as_direct=True)
     out = dispatch("apply", workspace=ws, payload={"job_id": "C0-001"})
     assert out["apply_ready"] is False
-    assert "transferable_upgraded_to_direct" in out["blockers"]
+    assert "transferable_upgraded_to_direct" not in out["blockers"]
 
 
 def test_recruiter_name_blocks_apply(tmp_path):
@@ -149,7 +149,19 @@ def test_scan_push_materials_apply_e2e(tmp_path):
     )
     assert scan["status"] == "succeeded"
     assert scan.get("generate_materials") is False
-    push = dispatch("push", workspace=ws, payload={"run_id": "run1", "fresh_title": "fresh_24h_e2e"})
+    preview = dispatch("push", workspace=ws, payload={"run_id": "run1", "fresh_title": "fresh_24h_e2e"})
+    assert preview["status"] == "planned"
+    assert preview["requires_confirmation"] is True
+    assert preview["proposed_ids"]
+    push = dispatch(
+        "push",
+        workspace=ws,
+        payload={
+            "run_id": "run1",
+            "fresh_title": "fresh_24h_e2e",
+            "confirmation_id": preview["proposal_id"],
+        },
+    )
     assert push["status"] == "succeeded"
     assert "archive" not in (push.get("side_effects") or [])
     materials = dispatch("materials", workspace=ws, payload={"job_id": "C0-001"})

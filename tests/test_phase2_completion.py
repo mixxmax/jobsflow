@@ -17,7 +17,7 @@ from tools.workflow.engine import dispatch
 from tools.workflow.entity_state import load_entity_state
 from tools.workflow.fresh_store import LocalCsvFreshStore, default_fresh_store
 from tools.workflow.package_validator import MaterialsPackageValidator
-from tools.workflow.testing_packages import build_package, build_workspace, prepare_package_for_apply
+from tools.workflow.testing_packages import build_package, build_workspace, prepare_package_for_apply, canonical_fixture, write_minimal_pdf
 
 
 def _scored_run(ws: Path, run_id: str = "run-completion") -> None:
@@ -38,7 +38,13 @@ def test_workflow_push_uses_a_real_local_csv_sink(tmp_path, monkeypatch):
     ws = build_workspace(tmp_path)
     _scored_run(ws)
     monkeypatch.setenv("JOBSFlow_FRESH_BACKEND", "csv")
-    out = dispatch("push", workspace=ws, payload={"run_id": "run-completion"})
+    preview = dispatch("push", workspace=ws, payload={"run_id": "run-completion"})
+    assert preview["status"] == "planned"
+    out = dispatch(
+        "push",
+        workspace=ws,
+        payload={"run_id": "run-completion", "confirmation_id": preview["proposal_id"]},
+    )
     assert out["status"] == "succeeded"
     assert out["backend"] == "local_csv"
     assert out["postconditions"] == ["fresh_rows_read_back"]
@@ -126,6 +132,7 @@ def test_generic_outbound_without_role_or_employer_is_not_apply_ready(tmp_path):
 def test_apply_requires_a_hash_bound_audit_receipt(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws)
+    prepare_package_for_apply(ws)
     (package / "materials_audit.json").unlink()
     report = MaterialsPackageValidator().validate(package)
     assert report["apply_ready"] is False
@@ -135,6 +142,7 @@ def test_apply_requires_a_hash_bound_audit_receipt(tmp_path):
 def test_forged_receipt_without_independent_audit_is_rejected(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws)
+    prepare_package_for_apply(ws)
     (package / "materials_audit.json").unlink()
     atomic_write_json(
         package / "materials_audit.json",
@@ -176,10 +184,38 @@ def test_cli_entrypoints_drive_the_complete_synthetic_chain(tmp_path):
     from tools.workflow.__main__ import main
 
     assert main(["scan", "--workspace", str(ws), "--fixture", str(fixture)]) == 0
-    assert main(["push", "--workspace", str(ws), "--run-id", "run-cli", "--backend", "csv"]) == 0
+    preview = dispatch(
+        "push",
+        workspace=ws,
+        payload={"run_id": "run-cli", "backend": "csv"},
+    )
+    assert preview["status"] == "planned"
+    assert main(
+        [
+            "push",
+            "--workspace",
+            str(ws),
+            "--run-id",
+            "run-cli",
+            "--backend",
+            "csv",
+            "--confirm",
+            preview["proposal_id"],
+        ]
+    ) == 0
     assert main(["materials", "--workspace", str(ws), "--job-id", "C0-001", "--plan", str(plan)]) == 0
-    assert main(["materials", "--workspace", str(ws), "--job-id", "C0-001", "--stage", "drafting"]) == 0
-    assert main(["audit", "--workspace", str(ws), "--job-id", "C0-001"]) == 0
+    canonical = tmp_path / "canonical.json"
+    atomic_write_json(canonical, canonical_fixture())
+    assert main(["materials", "draft", "--workspace", str(ws), "--job-id", "C0-001", "--content", str(canonical)]) == 0
+    task = json.loads((package / "materials_audit_task.json").read_text(encoding="utf-8"))
+    audit_result = tmp_path / "audit_result.json"
+    atomic_write_json(audit_result, {"job_id": "C0-001", "audit_scope": "jd_mapping_and_presentation", "audit_input_fingerprint": task["audit_input_fingerprint"], "auditor_context_id": task["auditor_context_id"], "counts": {"P0": 0, "P1": 0, "P2": 0}, "findings": []})
+    assert main(["audit", "--workspace", str(ws), "--job-id", "C0-001", "--result", str(audit_result)]) == 0
+    assert main(["materials", "render", "--workspace", str(ws), "--job-id", "C0-001"]) == 0
+    from tools.workflow.materials_renderer import expected_filenames
+    names = expected_filenames(package, ws)
+    write_minimal_pdf(package / names["cv_pdf"], "Paralegal contract review support and accurate records with IELTS 7.5 English experience.")
+    write_minimal_pdf(package / names["cl_pdf"], "Application for Paralegal at Acme with contract review support and IELTS 7.5 English experience.")
     assert main(["materials", "--workspace", str(ws), "--job-id", "C0-001", "--stage", "pdf_generated"]) == 0
     assert main(["format", "--workspace", str(ws), "--job-id", "C0-001"]) == 0
     assert main(["apply", "--workspace", str(ws), "--job-id", "C0-001"]) == 0
@@ -189,7 +225,7 @@ def test_valid_package_cannot_bypass_material_state_chain(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws)
     out = dispatch("apply", workspace=ws, payload={"job_id": "C0-001"})
-    assert out["apply_ready"] is True
+    assert out["apply_ready"] is False
     assert out["status"] == "blocked"
-    assert "workflow_state_not_ready" in out["blockers"]
+    assert "content_audit_missing" in out["blockers"]
     assert load_entity_state(ws, "materials", "C0-001").phase == "idle"

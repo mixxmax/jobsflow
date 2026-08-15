@@ -37,4 +37,9 @@ Bug fixes should include a test that fails before the change. Portal network cod
 - DOCX + LibreOffice headless is the maintained PDF path; CV and cover letter are each one page.
 - Company facts in materials require source URLs; candidate claims require profile/base evidence.
 
+Product changes belong in the tracked repository. `JobSearch_2026/` is a
+gitignored personal runtime for concrete job-search operations, not a second
+development line; do not use it as the source of product fixes or commit its
+contents.
+
 Keep changes focused and document any migration or residual risk.

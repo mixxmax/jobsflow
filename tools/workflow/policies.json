@@ -5,7 +5,7 @@
     {
       "rule_id": "FRESH-001",
       "domain": "archive",
-      "statement": "Scan, push and promote write or merge into fresh; they never archive or clear it.",
+      "statement": "Scan produces review artifacts only; confirmed push and promote may write or merge into fresh, and none of these actions may archive or clear it.",
       "level": "MUST",
       "autonomy": "A0",
       "enforcement": "code",
@@ -38,7 +38,7 @@
     {
       "rule_id": "PUSH-001",
       "domain": "push",
-      "statement": "Formal push is blocked while semantic tasks are pending unless a diagnostic override is explicit.",
+      "statement": "A tracker write requires a stored preview and explicit user confirmation; semantic tasks still block ordinary push.",
       "level": "MUST",
       "autonomy": "A0",
       "enforcement": "code",
@@ -71,7 +71,7 @@
     {
       "rule_id": "MAT-002",
       "domain": "materials",
-      "statement": "Every outbound claim must bind a known evidence ID; forbidden claims cannot enter outbound text.",
+      "statement": "The materials plan must be structurally valid; outbound entity hygiene and forbidden wording remain mechanical checks, not a claim-authorization audit.",
       "level": "MUST",
       "autonomy": "A1",
       "enforcement": "schema",
@@ -82,10 +82,10 @@
     {
       "rule_id": "MAT-003",
       "domain": "materials",
-      "statement": "A transferable or stretch assessment must not be written as a direct claim.",
+      "statement": "The independent CV/CL auditor repairs JD mapping and presentation findings; factual correctness remains with the main production model and optional mechanical factcheck.",
       "level": "MUST_NOT",
-      "autonomy": "A1",
-      "enforcement": "model_validator",
+      "autonomy": "A2",
+      "enforcement": "model_audit",
       "failure_status": "failed",
       "override_policy": "none",
       "tests": ["test_materials_compiled_sop.py"]
@@ -177,6 +177,17 @@
       "failure_status": "blocked",
       "override_policy": "user_confirmed",
       "tests": ["test_sync_coordinator.py"]
+    },
+    {
+      "rule_id": "SYNC-004",
+      "domain": "sync",
+      "statement": "An explicitly confirmed entry batch is inserted directly below the header, marked as the current batch, and highlighted beige; prior batches are demoted.",
+      "level": "MUST",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "needs_reconcile",
+      "override_policy": "none",
+      "tests": ["test_scan_entry_boundary.py", "test_sync_coordinator.py"]
     }
   ]
 }

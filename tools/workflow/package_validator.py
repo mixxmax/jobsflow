@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,9 @@ from tools.workflow.materials_schema import P0_CODES, P1_CODES
 from tools.workflow.materials_state import compute_apply_ready
 from tools.workflow.materials_validator import validate_materials_packet
 from tools.workflow.plan_gate import load_validated_plan
+from tools.workflow.materials_hashes import semantic_material_hashes
+from tools.workflow.materials_metadata import metadata_violations
+from tools.fresh_24h.job_assessment import jd_fingerprint
 
 AUDIT_RECEIPT_NAME = "materials_audit.json"
 
@@ -47,6 +51,16 @@ def _sha_text(text: str) -> str:
 
 def _sha_file(path: Path) -> str:
     return _sha_bytes(path.read_bytes())
+
+
+def _metadata_issues(path: Path) -> list[str]:
+    """Catch template metadata before an independent content audit is spent."""
+    try:
+        return metadata_violations(Path(path))
+    except Exception:
+        # PDF readability is checked separately; a DOCX failure remains a
+        # deterministic metadata gate rather than an LLM audit task.
+        return ["docx_metadata_unreadable"] if Path(path).suffix.casefold() == ".docx" else []
 
 
 def audit_receipt_path(package: Path) -> Path:
@@ -83,17 +97,37 @@ def _read_audit_receipt(package: Path) -> dict[str, Any] | None:
 def _audit_receipt_matches(package: Path, receipt: dict[str, Any] | None, live: dict[str, str]) -> bool:
     if not receipt or str(receipt.get("status") or "") != "passed":
         return False
-    if str(receipt.get("auditor") or "") != "jobsflow.deterministic_materials_auditor":
-        return False
-    independent = receipt.get("independent_report")
-    if not isinstance(independent, dict) or independent.get("status") != "passed":
-        return False
-    stored = receipt.get("artifact_hashes")
-    if not isinstance(stored, dict):
-        return False
-    expected = {str(key): str(value) for key, value in stored.items() if value}
-    actual = {str(key): str(value) for key, value in collect_outbound_hashes(package).items() if value}
-    return expected == actual and bool(actual)
+    # v2 semantic audit receipt.  It is bound to normalized CV/CL text rather
+    # than raw DOCX bytes, so metadata-only changes do not force a new model
+    # audit.  The host computes this status after validating the child JSON.
+    if receipt.get("audit_scope") == "jd_mapping_and_presentation" and receipt.get("content_gate") == "passed":
+        semantic = receipt.get("semantic_material_hashes")
+        producer = str(receipt.get("producer_context_id") or "")
+        auditor = str(receipt.get("auditor_context_id") or "")
+        evidence = _json(Path(package) / "materials_audit_evidence.json") or {}
+        task_file = Path(package) / "materials_audit_task.json"
+        evidence_ok = (
+            evidence.get("audit_input_fingerprint") == receipt.get("audit_input_fingerprint")
+            and evidence.get("semantic_material_hashes") == semantic
+            and evidence.get("report_sha256") == _sha_file(Path(package) / AUDIT_RECEIPT_NAME)
+            and (
+                not evidence.get("task_sha256")
+                or (task_file.is_file() and evidence.get("task_sha256") == _sha_file(task_file))
+            )
+        )
+        return (
+            isinstance(semantic, dict)
+            and semantic == semantic_material_hashes(package)
+            and bool(auditor)
+            and auditor != producer
+            and int((receipt.get("open_counts") or {}).get("P0", 0)) == 0
+            and int((receipt.get("open_counts") or {}).get("P1", 0)) == 0
+            and evidence_ok
+        )
+    # Retired deterministic/legacy receipts can still be rendered as
+    # diagnostics by ``audit_package`` but can never impersonate the
+    # independent content audit required by the product workflow.
+    return False
 
 
 def _pdf_stats(path: Path) -> dict[str, Any]:
@@ -157,7 +191,10 @@ def _find_cv_pdf(package: Path) -> Path | None:
 def live_package_hashes(package: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     package = Path(package)
     hashes = dict(extra or {})
-    hashes["jd"] = _sha_text(read_jd(package))
+    # Use the same normalized JD fingerprint as assessment/package context.
+    # Raw-file SHA values differ when a user-paste envelope is present and
+    # previously produced a false stale_input_used at the final gate.
+    hashes["jd"] = jd_fingerprint(read_jd(package))
     hashes.update(collect_outbound_hashes(package))
     return hashes
 
@@ -228,14 +265,15 @@ class MaterialsPackageValidator:
         # the package is stopped for review).
         role = str(job.get("role_material") or job.get("role_display") or "").strip()
         employer = str(job.get("company_out") or job.get("employer_name") or "").strip()
-        if not role or not employer:
+        publisher_type = str(job.get("publisher_type") or "unknown").casefold()
+        if not role or publisher_type == "unknown":
             findings.append(
                 _finding(
                     "MAT-004",
                     "P0",
                     "entity_contract_incomplete",
                     "job_manifest.json",
-                    "verified role and employer are required before outbound validation",
+                    "verified role and publisher boundary are required before outbound validation",
                 )
             )
         else:
@@ -250,7 +288,13 @@ class MaterialsPackageValidator:
                 if not text.strip():
                     continue
                 role_ok = _normalized_token(role) in _normalized_token(text) or _role_tokens_match(role, text)
-                employer_ok = _normalized_token(employer) in _normalized_token(text)
+                # A CV describes the candidate and need not name every target
+                # employer.  Cover Letter/email use the verified employer when
+                # disclosed; an undisclosed recruiter client stays unnamed.
+                label_key = str(label).casefold()
+                is_cv_material = label_key == "cv" or ("cv" in label_key and "cover" not in label_key and "letter" not in label_key)
+                employer_required = bool(employer) and not is_cv_material
+                employer_ok = not employer_required or _normalized_token(employer) in _normalized_token(text)
                 if not role_ok or not employer_ok:
                     missing = ", ".join(
                         item
@@ -324,11 +368,47 @@ class MaterialsPackageValidator:
         artifact_live = collect_outbound_hashes(package)
         frozen = load_artifact_manifest(package)
         drifted = artifact_drift(frozen, artifact_live)
+        # A post-audit DOCX metadata edit is deterministic and safe when the
+        # normalized CV/CL body is unchanged.  Body edits, PDFs, email and the
+        # validated plan still invalidate the package.  This keeps the audit
+        # bound to semantic content rather than ZIP container bytes.
+        receipt_for_drift = _read_audit_receipt(package)
+        semantic_drift_exempt = False
+        if receipt_for_drift and receipt_for_drift.get("audit_scope") == "jd_mapping_and_presentation":
+            stored_semantic = receipt_for_drift.get("semantic_material_hashes")
+            semantic_drift_exempt = isinstance(stored_semantic, dict) and stored_semantic == semantic_material_hashes(package)
+        if semantic_drift_exempt:
+            drifted = [
+                key
+                for key in drifted
+                if not (
+                    str(key).casefold() in {"cv_docx", "cl_docx"}
+                    or (str(key).casefold().startswith("file:") and str(key).casefold().endswith(".docx"))
+                )
+            ]
         if drifted:
             hashes_match = False
             findings.append(
                 _finding("MAT-001", "P0", "stale_artifact", drifted[0], f"artifact hash drift: {', '.join(drifted)}")
-            )
+                    )
+        metadata_paths = [found.get("cv_docx"), found.get("cl_docx"), cv_pdf, cl_pdf]
+        seen_metadata_paths: set[Path] = set()
+        for path in metadata_paths:
+            if path is not None:
+                path = Path(path)
+                if path in seen_metadata_paths:
+                    continue
+                seen_metadata_paths.add(path)
+                for code in _metadata_issues(path):
+                    findings.append(
+                        _finding(
+                            "MAT-004",
+                            "P1",
+                            code,
+                            path.name,
+                            "outbound document metadata contains template residue",
+                        )
+                    )
 
         p0 = [f for f in findings if f["severity"] == "P0"]
         p1 = [f for f in findings if f["severity"] == "P1"]
@@ -470,7 +550,7 @@ def _extract_language_levels(cv: str, cl: str, email: str) -> dict[str, str]:
     import re
 
     def grab(text: str) -> str:
-        match = re.search(r"IELTS\s+[0-9.]+", text or "", re.I)
+        match = re.search(r"IELTS\s+\d+(?:\.\d+)?", text or "", re.I)
         return match.group(0) if match else ""
 
     return {"cv": grab(cv), "cl": grab(cl), "email": grab(email)}
@@ -479,7 +559,14 @@ def _extract_language_levels(cv: str, cl: str, email: str) -> dict[str, str]:
 def _extract_numbers(cv: str, cl: str, email: str) -> dict[str, list[str]]:
     import re
 
+    # Day-month-year phrases (e.g. "15 August 2026") are dates, not evidence
+    # numbers; stripping them keeps the cross-material number check free of
+    # date noise.
+    date = re.compile(
+        r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b"
+    )
+
     def grab(text: str) -> list[str]:
-        return re.findall(r"\d+(?:\.\d+)?", text or "")
+        return re.findall(r"\d+(?:\.\d+)?", date.sub(" ", text or ""))
 
     return {"cv": grab(cv), "cl": grab(cl), "email": grab(email)}

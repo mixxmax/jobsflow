@@ -231,6 +231,36 @@ class PublicTemplateGuardTests(GuardRepoFixture):
         self.assertIn("private/legacy workflow", result.stdout)
 
 
+class RuntimeInstanceBoundaryGuardTests(GuardRepoFixture):
+    def test_runtime_private_scanner_implementation_fails(self):
+        path = self.root / "JobSearch_2026" / "scripts" / "portal_jd_cdp.py"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            "from playwright.sync_api import sync_playwright\n"
+            "# connect_over_cdp and write directly to a private JD cache\n",
+            encoding="utf-8",
+        )
+
+        result = run_guards(self.root)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("runtime instance script is not a reviewed thin delegate", result.stdout)
+        self.assertIn("portal_jd_cdp.py", result.stdout)
+
+    def test_reviewed_runtime_delegate_cannot_grow_a_private_implementation(self):
+        path = self.root / "JobSearch_2026" / "scripts" / "private_temp_two_pass.sh"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            "#!/usr/bin/env bash\npython3 -m tools.workflow scan\n# connect_over_cdp\n",
+            encoding="utf-8",
+        )
+
+        result = run_guards(self.root)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("runtime thin delegate contains private implementation token", result.stdout)
+
+
 class RealRepoTests(unittest.TestCase):
     def test_guards_pass_on_this_repo(self):
         # The live check CI runs: the actual repo tree must satisfy its own guards.

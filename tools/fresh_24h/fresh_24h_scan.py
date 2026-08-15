@@ -14,10 +14,11 @@ applies hard/soft rules, dedupes against the apply tracker, and writes:
   JobSearch_2026/02_Tracker/fresh_24h_YYYY-MM-DD.csv
   JobSearch_2026/02_Tracker/fresh_24h_YYYY-MM-DD_run.json
 
-Does NOT auto-apply. Default is dry-write candidates only; use --append-tracker
-to append new rows to the main apply list with status 未做 / 待审.
+Does NOT write a tracker. The legacy ``--append-tracker`` switch is refused;
+use ``python3 -m tools.workflow push`` preview → explicit confirmation instead.
 
-Reporting policy (sheet): only CareerOps ≥ 3.0 when pushing via push_to_gsheet.py.
+Reporting policy (sheet): the confirmed workflow push applies the configured
+retention policy; this scanner itself never writes the tracker.
 """
 
 from __future__ import annotations
@@ -862,7 +863,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--append-tracker",
         action="store_true",
-        help="Append decision=new rows to main tracker (default: candidates CSV only)",
+        help="Legacy write switch (refused; use workflow push preview/confirm)",
     )
     ap.add_argument(
         "--include-rejects",
@@ -881,6 +882,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Seconds between serial queries within each portal worker",
     )
     args = ap.parse_args(argv)
+
+    if args.append_tracker:
+        print(
+            "ERROR: direct tracker writes are disabled; run the unified workflow "
+            "push preview and confirm the returned proposal instead.",
+            file=sys.stderr,
+        )
+        return 2
 
     repo: Path = args.repo.resolve()
     state_path = (args.state or (repo / "JobSearch_2026" / "02_Tracker" / "fresh_refresh_state.json")).resolve()
@@ -1203,7 +1212,7 @@ def main(argv: list[str] | None = None) -> int:
             "JobsDB has no native 24h API; dated posts filtered client-side.",
             "mode=temp uses last_refresh_at from fresh_refresh_state.json.",
             "Sheet push policy: CareerOps >= 3.0 only (push_to_gsheet --min-score 3).",
-            "Default does not auto-apply; review candidates before --append-tracker.",
+            "Default writes candidates only; tracker entry is available only through the confirmed workflow push.",
         ],
     }
     atomic_write_json(run_path, summary)
@@ -1249,7 +1258,7 @@ def main(argv: list[str] | None = None) -> int:
         for r in appended:
             print(f"    + {r.get('岗位编号')} | {r.get('公司')} | {r.get('职位')}")
     elif n_new:
-        print("  (candidates only — re-run with --append-tracker to add to main list)")
+        print("  (candidates only — review first, then use workflow push preview/confirm to enter selected rows)")
     if errors:
         print(f"  portal errors: {len(errors)} (see run log)")
 

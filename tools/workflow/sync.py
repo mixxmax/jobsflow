@@ -6,9 +6,11 @@ coordination policy in one deep module so callers do not need to know about
 digests, retries, ownership, or conflict handling.
 
 The interface deliberately favors strong local invariants and eventual
-projection consistency.  Google Sheets cannot participate in a real database
-transaction, so every remote write is guarded by a precondition, read back,
-and recorded in an operation ledger that can be replayed after a crash.
+projection consistency. Google Sheets cannot participate in a real database
+transaction, so every remote write is guarded by a precondition and recorded
+in an operation ledger that can be replayed after a crash. Additive Sheets
+writes use an append-only projection; full read-back remains the migration and
+reconciliation path.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from tools.workflow.fresh_store import (
     _headers_for_rows,
     merge_fresh_rows,
 )
+from tools.fresh_24h.batch_mark import demote_previous_batch
 
 SYNC_SCHEMA_VERSION = 1
 
@@ -123,12 +126,12 @@ def _hash(value: Any) -> str:
 
 
 def _row_key(row: dict[str, Any]) -> str | None:
-    job_id = str(row.get("岗位编号") or row.get("job_id") or "").strip()
-    if job_id:
-        return f"id:{job_id}"
     url = normalize_job_url(str(row.get("链接") or row.get("url") or "").strip())
     if url:
         return f"url:{url}"
+    job_id = str(row.get("岗位编号") or row.get("job_id") or "").strip()
+    if job_id:
+        return f"id:{job_id}"
     return None
 
 
@@ -462,8 +465,24 @@ class SyncCoordinator:
         run_id: str = "",
         operation_id: str | None = None,
         dry_run: bool = False,
+        target_snapshot: FreshSnapshot | None = None,
     ) -> dict[str, Any]:
-        ledger, local_before, target_before, backend = self._prepare_target(title, store)
+        if target_snapshot is None:
+            ledger, local_before, target_before, backend = self._prepare_target(title, store)
+        else:
+            # The push adapter already read and digest-bound the target while
+            # validating the confirmation proposal. Reuse that snapshot to
+            # avoid a duplicate full-sheet read; the append adapter still
+            # performs its own immediate precondition check before writing.
+            ledger = TrackerLedger(self.workspace, title)
+            if not ledger.exists():
+                ledger.bootstrap(target_snapshot)
+            local_before = ledger.read()
+            target_before = target_snapshot
+            backend = _backend_name(store)
+            projection = self.operations.read_projection(title, backend)
+            if projection is None:
+                self.operations.write_projection(title, backend, target_before)
         projection = self.operations.read_projection(title, backend) or target_before
         remote_diff = _diff_snapshots(projection, local_before, target_before)
         if remote_diff["conflicts"] or remote_diff["remote_changes"] or remote_diff["remote_only"]:
@@ -482,7 +501,57 @@ class SyncCoordinator:
                 "report_path": report_path,
             }
 
-        merged_rows, stats = merge_system_rows(local_before.rows, incoming)
+        existing_keys = {
+            _row_key(row) for row in local_before.rows if _row_key(row)
+        }
+        append_rows = [
+            dict(row)
+            for row in incoming
+            if _row_key(row) and _row_key(row) not in existing_keys
+        ]
+        # An explicit entry starts a new presentation batch.  Demote the
+        # previous batch in the local source-of-truth before merging so the
+        # ledger and every projection agree that only the newly entered rows
+        # are marked ``本轮新增=是``.  The store applies the same transition to
+        # its live projection immediately before inserting the rows.
+        merge_base_rows = [dict(row) for row in local_before.rows]
+        if append_rows and any((row.get("本轮新增") or "") == "是" for row in append_rows):
+            demote_previous_batch(merge_base_rows)
+        merged_rows, stats = merge_system_rows(merge_base_rows, incoming)
+        if append_rows:
+            # New explicit-entry rows are always presented first, even when
+            # a schema migration forces the guarded full-replacement path.
+            # Previously this ordering was applied only to the fast Sheets
+            # adapter, so local CSV and legacy-schema tabs put new rows at the
+            # bottom.
+            new_keys = {_row_key(row) for row in append_rows if _row_key(row)}
+            by_key = {
+                _row_key(row): row
+                for row in merged_rows
+                if _row_key(row) in new_keys
+            }
+            ordered_new = [by_key[_row_key(row)] for row in append_rows if _row_key(row) in by_key]
+            existing_part = [row for row in merged_rows if _row_key(row) not in new_keys]
+            merged_rows = ordered_new + existing_part
+            if any("行号" in row for row in merged_rows):
+                for row_number, row in enumerate(merged_rows, start=2):
+                    row["行号"] = str(row_number)
+        # The fast Sheets projection is safe only when the confirmed batch is
+        # purely additive and the schema is unchanged.  Any update, duplicate,
+        # or header migration keeps the guarded full-replacement path.
+        append_only = (
+            bool(append_rows)
+            and len(append_rows) == len(incoming)
+            and stats["updated"] == 0
+            and _headers_for_rows(local_before.rows, local_before.headers)
+            == _headers_for_rows(merged_rows, local_before.headers)
+            and callable(getattr(store, "append_rows_if_digest", None))
+        )
+        if append_only:
+            # Sheets inserts the new batch at row 2; the ordering above keeps
+            # the local ledger in the same order so its digest remains the
+            # projection's digest.
+            pass
         merged = FreshSnapshot(
             title=title,
             headers=_headers_for_rows(merged_rows, local_before.headers),
@@ -532,10 +601,22 @@ class SyncCoordinator:
             operation.status = "applying"
             operation.attempts += 1
             self.operations.save(operation)
-            _replace_if_current(store, merged, expected_digest=target_before.digest)
-            after = store.read_active()
-            if after.digest != merged.digest:
-                raise SyncError("projection_readback_digest_mismatch")
+            if append_only:
+                after = store.append_rows_if_digest(
+                    append_rows,
+                    headers=merged.headers,
+                    expected_digest=target_before.digest,
+                )
+                postconditions = [
+                    "projection_write_issued",
+                    "source_ledger_committed",
+                ]
+            else:
+                _replace_if_current(store, merged, expected_digest=target_before.digest)
+                after = store.read_active()
+                if after.digest != merged.digest:
+                    raise SyncError("projection_readback_digest_mismatch")
+                postconditions = ["projection_read_back", "source_ledger_committed"]
             self.operations.write_projection(title, backend, after)
             operation.status = "verified"
             operation.target_after_digest = after.digest
@@ -547,7 +628,8 @@ class SyncCoordinator:
                 "source_digest": merged.digest,
                 "target_before_digest": target_before.digest,
                 "target_after_digest": after.digest,
-                "postconditions": ["projection_read_back", "source_ledger_committed"],
+                "postconditions": postconditions,
+                "write_mode": "append_only" if append_only else "replace_full",
                 **stats,
             }
         except (SnapshotConflict, SyncConflict) as exc:

@@ -376,6 +376,21 @@ def _row_match_keys(row: dict) -> set[str]:
     return keys
 
 
+def preview_key(row: dict[str, Any]) -> str:
+    """Stable internal identity for a scan result before tracker entry.
+
+    This is not a user-facing job number. Persistent IDs such as ``A0-001``
+    are allocated only after a confirmed tracker push.
+    """
+
+    raw = str(
+        row.get("url")
+        or row.get("链接")
+        or f"{row.get('source') or ''}|{row.get('company') or ''}|{row.get('title') or ''}"
+    ).strip()
+    return f"preview-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
+
+
 def load_hits(csv_path: Path) -> list[dict]:
     with csv_path.open(encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -826,7 +841,13 @@ def run_two_pass(
             assessment_events.append(
                 build_job_assessment(
                     repo=repo,
-                    job_id=str(h.get("岗位编号") or h.get("job_id") or h.get("id") or ""),
+                    job_id=str(
+                        h.get("_preview_key")
+                        or h.get("岗位编号")
+                        or h.get("job_id")
+                        or h.get("id")
+                        or ""
+                    ),
                     title=str(h.get("title") or ""),
                     company=str(h.get("company") or ""),
                     source=str(h.get("source") or ""),
@@ -849,6 +870,7 @@ def run_two_pass(
 
     gated: list[tuple[dict, Any]] = []
     for h in hits:
+        h.setdefault("_preview_key", preview_key(h))
         # Pass 1 — teaser / card only (no deep fetch)
         teaser1 = h.get("teaser") or ""
         sc1 = score_hit(h, teaser1, repo=repo, profile=scoring_profile)
@@ -1214,9 +1236,12 @@ def run_two_pass(
                 if drop_below_final:
                     continue
 
-            # Row uses pass-2 as CareerOps* (what you rank on in sheet)
-            cells = build_tracker_row("TMP", 0, h, sc2)
+            # Row uses pass-2 as CareerOps* (what you rank on in the preview)
+            # but has no persistent tracker ID until the user confirms push.
+            cells = build_tracker_row("", 0, h, sc2)
             row = dict(zip(SHEET_HEADERS, cells))
+            row["岗位编号"] = ""
+            row["_preview_key"] = h.get("_preview_key") or preview_key(h)
             row["简历版本"] = sc2.resume_ver
             row["_deep_jd_full"] = h.get("_deep_jd_full", "")
             row["_deep_jd_url"] = h.get("url", "")
@@ -1322,14 +1347,14 @@ def _persist_deep_jds(rows: list[dict], repo: Path) -> None:
         jd_full = r.pop("_deep_jd_full", "")
         if not jd_full:
             continue
-        pid = (r.get("岗位编号") or "").strip()
+        pid = (r.get("岗位编号") or r.get("_preview_key") or "").strip()
         if not pid:
             continue
         url = (r.get("链接") or r.get("_deep_jd_url") or "").strip()
-        # 未入表阶段岗位编号只是"字母+层级"前缀（如 D0），多行会撞名，
-        # 用 URL 短 hash 后缀保证文件唯一；完整 ID 时保持原名。
-        if re.fullmatch(r"[A-G][0-3]", pid) and url:
-            pid = f"{pid}-{hashlib.sha256(url.encode('utf-8')).hexdigest()[:8]}"
+        # Before entry the row has only an internal preview key. Use it (or a
+        # URL hash fallback) so deep JD cache files never masquerade as IDs.
+        if not re.fullmatch(r"[A-G][0-3]-\d{3,}", pid) and url and not pid.startswith("preview-"):
+            pid = f"preview-{hashlib.sha256(url.encode('utf-8')).hexdigest()[:12]}"
         header = f"# JD - {pid}\n\n"
         if url:
             header += f"- url: {url}\n"
@@ -1537,16 +1562,10 @@ def main(argv: list[str] | None = None) -> int:
         max_deep=max_deep,
         drop_below_final=args.hide_below_final,
     )
-    # 未入表阶段不分配完整 ID（D0-025 这种会因语义改道而过期、且呈现时还需
-    # 查表核对）。这里只填"字母+层级"前缀（如 D0 / C1 / F0），后三位序号
-    # 留给 push_to_gsheet 入表时按 gsheet 全表基线统一分配。
+    # 未入表阶段不分配任何岗位编号。lane（简历版本/赛道）和层级仍然
+    # 用于预览；完整 A0-001 之类的编号只在确认 push 时分配。
     for r in rows:
-        letter = (str(r.get("简历版本") or "F").strip().upper()[:1] or "F")
-        if letter == "B":
-            letter = "F"
-        tier_name = str(r.get("层级") or "")
-        digit = {"核心": 0, "一级": 1, "二级": 2, "剔除": 3}.get(tier_name, 0)
-        r["岗位编号"] = f"{letter}{digit}"
+        r["岗位编号"] = ""
     # After ID alloc (which sets 层级 from score), flag pass-2 soft drops for review
     for r in rows:
         if r.pop("_below_final", False):
@@ -1590,7 +1609,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     atomic_write_json(meta_path, meta)
 
-    print("id baseline prefixes=0 (未入表阶段不分配完整 ID；入表时由 push 按 gsheet 基线分配)")
+    print("job IDs: none in preview (persistent IDs are assigned only after confirmed push)")
     print(
         f"pass1 direct={meta['pass1_kept']} rescued={meta['pass1_rescued']} "
         f"dropped={meta['pass1_dropped']}"

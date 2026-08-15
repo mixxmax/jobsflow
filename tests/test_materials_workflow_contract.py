@@ -184,6 +184,9 @@ def test_clean_clone_selected_job_to_materials_pipeline(tmp_path, monkeypatch):
     )
     jd_path = tmp_path / "jd.txt"
     jd_path.write_text(jd, encoding="utf-8")
+    # Package creation is the confirmed entry boundary; materials helpers may
+    # not create it implicitly from a tracker row.
+    create_package_from_tracker(root, "A0-005")
     assert materials_main(["jd", "set", "--job-id", "A0-005", "--file", str(jd_path)]) == 0
 
     package = _pkg(None, job_id="A0-005")

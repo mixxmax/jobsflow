@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from tools.io_utils import atomic_write_json
 from tools.workflow.state import ALLOWED_TRANSITIONS, IllegalTransition, STATE_SCHEMA_VERSION
@@ -34,10 +35,15 @@ ENTITY_TRANSITIONS: dict[str, dict[str, set[str]]] = {
         "context_loaded": {"inputs_validated", "planning_pending"},
         "inputs_validated": {"planning_pending"},
         "planning_pending": {"plan_validated"},
-        "plan_validated": {"drafting", "content_audit_pending"},
+        # A configured independent worker may complete the audit inside the
+        # canonical-draft action.  The event still records the audit receipt;
+        # allowing this direct edge avoids a fake intermediate command whose
+        # only purpose would be advancing state.
+        "plan_validated": {"drafting", "content_audit_pending", "content_passed"},
         "drafting": {"content_audit_pending"},
         "content_audit_pending": {"content_passed"},
-        "content_passed": {"pdf_generated"},
+        "content_passed": {"docx_generated", "pdf_generated"},
+        "docx_generated": {"pdf_generated"},
         "pdf_generated": {"format_passed"},
         "format_passed": {"apply_ready"},
         "apply_ready": {"user_confirmed_for_submission"},
@@ -156,6 +162,64 @@ def commit_entity_state(
     return next_state
 
 
+def reset_entity_state(
+    workspace: Path,
+    entity_type: str,
+    entity_id: str,
+    *,
+    target_phase: str,
+    reason: str,
+    expected_revision: int | None = None,
+    event_id: str = "",
+) -> EntityState:
+    """Atomically rewind an entity for an explicit, recoverable reset.
+
+    Normal workflow actions may only move along ``ENTITY_TRANSITIONS``.  A
+    user-confirmed reset is the one deliberate exception: it records a reset
+    event, clears stale blockers, increments the revision, and writes the
+    exact phase from which the next command may continue.  This prevents the
+    materials package and its per-job state file from drifting apart.
+    """
+
+    table = ENTITY_TRANSITIONS.get(entity_type) or {}
+    known = set(table) | {phase for values in table.values() for phase in values}
+    if target_phase not in known:
+        raise IllegalTransition(f"unknown reset phase: {entity_type}:{target_phase}")
+    current = load_entity_state(workspace, entity_type, entity_id)
+    if expected_revision is not None and current.revision != expected_revision:
+        raise StateConflict("state_conflict")
+    history = list(current.extra.get("reset_history") or []) if isinstance(current.extra, dict) else []
+    history.append(
+        {
+            "event_id": event_id or f"reset-{uuid4().hex[:12]}",
+            "from": current.phase,
+            "to": target_phase,
+            "reason": str(reason or "explicit_reset"),
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    )
+    next_state = EntityState(
+        **{
+            **current.__dict__,
+            "phase": target_phase,
+            "revision": current.revision + 1,
+            "last_event_id": event_id or history[-1]["event_id"],
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "blockers": [],
+            "degraded_reason": "",
+            "extra": {
+                **(current.extra if isinstance(current.extra, dict) else {}),
+                "reset_scope": str(reason or "explicit_reset"),
+                "reset_history": history[-20:],
+            },
+        }
+    )
+    path = entity_path(workspace, entity_type, entity_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, next_state.to_dict())
+    return next_state
+
+
 def direct_successors(entity_type: str, phase: str) -> set[str]:
     table = ENTITY_TRANSITIONS.get(entity_type) or ALLOWED_TRANSITIONS
     return set(table.get(phase, set()))
@@ -169,7 +233,7 @@ ACTION_DESTINATIONS: dict[str, set[str]] = {
     "scan": {"scan_requested", "scan_completed", "scan_degraded", "scan_failed"},
     "push": {"pushed_to_fresh", "semantic_pending"},
     "promote": {"promoted_retained"},
-    "materials": {"planning_pending", "plan_validated", "content_audit_pending", "pdf_generated"},
+    "materials": {"planning_pending", "plan_validated", "content_audit_pending", "docx_generated", "pdf_generated"},
     "audit": {"content_passed"},
     "format": {"format_passed"},
     "apply": {"apply_ready"},
@@ -199,6 +263,11 @@ def action_is_mutating(action: str) -> bool:
 
 def action_allowed_from(action: str, entity_type: str, phase: str) -> bool:
     if not action_is_mutating(action):
+        return True
+    # A repair cycle intentionally re-enters the drafting adapter while the
+    # entity remains in ``content_audit_pending``.  It must not be represented
+    # as a forward transition (which would let a model skip the audit gate).
+    if action == "materials" and entity_type == "materials" and phase == "content_audit_pending":
         return True
     possible = ACTION_DESTINATIONS.get(action) or set()
     allowed = direct_successors(entity_type, phase)

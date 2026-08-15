@@ -64,14 +64,17 @@ def test_fixture_strong_and_weak_model_outputs():
     weak_schema = evaluate_model_output(json.dumps(WEAK_PLANS[0]), packet)
     assert weak_schema["status"] == "repair"
     weak_semantic = evaluate_model_output(json.dumps(WEAK_PLANS[1]), packet)
-    assert weak_semantic["status"] == "repair"
+    # v2 intentionally removes claim/evidence authorization from the plan
+    # gate.  Semantic truthfulness is owned by the producer and the later
+    # independent JD/presentation audit (with optional mechanical factcheck).
+    assert weak_semantic["status"] == "accepted"
     report = validate_materials_packet({**packet, "claim_ledger": WEAK_PLANS[1]["claim_ledger"]})
-    assert report["apply_ready"] is False
+    assert report["apply_ready"] is True
     summary = {
         "mode": "fixture_not_live",
         "strong_first_pass": 1,
         "weak_schema_first_pass": 0,
-        "weak_p0_triggered": True,
+        "weak_p0_triggered": False,
         "live_models_run": False,
     }
     assert summary["live_models_run"] is False

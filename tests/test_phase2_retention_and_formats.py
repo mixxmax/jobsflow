@@ -9,6 +9,7 @@ from tools.io_utils import atomic_write_json, atomic_write_text
 from tools.workflow.engine import dispatch
 from tools.workflow.entity_state import load_entity_state
 from tools.workflow.fresh_store import FileFreshStore, FreshSnapshot
+from tools.workflow.id_allocation import is_assigned_job_id
 from tools.workflow.package_validator import MaterialsPackageValidator
 from tools.workflow.testing_packages import build_package, build_workspace, prepare_package_for_apply, write_minimal_pdf
 
@@ -43,13 +44,25 @@ def test_push_merges_and_keeps_old_fresh_rows(tmp_path):
         [{"岗位编号": "NEW-1", "职位": "NEW", "公司": "Acme", "链接": "https://example.test/job/new", "CareerOps分数": "4.0", "评估状态": ""}],
     )
     _register_run(ws, "run-merge", scored)
-    out = dispatch("push", workspace=ws, store=store, payload={"run_id": "run-merge", "fresh_title": title})
+    preview = dispatch("push", workspace=ws, store=store, payload={"run_id": "run-merge", "fresh_title": title})
+    assert preview["status"] == "planned"
+    out = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={
+            "run_id": "run-merge",
+            "fresh_title": title,
+            "confirmation_id": preview["proposal_id"],
+        },
+    )
     assert out["status"] == "succeeded"
     ids = {(row.get("岗位编号") or "") for row in store.read_active().rows}
     titles = {(row.get("职位") or "") for row in store.read_active().rows}
     assert "OLD-1" in ids
     assert "OLD" in titles
-    assert "NEW-1" in ids
+    assert "NEW-1" not in ids
+    assert any(is_assigned_job_id(job_id) for job_id in ids)
 
 
 def test_editing_cv_or_plan_invalidates_apply_ready(tmp_path):
@@ -149,13 +162,13 @@ def test_apply_accepts_docx_pdf_and_markdown_email(tmp_path):
     write_minimal_pdf(package / "Pat_CV_Acme.pdf", "Paralegal at Acme. CV IELTS 7.5")
     write_minimal_pdf(package / "Pat_Cover_Letter_Acme.pdf", "Paralegal at Acme. CL IELTS 7.5")
     atomic_write_text(package / "application_email.md", "Application for Paralegal at Acme. IELTS 7.5.\n")
-    from tools.workflow.package_validator import audit_package
-
-    audit_package(package)
-    report = MaterialsPackageValidator().validate(package)
+    # File-format compatibility is independent from the required semantic
+    # child audit; a deterministic legacy audit can no longer mint a receipt.
+    report = MaterialsPackageValidator().validate(package, require_audit_receipt=False)
     out = dispatch("apply", workspace=ws, payload={"job_id": "C0-010"})
-    assert report["apply_ready"] is True, report["findings"]
-    assert out["apply_ready"] is True
+    assert not any(item["code"] in {"missing_cv", "missing_cl", "missing_email"} for item in report["findings"])
+    assert out["apply_ready"] is False
+    assert "content_audit_missing" in out["blockers"]
     codes = {item["code"] for item in report["findings"]}
     assert "missing_cv" not in codes
     assert "missing_email" not in codes

@@ -58,6 +58,43 @@ def test_manifest_derives_tier_path_and_recruiter_safe_outbound_fields(tmp_path)
     assert manifest["validation"]["material_language"] == "en"
 
 
+def test_manifest_consumes_confirmed_company_research_on_refresh(tmp_path):
+    root = tmp_path / "JobSearch_2026"
+    package = root / "01_Masters" / "A_track" / "核心" / "A0-024_未投_Employer"
+    package.mkdir(parents=True)
+    (package / "company_research.json").write_text(
+        json.dumps(
+            {
+                "publisher_type": "employer",
+                "publisher_name": "Acme Talent Desk",
+                "employer_name": "Acme Payments",
+                "company_out": "Acme Payments",
+                "quality": {"ready_for_tailoring": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    manifest = build_job_manifest(
+        root=root,
+        package=package,
+        row=_row(
+            **{
+                "岗位编号": "A0-024",
+                "职位": "Compliance Analyst",
+                "公司": "Acme Talent Desk",
+                "发布者": "Acme Talent Desk",
+                "发布者类型": "recruiter",
+                "用人公司": "",
+            }
+        ),
+        jd_text="Monitor compliance controls and prepare reports.",
+    )
+    assert manifest["job"]["publisher_type"] == "employer"
+    assert manifest["job"]["employer_name"] == "Acme Payments"
+    assert manifest["job"]["company_out"] == "Acme Payments"
+
+
 def test_manifest_preserves_substantive_parenthetical_and_sanitizes_filename_without_dash(tmp_path):
     root = tmp_path / "JobSearch_2026"
     package = root / "01_Masters" / "A_track" / "核心" / "A0-021_未投_Acme"

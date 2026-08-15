@@ -8,6 +8,7 @@ stable package boundary, so this module is the single writer for the initial
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -17,7 +18,7 @@ from tools.io_utils import atomic_write_json, atomic_write_text
 from tools.job_materials.manifest import (
     build_job_manifest,
     derive_tier,
-    refresh_job_manifest,
+    parse_job_id,
     write_job_manifest,
 )
 from tools.job_materials.paths import is_archived_path, load_lanes, masters_dir
@@ -107,10 +108,10 @@ def find_tracker_row(root: Path, job_id: str) -> tuple[dict[str, str], Path] | N
     return None
 
 
-def _existing_package(root: Path, job_id: str) -> Path | None:
+def _existing_packages(root: Path, job_id: str) -> list[Path]:
     base = masters_dir(root)
     if not base.is_dir():
-        return None
+        return []
     matches = sorted(
         (
             p
@@ -119,7 +120,14 @@ def _existing_package(root: Path, job_id: str) -> Path | None:
         ),
         key=lambda p: str(p),
     )
-    return matches[0].resolve() if matches else None
+    return [path.resolve() for path in matches]
+
+
+def _existing_package(root: Path, job_id: str) -> Path | None:
+    """Legacy convenience lookup; callers that write must use the bound route."""
+
+    matches = _existing_packages(root, job_id)
+    return matches[0] if matches else None
 
 
 def _lane_for_row(root: Path, row: dict[str, str]) -> str:
@@ -129,7 +137,70 @@ def _lane_for_row(root: Path, row: dict[str, str]) -> str:
         return match.group(1)
     track = (row.get("赛道") or "").strip().upper()
     match = re.match(r"([A-G])", track)
-    return match.group(1) if match else "F"
+    return match.group(1) if match else ""
+
+
+def _package_route(root: Path, job_id: str, row: dict[str, str]) -> dict[str, Any]:
+    """Return the one legal package path for an entered row.
+
+    A persistent ID is allocated only after lane classification.  Its first
+    letter is therefore the route authority; a stale or manually edited lane
+    in a tracker row is a hard error, never a reason to place materials in a
+    different lane.
+    """
+
+    parts = parse_job_id(job_id)
+    id_lane = str(parts.get("lane") or "").upper()
+    row_lane = _lane_for_row(root, row)
+    if id_lane and row_lane and id_lane != row_lane:
+        raise ValueError(f"lane_binding_mismatch:job_id={job_id}:row_lane={row_lane}:id_lane={id_lane}")
+    lane = id_lane or row_lane
+    if not lane:
+        raise ValueError(f"lane_binding_missing:job_id={job_id}")
+    lanes = load_lanes(root)
+    lane_folder = lanes.get(lane, {}).get("folder") or f"{lane}_track"
+    tier = derive_tier(job_id, row.get("层级") or row.get("tier") or "")
+    tier_label = _safe_component(tier.get("label") or "待审", fallback="待审")
+    company = _safe_component(
+        row.get("公司") or row.get("company") or "未披露公司", fallback="未披露公司"
+    )
+    package = masters_dir(root) / lane_folder / tier_label / f"{job_id}_未投_{company}"
+    return {
+        "lane": lane,
+        "lane_folder": lane_folder,
+        "tier": tier,
+        "tier_label": tier_label,
+        "company": company,
+        "package": package.resolve(),
+    }
+
+
+def _write_package_binding(
+    root: Path,
+    package: Path,
+    *,
+    job_id: str,
+    lane: str,
+    tier: dict[str, Any],
+    tracker_path: Path,
+) -> None:
+    relative = package.resolve().relative_to(Path(root).resolve()).as_posix()
+    atomic_write_json(
+        package / "package_binding.json",
+        {
+            "schema_version": 1,
+            "job_id": job_id,
+            "lane": lane,
+            "tier": {
+                "code": str(tier.get("code") or ""),
+                "label": str(tier.get("label") or ""),
+                "source": str(tier.get("source") or ""),
+            },
+            "expected_relative_path": relative,
+            "tracker_path": str(Path(tracker_path).resolve()),
+            "binding_digest": hashlib.sha256(relative.encode("utf-8")).hexdigest(),
+        },
+    )
 
 
 def _snapshot(job_id: str, row: dict[str, str], *, tracker_path: Path, lane: str) -> str:
@@ -179,45 +250,28 @@ def _snapshot(job_id: str, row: dict[str, str], *, tracker_path: Path, lane: str
     return "\n".join(lines)
 
 
-def create_package_from_tracker(root: Path, job_id: str) -> Path:
-    """Create a material package for a selected local tracker row.
+def create_package_from_entry_row(root: Path, row: dict[str, str], *, tracker_path: Path) -> Path:
+    """Create the package at the explicit entry boundary.
 
-    Existing packages are returned unchanged.  The function never fabricates a
-    package without a matching row because that would sever the job-id contract.
+    This is the only product writer used after ``/push`` allocates a durable
+    ID.  It is intentionally idempotent for the exact bound path and refuses
+    a pre-existing same-ID directory elsewhere in ``01_Masters``.
     """
-    existing = _existing_package(root, job_id)
-    if existing:
-        found = find_tracker_row(root, job_id)
-        if found:
-            row, tracker_path = found
-            refresh_job_manifest(
-                root=root,
-                package=existing,
-                row=row,
-                tracker_path=tracker_path,
-            )
-        return existing
 
-    found = find_tracker_row(root, job_id)
-    if not found:
-        raise LookupError(
-            f"job_id={job_id} is not present in local tracker CSVs under {root / '02_Tracker'}"
+    root = Path(root).expanduser().resolve()
+    job_id = str(row.get("岗位编号") or row.get("job_id") or "").strip().upper()
+    if not job_id:
+        raise ValueError("package_job_id_missing")
+    route = _package_route(root, job_id, row)
+    expected = Path(route["package"])
+    existing = _existing_packages(root, job_id)
+    wrong = [path for path in existing if path != expected]
+    if wrong:
+        raise ValueError(
+            "package_path_binding_mismatch:"
+            + ",".join(path.relative_to(root).as_posix() for path in wrong)
         )
-    row, tracker_path = found
-    lane = _lane_for_row(root, row)
-    lanes = load_lanes(root)
-    lane_folder = lanes.get(lane, {}).get("folder") or f"{lane}_track"
-    # The numeric tier in a stable job ID is authoritative.  A stale tracker
-    # display value must not silently route a C0/D0 package into 一级/二级.
-    tier = _safe_component(
-        derive_tier(job_id, row.get("层级") or "").get("label") or "待审",
-        fallback="待审",
-    )
-    company = _safe_component(
-        row.get("公司") or row.get("company") or "未披露公司", fallback="未披露公司"
-    )
-    package = masters_dir(root) / lane_folder / tier / f"{job_id}_未投_{company}"
-    package.mkdir(parents=True, exist_ok=True)
+    expected.mkdir(parents=True, exist_ok=True)
     publisher = (
         row.get("发布者")
         or row.get("publisher")
@@ -236,31 +290,137 @@ def create_package_from_tracker(root: Path, job_id: str) -> Path:
         or row.get("employer_name")
         or ""
     ).strip()
-    atomic_write_text(package / "job_snapshot.md", _snapshot(job_id, row, tracker_path=tracker_path, lane=lane))
+    atomic_write_text(
+        expected / "job_snapshot.md",
+        _snapshot(job_id, row, tracker_path=Path(tracker_path), lane=route["lane"]),
+    )
     atomic_write_json(
-        package / "tracker_row.json",
+        expected / "tracker_row.json",
         {
             "job_id": job_id,
-            "lane": lane,
+            "lane": route["lane"],
             "publisher_name": publisher,
             "publisher_type": publisher_type,
             "employer_name": employer,
-            "tracker_path": str(tracker_path),
+            "tracker_path": str(Path(tracker_path).resolve()),
             "row": row,
         },
     )
     write_job_manifest(
-        package,
+        expected,
         build_job_manifest(
             root=root,
-            package=package,
-            row=row,
-            tracker_path=tracker_path,
+            package=expected,
+            row={**row, "简历版本": route["lane"]},
+            tracker_path=Path(tracker_path),
         ),
     )
-    return package.resolve()
+    _write_package_binding(
+        root,
+        expected,
+        job_id=job_id,
+        lane=route["lane"],
+        tier=route["tier"],
+        tracker_path=Path(tracker_path),
+    )
+    return expected
+
+
+def validate_entry_row_binding(root: Path, row: dict[str, Any]) -> list[str]:
+    """Validate an allocated entry row without creating files."""
+
+    job_id = str(row.get("岗位编号") or row.get("job_id") or "").strip().upper()
+    if not job_id:
+        return ["package_job_id_missing"]
+    try:
+        route = _package_route(Path(root), job_id, {str(k): str(v or "") for k, v in row.items()})
+    except ValueError as exc:
+        return [str(exc)]
+    expected = Path(route["package"])
+    wrong = [path for path in _existing_packages(Path(root), job_id) if path != expected]
+    if wrong:
+        return [
+            "package_path_binding_mismatch:"
+            + ",".join(path.relative_to(Path(root).resolve()).as_posix() for path in wrong)
+        ]
+    return []
+
+
+def create_package_from_tracker(root: Path, job_id: str) -> Path:
+    """Create a material package for a selected local tracker row.
+
+    Existing packages are returned unchanged.  The function never fabricates a
+    package without a matching row because that would sever the job-id contract.
+    """
+    found = find_tracker_row(root, job_id)
+    if not found:
+        raise LookupError(
+            f"job_id={job_id} is not present in local tracker CSVs under {root / '02_Tracker'}"
+        )
+    row, tracker_path = found
+    return create_package_from_entry_row(root, row, tracker_path=tracker_path)
 
 
 def resolve_package(root: Path, job_id: str) -> Path:
     """Resolve an existing package or create one from its tracker row."""
     return create_package_from_tracker(root, job_id)
+
+
+def validate_package_binding(root: Path, package: Path, job_id: str) -> list[str]:
+    """Validate that a package is in the lane/tier route fixed at entry.
+
+    This check is deliberately independent of model output.  A package found
+    under another lane remains visible for migration, but the materials
+    workflow cannot read or write it until it is moved through an explicit
+    entry-boundary repair.
+    """
+
+    root = Path(root).expanduser().resolve()
+    package = Path(package).expanduser().resolve()
+    wanted = str(job_id or "").strip().upper()
+    errors: list[str] = []
+    parts = parse_job_id(wanted)
+    lane = str(parts.get("lane") or "").upper()
+    tier = derive_tier(wanted)
+    lanes = load_lanes(root)
+    expected_folder = lanes.get(lane, {}).get("folder") if lane else None
+    expected_tier = _safe_component(tier.get("label") or "待审", fallback="待审")
+    try:
+        relative = package.relative_to(root).as_posix()
+    except ValueError:
+        return ["package_path_binding_mismatch"]
+    expected_prefix = f"01_Masters/{expected_folder}/{expected_tier}/" if expected_folder else ""
+    if not expected_prefix or not relative.startswith(expected_prefix):
+        errors.append("package_path_binding_mismatch")
+    if not package.name.startswith(f"{wanted}_未投_"):
+        errors.append("package_name_binding_mismatch")
+
+    manifest = {}
+    try:
+        manifest_value = json.loads((package / "job_manifest.json").read_text(encoding="utf-8"))
+        manifest = manifest_value if isinstance(manifest_value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        manifest = {}
+    if str(manifest.get("job_id") or "").upper() != wanted:
+        errors.append("manifest_job_id_mismatch")
+    if lane and str(manifest.get("lane") or "").upper() != lane:
+        errors.append("manifest_lane_mismatch")
+    manifest_tier = manifest.get("tier") if isinstance(manifest.get("tier"), dict) else {}
+    if tier.get("code") and str(manifest_tier.get("code") or "") != str(tier.get("code")):
+        errors.append("manifest_tier_mismatch")
+
+    binding_path = package / "package_binding.json"
+    if binding_path.is_file():
+        try:
+            binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            binding = {}
+        if not isinstance(binding, dict):
+            binding = {}
+        if str(binding.get("job_id") or "").upper() != wanted:
+            errors.append("package_binding_job_id_mismatch")
+        if lane and str(binding.get("lane") or "").upper() != lane:
+            errors.append("package_binding_lane_mismatch")
+        if str(binding.get("expected_relative_path") or "") != relative:
+            errors.append("package_binding_path_mismatch")
+    return sorted(set(errors))

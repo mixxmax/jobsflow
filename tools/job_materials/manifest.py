@@ -176,6 +176,15 @@ def _company_research_fingerprint(package: Path) -> str:
         return ""
 
 
+def _package_company_research(package: Path) -> dict[str, Any]:
+    path = Path(package) / "company_research.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def build_job_manifest(
     *,
     root: Path,
@@ -203,6 +212,22 @@ def build_job_manifest(
     url = _row_value(row, "链接", "url")
     source = _row_value(row, "来源", "source") or "unknown"
     company_source = _row_value(row, "公司", "company") or publisher_name
+    # A confirmed/company-research classification is the canonical entity
+    # source.  Pipeline refreshes must not regress it to the tracker snapshot
+    # or to ``unknown``.
+    research = _package_company_research(package)
+    research_type = _clean(research.get("publisher_type"))
+    research_publisher = _clean(research.get("publisher_name"))
+    research_employer = _clean(research.get("employer_name"))
+    research_company = _clean(research.get("company") or research.get("company_out"))
+    if research_type and research_type.casefold() != "unknown":
+        publisher_type = research_type
+    if research_publisher:
+        publisher_name = research_publisher
+    if research_employer:
+        employer_name = research_employer
+    if research_company:
+        company_source = research_company
     jd = _jd_info(root, url, jd_text)
     jd_for_classification = str(jd.pop("_text", "") or jd_text or "")
     classification = classify_publisher(
@@ -212,6 +237,11 @@ def build_job_manifest(
         source_url=url,
         jd_text=jd_for_classification,
     )
+    # Manifest refresh is metadata bookkeeping and may record a newly
+    # classified lane before an explicit package migration. The entry package
+    # writer is the hard boundary that rejects an ID/lane mismatch and fixes
+    # the filesystem route; keeping this builder observational preserves the
+    # stale-artifact signal instead of silently moving a package.
     lane = (_row_value(row, "简历版本", "lane", "赛道")[:1] or parse_job_id(job_id)["lane"] or "F").upper()
     tier = derive_tier(job_id, _row_value(row, "层级", "tier"))
     keywords = list(jd.get("keywords") or _jd_keywords(jd_text, limit=8))

@@ -8,6 +8,7 @@ from typing import Any
 from tools.workflow.contracts import result
 from tools.workflow.package_context import PackageContextLoader
 from tools.workflow.package_validator import MaterialsPackageValidator, live_package_hashes
+from tools.workflow.materials_renderer import mechanical_format_gate
 
 
 def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = None, dry_run: bool = False) -> dict[str, Any]:
@@ -25,11 +26,28 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
             submitted=False,
             apply_ready=False,
         )
+    # /apply is a second defence against a model or platform bypassing the
+    # render stage.  A package without a template-bound mechanical report can
+    # never be considered ready even if its text files look plausible.
+    format_report = mechanical_format_gate(Path(ctx.package), workspace)
     current_hashes = live_package_hashes(Path(ctx.package), extra=ctx.input_hashes)
     report = MaterialsPackageValidator().validate(
         ctx.package,
         current_hashes=current_hashes,
     )
+    if not format_report.get("format_passed"):
+        report.setdefault("findings", []).extend(
+            {
+                "rule_id": "MAT-004",
+                "severity": "P1",
+                "code": item.get("code"),
+                "artifact": item.get("artifact", "package"),
+                "evidence": item.get("evidence", ""),
+            }
+            for item in format_report.get("findings") or []
+        )
+        report["format_passed"] = False
+        report["apply_ready"] = False
     ready = bool(report.get("apply_ready"))
     return result(
         status="succeeded" if ready else "blocked",

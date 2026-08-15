@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.workflow.fresh_store import MemoryFreshStore
+from tools.workflow.fresh_store import FreshSnapshot, GSheetFreshStore, MemoryFreshStore
 from tools.workflow.sync import SyncCoordinator
 from tools.workflow.engine import dispatch
 from tools.workflow.adapters.scan import write_run_record
@@ -34,6 +34,65 @@ class WriteThenFailStore(MemoryFreshStore):
         if self.fail_once:
             self.fail_once = False
             raise OSError("crash_after_remote_write")
+
+
+class AppendOnlyStore(MemoryFreshStore):
+    def __init__(self, title: str, rows=None):
+        super().__init__(title, rows)
+        self.append_calls = 0
+        self.replace_calls = 0
+
+    def replace_active_if_digest(self, snapshot, expected_digest):
+        self.replace_calls += 1
+        return super().replace_active_if_digest(snapshot, expected_digest)
+
+    def append_rows_if_digest(self, rows, *, headers, expected_digest):
+        self.append_calls += 1
+        current = self.read_active()
+        assert current.digest == expected_digest
+        self.headers = list(headers)
+        self.rows = [dict(row) for row in rows] + [dict(row) for row in current.rows]
+        return self.read_active()
+
+
+class FakeWorksheet:
+    def __init__(self):
+        self.calls = []
+
+    def insert_rows(self, values, **kwargs):
+        self.calls.append((values, kwargs))
+
+
+class FakeSpreadsheet:
+    def __init__(self):
+        self.format_requests = []
+
+    def batch_update(self, payload):
+        self.format_requests.append(payload)
+
+
+class FormattingWorksheet(FakeWorksheet):
+    id = 77
+
+    def __init__(self):
+        super().__init__()
+        self.spreadsheet = FakeSpreadsheet()
+
+    def batch_update(self, values, **kwargs):
+        self.calls.append(("values", values, kwargs))
+
+
+class FakeGSheetStore(GSheetFreshStore):
+    def __init__(self, snapshot):
+        self.title = snapshot.title
+        self._snapshot = snapshot
+        self.worksheet = FakeWorksheet()
+
+    def read_active(self):
+        return self._snapshot.copy()
+
+    def _ensure_worksheet(self, headers=None):
+        return self.worksheet
 
 
 def _row(status: str = ""):
@@ -65,6 +124,89 @@ def test_push_uses_operation_ledger_and_readback(tmp_path):
     )
     assert operation["status"] == "verified"
     assert operation["run_id"] == "scan-1"
+
+
+def test_additive_push_uses_append_projection_without_full_replace(tmp_path):
+    store = AppendOnlyStore(
+        "fresh_24h_2026-08-14",
+        [{"岗位编号": "C0-001", "职位": "Old", "公司": "Acme", "链接": "https://example.test/old"}],
+    )
+    store.headers = list(_row().keys())
+    out = SyncCoordinator(tmp_path).push_rows(
+        title=store.title,
+        incoming=[_row()],
+        store=store,
+        run_id="scan-append",
+    )
+    assert out["status"] == "succeeded"
+    assert out["write_mode"] == "append_only"
+    assert store.append_calls == 1
+    assert store.replace_calls == 0
+    assert out["postconditions"] == ["projection_write_issued", "source_ledger_committed"]
+    assert [row["岗位编号"] for row in store.read_active().rows] == ["C0-901", "C0-001"]
+
+
+def test_gsheet_append_path_inserts_rows_without_clear_or_full_update():
+    headers = ["岗位编号", "职位", "公司", "链接"]
+    current = FreshSnapshot(
+        title="fresh_24h_2026-08-14",
+        headers=headers,
+        rows=[{"岗位编号": "C0-001", "职位": "Old", "公司": "Acme", "链接": "https://example.test/old"}],
+    )
+    store = FakeGSheetStore(current)
+    incoming = [{"岗位编号": "C0-901", "职位": "New", "公司": "Acme", "链接": "https://example.test/new"}]
+    after = store.append_rows_if_digest(
+        incoming,
+        headers=headers,
+        expected_digest=current.digest,
+    )
+    assert after.rows[0]["岗位编号"] == "C0-901"
+    assert len(store.worksheet.calls) == 1
+    assert store.worksheet.calls[0][1]["row"] == 2
+
+
+def test_gsheet_entry_append_demotes_old_batch_and_formats_new_rows():
+    headers = ["岗位编号", "职位", "公司", "链接", "CareerOps分数", "本轮新增", "批次", "入表时间", "行号"]
+    old = {
+        "岗位编号": "C0-001",
+        "职位": "Old",
+        "公司": "Acme",
+        "链接": "https://example.test/old",
+        "CareerOps分数": "3.0",
+        "本轮新增": "是",
+        "批次": "temp_old",
+        "入表时间": "2026-08-14 10:00 HKT",
+        "行号": "2",
+    }
+    new = {
+        "岗位编号": "C0-002",
+        "职位": "New",
+        "公司": "Acme",
+        "链接": "https://example.test/new",
+        "CareerOps分数": "4.0",
+        "本轮新增": "是",
+        "批次": "temp_new",
+        "入表时间": "2026-08-14 11:00 HKT",
+        "行号": "2",
+    }
+    current = FreshSnapshot("fresh_24h_2026-08-14", [old], headers)
+
+    class FormattingStore(FakeGSheetStore):
+        def __init__(self, snapshot):
+            super().__init__(snapshot)
+            self.worksheet = FormattingWorksheet()
+
+    store = FormattingStore(current)
+    after = store.append_rows_if_digest([new], headers=headers, expected_digest=current.digest)
+    assert [row["岗位编号"] for row in after.rows] == ["C0-002", "C0-001"]
+    assert after.rows[0]["本轮新增"] == "是"
+    assert after.rows[1]["本轮新增"] == "否"
+    assert after.rows[1]["入表时间"] == "较早入表"
+    assert any(
+        request.get("repeatCell", {}).get("cell", {}).get("userEnteredFormat", {}).get("backgroundColor")
+        == {"red": 1.0, "green": 0.95, "blue": 0.8}
+        for request in store.worksheet.spreadsheet.format_requests[0]["requests"]
+    )
 
 
 def test_remote_change_is_not_silently_overwritten(tmp_path):
@@ -183,8 +325,27 @@ def test_local_only_is_a_csv_backend_alias(tmp_path):
         encoding="utf-8",
     )
     write_run_record(ws, run_id="local-only-run", mode="temp", scored_path=scored)
+    # /push is a two-step boundary: the first invocation is write-free, and
+    # only the explicit proposal confirmation may create the ledger entry.
+    from tools.workflow.engine import dispatch
+
+    preview = dispatch(
+        "push",
+        workspace=ws,
+        payload={"run_id": "local-only-run", "backend": "csv"},
+    )
+    assert preview["status"] == "planned"
     assert workflow_main(
-        ["push", "--workspace", str(ws), "--run-id", "local-only-run", "--local-only"]
+        [
+            "push",
+            "--workspace",
+            str(ws),
+            "--run-id",
+            "local-only-run",
+            "--local-only",
+            "--confirm",
+            preview["proposal_id"],
+        ]
     ) == 0
     assert list((ws / "02_Tracker" / "workflow" / "ledger").glob("*.json"))
     assert list((ws / "02_Tracker" / "workflow" / "fresh").glob("*/active.csv"))

@@ -265,6 +265,16 @@ def test_validator_reports_unreadable_pdf(tmp_path: Path):
     assert any(pdf_path.name in error and "open pdf" in error.lower() for error in errors)
 
 
+def test_validator_does_not_flag_valid_support_comma_list(tmp_path: Path):
+    write_valid_package(tmp_path)
+    cover = next(tmp_path.glob("*_Cover_Letter.docx"))
+    document = Document()
+    document.add_paragraph("I provide litigation support, investigations and clear written advice.")
+    document.save(cover)
+    errors = validate_package(tmp_path, COMPANY, ROLE)
+    assert not any("incomplete sentence" in error for error in errors)
+
+
 def test_cli_validates_only_jobs_assigned_to_lane(tmp_path: Path):
     valid_dir = tmp_path / "valid"
     write_valid_package(valid_dir)
