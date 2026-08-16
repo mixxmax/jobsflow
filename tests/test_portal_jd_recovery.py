@@ -156,6 +156,7 @@ class _FakeContext:
 def _session_with_page(page, *, user_data_dir=None, interactive=False, timeout=600):
     session = browser.JdBrowserSession(
         portal="jobsdb",
+        headless=not interactive,
         interactive_verification=interactive,
         verification_timeout_seconds=timeout,
         user_data_dir=user_data_dir,
@@ -277,7 +278,8 @@ def test_interactive_challenge_then_valid_polls_and_saves_once(tmp_path, monkeyp
         state_payload={"cookies": [{"name": "cf_clearance", "value": "x"}], "origins": []},
     )
     session = browser.JdBrowserSession(
-        portal="jobsdb", interactive_verification=True, verification_timeout_seconds=600
+        portal="jobsdb", headless=False, interactive_verification=True,
+        verification_timeout_seconds=600
     )
     session.context = ctx
     monkeypatch.setattr(browser.sys, "stdin", object())  # no isatty at all
@@ -308,7 +310,8 @@ def test_interactive_never_validates_reports_verification_timeout(tmp_path, monk
     }
     page = _SequencedPage([challenge_state])
     session = browser.JdBrowserSession(
-        portal="jobsdb", interactive_verification=True, verification_timeout_seconds=3
+        portal="jobsdb", headless=False, interactive_verification=True,
+        verification_timeout_seconds=3
     )
     session.context = _FakeContext(page=page)
     clock = iter([0, 1, 2, 3, 4, 5])
@@ -329,7 +332,8 @@ def test_signal_file_triggers_recheck_but_never_success(tmp_path, monkeypatch):
     }
     page = _SequencedPage([challenge_state])
     session = browser.JdBrowserSession(
-        portal="jobsdb", interactive_verification=True, verification_timeout_seconds=3
+        portal="jobsdb", headless=False, interactive_verification=True,
+        verification_timeout_seconds=3
     )
     session.context = _FakeContext(page=page)
     clock = iter([0, 1, 2, 3, 4, 5])
@@ -344,6 +348,122 @@ def test_signal_file_triggers_recheck_but_never_success(tmp_path, monkeypatch):
     assert result.ok is False
     assert result.fail_reason == "verification_timeout"
     assert not signal.exists()  # consumed, never flips a failure into success
+
+
+def test_recovery_hands_off_to_user_main_chrome_over_cdp(tmp_path, monkeypatch):
+    """Recovery attaches to the user's daily Chrome via CDP, never Playwright."""
+    circuit_calls = {"reconciled": 0}
+    cleared = []
+    saved = []
+    monkeypatch.setattr(
+        browser,
+        "_clear_failure",
+        lambda url, root: cleared.append((url, root)),
+    )
+
+    import tools.fresh_24h.jd_cache as jd_cache_mod
+
+    real_save = jd_cache_mod.save_jd_cache
+
+    def fake_save(url, text, source=None, root=None, **kw):
+        saved.append((url, source))
+        return real_save(url, text, source=source, root=root, **kw)
+
+    monkeypatch.setattr(jd_cache_mod, "save_jd_cache", fake_save)
+
+    body = _long_jd_body()
+
+    class FakeRecoveryClass(browser.JobsdbHumanVerificationRecovery):
+        def _cdp_fetch(self, url):
+            return browser.JdFetchResult(
+                ok=True,
+                url=url,
+                portal="jobsdb",
+                text=body,
+                chars=len(body),
+                content_validated=True,
+                attempts=1,
+                browser_channel="user-chrome-cdp",
+            )
+
+    class FakeCircuit:
+        def reconcile_success(self):
+            circuit_calls["reconciled"] += 1
+
+    def _no_playwright(**kwargs):
+        raise AssertionError("recovery must not launch a Playwright session")
+
+    monkeypatch.setattr(browser, "JdBrowserSession", _no_playwright)
+
+    recovery = FakeRecoveryClass(
+        profile_dir=tmp_path / "profile",
+        verification_timeout_seconds=30,
+    )
+    result = recovery.recover(
+        "https://hk.jobsdb.com/job/222",
+        circuit=FakeCircuit(),
+        cache_root=tmp_path,
+    )
+
+    assert result.ok is True
+    assert result.content_validated is True
+    assert result.detail_reason == "manual_recovery_cdp_user_chrome"
+    assert recovery.status == "succeeded"
+    assert circuit_calls["reconciled"] == 1
+    assert saved and saved[0][1] == "browser_cdp_jobsdb"
+    assert cleared  # failure cache entry cleared for the recovered URL
+
+    second = recovery.recover(
+        "https://hk.jobsdb.com/job/333",
+        circuit=FakeCircuit(),
+        cache_root=tmp_path,
+    )
+    assert second.ok is False
+    assert second.detail_reason == "manual_recovery_already_attempted"
+    assert circuit_calls["reconciled"] == 1
+
+
+def test_private_pool_uses_configured_persistent_profile(tmp_path):
+    profile_dir = tmp_path / "jobsdb_profile"
+    pool = browser.BrowserSessionPool()
+    pool.configure_jobsdb_profile(profile_dir)
+
+    session = pool.session_for("https://hk.jobsdb.com/job/222")
+
+    assert session is not None
+    assert session.headless is True
+    assert session.channel == "chrome"
+    assert session.user_data_dir == profile_dir
+    pool.close()
+
+
+def test_recovery_failure_never_closes_circuit_or_uses_playwright(
+    tmp_path, monkeypatch
+):
+    circuit_calls = {"reconciled": 0}
+
+    class FakeRecoveryClass(browser.JobsdbHumanVerificationRecovery):
+        def _cdp_fetch(self, url):
+            return self._failure(url, "cdp_endpoint_unavailable")
+
+    class FakeCircuit:
+        def reconcile_success(self):
+            circuit_calls["reconciled"] += 1
+
+    def _no_playwright(**kwargs):
+        raise AssertionError("failed recovery must not launch any browser")
+
+    monkeypatch.setattr(browser, "JdBrowserSession", _no_playwright)
+    recovery = FakeRecoveryClass(profile_dir=tmp_path / "profile")
+
+    result = recovery.recover(
+        "https://hk.jobsdb.com/job/222", circuit=FakeCircuit(), cache_root=tmp_path
+    )
+
+    assert result.ok is False
+    assert result.detail_reason == "cdp_endpoint_unavailable"
+    assert recovery.status == "failed"
+    assert circuit_calls["reconciled"] == 0
 
 
 def test_storage_state_path_must_be_inside_home(tmp_path):
@@ -672,6 +792,95 @@ def test_two_pass_circuit_stops_third_url_and_cache_still_wins(monkeypatch, tmp_
     assert status["jd_cache_hits"] == 1
     assert status["failure_cache_hits"] == 0
     assert status["recommended_action"] == "wait_or_manual_verify"
+
+
+def test_private_two_pass_hands_first_challenge_to_one_shot_recovery(
+    monkeypatch, tmp_path
+):
+    import portal_jd_browser as short_browser  # noqa: E402
+
+    private = tmp_path / "JobSearch_2026"
+    (private / "00_Profile").mkdir(parents=True)
+    (private / "00_Profile" / "queries.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("JOBSEARCH_ROOT", str(private))
+    monkeypatch.setattr(
+        short_browser.BrowserSessionPool, "session_for", lambda self, url: None
+    )
+
+    initial_calls = []
+
+    def challenge(url, **kwargs):
+        initial_calls.append(url)
+        return browser.JdFetchResult(
+            ok=False,
+            url=url,
+            portal="jobsdb",
+            fail_reason="challenge",
+            detail_reason="challenge",
+            attempts=1,
+        )
+
+    monkeypatch.setattr(short_browser, "fetch_jd_body", challenge)
+
+    recovery_calls = []
+
+    class FakeRecovery:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.status = "not_attempted"
+            self.navigation_count = 0
+            self.profile_dir = tmp_path / "jobsdb_profile"
+            self.__class__.instances.append(self)
+
+        def recover(self, url, **kwargs):
+            recovery_calls.append((url, kwargs))
+            self.status = "succeeded"
+            self.navigation_count = 2
+            return browser.JdFetchResult(
+                ok=True,
+                url=url,
+                portal="jobsdb",
+                text=_long_jd_body(),
+                chars=len(_long_jd_body()),
+                content_validated=True,
+                detail_reason="manual_recovery_headless_validated",
+            )
+
+    monkeypatch.setattr(
+        short_browser, "JobsdbHumanVerificationRecovery", FakeRecovery
+    )
+    monkeypatch.setattr(
+        two_pass_score, "score_hit", lambda h, teaser, **kwargs: _fake_score_result(3.5)
+    )
+
+    rows, meta = two_pass_score.run_two_pass(
+        [
+            {
+                "title": "KYC Review Officer",
+                "company": "Bank",
+                "source": "jobsdb",
+                "url": "https://hk.jobsdb.com/job/909",
+                "teaser": "operations",
+            }
+        ],
+        repo=tmp_path,
+        gate_pass1=3.3,
+        min_final=0.0,
+        max_deep=10,
+        sleep_s=0.0,
+        drop_below_final=False,
+    )
+
+    assert initial_calls == ["https://hk.jobsdb.com/job/909"]
+    assert len(recovery_calls) == 1
+    assert len(FakeRecovery.instances) == 1
+    assert rows[0]["JD深度"] == "full"
+    assert meta["jobsdb_manual_recovery_status"] == "succeeded"
+    assert meta["jobsdb_manual_recovery_attempted"] == 1
+    assert meta["jobsdb_manual_recovery_success"] == 1
+    assert meta["jobsdb_detail_status"]["manual_recovery_status"] == "succeeded"
 
 
 def test_two_pass_counts_retry_attempts_as_real_navigations(monkeypatch, tmp_path):

@@ -181,6 +181,17 @@ def test_cli_interactive_verification_requires_headed(monkeypatch, tmp_path):
         )
 
 
+def test_session_interactive_verification_requires_visible_browser():
+    with pytest.raises(
+        ValueError, match="interactive_verification_requires_headed"
+    ):
+        browser.JdBrowserSession(
+            portal="jobsdb",
+            headless=True,
+            interactive_verification=True,
+        )
+
+
 class _FakeCliSession:
     """Session stand-in for CLI lifecycle tests: records close() calls."""
 

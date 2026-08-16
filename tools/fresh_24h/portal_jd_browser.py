@@ -27,6 +27,7 @@ import math
 import os
 import random
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -34,7 +35,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 REPO = Path(__file__).resolve().parents[2]
@@ -572,6 +573,8 @@ class JdBrowserSession:
         verification_timeout_seconds: int = 600,
         user_data_dir: str | Path | None = None,
     ) -> None:
+        if interactive_verification and headless:
+            raise ValueError("interactive_verification_requires_headed")
         self.portal = portal
         self.headless = headless
         self.storage_state = storage_state
@@ -1020,12 +1023,28 @@ def _jobsdb_profile_dir() -> Path | None:
     return path
 
 
+def default_jobsdb_recovery_profile_dir() -> Path:
+    """Dedicated visible-Chrome profile used only for human WAF recovery.
+
+    This deliberately does not attach Playwright to the user's already-open
+    daily Chrome profile.  It launches the installed Google Chrome app in a
+    visible window while keeping JobsDB cookies isolated from unrelated
+    personal browsing data and avoiding Chrome profile-lock corruption.
+    """
+    return Path.home() / ".config" / "jobsearch" / "browser_profiles" / "jobsdb"
+
+
 class BrowserSessionPool:
     """Keep one browser/context per portal for a single scoring cycle."""
 
     def __init__(self, *, headless: bool = True) -> None:
         self.headless = headless
         self._sessions: dict[str, JdBrowserSession] = {}
+        self._jobsdb_profile_override: Path | None = None
+
+    def configure_jobsdb_profile(self, profile_dir: str | Path) -> None:
+        """Use one persistent JobsDB profile for headless scans and recovery."""
+        self._jobsdb_profile_override = Path(profile_dir).expanduser()
 
     def session_for(self, url: str) -> JdBrowserSession | None:
         portal = detect_portal(url)
@@ -1034,7 +1053,11 @@ class BrowserSessionPool:
         if portal not in {"jobsdb", "linkedin"}:
             return None
         if portal not in self._sessions:
-            user_data_dir = _jobsdb_profile_dir() if portal == "jobsdb" else None
+            user_data_dir = (
+                self._jobsdb_profile_override or _jobsdb_profile_dir()
+                if portal == "jobsdb"
+                else None
+            )
             self._sessions[portal] = JdBrowserSession(
                 portal=portal,
                 headless=self.headless,
@@ -1042,10 +1065,290 @@ class BrowserSessionPool:
             )
         return self._sessions[portal]
 
+    def replace_session(self, portal: str, session: JdBrowserSession) -> None:
+        """Replace one portal session, closing the stale context first."""
+        previous = self._sessions.get(portal)
+        if previous is not None and previous is not session:
+            previous.close()
+        self._sessions[portal] = session
+
+    def discard_session(self, portal: str) -> None:
+        """Close and forget a portal context before changing browser mode."""
+        previous = self._sessions.pop(portal, None)
+        if previous is not None:
+            previous.close()
+
     def close(self) -> None:
         for session in self._sessions.values():
             session.close()
         self._sessions.clear()
+
+
+class JobsdbHumanVerificationRecovery:
+    """One-shot human verification in the user's *daily* Chrome over CDP.
+
+    The dedicated-profile visible-Chrome design was retired: Cloudflare binds
+    its clearance to the real browsing profile, so a clean profile that passes
+    the challenge still fails revalidation and the circuit reopens. The flow
+    that actually works attaches to the user's running daily Chrome via CDP:
+
+    1. probe the local debugging endpoint (default 127.0.0.1:9222);
+    2. if down, ask the installed Google Chrome to open with
+       ``--remote-debugging-port`` on the target URL and wait briefly;
+    3. open the URL inside the user's real profile, poll until the page is a
+       real JD (the user clicks any live challenge in their own window);
+    4. validate with the standard structural checks, cache the text, then
+       reconcile the circuit and clear the failure cache.
+
+    Exactly one handoff runs per scan; a failed handoff never reopens a
+    Playwright window.
+    """
+
+    def __init__(
+        self,
+        *,
+        profile_dir: str | Path | None = None,
+        verification_timeout_seconds: int = 600,
+        before_visible: Callable[[], None] | None = None,
+        on_validated_session: Callable[[JdBrowserSession], None] | None = None,
+        debug_port: int = 9222,
+    ) -> None:
+        profile = (
+            profile_dir
+            or _jobsdb_profile_dir()
+            or default_jobsdb_recovery_profile_dir()
+        )
+        self.profile_dir = Path(profile).expanduser()
+        self.verification_timeout_seconds = max(
+            1, int(verification_timeout_seconds)
+        )
+        self.before_visible = before_visible
+        # Retained for call-site compatibility; a CDP attach owns no
+        # JdBrowserSession, so a validated session is never handed off.
+        self.on_validated_session = on_validated_session
+        self.debug_port = int(debug_port)
+        self.attempted = False
+        self.status = "not_attempted"
+        self.navigation_count = 0
+
+    @staticmethod
+    def _failure(url: str, reason: str) -> JdFetchResult:
+        return JdFetchResult(
+            ok=False,
+            url=url,
+            portal="jobsdb",
+            fail_reason="degraded",
+            detail_reason=reason,
+            attempts=0,
+            last_reason=reason,
+            recommended_action="wait_or_manual_verify",
+        )
+
+    def _endpoint_alive(self) -> bool:
+        """Probe the Chrome debugging endpoint without starting Playwright."""
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.debug_port}/json/version", timeout=1
+            ) as response:
+                return bool(response.status == 200)
+        except Exception:
+            return False
+
+    def _launch_user_chrome_with_debug_port(self, url: str) -> None:
+        """Ask the installed Google Chrome to open with the debug port.
+
+        macOS runs a single Chrome instance: when the daily Chrome is already
+        open without the port, this call merely focuses it and the endpoint
+        stays down; the caller keeps polling and reports the exact manual
+        command if the endpoint never appears.
+        """
+        try:
+            subprocess.Popen(
+                [
+                    "open",
+                    "-na",
+                    "Google Chrome",
+                    "--args",
+                    f"--remote-debugging-port={self.debug_port}",
+                    url,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    def _cdp_fetch(self, url: str) -> JdFetchResult:
+        """Drive one URL inside the user's daily Chrome over CDP."""
+        from playwright.sync_api import sync_playwright
+
+        manual_hint = (
+            'open -na "Google Chrome" --args '
+            f"--remote-debugging-port={self.debug_port} {url}"
+        )
+        if not self._endpoint_alive():
+            print(
+                "JobsDB 需要人工验证：调试端口未开，正在尝试以调试端口启动你的 "
+                "Google Chrome；若你的 Chrome 已在运行，请完全退出（⌘Q）后手动执行：\n"
+                f"  {manual_hint}",
+                file=sys.stderr,
+            )
+            self._launch_user_chrome_with_debug_port(url)
+            launch_deadline = time.monotonic() + 90
+            while time.monotonic() < launch_deadline:
+                if self._endpoint_alive():
+                    break
+                time.sleep(2.0)
+            else:
+                return self._failure(url, "cdp_endpoint_unavailable")
+        with sync_playwright() as p:
+            try:
+                remote = p.chromium.connect_over_cdp(
+                    f"http://127.0.0.1:{self.debug_port}"
+                )
+            except Exception:
+                return self._failure(url, "cdp_connect_failed")
+            try:
+                contexts = remote.contexts
+                if not contexts:
+                    return self._failure(url, "cdp_no_context")
+                page = contexts[0].new_page()
+                try:
+                    self.navigation_count += 1
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    title, text, selector = _observe_cdp(page)
+                    if not selector and _looks_challenged_cdp(title, text, page):
+                        print(
+                            "请在你的 Chrome 窗口中完成 Cloudflare 验证"
+                            f"（等待 {self.verification_timeout_seconds}s）……",
+                            file=sys.stderr,
+                        )
+                        validated, reason = _poll_until_real_jd_cdp(
+                            page, self.verification_timeout_seconds
+                        )
+                        if not validated:
+                            return self._failure(url, f"cdp_{reason}")
+                        title, text, selector = _observe_cdp(page)
+                    if not selector or not text:
+                        return self._failure(url, "cdp_no_jd_content")
+                    if not is_real_jd(
+                        title=title,
+                        body=text,
+                        html_snip="",
+                        has_jd_container=True,
+                        cf_mitigated=None,
+                    ):
+                        return self._failure(url, "cdp_content_not_validated")
+                    return JdFetchResult(
+                        ok=True,
+                        url=url,
+                        portal="jobsdb",
+                        text=text,
+                        chars=len(text),
+                        selector=selector,
+                        content_validated=True,
+                        attempts=1,
+                        browser_channel="user-chrome-cdp",
+                        session_mode="cdp-user-profile",
+                        headless=False,
+                    )
+                finally:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    remote.close()
+                except Exception:
+                    pass
+
+    def recover(
+        self,
+        url: str,
+        *,
+        circuit: PortalCircuitBreaker | None = None,
+        cache_root: Path | None = None,
+    ) -> JdFetchResult:
+        if self.attempted:
+            return self._failure(url, "manual_recovery_already_attempted")
+        self.attempted = True
+        self.status = "cdp_verification_pending"
+
+        if self.before_visible is not None:
+            try:
+                self.before_visible()
+            except Exception:
+                self.status = "failed"
+                return self._failure(url, "manual_recovery_profile_release_error")
+        try:
+            result = self._cdp_fetch(url)
+        except Exception:
+            self.status = "failed"
+            return self._failure(url, "cdp_recovery_error")
+        if not (result.ok and result.content_validated):
+            self.status = "failed"
+            return result
+
+        from tools.fresh_24h.jd_cache import save_jd_cache
+
+        save_jd_cache(
+            result.url or url,
+            result.text or "",
+            source="browser_cdp_jobsdb",
+            root=cache_root or _default_cache_root(),
+        )
+        if circuit is not None:
+            circuit.reconcile_success()
+        _clear_failure(result.url or url, cache_root or _default_cache_root())
+        result.detail_reason = "manual_recovery_cdp_user_chrome"
+        self.status = "succeeded"
+        return result
+
+
+def _observe_cdp(page) -> tuple[str, str, str]:
+    """Read (title, best trusted-selector text, selector) from a CDP page."""
+    try:
+        title = page.title() or ""
+    except Exception:
+        title = ""
+    text, selector = "", ""
+    for sel in TRUSTED_SELECTORS.get("jobsdb", []):
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                candidate = _clean_text(loc.first.inner_text(timeout=1500))
+                if len(candidate) > len(text):
+                    text, selector = candidate, sel
+        except Exception:
+            continue
+    return title, text, selector
+
+
+def _looks_challenged_cdp(title: str, text: str, page) -> bool:
+    try:
+        html = page.content()[:1500]
+    except Exception:
+        html = ""
+    outcome = classify_outcome(
+        main_response=None, title=title, body=text, html_snip=html
+    )
+    return outcome in {"challenge", "rate_limited", "blocked"}
+
+
+def _poll_until_real_jd_cdp(page, timeout_s: float) -> tuple[bool, str]:
+    """Wait for the user to clear a live challenge in their own Chrome."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        title, text, selector = _observe_cdp(page)
+        if selector:
+            return True, "ok"
+        if not _looks_challenged_cdp(title, text, page):
+            return False, "not_a_jd"
+        time.sleep(2.0)
+    return False, "challenge_timeout"
 
 
 def _stamp_session_meta(result: JdFetchResult, session: "JdBrowserSession") -> None:

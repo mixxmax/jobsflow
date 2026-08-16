@@ -62,4 +62,4 @@ echo "Next: review the preview, then use workflow push preview/confirm to enter 
 echo "  python3 -m tools.workflow push --run-id <scan-run-id>"
 echo "  python3 -m tools.workflow push --run-id <scan-run-id> --confirm <proposal-id>"
 echo "Materials only on demand (never from this script):"
-echo "  python3 -m tools.job_materials pipeline --package '…/C0-xxx_未投_…' --lane C"
+echo "  python3 -m tools.workflow materials --job-id C0-xxx"
