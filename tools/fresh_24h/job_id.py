@@ -55,6 +55,7 @@ def allocate_ids(
     letter_key: str = "简历版本",
     score_key: str = "CareerOps分数",
     grade_key: str = "CareerOps等级",
+    occupied_ids: Iterable[str] | None = None,
 ) -> list[dict]:
     """Assign 岗位编号 + 层级 in place.
 
@@ -62,9 +63,15 @@ def allocate_ids(
     to an already assigned ID. Those IDs are preserved on reruns; only rows
     without a known identity receive a new sequence number. This prevents a
     rescored job from looking like a brand-new application.
+
+    ``occupied_ids`` are sequence numbers already consumed outside the
+    tracker (for example package directories under ``01_Masters`` created by
+    an earlier entry whose sheet row was removed).  They are never reused,
+    so a re-entry cannot alias a live package.
     """
     counters = dict(baseline_max)
     existing_ids = existing_ids or {}
+    occupied_ids = occupied_ids or ()
     used_ids: set[str] = set()
     reserved_ids: set[str] = set()
     for value in existing_ids.values():
@@ -75,6 +82,7 @@ def allocate_ids(
         letter, digit, number = parsed
         pref = f"{letter}{digit}"
         counters[pref] = max(counters.get(pref, 0), number)
+    occupied: set[str] = {str(value).strip() for value in occupied_ids if parse_id(str(value))}
 
     for row in jobs:
         score = float(row.get(score_key) or 0)
@@ -95,7 +103,7 @@ def allocate_ids(
         else:
             counters[pref] = counters.get(pref, 0) + 1
             candidate = f"{letter}{digit}-{counters[pref]:03d}"
-            while candidate in reserved_ids or candidate in used_ids:
+            while candidate in reserved_ids or candidate in used_ids or candidate in occupied:
                 counters[pref] += 1
                 candidate = f"{letter}{digit}-{counters[pref]:03d}"
             row["岗位编号"] = candidate

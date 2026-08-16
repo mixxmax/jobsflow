@@ -214,6 +214,33 @@ def row_identity(row: dict[str, Any]) -> str:
     return f"{source}|{company}|{title}".casefold()
 
 
+def _occupied_package_ids(workspace: Path) -> set[str]:
+    """Sequence numbers already consumed by package directories.
+
+    A package may survive after its tracker row is removed (or re-entered
+    under another identity).  Those IDs are never handed out again, so a
+    re-entry cannot alias a live package.
+    """
+
+    masters = Path(workspace) / "01_Masters"
+    if not masters.is_dir():
+        return set()
+    ids: set[str] = set()
+    for lane_folder in masters.iterdir():
+        if not lane_folder.is_dir():
+            continue
+        for tier_folder in lane_folder.iterdir():
+            if not tier_folder.is_dir():
+                continue
+            for entry in tier_folder.iterdir():
+                if not entry.is_dir():
+                    continue
+                prefix = entry.name.split("_", 1)[0].strip()
+                if is_assigned_job_id(prefix):
+                    ids.add(prefix)
+    return ids
+
+
 def prepare_rows_for_entry(
     rows: Iterable[dict[str, Any]],
     existing_rows: Iterable[dict[str, Any]],
@@ -263,5 +290,6 @@ def prepare_rows_for_entry(
         prepared,
         baseline_max=baseline,
         existing_ids={key: value for key, value in existing_ids.items()},
+        occupied_ids=_occupied_package_ids(workspace) if workspace is not None else None,
     )
     return prepared
