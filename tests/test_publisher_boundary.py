@@ -109,6 +109,48 @@ def test_outbound_filename_keeps_meaningful_parentheses_without_short_dash():
     assert "-" not in names["cv_docx"]
 
 
+def test_short_filename_does_not_apply_long_name_compression():
+    company = "Acme Limited"
+    names = build_material_filenames(
+        role="Officer to Assistant Manager, CDD, Channel Management Dept",
+        candidate_name="Jane Doe",
+        classification=classify_publisher(
+            publisher_name=company,
+            publisher_type="employer",
+            employer_name=company,
+        ),
+    )
+    stem = names["filename_stem_policy"]
+    assert stem["source_stem_chars"] <= 80
+    assert stem["compression_applied"] is False
+    assert stem["shortened"] is False
+    assert "Acme_Limited" in stem["stem"]
+    assert "Channel_Management_Dept" in stem["stem"]
+
+
+def test_long_company_and_role_use_bounded_filename_labels_only():
+    legal_company = "Industrial and Commercial Bank of China (Asia) Limited"
+    result = classify_publisher(
+        publisher_name=legal_company,
+        publisher_type="employer",
+        employer_name=legal_company,
+    )
+    names = build_material_filenames(
+        role="Officer to Assistant Manager, CDD, Channel Management Dept",
+        candidate_name="Yanlong Sun",
+        classification=result,
+    )
+
+    stem = names["filename_stem_policy"]
+    assert len(stem["stem"]) <= 80
+    assert "ICBC_Asia" in stem["stem"]
+    assert "CDD_Channel_Management" in stem["stem"]
+    assert "Limited" not in stem["stem"]
+    assert "Dept" not in stem["stem"]
+    # The legal source identity is not discarded or rewritten in the entity.
+    assert names["employer_name_used"] == legal_company
+
+
 def test_tailor_payload_uses_one_primary_role_and_preserves_specialism_parentheses():
     payload = build_tailored_payload(
         base=_base(),

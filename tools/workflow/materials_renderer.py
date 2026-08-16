@@ -15,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from tools.io_utils import atomic_write_json
+from tools.job_materials.filename_policy import build_filename_stem
 from tools.job_materials.manifest import load_job_manifest
 from tools.job_materials.paths import find_latest_cl_master_docx, find_latest_master_docx
 from tools.workflow.materials_draft import canonical_digest, canonical_material_texts, load_canonical_draft
@@ -51,13 +52,6 @@ def _candidate_name(workspace: Path) -> str:
     return value
 
 
-def _filename_component(value: str) -> str:
-    text = re.sub(r"[\\/:*?\"<>|_]+", " ", str(value or ""))
-    # JobsFlow material names use spaces and retain substantive parentheses.
-    text = re.sub(r"[\-–—]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip(" .")
-
-
 def expected_filenames(package: Path, workspace: Path) -> dict[str, str]:
     # A vNext generation freezes one entity contract. Renderer/filename code
     # must not re-parse the manifest and accidentally turn a recruiter into
@@ -74,29 +68,33 @@ def expected_filenames(package: Path, workspace: Path) -> dict[str, str]:
             if str(entity.get("recruiter_boundary") or "").startswith("recruiter") and not target_value:
                 target_value = ""
             if role_value:
-                role = _filename_component(role_value)
-                company = _filename_component(target_value)
-                candidate = _filename_component(_candidate_name(Path(workspace)))
-                prefix = " ".join(item for item in (candidate, company, role) if item).strip()
+                stem = build_filename_stem(
+                    candidate=_candidate_name(Path(workspace)),
+                    company=target_value,
+                    role=role_value,
+                    separator=" ",
+                )["stem"]
                 return {
-                    "cv_docx": f"{prefix} CV.docx",
-                    "cl_docx": f"{prefix} Cover Letter.docx",
-                    "cv_pdf": f"{prefix} CV.pdf",
-                    "cl_pdf": f"{prefix} Cover Letter.pdf",
+                    "cv_docx": f"{stem} CV.docx",
+                    "cl_docx": f"{stem} Cover Letter.docx",
+                    "cv_pdf": f"{stem} CV.pdf",
+                    "cl_pdf": f"{stem} Cover Letter.pdf",
                 }
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             pass
     manifest = load_job_manifest(Path(package)) or {}
     job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
-    role = _filename_component(str(job.get("role_material") or job.get("role_display") or "Application"))
-    company = _filename_component(str(job.get("company_out") or job.get("employer_name") or ""))
-    candidate = _filename_component(_candidate_name(Path(workspace)))
-    prefix = " ".join(item for item in (candidate, company, role) if item).strip()
+    stem = build_filename_stem(
+        candidate=_candidate_name(Path(workspace)),
+        company=str(job.get("company_out") or job.get("employer_name") or ""),
+        role=str(job.get("role_material") or job.get("role_display") or "Application"),
+        separator=" ",
+    )["stem"]
     return {
-        "cv_docx": f"{prefix} CV.docx",
-        "cl_docx": f"{prefix} Cover Letter.docx",
-        "cv_pdf": f"{prefix} CV.pdf",
-        "cl_pdf": f"{prefix} Cover Letter.pdf",
+        "cv_docx": f"{stem} CV.docx",
+        "cl_docx": f"{stem} Cover Letter.docx",
+        "cv_pdf": f"{stem} CV.pdf",
+        "cl_pdf": f"{stem} Cover Letter.pdf",
     }
 
 

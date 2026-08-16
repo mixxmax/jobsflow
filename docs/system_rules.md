@@ -42,6 +42,11 @@
   shorter than its lane master. Never stretch text, add generic filler, or
   edit the PDF directly.
 - Use clean filenames without dates or internal version tokens.
+- Host-generated outbound filename stems have an 80-character budget. The host first preserves
+  a path-safe complete candidate/company/primary-role label; only when that complete stem exceeds
+  80 characters may it deterministically shorten legal company suffixes, title ranges or department
+  tails. This compression is filename-only: the full source identity remains in the manifest and
+  material content, and models cannot choose an alternate filename or renderer.
 - Verify: one page, expected contact details from the private profile, no
   watermark, no missing glyphs, and no stale conversion cache.
 
@@ -125,6 +130,11 @@ Their actual queries and relevance rules are candidate- and profession-specific.
   digest-bound, write-free proposal; only the same run's unexpired proposal
   with explicit user confirmation may assign a persistent ID and write CSV or
   Google Sheets. A model must never infer entry permission from scan completion.
+- The gateway rejects model-supplied tracker rows, direct-write flags, ID
+  allocation flags or archive/clear requests on `/scan` and `/push`. Selection
+  is a list of stable keys from the hash-bound scored artifact; an unknown key
+  blocks the preview instead of silently producing a partial batch. Confirmation
+  may not broaden or replace the stored selection.
 - Do not claim full-JD analysis when only a teaser is available.
 - Never hard-reject an information-poor card solely because its title-only
   pass-1 score is below 3.3. If deep text cannot be obtained within policy or
@@ -240,6 +250,8 @@ Their actual queries and relevance rules are candidate- and profession-specific.
   `02_Tracker/workflow/id_counters.json`, one latest sequence per lane/tier
   prefix (for example `C0`). The counter is advanced only after explicit entry
   confirmation. A preview may show proposed numbers but never consumes them.
+  Existing package directories are also treated as occupied IDs, so deleting a
+  tracker row cannot cause a later re-entry to reuse its material package ID.
 - A changed remote projection is never silently overwritten. Reconciliation
   writes a diff report under `02_Tracker/workflow/sync_conflicts/`; failed
   operations remain replayable and do not claim success.

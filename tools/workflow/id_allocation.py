@@ -226,18 +226,16 @@ def _occupied_package_ids(workspace: Path) -> set[str]:
     if not masters.is_dir():
         return set()
     ids: set[str] = set()
-    for lane_folder in masters.iterdir():
-        if not lane_folder.is_dir():
+    # Use a recursive walk instead of assuming exactly ``lane/tier/package``.
+    # Older/private instances have occasionally inserted a descriptive folder
+    # between tier and package; any directory whose first token is a durable
+    # ID still consumes that sequence and must be treated as occupied.
+    for entry in masters.rglob("*"):
+        if not entry.is_dir():
             continue
-        for tier_folder in lane_folder.iterdir():
-            if not tier_folder.is_dir():
-                continue
-            for entry in tier_folder.iterdir():
-                if not entry.is_dir():
-                    continue
-                prefix = entry.name.split("_", 1)[0].strip()
-                if is_assigned_job_id(prefix):
-                    ids.add(prefix)
+        prefix = entry.name.split("_", 1)[0].strip()
+        if is_assigned_job_id(prefix):
+            ids.add(prefix)
     return ids
 
 

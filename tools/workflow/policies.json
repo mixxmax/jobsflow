@@ -14,6 +14,17 @@
       "tests": ["test_fresh_lifecycle.py", "test_workflow_orchestrator.py"]
     },
     {
+      "rule_id": "SCAN-002",
+      "domain": "scan",
+      "statement": "Scan is review-only: it may assign lane/tier metadata but never allocate persistent job IDs, write tracker rows, create material packages or render application files.",
+      "level": "MUST_NOT",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_scan_entry_boundary.py"]
+    },
+    {
       "rule_id": "FRESH-002",
       "domain": "archive",
       "statement": "Fresh may be archived or cleared only after an explicit, unexpired confirmation whose digest still matches.",
@@ -45,6 +56,28 @@
       "failure_status": "blocked",
       "override_policy": "diagnostic_only",
       "tests": ["test_workflow_orchestrator.py"]
+    },
+    {
+      "rule_id": "PUSH-002",
+      "domain": "push",
+      "statement": "Persistent job IDs are allocated only at confirmed entry from the workspace-local per-prefix latest counter; previews never consume or reuse a sequence.",
+      "level": "MUST",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_scan_entry_boundary.py"]
+    },
+    {
+      "rule_id": "PUSH-003",
+      "domain": "push",
+      "statement": "A confirmation is bound to the exact scan run, scored-artifact digest and preview selection; a model may not inject rows, broaden the selection or bypass the gateway.",
+      "level": "MUST_NOT",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_scan_entry_boundary.py"]
     },
     {
       "rule_id": "INTENT-001",

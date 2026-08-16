@@ -24,6 +24,7 @@ from tools.workflow.id_allocation import (
     prepare_rows_for_entry,
 )
 from tools.workflow.sync import SyncCoordinator
+from tools.job_urls import normalize_job_url
 from tools.job_materials.packages import create_package_from_entry_row, validate_entry_row_binding
 
 ENTRY_RULE_IDS = ["PUSH-001", "FRESH-001", "SYNC-001", "SYNC-004"]
@@ -77,6 +78,63 @@ def _load_scored_rows(workspace: Path, run: dict[str, Any]) -> tuple[list[dict[s
     return rows, None
 
 
+def _selection_keys(payload: dict[str, Any]) -> list[str]:
+    """Read the user-selected stable keys for an entry preview.
+
+    Selection is deliberately key-based rather than accepting model-supplied
+    row bodies.  The rows are still loaded from the hash-bound scored artifact,
+    so a model cannot invent tracker fields while selecting a subset.
+    """
+    raw = payload.get("selected_keys")
+    if raw is None:
+        raw = payload.get("select")
+    if isinstance(raw, str):
+        values = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = []
+    return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _row_selection_values(row: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for field in ("岗位编号", "job_id", "scan_id", "链接", "url"):
+        value = str(row.get(field) or "").strip()
+        if not value:
+            continue
+        values.add(value.casefold())
+        if field in {"链接", "url"}:
+            values.add(normalize_job_url(value, source=str(row.get("来源") or row.get("source") or "")).casefold())
+    return values
+
+
+def _select_scored_rows(rows: list[dict[str, str]], keys: list[str]) -> tuple[list[dict[str, str]], str | None]:
+    """Select scored rows by URL, scan ID or persistent ID without rewriting them."""
+    if not keys:
+        return rows, None
+    normalized = {
+        (normalize_job_url(key).casefold() if key.startswith(("http://", "https://")) else key.casefold())
+        for key in keys
+    }
+    selected = [row for row in rows if _row_selection_values(row) & normalized]
+    matched = set().union(*(_row_selection_values(row) for row in selected)) if selected else set()
+    missing = sorted(key for key in normalized if key not in matched)
+    if missing:
+        # Do not silently drop a typo or an unknown job key.  A lower-capability
+        # model must receive a deterministic blocker and ask the user to
+        # correct the selection instead of entering a partial, unexpected set.
+        return [], "push_selection_key_not_found:" + ",".join(missing)
+    return selected, None
+
+
+def _normalize_selection_key(value: str) -> str:
+    value = str(value or "").strip()
+    if value.startswith(("http://", "https://")):
+        return normalize_job_url(value).casefold()
+    return value.casefold()
+
+
 def _entry_preview(
     *,
     workspace: Path,
@@ -87,6 +145,8 @@ def _entry_preview(
     target_snapshot=None,
     now=None,
     mode: str = "temp",
+    selection_keys: list[str] | None = None,
+    source_row_count: int | None = None,
 ) -> dict[str, Any]:
     """Create a digest-bound, write-free proposal for a tracker entry."""
 
@@ -130,6 +190,8 @@ def _entry_preview(
             "prepared_rows": prepared,
             "backend": store.__class__.__name__,
             "batch_id": batch_id,
+            "selection_keys": list(selection_keys or []),
+            "source_row_count": int(source_row_count if source_row_count is not None else len(rows)),
         },
     )
     ConfirmationStore(workspace).save(proposal)
@@ -172,6 +234,17 @@ def handle(
     payload = payload or {}
     if workspace is None:
         return result(status="blocked", blockers=["workspace_required"], rule_ids=["PUSH-001"])
+    proposal_id = str(payload.get("confirmation_id") or payload.get("proposal_id") or "")
+    confirmations = ConfirmationStore(workspace)
+    proposal_hint = confirmations.load(proposal_id) if proposal_id else None
+    # A confirmation proposal carries the exact scan run it was previewed
+    # from. Bind to that run before the state machine chooses an entity, so a
+    # confirmation call that omits --run-id cannot fall back to an old mode/
+    # latest state.
+    if proposal_id and not str(payload.get("run_id") or "").strip() and isinstance(proposal_hint, dict):
+        bound_run_id = str(proposal_hint.get("run_id") or "").strip()
+        if bound_run_id:
+            payload["run_id"] = bound_run_id
     _path, run = _latest_run(workspace, payload.get("run_id"))
     if not run:
         return result(status="blocked", blockers=["scan_run_missing"], rule_ids=["PUSH-001", "FRESH-001"])
@@ -193,9 +266,22 @@ def handle(
     rows, error = _load_scored_rows(workspace, run)
     if error or rows is None:
         return result(status="blocked", blockers=[error or "scored_artifact_missing"], rule_ids=["PUSH-001", "FRESH-001"])
+    source_row_count = len(rows)
+    selection_keys = _selection_keys(payload)
+    if not proposal_id:
+        rows, selection_error = _select_scored_rows(rows, selection_keys)
+        if selection_error:
+            return result(
+                status="blocked",
+                after_state="scan_completed",
+                rule_ids=ENTRY_RULE_IDS,
+                blockers=[selection_error],
+                selection_keys=selection_keys,
+            )
     title = str(
         payload.get("fresh_title")
         or run.get("fresh_title")
+        or (proposal_hint or {}).get("target")
         or f"fresh_24h_{run.get('scan_day') or date.today().isoformat()}"
     )
     try:
@@ -208,8 +294,6 @@ def handle(
             backend=str(payload.get("backend") or "auto"),
         )
     target_before = target.read_active()
-    proposal_id = str(payload.get("confirmation_id") or payload.get("proposal_id") or "")
-    confirmations = ConfirmationStore(workspace)
 
     if not proposal_id:
         try:
@@ -224,6 +308,8 @@ def handle(
                 store=target,
                 target_snapshot=target_before,
                 mode=str(run.get("mode") or payload.get("mode") or "temp"),
+                selection_keys=selection_keys,
+                source_row_count=source_row_count,
             )
         except ValueError as exc:
             return result(
@@ -238,8 +324,19 @@ def handle(
             rule_ids=ENTRY_RULE_IDS,
         )
 
-    proposal = confirmations.load(proposal_id)
+    proposal = proposal_hint or confirmations.load(proposal_id)
     prepared = [dict(row) for row in (proposal or {}).get("prepared_rows") or []]
+    if proposal and selection_keys:
+        expected_keys = {_normalize_selection_key(value) for value in proposal.get("selection_keys") or []}
+        actual_keys = {_normalize_selection_key(value) for value in selection_keys}
+        if expected_keys != actual_keys:
+            return result(
+                status="blocked",
+                after_state="scan_completed",
+                rule_ids=ENTRY_RULE_IDS,
+                blockers=["confirmation_selection_changed"],
+                proposal_id=proposal_id,
+            )
     blockers = validate_proposal(
         proposal,
         action="push_fresh",

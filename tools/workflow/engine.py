@@ -17,7 +17,7 @@ from tools.workflow.adapters import push as push_adapter
 from tools.workflow.adapters import scan as scan_adapter
 from tools.workflow.adapters import sync as sync_adapter
 from tools.workflow.audit import append_workflow_event, new_event_id
-from tools.workflow.confirmation import iso
+from tools.workflow.confirmation import ConfirmationStore, iso
 from tools.workflow.contracts import ActionRequest, result
 from tools.workflow.entity_state import (
     StateConflict,
@@ -70,6 +70,18 @@ class WorkflowEngine:
         # alternate engine name.
         if request.action in _MATERIALS_ACTIONS:
             payload["materials_engine"] = "vnext"
+        # A confirmation proposal is bound to the scan run that produced its
+        # scored artifact.  Requiring a model to repeat that run ID creates a
+        # dangerous ambiguity: ``push --confirm`` can otherwise resolve the
+        # entity to the old mode/latest state and fail before the adapter gets
+        # a chance to validate the proposal.  Recover the bound run ID from
+        # the proposal when the caller omitted it; an explicit run ID remains
+        # subject to the adapter's mismatch check.
+        if request.action == "push" and not str(payload.get("run_id") or "").strip():
+            confirmation_id = request.confirmation_id or payload.get("proposal_id") or payload.get("confirmation_id")
+            proposal = ConfirmationStore(Path(workspace)).load(str(confirmation_id or ""))
+            if isinstance(proposal, dict) and str(proposal.get("run_id") or "").strip():
+                payload["run_id"] = str(proposal["run_id"])
         # Keep the request object and the normalized adapter payload aligned
         # for the optional QC bridge and audit record.  Direct
         # ``WorkflowEngine.execute`` callers must receive the same forced
@@ -122,7 +134,7 @@ class WorkflowEngine:
                 _audit(workspace, request, out, entity, event_id, duration_ms=_elapsed_ms(started))
                 return out
 
-        if not dry_run and not action_allowed_from(request.action, entity_type, entity.phase):
+        if not dry_run and not action_allowed_from(request.action, entity_type, entity.phase, payload):
             out = result(
                 status="blocked",
                 before_state=entity.phase,

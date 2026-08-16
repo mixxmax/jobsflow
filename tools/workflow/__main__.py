@@ -101,6 +101,11 @@ def main(argv: list[str] | None = None) -> int:
     push.add_argument("--run-id", default="")
     push.add_argument("--allow-pending-semantic", action="store_true")
     push.add_argument("--fresh-title", default="")
+    push.add_argument(
+        "--select",
+        default="",
+        help="仅预览/入表指定岗位；用逗号分隔 URL、scan_id 或已有岗位编号",
+    )
     push.add_argument("--backend", choices=["auto", "csv", "gsheet", "file"], default="auto")
     push.add_argument(
         "--confirm",
@@ -212,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
                 "run_id": args.run_id,
                 "allow_pending_semantic": args.allow_pending_semantic,
                 "fresh_title": args.fresh_title,
+                "selected_keys": [value.strip() for value in args.select.split(",") if value.strip()],
                 "backend": "csv" if args.local_only else args.backend,
                 "confirmation_id": args.confirmation_id,
             }

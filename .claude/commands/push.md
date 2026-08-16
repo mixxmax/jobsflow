@@ -5,6 +5,8 @@
 ```bash
 # 第一步：只生成入表预览和 proposal，不写表、不分配永久编号
 python3 -m tools.workflow push --run-id <id>
+# 只把用户选中的岗位放入本次 proposal（可用 URL、scan_id 或已有岗位编号）
+python3 -m tools.workflow push --run-id <id> --select <key1>,<key2>
 
 # 用户查看职位、lane、拟分配编号后，第二步才允许写入
 python3 -m tools.workflow push --run-id <id> --confirm <proposal-id>
@@ -25,6 +27,12 @@ python3 -m tools.workflow sync retry --operation-id <sync-id> --fresh-title <tit
 没有 `--confirm` 时，网关只能返回预览；模型不得自行把预览当作入表。
 `--confirm` 必须是同一 run 的、未过期且摘要未变化的 proposal。正式入表时
 才分配 `A0-001` 这类永久岗位编号。扫描阶段只有 lane/层级/评分，不生成岗位编号。
+如果用户只确认预览中的部分岗位，必须在第一次 `push` 预览时使用
+`--select`（或 API 的 `selected_keys`）；系统从哈希绑定的评分文件中筛选这些
+行，确认时只写入 proposal 中的子集，不会把整份扫描结果误写入台账。确认调用
+可以省略 `--run-id`，系统会从 proposal 自动恢复绑定的 run。
+模型不得向 API 传入自造的 `rows`/`prepared_rows`、直接写入标志、编号分配标志，
+也不得把未知选择键静默忽略；这些请求由网关直接阻断。
 不要直接运行 `fresh_24h_scan.py --append-tracker` 或 `push_to_gsheet.py`，这两条
 旧写入旁路已被代码拒绝。
 

@@ -94,6 +94,8 @@ class CurrentJobBundle:
     profile_facts: tuple[dict[str, Any], ...]
     assessment: dict[str, Any]
     preflight: dict[str, Any]
+    company_research: dict[str, Any]
+    company_research_request: str
     entity: JobEntity
     baseline: dict[str, Any]
     rules_digest: str
@@ -116,6 +118,8 @@ class CurrentJobBundle:
             },
             "assessment": self.assessment,
             "preflight": self.preflight,
+            "company_research": self.company_research,
+            "company_research_request": self.company_research_request,
             "entity": self.entity.as_dict(),
             "baseline": self.baseline,
             "rules_digest": self.rules_digest,

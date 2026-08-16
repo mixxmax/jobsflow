@@ -267,13 +267,32 @@ def action_is_mutating(action: str) -> bool:
     }
 
 
-def action_allowed_from(action: str, entity_type: str, phase: str) -> bool:
+def action_allowed_from(
+    action: str,
+    entity_type: str,
+    phase: str,
+    payload: dict[str, Any] | None = None,
+) -> bool:
+    payload = payload or {}
     if not action_is_mutating(action):
         return True
     # A repair cycle intentionally re-enters the drafting adapter while the
     # entity remains in ``content_audit_pending``.  It must not be represented
     # as a forward transition (which would let a model skip the audit gate).
     if action == "materials" and entity_type == "materials" and phase == "content_audit_pending":
+        return True
+    # PDF conversion is a retry-safe, idempotent stage.  The first conversion
+    # may already have advanced the entity to ``pdf_generated`` (or a later
+    # gate), while a harness can still legitimately repeat the same command
+    # after a timeout or a duplicate tool response.  The vNext adapter checks
+    # the actual artifacts and never regresses the phase.
+    stage = str(payload.get("stage") or payload.get("materials_cmd") or "").casefold()
+    if (
+        action == "materials"
+        and entity_type == "materials"
+        and stage in {"pdf", "convert", "pdf_generated"}
+        and phase in {"pdf_generated", "format_passed", "apply_ready"}
+    ):
         return True
     possible = ACTION_DESTINATIONS.get(action) or set()
     allowed = direct_successors(entity_type, phase)

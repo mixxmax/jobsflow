@@ -170,6 +170,24 @@ def build_task(*, bundle: dict[str, Any], canonical: dict[str, Any], run: dict[s
             "title_punctuation": "when retained, preserve parentheses and their wording; do not substitute commas or hyphens",
         },
     }
+    filename_contract = {
+        "source": "host_expected_filenames",
+        "model_may_edit": False,
+        "max_stem_chars": 80,
+        "company": (
+            "verified employer label only; recruiter names are never outbound; "
+            "legal suffixes shorten only when the complete stem exceeds 80 characters"
+        ),
+        "role": (
+            "one selected primary role; department/range noise shortens only when "
+            "the complete stem exceeds 80 characters"
+        ),
+        "compression_trigger": (
+            "host first builds the complete safe stem; no compression when it fits "
+            "max_stem_chars"
+        ),
+        "full_source_retention": "manifest and material content retain the complete source identity",
+    }
     materials: dict[str, Any] = {}
     for material in MATERIALS:
         blocks = _blocks(canonical, material)
@@ -212,6 +230,7 @@ def build_task(*, bundle: dict[str, Any], canonical: dict[str, Any], run: dict[s
         "audit_mode": "bounded_tailoring_delta",
         "audit_focus": audit_focus,
         "entity_contract": entity_contract,
+        "filename_contract": filename_contract,
         "tailoring_delta": tailoring_delta,
         "requires_strong_auditor": any(
             count / max(1, len(_baseline_blocks(bundle, material))) > 0.35
@@ -240,11 +259,13 @@ def build_task(*, bundle: dict[str, Any], canonical: dict[str, Any], run: dict[s
             "tailoring_delta",
             "layout_contract",
             "layout_contract.coverage_dispositions",
+            "filename_contract",
             "rule_pack",
         ],
         "write_allowlist": ["materials_audit_result.json"],
         "forbidden": ["claim_contract", "fact_evidence", "profile", "assessment", "company_research", "email", "pdf", "docx", "format", "page_count", "font", "metadata", "network"],
         "output_schema": {
+            "job_id": "host-bound; optional in child output; the gateway binds the current task job_id",
             "audit_scope": "jd_mapping_and_presentation",
             "findings": "array of {finding_id,severity,rule_id,material,target_id,quote,reason,required_action}",
             "counts": "object {P0,P1,P2}",
@@ -315,12 +336,18 @@ def validate_result(report: Any, *, task: dict[str, Any]) -> list[str]:
 
 
 def record_result(package, report: dict[str, Any], *, task: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
-    errors = validate_result(report, task=task)
+    # ``job_id`` is execution context, not a semantic finding.  Lower-capability
+    # auditors should not have to reproduce a hidden routing field; bind it at
+    # the host boundary while still rejecting an explicit wrong ID.
+    bound_report = dict(report)
+    if not text(bound_report.get("job_id")):
+        bound_report["job_id"] = task.get("job_id")
+    errors = validate_result(bound_report, task=task)
     if errors:
         raise ValueError("invalid_vnext_audit_result: " + ", ".join(errors))
     findings: list[dict[str, Any]] = []
     history = dict(run.get("finding_history") or {})
-    for raw in report.get("findings") or []:
+    for raw in bound_report.get("findings") or []:
         item = dict(raw)
         item.setdefault("status", "open")
         fp = str(item.get("fingerprint") or _finding_fingerprint(item))

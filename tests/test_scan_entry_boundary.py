@@ -92,6 +92,115 @@ def test_push_preview_is_write_free_and_confirmation_allocates_id(tmp_path):
     assert is_assigned_job_id(store.read_active().rows[0]["岗位编号"])
 
 
+def test_confirmation_restores_bound_run_when_cli_omits_run_id(tmp_path):
+    from tools.workflow.fresh_store import MemoryFreshStore
+
+    ws = build_workspace(tmp_path)
+    scan = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "scan-bound-confirm",
+                "jobs": [{"title": "Analyst", "company": "Acme", "score": "4.0", "lane": "C"}],
+            },
+        },
+    )
+    store = MemoryFreshStore("fresh_bound_confirm", [])
+    preview = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={"run_id": scan["run_id"], "fresh_title": store.title},
+    )
+    confirmed = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={"confirmation_id": preview["proposal_id"]},
+    )
+    assert confirmed["status"] == "succeeded"
+    assert store.row_count() == 1
+
+
+def test_push_preview_can_bind_only_user_selected_rows(tmp_path):
+    from tools.workflow.fresh_store import MemoryFreshStore
+
+    ws = build_workspace(tmp_path)
+    scan = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "scan-selected-subset",
+                "jobs": [
+                    {"title": "Keep one", "company": "Acme", "url": "https://example.test/keep-1", "score": "4.0", "lane": "C"},
+                    {"title": "Skip one", "company": "Acme", "url": "https://example.test/skip", "score": "4.0", "lane": "C"},
+                    {"title": "Keep two", "company": "Acme", "url": "https://example.test/keep-2", "score": "4.0", "lane": "C"},
+                ],
+            },
+        },
+    )
+    store = MemoryFreshStore("fresh_selected_subset", [])
+    selected = ["https://example.test/keep-1", "https://example.test/keep-2"]
+    preview = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={
+            "run_id": scan["run_id"],
+            "fresh_title": store.title,
+            "selected_keys": selected,
+        },
+    )
+    assert preview["status"] == "planned"
+    assert preview["proposal"]["source_row_count"] == 3
+    assert preview["row_count"] == 2
+    assert {row["职位"] for row in preview["proposal"]["prepared_rows"]} == {"Keep one", "Keep two"}
+
+    confirmed = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={
+            "fresh_title": store.title,
+            "confirmation_id": preview["proposal_id"],
+        },
+    )
+    assert confirmed["status"] == "succeeded"
+    assert {row["职位"] for row in store.read_active().rows} == {"Keep one", "Keep two"}
+
+
+def test_push_selection_does_not_silently_drop_unknown_key(tmp_path):
+    from tools.workflow.fresh_store import MemoryFreshStore
+
+    ws = build_workspace(tmp_path)
+    scan = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "scan-selection-typo",
+                "jobs": [{"title": "Keep", "company": "Acme", "url": "https://example.test/keep", "score": "4.0"}],
+            },
+        },
+    )
+    out = dispatch(
+        "push",
+        workspace=ws,
+        store=MemoryFreshStore("fresh_selection_typo", []),
+        payload={
+            "run_id": scan["run_id"],
+            "selected_keys": ["https://example.test/keep", "https://example.test/does-not-exist"],
+        },
+    )
+    assert out["status"] == "blocked"
+    assert any(blocker.startswith("push_selection_key_not_found:") for blocker in out["blockers"])
+
+
 def test_confirmed_entry_is_newest_batch_and_demotes_previous_batch(tmp_path):
     from tools.workflow.fresh_store import MemoryFreshStore
 
@@ -229,6 +338,26 @@ def test_entry_allocator_ignores_preview_ids_and_preserves_existing_url():
     assert prepared[0]["岗位编号"] == "C0-017"
     assert is_assigned_job_id(prepared[1]["岗位编号"])
     assert prepared[0]["岗位编号"] != "SCAN-001"
+
+
+def test_entry_allocator_skips_ids_occupied_by_existing_material_packages(tmp_path):
+    ws = build_workspace(tmp_path)
+    occupied = ws / "01_Masters" / "C_track" / "核心" / "C0-001_未投_Old_Role"
+    occupied.mkdir(parents=True)
+    prepared = prepare_rows_for_entry(
+        [
+            {
+                "职位": "New role",
+                "公司": "Acme",
+                "链接": "https://example.test/new-role",
+                "CareerOps分数": "4.0",
+                "简历版本": "C",
+            }
+        ],
+        [],
+        workspace=ws,
+    )
+    assert prepared[0]["岗位编号"] == "C0-002"
 
 
 def test_entry_preview_does_not_consume_local_counter_and_confirm_advances_it(tmp_path):

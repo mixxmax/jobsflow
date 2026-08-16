@@ -140,6 +140,17 @@ def _plan_packet(
         "lane": bundle.get("lane"),
         "jd": bundle.get("jd"),
         "assessment": bundle.get("assessment") or {},
+        "company_research": bundle.get("company_research") or {},
+        "company_research_request": str(bundle.get("company_research_request") or ""),
+        "company_research_status": (
+            "verified"
+            if (bundle.get("company_research") or {}).get("quality", {}).get("ready_for_tailoring")
+            else (
+                "required"
+                if str(bundle.get("company_research_request") or "").strip()
+                else "jd_only_or_generic"
+            )
+        ),
         "candidate_profile": candidate_profile,
         "forbidden_claims": list(
             bundle.get("forbidden_claims")
@@ -161,6 +172,15 @@ def _plan_packet(
             ),
             "publisher_name_outbound": "forbidden",
             "model_may_edit": False,
+        },
+        "filename_contract": {
+            "source": "host_expected_filenames",
+            "model_may_edit": False,
+            "max_stem_chars": 80,
+            "company": "verified employer label only; recruiter names are never outbound; legal suffixes shorten only when the complete stem exceeds 80 characters",
+            "role": "one selected primary role; department/range noise shortens only when the complete stem exceeds 80 characters",
+            "compression_trigger": "host first builds the complete safe stem; no compression when it fits max_stem_chars",
+            "full_source_retention": "manifest and material content retain the complete source identity",
         },
         "baseline": {
             material: {
@@ -706,6 +726,43 @@ class MaterialsEngine:
         if stage in {"pdf", "convert", "pdf_generated"}:
             if not audit_current(package, run):
                 return {"status": "blocked", "blockers": ["content_audit_not_current"], "engine": "materials-vnext", "after_state": run.get("phase")}
+            current_phase = str(run.get("phase") or "")
+            if current_phase in {"pdf_generated", "format_passed", "apply_ready"} and not bool(payload.get("force")):
+                # A duplicate PDF request is safe to acknowledge only when
+                # both expected artifacts are still present.  Do not rerun
+                # conversion after format/apply, because that would make the
+                # mechanical receipt stale; report a precise missing-artifact
+                # blocker instead.
+                from tools.workflow.materials_renderer import expected_filenames
+
+                names = expected_filenames(package, Path(workspace))
+                missing = [
+                    names[key]
+                    for key in ("cv_pdf", "cl_pdf")
+                    if not (package / names[key]).is_file()
+                ]
+                if missing:
+                    return {
+                        "status": "blocked",
+                        "after_state": current_phase,
+                        "blockers": ["pdf_artifact_missing"],
+                        "missing": missing,
+                        "engine": "materials-vnext",
+                    }
+                return {
+                    "status": "succeeded",
+                    "after_state": current_phase,
+                    "conversion": {"status": "cached", "idempotent": True, "files": [names["cv_pdf"], names["cl_pdf"]]},
+                    "idempotent": True,
+                    "engine": "materials-vnext",
+                }
+            if current_phase in {"format_passed", "apply_ready"} and bool(payload.get("force")):
+                return {
+                    "status": "blocked",
+                    "after_state": current_phase,
+                    "blockers": ["pdf_rebuild_requires_reset"],
+                    "engine": "materials-vnext",
+                }
             try:
                 from tools.workflow.materials_renderer import convert_rendered_pdfs
 

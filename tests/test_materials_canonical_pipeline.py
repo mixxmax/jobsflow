@@ -50,6 +50,8 @@ def test_canonical_draft_launches_compact_cv_cl_only_audit(tmp_path):
         "cross_material_consistency",
         "grammar_fragments_and_template_residue",
     ]
+    assert task["filename_contract"]["model_may_edit"] is False
+    assert task["filename_contract"]["max_stem_chars"] == 80
     assert task["entity_contract"] == {
         "role_display": "Paralegal",
         "role_primary": "Paralegal",
@@ -193,6 +195,87 @@ def test_runtime_loader_accepts_records_nested_assessment_and_company_research(t
     assert "assessment_missing_or_stale" not in ctx.blockers
     assert "entity_contract_incomplete" not in ctx.blockers
     assert ctx.publisher_type == "employer"
+
+
+def test_runtime_loader_matches_preview_assessment_by_stable_job_url(tmp_path):
+    """A rescored preview record must survive durable tracker-ID allocation."""
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    snapshot_url = "https://example.test/C0-001"
+    snapshot = (package / "job_snapshot.md").read_text(encoding="utf-8")
+    (package / "job_snapshot.md").write_text(
+        snapshot.replace("https://example.test/C0-001", snapshot_url),
+        encoding="utf-8",
+    )
+    local_assessment = json.loads((package / "assessment.json").read_text(encoding="utf-8"))
+    (package / "assessment.json").unlink()
+    (ws / "02_Tracker" / "job_assessments" / "preview-record.json").write_text(
+        json.dumps(
+            {
+                "job": {
+                    "job_id": "preview-20260816-abc",
+                    "title": "Paralegal",
+                    "company": "Acme",
+                    "source": "user_paste",
+                    "url": snapshot_url,
+                },
+                "jd": {"sha256": local_assessment["jd_hash"]},
+                "strengths": local_assessment["strengths"],
+                "gaps": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ctx = PackageContextLoader(ws).load("C0-001")
+
+    assert ctx.assessment is not None
+    assert ctx.assessment["job"]["job_id"].startswith("preview-")
+    assert "assessment_missing_or_stale" not in ctx.blockers
+
+
+def test_unknown_publisher_creates_one_research_request_before_material_bundle(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False, publisher_type="unknown", publisher_name="Acme")
+    manifest = json.loads((package / "job_manifest.json").read_text(encoding="utf-8"))
+    manifest["job"]["company_out"] = ""
+    (package / "job_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    first = PackageContextLoader(ws).load("C0-001")
+    request = package / "company_research_request.json"
+    assert request.is_file()
+    request_bytes = request.read_bytes()
+    second = PackageContextLoader(ws).load("C0-001")
+
+    request_value = json.loads(request.read_text(encoding="utf-8"))
+    assert request_value["inputs"]["company"] == "Acme"
+    assert request_value["inputs"]["role"] == "Paralegal"
+    assert "company_research_required" in first.blockers
+    assert first.company_research_request == str(request)
+    assert second.company_research_request == str(request)
+    assert request.read_bytes() == request_bytes
+
+
+def test_audit_host_binds_job_id_when_child_omits_routing_field(tmp_path):
+    ws, package = _planned(tmp_path)
+    drafted = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package)},
+    )
+    task = drafted["audit_task_packet"]
+    report = {
+        "audit_scope": "jd_mapping_and_presentation",
+        "audit_input_fingerprint": task["audit_input_fingerprint"],
+        "auditor_context_id": task["auditor_context_id"],
+        "counts": {"P0": 0, "P1": 0, "P2": 0},
+        "findings": [],
+    }
+    out = dispatch("audit", workspace=ws, payload={"job_id": "C0-001", "audit_result": report})
+    assert out["status"] == "succeeded"
+    stored = json.loads((package / "materials_vnext" / "audit_result.json").read_text(encoding="utf-8"))
+    assert stored["job_id"] == "C0-001"
 
 
 def test_batch_clamps_parallelism_and_isolates_job_failures(tmp_path, monkeypatch):

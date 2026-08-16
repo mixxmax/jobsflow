@@ -14,12 +14,19 @@ POLICIES_PATH = Path(__file__).with_name("policies.json")
 ACTION_RULES: dict[str, dict[str, Any]] = {
     "scan": {
         "autonomy": "A0",
-        "rule_ids": ["SCAN-001", "FRESH-001"],
+        "rule_ids": ["SCAN-001", "SCAN-002", "FRESH-001"],
         "requires_confirmation": False,
     },
     "push": {
         "autonomy": "A0",
-        "rule_ids": ["PUSH-001", "FRESH-001", "SYNC-001", "SYNC-004"],
+        "rule_ids": [
+            "PUSH-001",
+            "PUSH-002",
+            "PUSH-003",
+            "FRESH-001",
+            "SYNC-001",
+            "SYNC-004",
+        ],
         "requires_confirmation": True,
     },
     "promote": {
@@ -110,6 +117,37 @@ def decide(request: ActionRequest) -> PolicyDecision:
             rule_ids=[],
             blockers=["unknown_action"],
             next_action=None,
+        )
+    payload = request.payload or {}
+    # These are deliberately small, product-wide SOP guards.  They protect
+    # the high-risk boundaries even when a lower-capability model supplies a
+    # plausible-looking but out-of-contract payload.  The adapters remain the
+    # source of truth for row/hash/state validation; this layer only rejects
+    # attempts to bypass the declared entrypoint or invent side effects.
+    forbidden_by_action = {
+        "scan": {
+            "assign_ids", "allocate_ids", "write_tracker", "append_tracker",
+            "generate_materials", "create_package", "create_cv", "create_cl",
+            "render_docx", "render_pdf",
+        },
+        "push": {
+            "prepared_rows", "rows", "write_rows", "direct_write", "append_tracker",
+            "clear_fresh", "archive", "generate_materials", "create_cv", "create_cl",
+            "render_docx", "render_pdf",
+        },
+        "materials": {"legacy_pipeline", "direct_docx", "direct_pdf", "direct_convert"},
+    }
+    forbidden = sorted(
+        key for key in forbidden_by_action.get(request.action, set())
+        if payload.get(key)
+    )
+    if forbidden:
+        return PolicyDecision(
+            allowed=False,
+            rule_ids=list(spec["rule_ids"]),
+            blockers=["sop_boundary_violation", *forbidden],
+            next_action=None,
+            autonomy_level=spec["autonomy"],
         )
     confirmation_id = request.confirmation_id or (request.payload or {}).get("proposal_id")
     needs_confirm = bool(spec["requires_confirmation"])

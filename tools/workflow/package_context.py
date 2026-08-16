@@ -12,9 +12,13 @@ from tools.job_materials.jd_store import jd_meta, package_id_from_path, read_jd
 from tools.job_materials.manifest import derive_tier, load_job_manifest, parse_job_id, reconcile_package_metadata
 from tools.job_materials.paths import load_lanes
 from tools.job_materials.packages import validate_package_binding
-from tools.job_materials.publisher import classify_publisher
+from tools.job_materials.company_research import (
+    load_company_research,
+    write_company_research_request,
+)
+from tools.job_materials.publisher import classify_publisher, snapshot_context
 from tools.workflow.id_allocation import is_assigned_job_id
-from tools.fresh_24h.job_assessment import jd_fingerprint
+from tools.fresh_24h.job_assessment import assessment_identity, jd_fingerprint
 from tools.workflow.materials_contract import build_entity_contract
 from tools.workflow.profile_facts import load_profile_facts
 
@@ -87,6 +91,7 @@ class MaterialsContext:
     employer_name: str = ""
     role_primary: str = ""
     company_research: dict[str, Any] = field(default_factory=dict)
+    company_research_request: str = ""
     forbidden_claims: list[str] = field(default_factory=list)
     manifest: dict[str, Any] = field(default_factory=dict)
     artifacts: dict[str, Any] = field(default_factory=dict)
@@ -142,6 +147,41 @@ class PackageContextLoader:
         if meta.get("is_shallow") or ctx.jd_depth not in {"deep", "ok"}:
             ctx.blockers.append("missing_full_jd")
 
+        # Resolve the package entity before loading per-job assessment.  The
+        # tracker may have assigned a durable ID after scoring, while the
+        # assessment writer intentionally kept a ``preview-*`` ID.  URL/title
+        # identity is the stable bridge between those two lifecycle stages.
+        manifest = reconciled_manifest or load_job_manifest(package) or {}
+        ctx.manifest = manifest
+        manifest_job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
+        snapshot = snapshot_context(package)
+        assessment_url = str(
+            meta.get("url")
+            or manifest_job.get("url")
+            or snapshot.get("source_url")
+            or ""
+        )
+        assessment_title = str(
+            manifest_job.get("role_material")
+            or manifest_job.get("role_display")
+            or snapshot.get("role")
+            or ""
+        )
+        assessment_company = str(
+            manifest_job.get("publisher_name")
+            or manifest_job.get("company_source")
+            or manifest_job.get("company_out")
+            or snapshot.get("publisher_name")
+            or snapshot.get("company")
+            or ""
+        )
+        assessment_source = str(
+            meta.get("source")
+            or manifest_job.get("source")
+            or snapshot.get("source")
+            or ""
+        )
+
         facts = _read_json(self.workspace / "00_Profile" / "fact_evidence.json") or {}
         ctx.profile_facts = load_profile_facts(self.workspace)
         ctx.profile_fact_ids = [
@@ -177,7 +217,16 @@ class PackageContextLoader:
 
         assessment = (
             _read_json(package / "assessment.json")
-            or _latest_assessment(self.workspace, ctx.job_id, ctx.jd_hash, legacy_jd_hash=_sha(ctx.jd_text))
+            or _latest_assessment(
+                self.workspace,
+                ctx.job_id,
+                ctx.jd_hash,
+                legacy_jd_hash=_sha(ctx.jd_text),
+                url=assessment_url,
+                title=assessment_title,
+                company=assessment_company,
+                source=assessment_source,
+            )
         )
         ctx.assessment = assessment if isinstance(assessment, dict) else None
         if ctx.assessment is None:
@@ -207,11 +256,35 @@ class PackageContextLoader:
             if ctx.unanswered_hard:
                 ctx.blockers.append("unresolved_hard_requirement")
 
-        research = _read_json(package / "company_research.json") or {}
+        # Reuse a verified package brief or the shared company cache before
+        # classifying the publisher.  This prevents a new package from
+        # rediscovering an already researched company and keeps the same
+        # research object in the current-job bundle and plan packet.
+        research_company = str(
+            manifest_job.get("publisher_name")
+            or manifest_job.get("company_source")
+            or manifest_job.get("company_out")
+            or snapshot.get("publisher_name")
+            or snapshot.get("company")
+            or ""
+        )
+        research = load_company_research(
+            package,
+            root=self.workspace,
+            company=research_company,
+        )
+        # ``load_company_research`` returns a normalized empty object with a
+        # fresh timestamp when neither a package brief nor a shared cache
+        # exists.  That timestamp is not an input and would make an otherwise
+        # unchanged bundle look stale on every resume.  Keep the absence as a
+        # stable empty object; real package/cache research remains intact.
+        if (
+            not (package / "company_research.json").is_file()
+            and not bool((research.get("cache") or {}).get("hit"))
+        ):
+            research = {}
         ctx.company_research = research if isinstance(research, dict) else {}
-        manifest = reconciled_manifest or load_job_manifest(package) or {}
-        ctx.manifest = manifest
-        job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
+        job = manifest_job
         ctx.publisher_type = str(research.get("publisher_type") or job.get("publisher_type") or "unknown").casefold()
         ctx.publisher_name = str(research.get("publisher_name") or job.get("publisher_name") or "")
         # A recruitment agency is a publisher, not the hiring employer.  The
@@ -240,12 +313,32 @@ class PackageContextLoader:
                 publisher_name=ctx.publisher_name or str(job.get("company_source") or ""),
                 publisher_type=ctx.publisher_type,
                 employer_name=ctx.employer_name,
-                source_url=str(job.get("url") or ""),
+                source_url=str(meta.get("url") or job.get("url") or snapshot.get("source_url") or ""),
                 jd_text=ctx.jd_text,
             )
             ctx.publisher_type = str(classified.get("publisher_type") or "unknown").casefold()
             ctx.publisher_name = str(classified.get("publisher_name") or ctx.publisher_name)
             ctx.employer_name = str(classified.get("application_target") or ctx.employer_name)
+        if ctx.publisher_type == "unknown":
+            # Keep the blocker explicit and actionable.  We do not invent a
+            # company classification; instead, create one deterministic,
+            # source-aware request that the next model can fulfil.  Existing
+            # requests are reused, so repeated context loads never fan out
+            # files or model calls.
+            request_path = package / "company_research_request.json"
+            if not request_path.is_file():
+                request_path = write_company_research_request(
+                    package,
+                    company=research_company,
+                    role=str(ctx.role_primary or assessment_title or snapshot.get("role") or ""),
+                    jd_text=ctx.jd_text,
+                    publisher_name=ctx.publisher_name or research_company,
+                    source_url=str(meta.get("url") or job.get("url") or snapshot.get("source_url") or ""),
+                    publisher_type=ctx.publisher_type,
+                    employer_name=ctx.employer_name,
+                )
+            ctx.company_research_request = str(request_path)
+            ctx.blockers.append("company_research_required")
         # An undisclosed recruiter client is valid and must remain unnamed;
         # only the role and publisher boundary are mandatory here.
         if ctx.publisher_type == "unknown" or not ctx.role_primary:
@@ -316,10 +409,27 @@ class PackageContextLoader:
         return ctx
 
 
-def _latest_assessment(root: Path, job_id: str, jd_hash: str, *, legacy_jd_hash: str = "") -> dict[str, Any] | None:
+def _latest_assessment(
+    root: Path,
+    job_id: str,
+    jd_hash: str,
+    *,
+    legacy_jd_hash: str = "",
+    url: str = "",
+    title: str = "",
+    company: str = "",
+    source: str = "",
+) -> dict[str, Any] | None:
     folder = root / "02_Tracker" / "job_assessments"
     if not folder.is_dir():
         return None
+    expected_key, _ = assessment_identity(
+        url=url,
+        title=title,
+        company=company,
+        source=source,
+    )
+    identity_inputs_present = bool(url or title or company or source)
     for path in sorted(folder.glob("*.json"), reverse=True):
         data = _read_json(path)
         if not isinstance(data, dict):
@@ -331,7 +441,20 @@ def _latest_assessment(root: Path, job_id: str, jd_hash: str, *, legacy_jd_hash:
             or (data.get("input_signature") or {}).get("jd_sha256")
             or ""
         )
-        if stored_job == job_id and (not jd_hash or not stored_jd or stored_jd in {jd_hash, legacy_jd_hash}):
+        stored = data.get("job") if isinstance(data.get("job"), dict) else {}
+        stored_key, _ = assessment_identity(
+            url=str(stored.get("url") or data.get("url") or ""),
+            title=str(stored.get("title") or data.get("title") or ""),
+            company=str(stored.get("company") or data.get("company") or ""),
+            source=str(stored.get("source") or data.get("source") or ""),
+        )
+        # Durable job IDs are preferred, but rescoring may persist a preview
+        # key.  The assessment writer also stores a canonical URL identity;
+        # use it when the package has since received its A0/B0-style ID.
+        identity_match = stored_job == job_id or (
+            identity_inputs_present and stored_key == expected_key
+        )
+        if identity_match and (not jd_hash or not stored_jd or stored_jd in {jd_hash, legacy_jd_hash}):
             return data
     return None
 

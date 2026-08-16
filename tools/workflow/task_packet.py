@@ -151,6 +151,15 @@ def build_task_packet(
                 "undisclosed recruiter client never becomes the company."
             ),
         },
+        "filename_contract": {
+            "source": "host_expected_filenames",
+            "model_may_edit": False,
+            "max_stem_chars": 80,
+            "company": "use a verified employer label; omit recruiter names; legal suffixes may be shortened only when the complete stem exceeds 80 characters",
+            "role": "use one selected primary role; remove department/range noise only when the complete stem exceeds 80 characters; retain full role in manifest/content",
+            "compression_trigger": "host first builds the complete safe stem; compression is off when it is at or below max_stem_chars",
+            "collision_boundary": "package manifest and job ID remain the internal identity; do not append arbitrary model text",
+        },
         "company_research": company_research,
         "company_research_status": research_status,
         "page_budget": {"cv": 1, "cover_letter": 1},

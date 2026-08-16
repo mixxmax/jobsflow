@@ -46,6 +46,30 @@ def test_renderer_is_bound_to_lane_master_styles(tmp_path):
     assert receipt["template_sha256"]["cv"]
 
 
+def test_renderer_bounds_long_company_and_role_filename(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    manifest = json.loads((package / "job_manifest.json").read_text(encoding="utf-8"))
+    legal_company = "Industrial and Commercial Bank of China (Asia) Limited"
+    manifest["job"].update(
+        {
+            "publisher_type": "employer",
+            "publisher_name": legal_company,
+            "company_out": legal_company,
+            "employer_name": legal_company,
+            "role_material": "Officer to Assistant Manager, CDD, Channel Management Dept",
+            "role_display": "Officer to Assistant Manager, CDD, Channel Management Dept",
+        }
+    )
+    (package / "job_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    from tools.workflow.materials_renderer import expected_filenames
+
+    names = expected_filenames(package, ws)
+    assert names["cv_pdf"] == "Test Candidate ICBC Asia CDD Channel Management CV.pdf"
+    assert len(names["cv_pdf"].removesuffix(".pdf").removesuffix(" CV")) <= 80
+
+
 def test_renderer_refuses_to_fall_back_to_plain_document(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws)

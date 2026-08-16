@@ -26,6 +26,8 @@ python3 tools/fresh_24h/validate_queries.py \
 ```bash
 ./tools/fresh_24h/temp_two_pass.sh temp
 python3 -m tools.workflow push --run-id <scan-run-id>
+# 用户只确认部分岗位时，按 URL/scan_id/已有岗位编号筛选
+python3 -m tools.workflow push --run-id <scan-run-id> --select <key1>,<key2>
 # Review the proposal, then confirm it explicitly:
 python3 -m tools.workflow push --run-id <scan-run-id> --confirm <proposal-id>
 ```
@@ -42,6 +44,10 @@ Only the second command, with the same unexpired proposal, merges selected
 scored rows into the local CSV or optional Google Sheets projection. Permanent
 IDs are assigned at that boundary. Direct legacy tracker-writing scripts are
 disabled.
+The optional `--select` is applied only during the write-free preview and is
+bound into the proposal; confirmation cannot silently broaden or replace that
+selection. A confirmation may omit `--run-id` because the gateway restores the
+run bound to the proposal.
 
 For Google Sheets, the local workflow ledger is authoritative. Normal additive
 entry inserts the confirmed batch in one bulk operation and keeps older rows;

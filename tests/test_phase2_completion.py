@@ -169,6 +169,23 @@ def test_public_material_lifecycle_reaches_apply_ready_state(tmp_path):
     assert state.phase == "apply_ready"
 
 
+def test_pdf_stage_is_idempotent_after_first_conversion(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws)
+    prepare_package_for_apply(ws)
+
+    out = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": "C0-001", "stage": "pdf_generated"},
+    )
+
+    assert out["status"] == "succeeded"
+    assert out["idempotent"] is True
+    assert out["conversion"]["status"] == "cached"
+    assert load_entity_state(ws, "materials", "C0-001").phase == "format_passed"
+
+
 def test_cli_entrypoints_drive_the_complete_synthetic_chain(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws)

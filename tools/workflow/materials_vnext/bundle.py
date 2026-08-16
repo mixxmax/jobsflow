@@ -179,6 +179,10 @@ def build_bundle(workspace: Path, job_id: str, *, force: bool = False) -> tuple[
             source_mismatches.append("assessment")
         if digest(existing.get("preflight") or {}) != digest(ctx.preflight or {}):
             source_mismatches.append("preflight")
+        if digest(existing.get("company_research") or {}) != digest(ctx.company_research or {}):
+            source_mismatches.append("company_research")
+        if text(existing.get("company_research_request") or "") != text(ctx.company_research_request or ""):
+            source_mismatches.append("company_research_request")
         baseline = existing.get("baseline") if isinstance(existing.get("baseline"), dict) else {}
         for material in ("cv", "cover_letter"):
             blocks = (baseline.get(material) or {}).get("blocks") if isinstance(baseline.get(material), dict) else None
@@ -242,6 +246,8 @@ def build_bundle(workspace: Path, job_id: str, *, force: bool = False) -> tuple[
         profile_facts=tuple(dict(item) for item in ctx.profile_facts if isinstance(item, dict)),
         assessment=dict(ctx.assessment or {}),
         preflight=dict(ctx.preflight or {}),
+        company_research=dict(ctx.company_research or {}),
+        company_research_request=str(ctx.company_research_request or ""),
         entity=entity,
         baseline=baseline,
         rules_digest=str(rules.get("rules_digest") or ""),

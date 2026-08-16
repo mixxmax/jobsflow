@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from tools.job_materials.role_titles import normalize_role_for_material
+from tools.job_materials.filename_policy import build_filename_stem
 
 
 PUBLISHER_TYPES = {"employer", "recruiter", "unknown"}
@@ -337,14 +337,15 @@ def build_material_filenames(
     kind = _clean(classification.get("publisher_type")).casefold() or "unknown"
     # Keep one material-facing title.  The source title and any alternatives
     # remain in the private manifest; filenames must not silently combine A/B.
-    material_role = normalize_role_for_material(role)
-    parts = [
-        _filename_part(candidate_name),
-        _filename_part(employer),
-        _filename_part(material_role, "Application"),
-    ]
-    stem = "_".join(part for part in parts if part)
-    stem = stem[:140].strip("._") or "Application"
+    # The shared host policy also bounds long legal company names and title
+    # ranges without changing the full role/company stored elsewhere.
+    stem_info = build_filename_stem(
+        candidate=candidate_name,
+        company=employer,
+        role=role,
+        separator="_",
+    )
+    stem = str(stem_info.get("stem") or "Application")
     omitted = publisher if kind == "recruiter" and publisher else ""
     return {
         "cv_docx": f"{stem}_CV.docx",
@@ -355,6 +356,7 @@ def build_material_filenames(
         "publisher_type": kind,
         "employer_name_used": employer,
         "publisher_name_omitted": omitted,
+        "filename_stem_policy": stem_info,
         "policy": (
             "Use verified employer name only; omit recruiter/agency name from all outbound filenames."
             if omitted

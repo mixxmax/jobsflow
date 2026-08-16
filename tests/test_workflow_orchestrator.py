@@ -95,3 +95,23 @@ def test_apply_never_submits(tmp_path):
     assert "submit" not in (result.get("side_effects") or [])
     assert result.get("submitted") is not True
     assert "APPLY-001" in (result.get("rule_ids") or ["APPLY-001"])
+
+
+def test_sop_guard_rejects_model_bypass_payloads(tmp_path):
+    scan = dispatch(
+        "scan",
+        workspace=tmp_path,
+        payload={"mode": "temp", "assign_ids": True, "fixture": {"run_id": "sop-scan", "jobs": []}},
+        now=_now(),
+    )
+    assert scan["status"] == "blocked"
+    assert "sop_boundary_violation" in scan["blockers"]
+
+    push = dispatch(
+        "push",
+        workspace=tmp_path,
+        payload={"run_id": "sop-push", "prepared_rows": [{"岗位编号": "C0-001"}]},
+        now=_now(),
+    )
+    assert push["status"] == "blocked"
+    assert "sop_boundary_violation" in push["blockers"]

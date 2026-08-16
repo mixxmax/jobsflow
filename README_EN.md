@@ -20,7 +20,7 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-08-15
+## 🆕 Latest update · 2026-08-17 · v0.9.5
 
 - **A code-governed workflow instead of model self-discipline:** the unified
   gateway, policy registry, state machine, task packets, and postconditions now
@@ -61,6 +61,24 @@ and how to tailor the application without giving up final control.
 - **Better for models with limited capability:** models handle bounded semantic
   judgment and wording, while salary, language, qualification, state changes,
   evidence binding, and high-impact side effects remain deterministic.
+- **One governed SOP across all runtime lines:** `tools/` is the only product
+  implementation. The gateway, state machine, task packets, confirmation
+  boundaries and postconditions prevent a model from switching entry points or
+  writing a side effect at the wrong stage.
+- **The material chain is now baseline-anchored:** each lane's complete CV and
+  Cover Letter master is the content baseline. The main model submits a bounded
+  JD delta; the host compiles canonical CV/CL, automatically runs an independent
+  CV/CL-only audit, renders through the lane DOCX master, converts to PDF, and
+  runs deterministic format gates. Email is host-generated after content passes.
+- **JobsDB is cache-first with controlled human recovery:** in a private runtime,
+  a Cloudflare challenge may open in the user's own daily Chrome; the user clicks
+  once, then the same session is reused sequentially for validated detail pages.
+  There is no headless verification, cookie copying, personal token, or infinite
+  retry. CTgoodjobs remains on its existing structured/cache path; private token
+  integrations are not part of the public release.
+- **Lane and ID boundaries are explicit:** deep review locks a URL to one lane;
+  scan previews have no persistent job ID. Only confirmed `/push` allocates the
+  next lane/tier sequence and binds the tracker row to its package.
 
 - **Fewer wrong applications and fewer silent misses:** pass 1 schedules work;
   the full JD determines the final score, while insufficient-JD rows stay visible.
@@ -77,6 +95,35 @@ and how to tailor the application without giving up final control.
 | Reuses one resume everywhere | Builds direction-specific bases, then tailors per JD |
 | Silently skips what a weaker model missed | Enforces schemas, gates, source checks and coverage checks |
 | Uses a fixed industry template | Generates industry-aware directions from your CV and intent |
+
+## Product structure: standards, inputs, outputs and hand-offs
+
+| Stage | Non-negotiable standard | User action | Main output | Downstream hand-off |
+|---|---|---|---|---|
+| `/setup` / `/intent` | Confirm facts, intent, constraints, language/salary/location and scan preferences | Run setup once; preview and confirm later changes | Private profile, queries, scoring policy and lane mapping | Single profile source for scan and materials |
+| `/scan` | Cache first; pass 1 routes deep work; rescue missing teasers and gray bands | Run temp, daily or a chosen window | Job list, lane/tier preview, scores, JD depth and assessments | Display only: no tracker write, materials or persistent ID |
+| `/push` | Write-free proposal first; explicit confirmation is the side-effect boundary | Review/select jobs, then confirm | Local ledger, CSV/optional Sheets projection, persistent ID and bound package | Only confirmed jobs can enter `/materials` |
+| `/materials` | Independent CV/CL baseline deltas; content audit before rendering | Name one entered job | Canonical CV/CL, audit receipt, DOCX, PDF and host email | All content/format gates must pass before `/apply` |
+| `/apply` | Recheck current inputs and gates; never submit | Review the package and decide | `apply_ready` plus a submission checklist | The user performs the final submission |
+
+```text
+CV + intent → setup/intent → scan (cache → route → deep JD → score → lock lane)
+                                  │
+                         preview only: no ID, no tracker write
+                                  ▼
+              push preview → user confirm → ledger/CSV/Sheets + ID + package
+                                  ▼
+   materials: lane masters + JD delta → canonical → independent CV/CL audit
+                                  → lane DOCX → PDF → deterministic format gate
+                                  ▼
+                         apply_ready (user submits)
+```
+
+The baseline-first material strategy is the main cost control: the main model
+submits only `rewrite / reorder / merge / add` operations, the host retains every
+unmentioned baseline block, and the child auditor focuses on the delta before one
+compact full-document sweep. This avoids rebuilding a résumé from scratch for
+every posting while keeping output quality bounded for less capable models.
 
 ## Quick start
 
@@ -98,6 +145,7 @@ Then use:
 ```text
 /scan
 /push (preview only; confirm the proposal before writing)
+/push --select <url-or-scan-id>,<...> (preview only selected jobs)
 /push --confirm <proposal-id> (or --local-only --confirm for CSV-only)
 /materials C0-005 C
 /apply C0-005 C
@@ -248,9 +296,13 @@ by default; inspect or confirm an ambiguous choice with
 `python3 -m tools.job_materials role show` and `role choose`. Parentheses that express a
 real specialism, such as `Paralegal (Corporate Funds)`, remain intact. Only
 obvious location, contract/work-arrangement or identifier metadata parentheses
-are removed from the material-facing title. Filenames do not replace
-parentheses with a short dash or comma, and the Cover Letter normally names the
-primary role once rather than listing alternatives.
+are removed from the material-facing title. The host generates the outbound
+filename: when the complete safe stem is at or below 80 characters it preserves
+the source label as far as path safety allows; only an over-80 stem may shorten
+legal company suffixes, title ranges or department tails. This is filename-only
+compression: the full company and role remain in the manifest/material content,
+and the Cover Letter normally names the primary role once rather than listing
+alternatives.
 
 A deterministic preflight extracts salary, availability, work authorization, language/licence, experience and attachment requirements. A separate language gate compares explicit job-language requirements with the private language profile: an undeclared required language is excluded, a potentially higher level is flagged for human judgment, and the language used to write the advert is not mistaken for a job requirement. Salary parsing also handles localized numbers, range hyphens, and `k/M/B` or `千/万/亿` amount suffixes; ambiguous formats stay neutral and visible for confirmation. The system then produces an evidence map, four-slot cover-letter blueprint and quality gate, so models with different capability levels follow the same analysis rather than improvising or silently skipping questions.
 
@@ -312,8 +364,29 @@ Supported sources are LinkedIn, JobsDB, CTgoodjobs and FreeHire. Browser automat
 |---|:---:|:---:|---|
 | LinkedIn | ✓ | ✓ | Deep JD is preferred and cached for reuse |
 | JobsDB | ✓ | Partial | Paste the full JD when preparing materials |
-| CTgoodjobs | ✓ | Partial | Paste the full JD when preparing materials |
+| CTgoodjobs | ✓ | Partial | Existing structured/cache path; paste the full JD when preparing materials; no personal token is shipped |
 | FreeHire | ✓ | Manual | Additional job source; detail can be queried by posting ID |
+
+### JobsDB recovery: one human verification, then bounded reuse
+
+JobsDB is the main portal that may require a browser fallback. Its fixed order is:
+
+1. Check the URL-keyed JD cache first. A valid cache hit opens no browser and uses no
+   deep-fetch budget.
+2. If the full JD is not cached, make a bounded detail request. WAF, Cloudflare, 429
+   and empty-shell results are not retried indefinitely; consecutive challenges open a
+   portal circuit and remaining jobs become `paste_needed` / `provisional_needs_jd`.
+3. In a private runtime instance, the system may hand off once to the user's daily
+   Google Chrome. A real verification window appears; the user clicks the Cloudflare
+   challenge once. After a structurally validated JD is visible, the same Chrome
+   session is reused sequentially for the remaining JobsDB details in that run.
+4. This is not headless verification and does not copy cookies into another browser.
+   Failed verification, timeout, 429 or unvalidated content never closes the breaker.
+   Browser profiles, cookies and personal tokens stay outside GitHub.
+
+The public product ships the controlled interface and safe defaults; the private
+runtime enables the user-Chrome handoff. JobsDB never auto-generates materials, enters
+the tracker, or submits an application.
 
 ## Folder + tracker: a portable application workspace
 
@@ -408,3 +481,10 @@ pytest -q
 ```
 
 See [PUBLIC_RELEASE.md](PUBLIC_RELEASE.md) for release hygiene and history handling.
+
+## Version
+
+**0.9.5** — governed SOP gateway and state machine, locked lane/confirmed entry,
+baseline-anchored bounded material tailoring, independent CV/CL content audit,
+fixed lane-master DOCX/PDF rendering, cached JD retrieval and controlled JobsDB
+recovery.
