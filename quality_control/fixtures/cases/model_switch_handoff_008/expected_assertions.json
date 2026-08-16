@@ -1,0 +1,10 @@
+[
+  {
+    "assertion_id": "TAKEOVER-002",
+    "status": "pass"
+  },
+  {
+    "assertion_id": "TAKEOVER-003",
+    "status": "pass"
+  }
+]

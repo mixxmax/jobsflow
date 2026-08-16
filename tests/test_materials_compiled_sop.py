@@ -149,6 +149,20 @@ def test_cross_material_number_not_supported_by_cv_fails():
     assert "numbers_inconsistent" in {item["code"] for item in report["errors"]}
 
 
+def test_parallel_cv_cl_numbers_are_validated_against_shared_profile_facts():
+    packet = _packet(
+        outbound={
+            **_packet()["outbound"],
+            "numbers": {"cv": ["7.5"], "cl": ["7.5", "95"], "email": []},
+            "approved_numbers": ["7.5", "95"],
+        }
+    )
+
+    report = validate_materials_packet(packet)
+
+    assert "numbers_inconsistent" not in {item["code"] for item in report["errors"]}
+
+
 def test_missing_required_attachment_fails():
     packet = _packet(
         outbound={

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tools.workflow.engine import dispatch
 from tools.workflow.entity_state import load_entity_state
 from tools.workflow.package_validator import MaterialsPackageValidator
@@ -31,6 +33,7 @@ def test_push_without_scored_artifact_does_not_invent_placeholder(tmp_path):
         assert not any((row.get("链接") or "").startswith("https://example.test/j/1") for row in data.get("rows") or [])
 
 
+@pytest.mark.legacy
 def test_empty_outbound_package_is_not_apply_ready(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws)
@@ -47,6 +50,7 @@ def test_empty_outbound_package_is_not_apply_ready(tmp_path):
     assert "required_outbound_missing" in codes or "missing_cv" in codes or "missing_cv_pdf" in codes
 
 
+@pytest.mark.legacy
 def test_jd_edit_invalidates_previous_apply_ready(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws)
@@ -60,6 +64,7 @@ def test_jd_edit_invalidates_previous_apply_ready(tmp_path):
     assert "stale_input_used" in second["blockers"]
 
 
+@pytest.mark.legacy
 def test_transferable_wording_is_not_an_authorization_gate_before_validated_plan(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws, with_plan=False, with_outbound=False)
@@ -84,6 +89,7 @@ def test_transferable_wording_is_not_an_authorization_gate_before_validated_plan
     assert (package / "materials_plan.validated.json").exists()
 
 
+@pytest.mark.legacy
 def test_apply_from_idle_does_not_walk_unexecuted_phases(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws)

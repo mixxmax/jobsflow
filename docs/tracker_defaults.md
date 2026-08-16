@@ -92,12 +92,12 @@ See `tools/fresh_24h/README.md` and `tools/fresh_24h/AGENT_REFRESH.md`.
 
 ```bash
 # Only when you select a specific package (never triggered by scan/push)
-python3 -m tools.job_materials pipeline \
-  --package 'JobSearch_2026/01_Masters/.../C0-xxx_...' \
-  --lane C
+python3 -m tools.workflow materials --job-id C0-xxx
 ```
 
-- A-F **base versions** need fact-check; single-job tailor **only reorders emphasis**.
+- A-F **base versions** need fact-check; the gateway applies a bounded delta to
+  the selected lane masters and retains unmentioned blocks.
+- The legacy `tools.job_materials tailor/pipeline` authoring path is blocked.
 - Deep full text: **LinkedIn primary**; CT/JobsDB use `jd set` paste.
 - PDF: `docx_to_pdf.py` with LibreOffice headless (see `docs/system_rules.md`)
 
@@ -148,6 +148,11 @@ python3 -m tools.job_materials pipeline \
 - **推送闸门**：统一 workflow `push`（包括 `--local-only`）默认拒绝含
   pending 任务的行；先执行 `list → show → complete` 并重跑评分。只有明确的
   `--allow-pending-semantic` 诊断覆盖才会继续入表。
+- **双层完成条件**：深评的 `position_profile`（lane/公司性质）与
+  `semantic_resume_match`（画像/简历匹配）是两个独立任务；只完成其中一层仍
+  保持 `semantic_pending`，两层都完成后才成为 `semantic_ready`。评分器重跑后会
+  自动按最终 scored CSV sidecar 更新对应 workflow run 的 `scored_hash`、pending
+  数量和任务键，禁止手工改 `run.json` 或绕过 `/push`。
 - **画像分层**：`facts_anchor` 是可作为经历陈述的事实基线；`capability_upper` 只能用于可迁移潜力判断，不能写成已做过的实操经验。
 - **上沿校准**：`/setup` 会询问低（保守）/中（平衡）/高（扩展）。该选择只改变语义迁移的范围和确定性分数上限，不会解除事实、资格或禁止声称守卫。
 - **画像固定**：画像不随单个职位变化，agent 只负责「画像 ↔ JD」的比较匹配，替代原关键词匹配。

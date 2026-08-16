@@ -1,7 +1,9 @@
 # Cover Letter Template and Tailoring Guide
 
 Cover letters are produced from private, fact-checked evidence and a sourced
-company brief. Public files contain no filled candidate story.
+company brief. The lane Cover Letter master is the content baseline as well as
+the format template: tailor a focused set of blocks and retain the rest. Public
+files contain no filled candidate story.
 
 ## Four-paragraph blueprint
 

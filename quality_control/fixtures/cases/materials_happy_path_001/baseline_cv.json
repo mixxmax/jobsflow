@@ -1,0 +1,29 @@
+{
+  "sections": [
+    {
+      "id": "summary",
+      "heading": "Professional Summary",
+      "content": "Staff/Lead Engineer specializing in distributed platforms and high-reliability data pipelines."
+    },
+    {
+      "id": "skills",
+      "heading": "Core Competencies",
+      "content": "Python, Go, Architecture, Distributed Tracing, Testing Harnesses"
+    },
+    {
+      "id": "experience",
+      "heading": "Experience",
+      "items": [
+        {
+          "role": "Senior Engineer",
+          "company": "Synthetic Corp",
+          "period": "2021 - Present",
+          "bullets": [
+            "Built distributed testing harness supporting 10k daily evaluations with sub-second latency.",
+            "Led Python service decoupling reducing deployment failure rates by 35%."
+          ]
+        }
+      ]
+    }
+  ]
+}

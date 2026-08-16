@@ -88,13 +88,21 @@ def validate_materials_packet(
             errors.append(_error("MAT-002", "language_inconsistent", values=sorted(values)))
     numbers = outbound.get("numbers") or {}
     if numbers:
-        # The CV is the evidence-dense superset; the cover letter and email
-        # are projections of it.  Cross-material drift is a number those
-        # projections cite that the CV does not verify — not a density
-        # difference between the documents.
-        baseline = {str(x) for x in (numbers.get("cv") or [])}
-        for label in ("cover_letter", "cl", "email"):
-            strays = sorted({str(x) for x in (numbers.get(label) or [])} - baseline)
+        # CV and Cover Letter are parallel projections of the shared profile,
+        # not evidence authorities for one another.  New workflow packets
+        # therefore provide profile/baseline-approved values.  The CV fallback
+        # exists only for old packets created before this contract.
+        supplied_approved = outbound.get("approved_numbers")
+        approved = {
+            str(x)
+            for x in (
+                supplied_approved
+                if isinstance(supplied_approved, list)
+                else (numbers.get("cv") or [])
+            )
+        }
+        for label in ("cv", "cover_letter", "cl", "email"):
+            strays = sorted({str(x) for x in (numbers.get(label) or [])} - approved)
             if strays:
                 errors.append(_error("MAT-002", "numbers_inconsistent", material=label, stray=strays))
 

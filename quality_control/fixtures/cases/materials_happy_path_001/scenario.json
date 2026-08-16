@@ -1,0 +1,12 @@
+{
+  "case_id": "materials_happy_path_001",
+  "description": "Happy path for materials pipeline with full compliance: plan, draft, child audit, rendering, and format check.",
+  "target_stage": "materials",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": ["submit_plan", "submit_draft", "render_materials", "format_check"],
+  "forbidden_actions": ["scan", "push", "unauthorized_write"],
+  "model_behavior": "happy_path",
+  "allow_model_switch": false,
+  "expected_verdict": "pass",
+  "expected_blocking_assertions": []
+}

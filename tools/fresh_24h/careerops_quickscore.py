@@ -504,6 +504,36 @@ def _semantic_task_key(title: str, company: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def _jobsearch_root(repo: Path | None = None) -> Path:
+    """Resolve the private runtime root used by semantic review artifacts.
+
+    ``repo`` is the workspace anchor used by tests and workflow adapters; when
+    it is the repository root, runtime data lives in its ``JobSearch_2026``
+    child. An explicit ``JOBSEARCH_ROOT`` remains authoritative for a live
+    private instance and isolated fixture tests.
+    """
+    configured = os.environ.get("JOBSEARCH_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if repo is not None:
+        root = Path(repo).expanduser().resolve()
+        return root if root.name == "JobSearch_2026" else root / "JobSearch_2026"
+    return Path(__file__).resolve().parents[2] / "JobSearch_2026"
+
+
+def _semantic_score_cap(cap: dict[str, Any], score: float, basis: str) -> float:
+    """Apply the deterministic calibration cap to a semantic verdict."""
+    semantic = cap.get("semantic_profile") if isinstance(cap.get("semantic_profile"), dict) else {}
+    level = str(semantic.get("upper_bound_level") or "medium").casefold()
+    caps = {
+        "low": {"direct": 5.0, "transferable": 4.0, "upper_only": 3.5, "none": 2.5},
+        "medium": {"direct": 5.0, "transferable": 4.5, "upper_only": 4.0, "none": 2.5},
+        "high": {"direct": 5.0, "transferable": 5.0, "upper_only": 4.5, "none": 2.5},
+    }
+    cap_value = caps.get(level, caps["medium"]).get(basis, caps["medium"]["upper_only"])
+    return max(1.0, min(cap_value, round(float(score), 1)))
+
+
 def score_job(
     *,
     title: str,

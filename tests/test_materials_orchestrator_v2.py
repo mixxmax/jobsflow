@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from docx import Document
 
 from tools.io_utils import atomic_write_json, atomic_write_text
@@ -21,7 +23,10 @@ from tools.workflow.materials_orchestrator import (
 )
 from tools.workflow.materials_rules import build_rule_pack, rules_digest, validate_rule_pack
 from tools.workflow.package_validator import _audit_receipt_matches
-from tools.workflow.testing_packages import build_package, build_workspace, canonical_fixture
+from tools.workflow.testing_packages import baseline_transform_fixture, build_package, build_workspace, canonical_fixture
+
+
+pytestmark = pytest.mark.legacy
 
 
 def _claim_contract(job_id: str = "C0-001"):
@@ -364,7 +369,7 @@ def test_strict_audit_gateway_creates_task_and_fails_closed(tmp_path):
     _write_cv_cl(package)
     plan = json.loads((package / "materials_plan.validated.json").read_text(encoding="utf-8"))
     assert dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "model_plan": plan})["status"] == "succeeded"
-    drafted = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": canonical_fixture()})
+    drafted = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package)})
     assert drafted["status"] == "succeeded"
     out = dispatch("audit", workspace=ws, payload={"job_id": "C0-001", "strict": True})
     assert out["status"] == "blocked"
@@ -381,7 +386,7 @@ def test_docx_is_created_only_after_content_audit_and_metadata_is_sanitized(tmp_
     package = build_package(ws, with_outbound=False)
     plan = json.loads((package / "materials_plan.validated.json").read_text(encoding="utf-8"))
     assert dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "model_plan": plan})["status"] == "succeeded"
-    drafted = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": canonical_fixture()})
+    drafted = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package)})
     assert not list(package.glob("*.docx"))
     task = drafted["audit_task_packet"]
     report = {"job_id": "C0-001", "audit_scope": "jd_mapping_and_presentation", "audit_input_fingerprint": task["audit_input_fingerprint"], "auditor_context_id": task["auditor_context_id"], "counts": {"P0": 0, "P1": 0, "P2": 0}, "findings": []}
@@ -396,7 +401,7 @@ def test_content_audit_repair_can_reenter_drafting_without_skipping_gate(tmp_pat
     package = build_package(ws, with_outbound=False)
     plan = json.loads((package / "materials_plan.validated.json").read_text(encoding="utf-8"))
     assert dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "model_plan": plan})["status"] == "succeeded"
-    drafted = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": canonical_fixture()})
+    drafted = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package)})
     assert drafted["status"] == "succeeded"
     run = load_run(package)
     task = json.loads((package / "materials_audit_task.json").read_text(encoding="utf-8"))
@@ -413,16 +418,25 @@ def test_content_audit_repair_can_reenter_drafting_without_skipping_gate(tmp_pat
             "required_action": "add evidence",
         }],
     }
-    report["findings"][0]["quote"] = "Its focus on vendor contract review"
-    report["findings"][0]["target_id"] = "cl-opening"
+    changed_cl = next(
+        item
+        for item in task["tailoring_delta"]["changes"]
+        if item["material"] == "cover_letter"
+    )
+    report["findings"][0]["quote"] = changed_cl["after"]
+    report["findings"][0]["target_id"] = changed_cl["target_id"]
     blocked = dispatch("audit", workspace=ws, payload={"job_id": "C0-001", "audit_result": report})
     assert blocked["status"] == "blocked"
     current = json.loads((package / "materials_draft.canonical.json").read_text(encoding="utf-8"))
-    before = next(item["text"] for item in current["cover_letter"]["blocks"] if item["id"] == "cl-opening")
+    before = next(
+        item["text"]
+        for item in current["cover_letter"]["blocks"]
+        if item["id"] == changed_cl["target_id"]
+    )
     retry = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "repair_patch": {
         "job_id": "C0-001", "base_canonical_sha256": current["canonical_sha256"],
         "audit_input_fingerprint": run["audit_input_fingerprint"],
-        "changes": [{"finding_ids": ["f1"], "material": "cover_letter", "target_id": "cl-opening", "before_text": before, "after_text": before + " I can provide accurate, bounded support."}],
+        "changes": [{"finding_ids": ["f1"], "material": "cover_letter", "target_id": changed_cl["target_id"], "before_text": before, "after_text": before + " I can provide accurate, bounded support."}],
     }})
     assert retry["status"] == "succeeded"
     assert retry["after_state"] == "content_audit_pending"

@@ -1,0 +1,14 @@
+[
+  {
+    "target": "private_runtime_workspace",
+    "action": "write"
+  },
+  {
+    "target": "private_runtime_workspace",
+    "action": "read"
+  },
+  {
+    "target": "tracker.csv",
+    "action": "write"
+  }
+]

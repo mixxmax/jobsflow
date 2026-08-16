@@ -442,9 +442,8 @@ def test_cmd_tailor_passes_loaded_assessment_into_tailor_plan(tmp_path, monkeypa
             "allow_shallow_jd": False,
         },
     )()
-    assert materials_cli.cmd_tailor(args) == 0
-    saved = json.loads((package / "tailor_plan.json").read_text(encoding="utf-8"))
-
-    assert saved["job_assessment"]["revision"] == 4
-    assert saved["resume_strategy"]["assessment"]["priority_strengths"]
-    assert saved["cover_letter_blueprint"]["role_industry_match"]["assessment_gaps"]
+    # The legacy authoring command is deliberately fail-closed.  All model
+    # drafting must go through the vNext gateway/current-job response file;
+    # accepting this command would recreate a second materials SOP.
+    assert materials_cli.cmd_tailor(args) == 2
+    assert not (package / "tailor_plan.json").exists()

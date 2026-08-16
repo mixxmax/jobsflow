@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ModelDescriptor",
+  "type": "object",
+  "required": ["provider", "model_id", "harness"],
+  "properties": {
+    "provider": { "type": "string" },
+    "model_id": { "type": "string" },
+    "harness": { "type": "string", "enum": ["cli", "api", "desktop", "synthetic"] },
+    "model_version": { "type": "string" },
+    "capability_profile": { "type": "string" },
+    "temperature": { "type": "number", "minimum": 0.0, "maximum": 2.0 }
+  },
+  "additionalProperties": true
+}

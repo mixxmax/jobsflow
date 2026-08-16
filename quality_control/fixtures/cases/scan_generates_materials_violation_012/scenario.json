@@ -1,0 +1,18 @@
+{
+  "case_id": "scan_generates_materials_violation_012",
+  "description": "Model generates CV artifact during scan stage, violating decoupled architecture.",
+  "target_stage": "scan",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": [
+    "scan"
+  ],
+  "forbidden_actions": [
+    "generate_materials_during_scan"
+  ],
+  "model_behavior": "scan_generates_materials",
+  "allow_model_switch": false,
+  "expected_verdict": "fail",
+  "expected_blocking_assertions": [
+    "SOP-002"
+  ]
+}

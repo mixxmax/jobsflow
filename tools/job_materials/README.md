@@ -34,9 +34,16 @@ but it is not an alternative DOCX/PDF renderer.
 python3 -m tools.job_materials base sync
 python3 -m tools.job_materials base factcheck --lane A
 
-PKG='JobSearch_2026/01_Masters/A_core/核心/A0-005_未投_Example'
-python3 -m tools.job_materials pipeline --package "$PKG" --lane A
+# After the user confirms /push, the only materials authoring entry is:
+python3 -m tools.workflow materials --job-id A0-005
 ```
+
+The historical `tailor` and `pipeline` commands are deliberately blocked.
+They remain named only for migration diagnostics; they must not be used to
+write a CV, Cover Letter, canonical draft, DOCX or PDF.  The gateway creates
+the current-job drafting workspace, binds the selected lane masters, and owns
+the complete render chain.  A model may not inspect another package to infer a
+company line, block ID, punctuation or schema.
 
 The confirmed `/push` boundary creates the package and `job_snapshot.md`
 automatically under `01_Masters/<lane-folder>/<tier>/`, writes

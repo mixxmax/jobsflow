@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HandoffPacket",
+  "type": "object",
+  "required": [
+    "handoff_id",
+    "run_id",
+    "current_stage",
+    "allowed_next_actions",
+    "forbidden_actions",
+    "task_packet_hash",
+    "canonical_draft_hash",
+    "open_findings",
+    "previous_model",
+    "new_model"
+  ],
+  "properties": {
+    "handoff_id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "current_stage": { "type": "string" },
+    "allowed_next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "task_packet_hash": { "type": "string" },
+    "canonical_draft_hash": { "type": "string" },
+    "open_findings": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "previous_model": { "type": "object" },
+    "new_model": { "type": "object" }
+  },
+  "additionalProperties": true
+}

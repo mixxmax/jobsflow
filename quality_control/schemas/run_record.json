@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunRecord",
+  "type": "object",
+  "required": [
+    "run_id",
+    "case_id",
+    "workflow_version",
+    "rules_digest",
+    "model",
+    "started_at",
+    "ended_at",
+    "stages",
+    "input_hashes",
+    "output_hashes",
+    "side_effects",
+    "assertions",
+    "verdict"
+  ],
+  "properties": {
+    "run_id": { "type": "string" },
+    "case_id": { "type": "string" },
+    "workflow_version": { "type": "string" },
+    "rules_digest": { "type": "string" },
+    "model": { "type": "object" },
+    "started_at": { "type": "string" },
+    "ended_at": { "type": "string" },
+    "stages": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "input_hashes": { "type": "object" },
+    "output_hashes": { "type": "object" },
+    "side_effects": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "assertions": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["pass", "warn", "fail", "blocked", "error"]
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "model_duration_ms": { "type": "number" },
+        "qa_duration_ms": { "type": "number" },
+        "external_duration_ms": { "type": "number" },
+        "tokens_used": { "type": "integer" },
+        "retry_count": { "type": "integer" },
+        "rework_cycles": { "type": "integer" }
+      }
+    }
+  },
+  "additionalProperties": true
+}

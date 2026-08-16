@@ -1,0 +1,18 @@
+{
+  "case_id": "audit_repair_recheck_007",
+  "description": "Model receives P1 finding, submits targeted patch for flawed block, and passes re-audit.",
+  "target_stage": "materials",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": [
+    "submit_plan",
+    "submit_draft",
+    "repair_patch"
+  ],
+  "forbidden_actions": [
+    "rewrite_full_document"
+  ],
+  "model_behavior": "repair_success",
+  "allow_model_switch": false,
+  "expected_verdict": "pass",
+  "expected_blocking_assertions": []
+}

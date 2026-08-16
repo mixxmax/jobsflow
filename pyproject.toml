@@ -16,4 +16,7 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not legacy'"
+markers = [
+  "legacy: frozen tests for the retired materials adapter; run explicitly with -m legacy",
+]

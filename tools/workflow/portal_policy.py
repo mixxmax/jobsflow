@@ -17,6 +17,8 @@ PROFILES = {
         "allow_model_override": False,
         "max_requests_per_scan": 10,
         "min_interval_seconds": 15,
+        "human_verification_handoff": False,
+        "verification_timeout_seconds": 600,
     },
     "private": {
         "challenge_threshold": 1,
@@ -25,6 +27,10 @@ PROFILES = {
         "allow_model_override": False,
         "max_requests_per_scan": 10,
         "min_interval_seconds": 15,
+        # Private interactive scans may ask the user once, in visible Chrome,
+        # then must prove that the same persistent profile works headlessly.
+        "human_verification_handoff": True,
+        "verification_timeout_seconds": 600,
     },
 }
 

@@ -1,0 +1,17 @@
+{
+  "case_id": "breakpoint_recovery_009",
+  "description": "Resume execution from persisted task packet breakpoint without restarting earlier stages.",
+  "target_stage": "materials",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": [
+    "resume_from_task_packet",
+    "submit_draft"
+  ],
+  "forbidden_actions": [
+    "rerun_pass_1"
+  ],
+  "model_behavior": "happy_path",
+  "allow_model_switch": false,
+  "expected_verdict": "pass",
+  "expected_blocking_assertions": []
+}

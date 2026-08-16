@@ -9,12 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from tools.job_materials.jd_store import jd_meta, package_id_from_path, read_jd
-from tools.job_materials.manifest import derive_tier, load_job_manifest, parse_job_id
+from tools.job_materials.manifest import derive_tier, load_job_manifest, parse_job_id, reconcile_package_metadata
 from tools.job_materials.paths import load_lanes
 from tools.job_materials.packages import validate_package_binding
 from tools.job_materials.publisher import classify_publisher
 from tools.workflow.id_allocation import is_assigned_job_id
-from tools.fresh_24h.job_assessment import jd_fingerprint, profile_fingerprint
+from tools.fresh_24h.job_assessment import jd_fingerprint
+from tools.workflow.materials_contract import build_entity_contract
 from tools.workflow.profile_facts import load_profile_facts
 
 
@@ -75,6 +76,9 @@ class MaterialsContext:
     # may be used without an external citation, but always through a stable ID.
     profile_facts: list[dict[str, Any]] = field(default_factory=list)
     profile_fact_ids: list[str] = field(default_factory=list)
+    scoring_profile: dict[str, Any] = field(default_factory=dict)
+    capability_profile: dict[str, Any] = field(default_factory=dict)
+    entity_contract: dict[str, Any] = field(default_factory=dict)
     assessment: dict[str, Any] | None = None
     preflight: dict[str, Any] | None = None
     unanswered_hard: list[str] = field(default_factory=list)
@@ -116,6 +120,10 @@ class PackageContextLoader:
             ctx.blockers.append("package_missing")
             return ctx
         ctx.package = str(package)
+        # Manifest/snapshot are projections of the entry-bound package.  Fix
+        # stale lane/tier/path coordinates before any bundle is built, while
+        # preserving user-owned overrides and facts.
+        reconciled_manifest = reconcile_package_metadata(self.workspace, package)
         ctx.blockers.extend(validate_package_binding(self.workspace, package, ctx.job_id))
         ctx.lane = ctx.job_id[:1]
         personal = _read_json(self.workspace / "00_Profile" / "config.personal.json") or {}
@@ -201,19 +209,31 @@ class PackageContextLoader:
 
         research = _read_json(package / "company_research.json") or {}
         ctx.company_research = research if isinstance(research, dict) else {}
-        manifest = load_job_manifest(package) or {}
+        manifest = reconciled_manifest or load_job_manifest(package) or {}
         ctx.manifest = manifest
         job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
         ctx.publisher_type = str(research.get("publisher_type") or job.get("publisher_type") or "unknown").casefold()
         ctx.publisher_name = str(research.get("publisher_name") or job.get("publisher_name") or "")
-        ctx.employer_name = str(
-            research.get("company_out")
-            or research.get("employer_name")
-            or research.get("company")
-            or job.get("company_out")
-            or job.get("employer_name")
-            or ""
-        )
+        # A recruitment agency is a publisher, not the hiring employer.  The
+        # agency's own name must never surface as the employer; only a
+        # separately verified company_out/employer_name is eligible.
+        if ctx.publisher_type in {"recruiter", "agency"}:
+            ctx.employer_name = str(
+                research.get("company_out")
+                or research.get("employer_name")
+                or job.get("company_out")
+                or job.get("employer_name")
+                or ""
+            )
+        else:
+            ctx.employer_name = str(
+                research.get("company_out")
+                or research.get("employer_name")
+                or research.get("company")
+                or job.get("company_out")
+                or job.get("employer_name")
+                or ""
+            )
         ctx.role_primary = str(job.get("role_material") or job.get("role_display") or "")
         if ctx.publisher_type == "unknown":
             classified = classify_publisher(
@@ -230,11 +250,61 @@ class PackageContextLoader:
         # only the role and publisher boundary are mandatory here.
         if ctx.publisher_type == "unknown" or not ctx.role_primary:
             ctx.blockers.append("entity_contract_incomplete")
+        role_selection = job.get("role_selection") if isinstance(job.get("role_selection"), dict) else {}
+        ambiguity_status = str(role_selection.get("ambiguity_status") or "").strip()
+        if not ambiguity_status:
+            # Legacy manifests predate ambiguity_status; a pending contract is
+            # one that still lists unselected alternates.
+            if bool(role_selection.get("confirmation_needed")) and str(
+                role_selection.get("selection_mode") or ""
+            ) != "user_override":
+                ambiguity_status = "pending_confirmation"
+            else:
+                ambiguity_status = "not_ambiguous"
+        if ambiguity_status == "pending_confirmation":
+            ctx.blockers.append("role_confirmation_required")
+        ctx.entity_contract = build_entity_contract(
+            job_id=ctx.job_id,
+            role=ctx.role_primary,
+            publisher_name=ctx.publisher_name,
+            publisher_type=ctx.publisher_type,
+            employer_name=ctx.employer_name,
+            company_out=str(job.get("company_out") or ""),
+            source=str(job.get("source") or ""),
+            role_title_contract=job.get("role_title_contract") if isinstance(job.get("role_title_contract"), dict) else None,
+            application_target=str((ctx.company_research or {}).get("application_target") or ""),
+        )
         ctx.artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
 
         queries = _read_json(self.workspace / "00_Profile" / "queries.json") or {}
         scoring_profile = queries.get("scoring_profile") if isinstance(queries.get("scoring_profile"), dict) else queries
-        ctx.profile_digest = profile_fingerprint(scoring_profile)
+        ctx.scoring_profile = dict(scoring_profile) if isinstance(scoring_profile, dict) else {}
+        lane_base = _read_json(self.workspace / "00_Profile" / "bases_runtime" / f"{ctx.lane}.json") or {}
+        if isinstance(lane_base, dict):
+            ctx.capability_profile = {
+                "base_id": str(lane_base.get("base_id") or ctx.lane),
+                "facts_anchor": list(lane_base.get("facts_anchor") or []),
+                "capability_upper": list(lane_base.get("capability_upper") or []),
+                "semantic_profile": dict(lane_base.get("semantic_profile") or {}),
+                "forbidden_claims": list(lane_base.get("forbidden_claims") or []),
+                "factcheck": dict(lane_base.get("factcheck") or {}),
+            }
+        # Materials are invalidated when any shared profile layer changes —
+        # search/scoring intent, confirmed facts, or the selected lane's
+        # facts/transfer ceiling.  A model switch never changes this bundle.
+        ctx.profile_digest = _sha(
+            json.dumps(
+                {
+                    "scoring_profile": ctx.scoring_profile,
+                    "profile_facts": ctx.profile_facts,
+                    "evidence_nodes": ctx.evidence_nodes,
+                    "capability_profile": ctx.capability_profile,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        )
         ctx.input_hashes = {
             "jd": ctx.jd_hash,
             "profile": ctx.profile_digest,

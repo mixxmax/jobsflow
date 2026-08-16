@@ -49,6 +49,14 @@ runs must not advance the cursor. Use `--no-record` for previews and debugging.
    profile calibration caps transferable/upper-only scores deterministically.
 7. Rerun scoring after completion. Inspect `语义匹配来源` and
    `语义待处理数`; formal local/Google pushes stop when pending tasks remain.
+   The scorer writes the final CSV sidecar and automatically refreshes any
+   matching `02_Tracker/workflow/scan_runs/<run_id>/run.json` with the new
+   `scored_hash`, `semantic_pending_rows`, `semantic_pending_tasks`, and the
+   two layer flags (`lane_classification` / `resume_match`). Legacy scan
+   summaries are reconciled by the same path for compatibility. Do not edit
+   `run.json` manually or bypass `/push`; after both layers are complete the
+   run becomes `semantic_ready` and the normal confirmation flow can consume
+   the new artifact.
 8. Write local/Google tracker rows only when requested.
 9. Never create application materials during scan.
 

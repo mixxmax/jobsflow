@@ -34,6 +34,32 @@ existing scripts remain the adapters that actually scan, push or draft.
 Material DOCX/PDF must use this same gateway and the lane-master renderer; a
 model may not choose a legacy renderer or direct conversion path. Confirmed
 `/push` creates the bound package, while `/materials` may only write inside it.
+The materials gateway is fixed to `materials-vnext-1` and reports its engine
+version on every materials/audit/format/apply result. If the product-line
+engine self-check fails, it stops rather than falling back to a legacy chain.
+The selected lane masters are also the semantic content baseline. A drafting
+model submits only the vNext bounded `operations` list (`replace`,
+`append_after`, or `reorder`); unmentioned blocks are retained and a
+full-document replacement or legacy `merge/add` response shape is rejected.
+Cover Letter recipient/company identity lines are host-managed from the current
+job contract: a disclosed employer is inserted, while an undisclosed recruiter
+client uses neutral wording and never exposes the publisher name.
+The first call freezes `current_job_bundle` and the two lane baselines. Models
+submit a validated plan followed by a bounded JSON transform; the host owns
+canonical compilation and all artifact paths. They may not inspect another
+package or prior canonical/audit to infer schema or wording. If the task seems
+to require an example from another job, stop and return a blocker instead of
+browsing. CV and Cover Letter are
+parallel transforms of their respective lane masters against one shared private
+profile; neither is evidence for the other. The ability ceiling is available for
+matching/transferable framing only, never as completed experience. Email is a
+deterministic host artifact created after the CV/CL content audit.
+
+If a package contains a pre-vNext material generation, the gateway reports
+`legacy_material_state_requires_vnext_reset` with a preview and confirmation
+command. Agents must not delete legacy files or infer permission to reset;
+after explicit user confirmation they may invoke the fixed `--scope all`
+reset, which archives the old generation before retrying vNext.
 
 ## /scan 模式
 
@@ -64,6 +90,20 @@ must be thin delegates to `python3 -m tools.workflow`. GitHub is a published sna
 product line with runtime data excluded.
 - Tracker sync uses the local ledger as the source of truth; CSV/Sheets are verified projections, and remote changes require reconcile or explicit pull
 
+## Quality control bridge
+
+The tracked `quality_control/` package is the synthetic admission and replay
+library. Real product calls are observed only through
+`tools/workflow/quality_control_bridge.py`, which is invoked inside the
+unified `WorkflowEngine` gateway. It must not create a second materials chain:
+vNext remains the CV/CL semantic auditor and the existing renderer remains the
+DOCX/PDF mechanical gate. The bridge is disabled by default; use
+`JOBSFLOW_QC_MODE=observe` for local observation, `warn` for non-blocking
+warnings, and `enforce` only for side-effect-free deterministic P0
+preconditions. QC traces are sanitized and stored under the current runtime
+workspace's `02_Tracker/workflow/quality_control/`; never commit them or read
+private runtime content into product source.
+
 ## Tracker defaults
 
 See `docs/tracker_defaults.md` for:
@@ -77,8 +117,9 @@ See `docs/tracker_defaults.md` for:
 |------|---------|
 | `python3 -m tools.workflow` | Unified gateway: scan/push/promote/materials/apply/archive |
 | `tools/workflow/` | Policy registry, state machine, confirmations, task packets |
-| `tools/workflow/materials_orchestrator.py` | Bounded CV/CL audit runs, repair handoff, reset and evidence capture |
-| `tools/workflow/materials_rules.py` / `materials_contract.py` | Compact audit SOP and frozen claim boundary |
+| `tools/workflow/materials_vnext/` | Product materials engine: lane baseline → bounded transform → CV/CL audit → template render |
+| `tools/workflow/materials_orchestrator.py` | Frozen legacy compatibility adapter; retained for migration/rollback only and not a product entrypoint |
+| `tools/workflow/materials_baseline.py` / `materials_rules.py` | Lane content floor, bounded tailoring delta and compact audit SOP |
 | `tools/workflow/auditor_dispatch.py` | Optional model-neutral child-auditor dispatch; no vendor is required |
 | `tools/workflow/sync.py` | Local tracker ledger, CSV/Sheets projections, reconcile/pull/replay |
 | `tools/fresh_24h/temp_two_pass.sh` | One-command scan + score |

@@ -13,6 +13,7 @@ from tools.workflow.materials_schema import (
     validate_plan_shape,
 )
 from tools.workflow.materials_rules import build_rule_pack
+from tools.workflow.materials_baseline import baseline_transform_task_schema, plan_jd_anchor_catalog
 from tools.workflow.policy import rules_for
 
 
@@ -33,11 +34,27 @@ def build_task_packet(
     if not isinstance(assessment, dict):
         assessment = {"value": assessment}
     company_research = ctx.get("company_research") or {}
+    content_baseline = ctx.get("content_baseline") or {}
+    scoring_profile = ctx.get("scoring_profile") if isinstance(ctx.get("scoring_profile"), dict) else {}
+    capability_profile = ctx.get("capability_profile") if isinstance(ctx.get("capability_profile"), dict) else {}
+    profile_facts = [
+        dict(item)
+        for item in (ctx.get("profile_facts") or [])
+        if isinstance(item, dict) and item.get("confirmed")
+    ]
     profile_fact_ids = {
         str(item)
         for item in (ctx.get("profile_fact_ids") or inputs.get("profile_fact_ids") or [])
         if str(item)
     }
+    initial_jd_anchors = plan_jd_anchor_catalog(
+        {
+            "jd_anchors": list(ctx.get("anchors") or []),
+            "duties": list(ctx.get("duties") or []),
+            "requirements": list(ctx.get("requirements") or []),
+            "themes": [],
+        }
+    )
     rule_pack = build_rule_pack()
     research_status = (
         "verified"
@@ -75,11 +92,65 @@ def build_task_packet(
             "user_confirmed": "stable profile fact ID is sufficient; no external URL is required",
             "derived": "must cite an approved evidence ID and cannot be treated as a baseline fact",
         },
-        "forbidden_claims": list(forbidden_claims or ctx.get("forbidden_claims") or []),
+        "candidate_profile": {
+            "source": "shared_private_profile",
+            "confirmed_facts": profile_facts,
+            "facts_anchor": list(capability_profile.get("facts_anchor") or []),
+            "capability_upper": list(capability_profile.get("capability_upper") or []),
+            "semantic_profile": dict(
+                capability_profile.get("semantic_profile")
+                or scoring_profile.get("semantic_profile")
+                or {}
+            ),
+            "forbidden_claims": list(capability_profile.get("forbidden_claims") or []),
+            "scoring_profile": {
+                key: scoring_profile.get(key)
+                for key in (
+                    "core_keywords",
+                    "evidence_keywords",
+                    "preferred_industry_keywords",
+                    "experience_profile",
+                    "languages",
+                    "max_relevant_years",
+                    "qualification_keywords",
+                    "semantic_profile",
+                    "track_mapping",
+                )
+                if key in scoring_profile
+            },
+            "usage_contract": {
+                "confirmed_facts": "may_be_used_as_candidate_facts",
+                "facts_anchor": "may_be_used_as_candidate_facts",
+                "capability_upper": "matching_and_transferable_framing_only",
+                "forbidden": "never_present_capability_upper_as_completed_experience",
+            },
+        },
+        "forbidden_claims": list(
+            dict.fromkeys(
+                [str(item) for item in (forbidden_claims or ctx.get("forbidden_claims") or []) if str(item)]
+                + [str(item) for item in (capability_profile.get("forbidden_claims") or []) if str(item)]
+            )
+        ),
         "publisher_type": ctx.get("publisher_type") or "unknown",
         "publisher_name": ctx.get("publisher_name") or "",
         "employer_name": ctx.get("employer_name") or "",
         "role_title_contract": {"role_primary": ctx.get("role_primary") or ""},
+        "cover_letter_header_contract": {
+            "source": "host_current_job_entity_contract",
+            "role_line": "host_substituted_from_role_primary",
+            "company_line": (
+                "host_substituted_from_employer_name"
+                if str(ctx.get("employer_name") or "").strip()
+                else "host_uses_neutral_hiring_organisation_line"
+            ),
+            "publisher_name_outbound": "forbidden",
+            "model_may_edit": False,
+            "instruction": (
+                "Do not rewrite, omit or copy a recipient/company identity line. "
+                "The host fills it from this job's verified employer boundary; an "
+                "undisclosed recruiter client never becomes the company."
+            ),
+        },
         "company_research": company_research,
         "company_research_status": research_status,
         "page_budget": {"cv": 1, "cover_letter": 1},
@@ -93,14 +164,22 @@ def build_task_packet(
             "overfill_action": "Tighten or reorder existing truthful wording before any format conversion; never silently create a second page.",
             "forbidden": ["generic filler", "invented facts", "font stretching", "manual PDF editing", "alternate DOCX entry point"],
         },
-        "required_output_schema": MATERIALS_PLAN_SCHEMA["name"],
-        "draft_seed_schema": {
-            "optional": True,
-            "purpose": "Provide prose and placement metadata only; the host assigns canonical block IDs.",
-            "cv": {"heading": "string", "summary": "string", "bullets": [{"text": "string", "section": "experience", "priority": 1, "jd_anchor_ids": ["JD-001"]}]},
-            "cover_letter": {"opening": "string", "paragraphs": ["string"], "signoff": "string"},
-            "fallback": "If omitted, the host requests a complete canonical CV/CL draft before rendering.",
+        "content_baseline": content_baseline,
+        "baseline_transform_contract": {
+            "artifact_type": "jobsflow_baseline_transform",
+            "baseline_sha256": str(content_baseline.get("baseline_sha256") or ""),
+            "unmentioned_blocks": "retain",
+            "deletion_allowed": False,
+            "changes": "array of {material, baseline_id or baseline_ids, action, text, jd_anchor_ids, priority}",
+            "additions": "array of {material, type, text, section, experience_id, jd_anchor_ids, priority, insert_after}",
+            "instruction": "Start from the complete lane baseline. Submit only JD-specific rewrites, reordering, merges and additions; never rebuild or shorten the CV/CL from scratch.",
         },
+        "required_output_schema": MATERIALS_PLAN_SCHEMA["name"],
+        "draft_seed_schema": baseline_transform_task_schema(
+            content_baseline,
+            job_id=job_id,
+            jd_anchors=initial_jd_anchors,
+        ),
         "materials_audit_rules": rule_pack,
         "materials_lessons": list(ctx.get("materials_lessons") or []),
         "materials_lessons_policy": "quality warnings only; never treat a lesson as candidate evidence",

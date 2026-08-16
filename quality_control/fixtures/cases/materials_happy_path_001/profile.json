@@ -1,0 +1,17 @@
+{
+  "candidate_name": "Synthetic Dev",
+  "title": "Lead Software Engineer",
+  "summary": "10 years building distributed backend and evaluation systems in Python and Go.",
+  "skills": ["Python", "Distributed Systems", "SQL", "CI/CD", "Quality Control"],
+  "experience": [
+    {
+      "company": "Synthetic Corp",
+      "role": "Senior Engineer",
+      "period": "2021 - Present",
+      "bullets": [
+        "Architected workflow automation pipeline reducing cycle latency by 45%.",
+        "Designed deterministic evaluation harness processing 10k daily tasks."
+      ]
+    }
+  ]
+}

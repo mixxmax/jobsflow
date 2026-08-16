@@ -1,4 +1,9 @@
-"""Finite, resumable materials orchestration with bounded semantic review."""
+"""Frozen legacy materials orchestration (backup/migration only).
+
+The product gateway no longer calls this module.  It remains available for
+inspection and rollback of pre-vNext packages; new behavior belongs in
+``tools.workflow.materials_vnext`` and must not be added here.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ from tools.workflow.materials_hashes import (
     audit_coverage_dispositions,
     audit_context_fingerprint,
     audit_input_fingerprint,
+    content_baseline_fingerprint,
     material_container_hashes,
     material_metadata_hashes,
     semantic_material_hashes,
@@ -213,10 +219,12 @@ def ensure_run(
     # ``claim_contract`` is a deprecated compatibility argument.  v2 audit
     # identity is deliberately independent of the authorization layer.
     del claim_contract
+    baseline_sha256 = content_baseline_fingerprint(package)
     context_fingerprint = audit_context_fingerprint(
         jd_text=jd_text,
         rules_digest=pack["rules_digest"],
         lessons_digest=lessons_digest,
+        content_baseline_sha256=baseline_sha256,
         coverage_dispositions=audit_coverage_dispositions(package),
     )
     fingerprint = audit_input_fingerprint(
@@ -267,6 +275,7 @@ def ensure_run(
         and str(existing.get("job_id") or job_id) == str(job_id)
         and str(existing.get("jd_sha256") or "") == sha256_text(jd_text)
         and str(existing.get("rules_digest") or "") == str(pack["rules_digest"])
+        and str(existing.get("content_baseline_sha256") or "") == baseline_sha256
         and str(existing.get("phase") or "") in {"repair_required", "content_audit_pending", "prepared", "drafted"}
     ):
         live_hashes = semantic_material_hashes(package)
@@ -310,6 +319,7 @@ def ensure_run(
         "rules_version": pack["rules_version"],
         "rules_digest": pack["rules_digest"],
         "lessons_digest": lessons_digest,
+        "content_baseline_sha256": baseline_sha256,
         "finding_history": {},
         "open_finding_fingerprints": [],
         "created_at": _now(),
@@ -344,14 +354,25 @@ def build_audit_task_packet(
     materials: dict[str, Any] = {}
     try:
         from tools.workflow.materials_draft import canonical_block_index, canonical_material_texts, load_canonical_draft
+        from tools.workflow.materials_baseline import build_tailoring_delta, load_content_baseline
 
         draft = load_canonical_draft(package)
         block_index = canonical_block_index(draft) if draft else {}
         canonical_texts = canonical_material_texts(draft) if draft else {}
-    except (ImportError, OSError, ValueError, TypeError):
+        content_baseline = load_content_baseline(package)
+        if content_baseline:
+            from tools.workflow.materials_baseline import validate_content_floor
+
+            floor_errors = validate_content_floor(content_baseline, draft)
+            if floor_errors:
+                raise ValueError("baseline_content_floor_invalid:" + ",".join(floor_errors))
+        tailoring_delta = build_tailoring_delta(content_baseline, draft) if content_baseline and draft.get("baseline_sha256") else {}
+    except (ImportError, OSError, TypeError):
         draft = {}
         block_index = {}
         canonical_texts = {}
+        content_baseline = {}
+        tailoring_delta = {}
     if not draft or any(not isinstance(draft.get(material), dict) or not (draft.get(material) or {}).get("blocks") for material in ("cv", "cover_letter")):
         # The child must audit the canonical semantic source, before the host
         # creates any DOCX/PDF.  Falling back to a pre-existing DOCX/PDF would
@@ -373,24 +394,35 @@ def build_audit_task_packet(
         ]
     if not jd_anchor_catalog:
         jd_anchor_catalog = [{"id": "JD-001", "text": "the selected JD duties and requirements", "priority": 1}]
+    delta_mode = bool(tailoring_delta and tailoring_delta.get("changes"))
+    transform_scope = (
+        (draft.get("transform_summary") or {}).get("scope")
+        if isinstance(draft.get("transform_summary"), dict)
+        else {}
+    )
+    broad_transform = any(
+        isinstance(item, dict) and item.get("review_level") == "broad"
+        for item in (transform_scope or {}).values()
+    )
     for label, text_value in canonical_texts.items():
+        selected_blocks = [
+            {
+                "id": block_id,
+                "type": item["block"].get("type"),
+                "text": item["block"].get("text"),
+                "jd_anchor_ids": item["block"].get("jd_anchor_ids") or [],
+                "section": item["block"].get("section") or "",
+                "experience_id": item["block"].get("experience_id") or "",
+                "priority": item["block"].get("priority", 0),
+            }
+            for block_id, item in block_index.items()
+            if item.get("material") == label
+        ]
         materials[label] = {
             "filename": CANONICAL_DRAFT_NAME if draft else "legacy_material",
             "text": text_value,
             "semantic_hash": run.get("semantic_material_hashes", {}).get(label, ""),
-            "blocks": [
-                {
-                    "id": block_id,
-                    "type": item["block"].get("type"),
-                    "text": item["block"].get("text"),
-                    "jd_anchor_ids": item["block"].get("jd_anchor_ids") or [],
-                    "section": item["block"].get("section") or "",
-                    "experience_id": item["block"].get("experience_id") or "",
-                    "priority": item["block"].get("priority", 0),
-                }
-                for block_id, item in block_index.items()
-                if item.get("material") == label
-            ],
+            "blocks": selected_blocks,
         }
     # Give a child a narrow, disposable read root.  The JSON packet still
     # contains compact text for hosts without file tools, but the staging
@@ -399,10 +431,27 @@ def build_audit_task_packet(
     run_root.mkdir(parents=True, exist_ok=True)
     atomic_write_text(run_root / "jd_full.md", jd_text)
     atomic_write_json(run_root / "rule_pack.json", pack)
+    if delta_mode:
+        atomic_write_json(run_root / "tailoring_delta.json", tailoring_delta)
     for label, item in materials.items():
         filename = "cv.txt" if label == "cv" else "cover_letter.txt"
         atomic_write_text(run_root / filename, str(item.get("text") or ""))
     _archive_staging(package, keep_run_id=run["run_id"])
+
+    manifest = _load(Path(package) / "job_manifest.json")
+    manifest_job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
+    entity_contract = {
+        "role_display": str(manifest_job.get("role_display") or manifest_job.get("role_material") or "").strip(),
+        "role_primary": str(manifest_job.get("role_material") or manifest_job.get("role_primary") or "").strip(),
+        "publisher_type": str(manifest_job.get("publisher_type") or "unknown").strip().casefold(),
+        "publisher_name": str(manifest_job.get("publisher_name") or "").strip(),
+        "employer_name": str(manifest_job.get("company_out") or manifest_job.get("employer_name") or "").strip(),
+        "role_policy": {
+            "slash_alternatives": "use the selected primary role, not every alternative",
+            "parentheticals": "preserve substantive parenthetical wording unless a user override selected a shorter title",
+            "title_punctuation": "when retained, preserve parentheses and their wording; do not substitute commas or hyphens",
+        },
+    }
 
     packet = {
         "schema_version": 2,
@@ -413,12 +462,26 @@ def build_audit_task_packet(
         "generation": run["generation"],
         "audit_attempt": int(run.get("audit_attempts") or 0) + 1,
         "audit_scope": "jd_mapping_and_presentation",
+        "audit_mode": "bounded_tailoring_delta" if delta_mode else "legacy_full_document",
         "producer_context_id": producer_context_id,
         "auditor_context_id": auditor_context_id or f"auditor-{uuid4().hex[:12]}",
         "audit_input_fingerprint": run["audit_input_fingerprint"],
         "staging_root": str(run_root),
         "jd": {"text": jd_text, "sha256": sha256_text(jd_text)},
         "materials": materials,
+        "tailoring_delta": tailoring_delta,
+        "audit_focus": {
+            "primary": "tailoring_delta" if delta_mode else "full_cv_cl",
+            "transform_scope": transform_scope or {},
+            "whole_document_sweep": [
+                "target_role",
+                "employer_recruiter_boundary",
+                "cross_material_consistency",
+                "grammar_fragments_and_template_residue",
+            ],
+            "instruction": "Spend most reasoning on changed blocks and their placement, then scan the complete final CV/CL once for global P0/P1 entity, consistency and language defects.",
+        },
+        "entity_contract": entity_contract,
         "layout_contract": {
             "jd_anchor_catalog": jd_anchor_catalog,
             "coverage_dispositions": coverage_dispositions,
@@ -440,13 +503,16 @@ def build_audit_task_packet(
             "decision": "JD mapping and presentation quality only",
         },
         "model_routing": {
-            "preferred_tier": "fast" if int(run.get("audit_attempts") or 0) == 0 else "strong",
+            "preferred_tier": "fast" if int(run.get("audit_attempts") or 0) == 0 and not broad_transform else "strong",
             "escalate_after_first_blocked_audit": True,
             "deterministic_checks_use_model": False,
         },
-        "requires_strong_auditor": int(run.get("audit_attempts") or 0) > 0,
+        "requires_strong_auditor": int(run.get("audit_attempts") or 0) > 0 or broad_transform,
         "read_allowlist": [
             "jd.text",
+            "tailoring_delta",
+            "audit_focus",
+            "entity_contract",
             "layout_contract",
             "layout_contract.coverage_dispositions",
             "materials.cv.text",

@@ -9,11 +9,11 @@ import pytest
 
 from tools.workflow.auditor_dispatch import _provider
 from tools.workflow.engine import dispatch
-from tools.workflow.materials_draft import apply_finding_scoped_patch
+from tools.workflow.materials_draft import apply_finding_scoped_patch, replay_effective_transform
 from tools.workflow.materials_orchestrator import load_run
 from tools.workflow.runtime import classify_paths
 from tools.workflow.package_context import PackageContextLoader
-from tools.workflow.testing_packages import build_package, build_workspace, canonical_fixture
+from tools.workflow.testing_packages import baseline_transform_fixture, build_package, build_workspace
 from tools.workflow import materials_batch
 
 
@@ -27,7 +27,7 @@ def _planned(tmp_path):
 
 def test_canonical_draft_launches_compact_cv_cl_only_audit(tmp_path):
     ws, package = _planned(tmp_path)
-    out = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": canonical_fixture()})
+    out = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package)})
     task = out["audit_task_packet"]
     assert out["after_state"] == "content_audit_pending"
     assert out["audit_dispatch"]["confirmation_required"] is False
@@ -35,25 +35,120 @@ def test_canonical_draft_launches_compact_cv_cl_only_audit(tmp_path):
     assert set(task["materials"]) == {"cv", "cover_letter"}
     assert "email" not in task["materials"]
     assert all("email" not in item.casefold() for item in task["read_allowlist"])
-    assert task["materials"]["cv"]["blocks"][0]["id"] == "cv-heading"
+    assert task["audit_mode"] == "bounded_tailoring_delta"
+    assert task["tailoring_delta"]["changed_block_count"] == 2
+    assert len(task["materials"]["cv"]["blocks"]) > len(
+        [item for item in task["tailoring_delta"]["changes"] if item["material"] == "cv"]
+    )
+    assert len(task["materials"]["cover_letter"]["blocks"]) > len(
+        [item for item in task["tailoring_delta"]["changes"] if item["material"] == "cover_letter"]
+    )
+    assert task["audit_focus"]["primary"] == "tailoring_delta"
+    assert task["audit_focus"]["whole_document_sweep"] == [
+        "target_role",
+        "employer_recruiter_boundary",
+        "cross_material_consistency",
+        "grammar_fragments_and_template_residue",
+    ]
+    assert task["entity_contract"] == {
+        "role_display": "Paralegal",
+        "role_primary": "Paralegal",
+        "publisher_type": "recruiter",
+        "publisher_name": "Michael Page",
+        "employer_name": "Acme",
+        "role_policy": {
+            "slash_alternatives": "use the selected primary role, not every alternative",
+            "parentheticals": "preserve substantive parenthetical wording unless a user override selected a shorter title",
+            "title_punctuation": "when retained, preserve parentheses and their wording; do not substitute commas or hyphens",
+        },
+    }
     assert not list(package.glob("*.docx"))
+
+
+def test_original_transform_replays_the_same_effective_generation(tmp_path):
+    ws, package = _planned(tmp_path)
+    transform = baseline_transform_fixture(package)
+
+    drafted = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": "C0-001", "canonical_draft": transform},
+    )
+
+    original_path = package / "materials_transform.original.json"
+    effective_path = package / "materials_transform.effective.json"
+    canonical_path = package / "materials_draft.canonical.json"
+    assert drafted["status"] == "succeeded"
+    assert json.loads(original_path.read_text(encoding="utf-8")) == transform
+    effective_before = json.loads(effective_path.read_text(encoding="utf-8"))
+    canonical_sha256 = json.loads(canonical_path.read_text(encoding="utf-8"))["canonical_sha256"]
+
+    canonical_path.unlink()
+    replayed = replay_effective_transform(
+        package,
+        context=PackageContextLoader(ws).load("C0-001").to_dict(),
+        plan=json.loads((package / "materials_plan.validated.json").read_text(encoding="utf-8")),
+    )
+
+    assert replayed["generation_id"] == effective_before["generation_id"]
+    assert replayed["canonical"]["canonical_sha256"] == canonical_sha256
+    assert json.loads(original_path.read_text(encoding="utf-8")) == transform
+
+
+def test_render_creates_a_deterministic_application_email_after_cv_cl_audit(tmp_path):
+    ws, package = _planned(tmp_path)
+    drafted = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package)},
+    )
+    task = drafted["audit_task_packet"]
+    passed = {
+        "job_id": "C0-001",
+        "audit_scope": "jd_mapping_and_presentation",
+        "audit_input_fingerprint": task["audit_input_fingerprint"],
+        "auditor_context_id": task["auditor_context_id"],
+        "counts": {"P0": 0, "P1": 0, "P2": 0},
+        "findings": [],
+    }
+    assert dispatch(
+        "audit", workspace=ws, payload={"job_id": "C0-001", "audit_result": passed}
+    )["status"] == "succeeded"
+
+    rendered = dispatch(
+        "materials", workspace=ws, payload={"job_id": "C0-001", "stage": "render"}
+    )
+
+    assert rendered["status"] == "succeeded"
+    email_path = package / "application_email.txt"
+    assert email_path.is_file()
+    email = email_path.read_text(encoding="utf-8")
+    assert "Application — Paralegal — Acme" in email
+    assert "Paralegal position at Acme" in email
+    assert "Test Candidate" in email
+    assert "Michael Page" not in email
+    assert "application_email" in rendered["side_effects"]
 
 
 def test_repair_is_finding_scoped_and_preserves_retry_budget(tmp_path):
     ws, package = _planned(tmp_path)
-    drafted = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": canonical_fixture()})
+    drafted = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package)})
     task = drafted["audit_task_packet"]
+    cl_block = next(
+        block for block in task["materials"]["cover_letter"]["blocks"]
+        if block.get("section") not in {"header", "contact", "subject"}
+    )
     finding = {
         "finding_id": "F-1", "severity": "P1", "rule_id": "MAP-001",
-        "material": "cover_letter", "target_id": "cl-opening",
-        "quote": "Its focus on vendor contract review", "reason": "value response is too implicit",
+        "material": "cover_letter", "target_id": cl_block["id"],
+        "quote": cl_block["text"], "reason": "value response is too implicit",
         "required_action": "make the evidence-to-value link explicit",
     }
     report = {"job_id": "C0-001", "audit_scope": "jd_mapping_and_presentation", "audit_input_fingerprint": task["audit_input_fingerprint"], "auditor_context_id": task["auditor_context_id"], "counts": {"P0": 0, "P1": 1, "P2": 0}, "findings": [finding]}
     assert dispatch("audit", workspace=ws, payload={"job_id": "C0-001", "audit_result": report})["status"] == "blocked"
     draft = json.loads((package / "materials_draft.canonical.json").read_text(encoding="utf-8"))
-    opening = next(item for item in draft["cover_letter"]["blocks"] if item["id"] == "cl-opening")
-    patch = {"job_id": "C0-001", "base_canonical_sha256": draft["canonical_sha256"], "audit_input_fingerprint": task["audit_input_fingerprint"], "changes": [{"finding_ids": ["F-1"], "material": "cover_letter", "target_id": "cl-opening", "before_text": opening["text"], "after_text": opening["text"] + " I can therefore contribute accurate, bounded support."}]}
+    opening = next(item for item in draft["cover_letter"]["blocks"] if item["id"] == cl_block["id"])
+    patch = {"job_id": "C0-001", "base_canonical_sha256": draft["canonical_sha256"], "audit_input_fingerprint": task["audit_input_fingerprint"], "changes": [{"finding_ids": ["F-1"], "material": "cover_letter", "target_id": cl_block["id"], "before_text": opening["text"], "after_text": opening["text"] + " I can therefore contribute accurate, bounded support."}]}
     repaired = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "repair_patch": patch})
     assert repaired["status"] == "succeeded"
     assert load_run(package)["audit_attempts"] == 1

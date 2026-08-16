@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 
+from tools.io_utils import atomic_write_json, atomic_write_text
 from tools.workflow.engine import dispatch
 from tools.workflow.materials_draft import load_canonical_draft
+from tools.workflow.package_validator import MaterialsPackageValidator
 from tools.workflow.materials_rules import build_rule_pack
 from tools.workflow.materials_schema import validate_plan_shape
 from tools.workflow.profile_facts import load_profile_facts
-from tools.workflow.testing_packages import build_package, build_workspace
+from tools.workflow.testing_packages import baseline_transform_fixture, build_package, build_workspace
 
 
 def _plan(package):
@@ -85,11 +87,15 @@ def test_canonical_blocks_and_audit_packet_expose_llmo_placement_metadata(tmp_pa
             assert "priority" in block
             assert "jd_anchor_ids" in block
 
-    resumed = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "stage": "drafting"})
+    resumed = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package)},
+    )
     assert resumed["status"] == "succeeded"
     task = resumed["audit_task_packet"]
     assert task["audit_scope"] == "jd_mapping_and_presentation"
-    assert {"POS-001", "HYG-001", "MAP-001", "STAR-001", "LLMO-001", "CON-001", "CL-001", "OPT-001"} == {item["rule_id"] for item in task["rule_pack"]["rules"]}
+    assert {"POS-001", "HYG-001", "BASE-001", "MAP-001", "STAR-001", "LLMO-001", "CON-001", "EDT-001", "CL-001", "OPT-001"} == {item["rule_id"] for item in task["rule_pack"]["rules"]}
     assert "layout_contract" in task
     assert all("section" in block for item in task["materials"].values() for block in item["blocks"])
     assert "email" in task["forbidden"]
@@ -99,9 +105,12 @@ def test_canonical_blocks_and_audit_packet_expose_llmo_placement_metadata(tmp_pa
 def test_compiled_rule_pack_is_cv_cl_only_and_covers_star_jd_and_llmo():
     pack = build_rule_pack()
     ids = {rule["rule_id"] for rule in pack["rules"]}
-    assert {"POS-001", "HYG-001", "MAP-001", "STAR-001", "LLMO-001", "CON-001", "CL-001", "OPT-001"} == ids
+    assert {"POS-001", "HYG-001", "BASE-001", "MAP-001", "STAR-001", "LLMO-001", "CON-001", "EDT-001", "CL-001", "OPT-001"} == ids
     assert pack["scope"] == "jd_mapping_and_presentation"
     assert all(set(rule["scope"]).issubset({"cv", "cover_letter"}) for rule in pack["rules"])
+    consistency = next(item for item in pack["rules"] if item["rule_id"] == "CON-001")
+    assert "parallel materials" in consistency["check"]
+    assert "omission from the other is not a contradiction" in consistency["check"]
 
 
 def test_unsupported_requirement_is_an_internal_omission_not_negative_outbound_copy():
@@ -150,9 +159,45 @@ def test_internal_omission_reaches_the_child_without_becoming_cv_cl_text(tmp_pat
     draft = load_canonical_draft(package)
     assert draft["coverage_dispositions"] == {"JD-002": "intentionally_omitted"}
 
-    resumed = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "stage": "drafting"})
+    resumed = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package)},
+    )
     task = resumed["audit_task_packet"]
     assert task["layout_contract"]["coverage_dispositions"] == {"JD-002": "intentionally_omitted"}
     assert "layout_contract.coverage_dispositions" in task["read_allowlist"]
     outbound_text = "\n".join(item["text"] for item in task["materials"].values())
     assert "intentionally_omitted" not in outbound_text
+
+
+def test_package_numbers_use_shared_profile_facts_not_the_other_material(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws)
+    # Build the same current-job packet a real /materials run uses, including
+    # both lane baselines and the shared private profile bundle.
+    assert dispatch("materials", workspace=ws, payload={"job_id": "C0-001"})["status"] == "succeeded"
+    packet_path = package / "materials_task_packet.json"
+    packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    packet["evidence_nodes"] = [
+        {
+            "id": "PROFILE-METRIC-095",
+            "text": "The user confirmed an approximately 95% outcome rate.",
+            "source_type": "user_confirmed",
+        }
+    ]
+    atomic_write_json(packet_path, packet)
+    atomic_write_text(
+        package / "cl.txt",
+        "Paralegal at Acme: I can bring adjacent contract-review experience with an approximately 95% outcome rate. IELTS 7.5.",
+    )
+
+    supported = MaterialsPackageValidator().validate(package, require_audit_receipt=False)
+    assert "numbers_inconsistent" not in {item["code"] for item in supported["findings"]}
+
+    atomic_write_text(
+        package / "cl.txt",
+        "Paralegal at Acme: I can bring adjacent contract-review experience with an unsupported 96% outcome rate. IELTS 7.5.",
+    )
+    unsupported = MaterialsPackageValidator().validate(package, require_audit_receipt=False)
+    assert "numbers_inconsistent" in {item["code"] for item in unsupported["findings"]}

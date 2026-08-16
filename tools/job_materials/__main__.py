@@ -23,8 +23,7 @@ Usage examples:
   python3 -m tools.job_materials jd set --package 'JobSearch_2026/01_Masters/A_track/核心/A0-005_未投_Example' --file ./jd.txt
   python3 -m tools.job_materials enrich --package '...'
 
-  python3 -m tools.job_materials tailor --package '...' --lane C
-  python3 -m tools.job_materials pipeline --package '...' --lane C
+  python3 -m tools.workflow materials --job-id C0-005
 """
 
 from __future__ import annotations
@@ -425,6 +424,23 @@ def cmd_enrich(args: argparse.Namespace) -> int:
 
 
 def cmd_tailor(args: argparse.Namespace) -> int:
+    # Material authoring has one supported product entrypoint.  Keeping the
+    # historical tailor command callable allowed a model to bypass the
+    # current-job drafting workspace and then copy wording/headers from an
+    # unrelated package.  Data-preparation commands in this compatibility
+    # module (jd/company/preflight/base) remain available; CV/CL authoring is
+    # fail-closed here.
+    print(
+        "legacy_materials_entrypoint_disabled: use "
+        "python3 -m tools.workflow materials --job-id <JOB-ID> "
+        "then submit the returned bounded plan/transform JSON",
+        file=sys.stderr,
+    )
+    return 2
+
+    # The implementation below is retained as migration history only.  It is
+    # intentionally unreachable so no harness can silently select a second
+    # materials SOP.
     root = jobsearch_root()
     package = _pkg(args.package)
     if package is None or not package.is_dir():
@@ -942,6 +958,18 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     Does NOT invent facts. Exit non-zero if base factcheck failed or JD stub/shallow
     (plan is still written so humans can see blockers).
     """
+    print(
+        "legacy_materials_pipeline_disabled: use "
+        "python3 -m tools.workflow materials --job-id <JOB-ID>; "
+        "the gateway creates the current-job drafting context, applies the "
+        "lane masters, runs the CV/CL audit and owns DOCX/PDF rendering "
+        "(materials-vnext)",
+        file=sys.stderr,
+    )
+    return 2
+
+    # Historical implementation retained below for source compatibility only;
+    # it must never be reached by a supported product invocation.
     root = jobsearch_root()
     package = _pkg(args.package, job_id=args.job_id)
     if package is None or not package.is_dir():
@@ -1042,14 +1070,13 @@ def main(argv: list[str] | None = None) -> int:
             "JobSearch_2026 materials (on-demand only). "
             "Separate from scan two-pass. "
             "JD body: LinkedIn CLI + Playwright browser (JobsDB/CT); paste fallback. "
-            "tailor = emphasis from independently fact-checked A–F evidence (no source reopen)."
+            "tailor/pipeline are blocked compatibility names; materials use tools.workflow."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Notes:\n"
             "  • Never auto-runs on /scan / push_to_gsheet / temp_two_pass.\n"
-            "  • pipeline writes tailor_plan + materials_status + base_master_ref;\n"
-            "    exit ≠ 0 if base factcheck failed or JD stub/shallow.\n"
+            "  • legacy tailor/pipeline authoring is disabled; use the workflow gateway.\n"
             "  • Application DOCX/PDF uses the fixed tools.workflow lane-master renderer.\n"
             "  • resume parse grafts apply-bot PDF→text into 00_Profile/resume_runtime/.\n"
         ),
@@ -1164,7 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser(
         "tailor",
-        help="Reorder emphasis from independently fact-checked A–F evidence toward JD (no freestyle claims)",
+        help="Deprecated and blocked: material authoring uses tools.workflow",
     )
     p.add_argument("--package", required=True)
     p.add_argument("--lane", default="", help="A-F (auto if empty)")
@@ -1180,8 +1207,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser(
         "pipeline",
         help=(
-            "On-demand package step: enrich → tailor → materials_status "
-            "(not part of scan; exit ≠0 if factcheck/JD weak)"
+            "Deprecated and blocked: material authoring uses tools.workflow"
         ),
     )
     p.add_argument("--package", default=None, help="Package path (or use --job-id)")

@@ -14,25 +14,39 @@ from time import perf_counter
 from typing import Any
 
 from tools.workflow.engine import dispatch
-from tools.workflow.materials_orchestrator import status as materials_status
 from tools.workflow.package_context import PackageContextLoader
+from tools.workflow.materials_vnext.migration import migration_blocker
+from tools.workflow.materials_vnext.store import load_run
 
 
 def _one(workspace: Path, job_id: str, action: str, engine: str) -> dict[str, Any]:
     started = perf_counter()
     if action == "status":
         package = PackageContextLoader(workspace).load(job_id).package
-        out = materials_status(Path(package)) if package else {"status": "blocked", "blockers": ["package_missing"]}
+        if package:
+            vnext = load_run(Path(package))
+            if vnext:
+                out = {"status": "succeeded", "engine": "materials-vnext", "materials_run": vnext}
+            else:
+                legacy = migration_blocker(workspace, Path(package), job_id)
+                out = legacy or {
+                    "status": "succeeded",
+                    "engine": "materials-vnext",
+                    "phase": "idle",
+                    "materials_run": None,
+                }
+        else:
+            out = {"status": "blocked", "blockers": ["package_missing"]}
     elif action == "render":
-        out = dispatch("materials", workspace=workspace, payload={"job_id": job_id, "stage": "render"})
+        out = dispatch("materials", workspace=workspace, payload={"job_id": job_id, "stage": "render", "materials_engine": "vnext"})
     elif action == "pdf":
         out = dispatch(
             "materials",
             workspace=workspace,
-            payload={"job_id": job_id, "stage": "pdf", "engine": engine, "parallel": True},
+            payload={"job_id": job_id, "stage": "pdf", "engine": engine, "parallel": True, "materials_engine": "vnext"},
         )
     elif action == "format":
-        out = dispatch("format", workspace=workspace, payload={"job_id": job_id})
+        out = dispatch("format", workspace=workspace, payload={"job_id": job_id, "materials_engine": "vnext"})
     else:  # pragma: no cover - caller validates
         out = {"status": "blocked", "blockers": ["unknown_batch_action"]}
     return {"job_id": job_id, "duration_ms": int((perf_counter() - started) * 1000), **out}

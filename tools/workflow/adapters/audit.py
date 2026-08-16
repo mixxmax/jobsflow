@@ -6,20 +6,32 @@ from pathlib import Path
 from uuid import uuid4
 
 from tools.workflow.contracts import result
-from tools.workflow.package_context import PackageContextLoader
-from tools.workflow.materials_orchestrator import (
-    build_audit_task_packet,
-    ensure_run,
-    load_run,
-    task_path,
-    record_audit_result,
-)
-from tools.workflow.auditor_dispatch import dispatch_configured_auditor
-from tools.workflow.materials_renderer import mechanical_format_gate
+# The retired adapter body below is retained as source for migration/rollback
+# inspection, but its imports are intentionally not loaded by the product
+# path.  The gateway dispatches vNext before this frozen body can run.
 
 
 def handle_audit(payload=None, *, workspace: Path | None = None, dry_run: bool = False):
     payload = payload or {}
+    if str(payload.get("materials_engine") or "").casefold() == "vnext":
+        from tools.workflow.materials_vnext import MaterialsEngine
+
+        if workspace is None:
+            return result(status="blocked", blockers=["workspace_required"], rule_ids=["MAT-VNEXT-001"])
+        out = MaterialsEngine().handle({**payload, "stage": "audit"}, workspace=workspace, dry_run=dry_run)
+        out.setdefault("engine", "materials-vnext")
+        out.setdefault("engine_version", "materials-vnext-1")
+        return out
+    return result(
+        status="blocked",
+        blockers=["legacy_materials_audit_entrypoint_disabled"],
+        rule_ids=["MAT-VNEXT-001"],
+        next_action="use_python3_-m_tools.workflow_audit",
+        engine="materials-vnext",
+        engine_version="materials-vnext-1",
+    )
+
+    # ---- frozen legacy audit adapter (backup only; never reached) ----
     job_id = str(payload.get("job_id") or "")
     if workspace is None:
         return result(status="blocked", blockers=["workspace_required"], rule_ids=["MAT-004"])
@@ -150,6 +162,25 @@ def handle_audit(payload=None, *, workspace: Path | None = None, dry_run: bool =
 
 def handle_format(payload=None, *, workspace: Path | None = None, dry_run: bool = False):
     payload = payload or {}
+    if str(payload.get("materials_engine") or "").casefold() == "vnext":
+        from tools.workflow.materials_vnext import MaterialsEngine
+
+        if workspace is None:
+            return result(status="blocked", blockers=["workspace_required"], rule_ids=["MAT-VNEXT-001"])
+        out = MaterialsEngine().handle({**payload, "stage": "format"}, workspace=workspace, dry_run=dry_run)
+        out.setdefault("engine", "materials-vnext")
+        out.setdefault("engine_version", "materials-vnext-1")
+        return out
+    return result(
+        status="blocked",
+        blockers=["legacy_materials_format_entrypoint_disabled"],
+        rule_ids=["MAT-VNEXT-001"],
+        next_action="use_python3_-m_tools.workflow_format",
+        engine="materials-vnext",
+        engine_version="materials-vnext-1",
+    )
+
+    # ---- frozen legacy format adapter (backup only; never reached) ----
     job_id = str(payload.get("job_id") or "")
     if workspace is None:
         return result(status="blocked", blockers=["workspace_required"], rule_ids=["MAT-004"])

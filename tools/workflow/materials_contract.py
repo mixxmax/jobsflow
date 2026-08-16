@@ -1,10 +1,11 @@
-"""Deprecated claim/entity contract compatibility helpers.
+"""Entity contract builder for the materials workflow.
 
-The v2 product workflow no longer builds or sends a claim authorization
-contract to the independent CV/CL auditor.  The functions remain importable
-for legacy packages and migration tooling, but they are not part of the
-runtime audit gate; user-confirmed profile facts are accepted by the main
-materials path and optional mechanical factcheck is separate.
+The claim-contract helpers are deprecated: the v2 product workflow no longer
+builds or sends a claim authorization contract to the independent CV/CL
+auditor.  The entity contract remains the single authoritative
+role/publisher/employer resolution shared by planning, rendering, email and
+validation; every consumer reads this contract instead of re-merging manifest
+and research fields.
 """
 
 from __future__ import annotations
@@ -12,6 +13,9 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Any
+
+from tools.job_materials.publisher import PUBLISHER_CLASSIFIER_VERSION
+from tools.job_materials.role_titles import ROLE_TITLE_PARSER_VERSION
 
 
 def _text(value: Any) -> str:
@@ -167,9 +171,11 @@ def build_entity_contract(
     source: str = "",
     source_priority: str = "tracker",
     confirmed: bool = False,
+    role_title_contract: dict[str, Any] | None = None,
+    application_target: str = "",
 ) -> dict[str, Any]:
     entity = {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract_type": "jobsflow_entity_contract",
         "job_id": job_id,
         "role": _text(role),
@@ -177,10 +183,19 @@ def build_entity_contract(
         "publisher_type": _text(publisher_type).casefold() or "unknown",
         "employer_name": _text(employer_name),
         "company_out": _text(company_out),
+        "application_target": _text(application_target),
         "source": _text(source),
         "source_priority": source_priority,
         "confirmed": bool(confirmed),
+        "parser_versions": {
+            "role_title": ROLE_TITLE_PARSER_VERSION,
+            "publisher_classifier": PUBLISHER_CLASSIFIER_VERSION,
+        },
     }
+    if isinstance(role_title_contract, dict) and role_title_contract:
+        entity["role_title_contract"] = {
+            key: value for key, value in role_title_contract.items() if key != "variants"
+        }
     entity["entity_sha256"] = _digest({key: value for key, value in entity.items() if key != "entity_sha256"})
     return entity
 

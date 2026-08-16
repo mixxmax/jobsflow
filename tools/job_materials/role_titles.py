@@ -11,6 +11,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from tools.salary_parsing import PARSED, parse_salary_range
+
+
+ROLE_TITLE_PARSER_VERSION = 2
+
 
 _PAREN_RE = re.compile(r"(?P<open>[\(（])(?P<inside>[^()（）]*)(?P<close>[\)）])")
 _IDENTIFIER_PAREN_RE = re.compile(
@@ -73,6 +78,10 @@ _METADATA_WORDS = (
 # user instead of being silently sent as a combined role.
 _COMPOUND_SLASHES = {
     "and/or",
+    "aml/kyc",
+    "kyc/aml",
+    "kyc/cdd",
+    "cdd/kyc",
     "ui/ux",
     "ux/ui",
     "qa/qc",
@@ -84,9 +93,12 @@ _COMPOUND_SLASHES = {
 }
 _COMPOUND_ACRONYMS = {
     "ai",
+    "aml",
     "api",
     "b2b",
     "b2c",
+    "cdd",
+    "kyc",
     "ml",
     "qa",
     "qc",
@@ -116,6 +128,13 @@ def _is_metadata_parenthetical(value: str) -> bool:
     text = _clean(value)
     folded = _fold(text)
     if not text or _IDENTIFIER_PAREN_RE.fullmatch(text):
+        return True
+    salary = parse_salary_range(text)
+    if salary.status == PARSED and (
+        salary.currency
+        or salary.period
+        or bool(re.search(r"(?i)\b(?:salary|pay|compensation|up\s+to|from)\b|[$€£¥]", text))
+    ):
         return True
     if any(word in folded for word in _METADATA_WORDS):
         # Avoid treating a specialization such as "Remote Sensing" as a
@@ -278,7 +297,14 @@ def build_role_title_contract(role: str, *, selected_primary: str = "") -> dict[
         for index, variant in enumerate(variants)
         if index != selected_index and variant.get("material")
     ]
+    if selection_mode == "user_override":
+        ambiguity_status = "user_confirmed"
+    elif alternates:
+        ambiguity_status = "pending_confirmation"
+    else:
+        ambiguity_status = "not_ambiguous"
     return {
+        "parser_version": ROLE_TITLE_PARSER_VERSION,
         "display": display,
         "primary": primary["material"],
         "primary_display": primary["display"],
@@ -288,7 +314,8 @@ def build_role_title_contract(role: str, *, selected_primary: str = "") -> dict[
         "specialisms": list(primary.get("specialisms") or []),
         "metadata_parentheticals": list(primary.get("metadata_parentheticals") or []),
         "selection_mode": selection_mode,
-        "confirmation_needed": bool(alternates),
+        "ambiguity_status": ambiguity_status,
+        "confirmation_needed": ambiguity_status == "pending_confirmation",
         "policy": (
             "Use one primary role in outbound material; keep alternatives for confirmation. "
             "Preserve substantive parentheses; remove only obvious location, work-arrangement "
@@ -306,6 +333,7 @@ def normalize_role_for_material(role: str, *, selected_primary: str = "") -> str
 
 
 __all__ = [
+    "ROLE_TITLE_PARSER_VERSION",
     "build_role_title_contract",
     "normalize_role_for_material",
 ]

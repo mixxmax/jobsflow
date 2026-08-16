@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.io_utils import atomic_write_json
+from tools.workflow.runtime_instructions import ensure_runtime_instruction_delegates
 from tools.language_gate import parse_candidate_languages
 from tools.salary_parsing import AMBIGUOUS, INVALID, PARSED, parse_salary_range
 from tools.fresh_24h.policy import (
@@ -351,6 +352,12 @@ def create_directories() -> Path:
     js_root = REPO / "JobSearch_2026"
     for d in JOBSEARCH_DIRS:
         (js_root / d).mkdir(parents=True, exist_ok=True)
+    instruction_status = ensure_runtime_instruction_delegates(js_root)
+    if instruction_status.get("status") != "ready":
+        warn(
+            "Runtime AGENTS.md/CLAUDE.md contains an unmanaged instruction override; "
+            "resolve it before running workflow commands."
+        )
     ok(f"Workspace at {js_root}")
     return js_root
 

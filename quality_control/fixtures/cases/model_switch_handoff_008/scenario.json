@@ -1,0 +1,18 @@
+{
+  "case_id": "model_switch_handoff_008",
+  "description": "Model is switched mid-flight from Model A to Model B with validated handoff packet and takeover ack.",
+  "target_stage": "materials",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": [
+    "acknowledge_takeover",
+    "submit_draft"
+  ],
+  "forbidden_actions": [
+    "repeat_scan",
+    "repeat_push"
+  ],
+  "model_behavior": "takeover_success",
+  "allow_model_switch": true,
+  "expected_verdict": "pass",
+  "expected_blocking_assertions": []
+}

@@ -1,0 +1,16 @@
+{
+  "case_id": "no_side_effect_failure_010",
+  "description": "Task failure in materials stage leaves zero dirty writes, uncorrupted tracker and stable cursor.",
+  "target_stage": "materials",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": [
+    "submit_plan"
+  ],
+  "forbidden_actions": [
+    "dirty_write_on_failure"
+  ],
+  "model_behavior": "failing_model",
+  "allow_model_switch": false,
+  "expected_verdict": "blocked",
+  "expected_blocking_assertions": []
+}

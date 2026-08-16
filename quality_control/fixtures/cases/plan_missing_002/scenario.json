@@ -1,0 +1,19 @@
+{
+  "case_id": "plan_missing_002",
+  "description": "Model attempts to skip plan and directly submit drafting transform.",
+  "target_stage": "materials",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": [
+    "submit_plan",
+    "submit_draft"
+  ],
+  "forbidden_actions": [
+    "skip_plan"
+  ],
+  "model_behavior": "plan_missing",
+  "allow_model_switch": false,
+  "expected_verdict": "fail",
+  "expected_blocking_assertions": [
+    "SOP-005"
+  ]
+}

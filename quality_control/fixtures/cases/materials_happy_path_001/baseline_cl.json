@@ -1,0 +1,20 @@
+{
+  "sections": [
+    {
+      "id": "salutation",
+      "content": "Dear Hiring Team,"
+    },
+    {
+      "id": "hook",
+      "content": "I am writing to express my strong interest in the Senior Distributed Systems Engineer role at TechScale Solutions."
+    },
+    {
+      "id": "match",
+      "content": "With 10 years architecting high-throughput backend services in Python, I have built reliable evaluation pipelines that scale under high concurrency."
+    },
+    {
+      "id": "closing",
+      "content": "Thank you for your time and consideration."
+    }
+  ]
+}

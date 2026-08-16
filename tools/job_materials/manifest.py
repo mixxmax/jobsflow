@@ -143,6 +143,123 @@ def write_job_manifest(package: Path, manifest: dict[str, Any]) -> Path:
     return path
 
 
+def reconcile_package_metadata(root: Path, package: Path) -> dict[str, Any]:
+    """Reconcile derived manifest/snapshot coordinates with the bound package.
+
+    The package path and ``A/B`` job-id are the entry-bound source of truth for
+    lane/tier.  Older runs could leave a manifest or ``job_snapshot.md`` that
+    still pointed at a previous lane.  Materials must never consume those
+    stale coordinates, but we can safely repair the derived bookkeeping while
+    preserving all user-owned overrides and job facts.
+    """
+
+    package = Path(package).expanduser().resolve()
+    manifest = _load_existing(package)
+    job_id = _clean(manifest.get("job_id") or package.name.split("_", 1)[0]).upper()
+    parts = parse_job_id(job_id)
+    lane = str(parts.get("lane") or "").upper()
+    tier = derive_tier(job_id)
+    changed = False
+    if job_id and manifest.get("job_id") != job_id:
+        manifest["job_id"] = job_id
+        changed = True
+    if lane and str(manifest.get("lane") or "").upper() != lane:
+        manifest["lane"] = lane
+        changed = True
+    if tier.get("code"):
+        old_tier = manifest.get("tier") if isinstance(manifest.get("tier"), dict) else {}
+        normalized_tier = {
+            "code": str(tier.get("code") or ""),
+            "label": str(tier.get("label") or ""),
+            "source": "job_id",
+        }
+        if old_tier != normalized_tier:
+            manifest["tier"] = normalized_tier
+            changed = True
+    paths = manifest.get("paths") if isinstance(manifest.get("paths"), dict) else {}
+    expected_dir = str(package)
+    if paths.get("package_dir") != expected_dir:
+        paths["package_dir"] = expected_dir
+        changed = True
+    if tier.get("label") and paths.get("path_tier_label") != tier.get("label"):
+        paths["path_tier_label"] = tier.get("label")
+        changed = True
+    if paths.get("path_tier_mismatch") and tier.get("code"):
+        paths["path_tier_mismatch"] = False
+        changed = True
+    manifest["paths"] = paths
+
+    # Company research is the only verified source for publisher/employer
+    # classification after a package is created.  Propagate its structured
+    # result into the manifest projection before any materials bundle is
+    # frozen.  This closes the historical split where ``company set`` updated
+    # research.json but the manifest continued to say ``unknown`` until a
+    # later hand edit.  Empty research fields never erase an existing value.
+    research = _package_company_research(package)
+    researched_job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
+    if research:
+        for field, keys in {
+            "publisher_type": ("publisher_type", "type"),
+            "publisher_name": ("publisher_name", "publisher"),
+            "company_out": ("company_out", "employer_name", "application_target"),
+            "employer_name": ("employer_name", "company_out", "application_target"),
+        }.items():
+            value = next((_clean(research.get(key)) for key in keys if _clean(research.get(key))), "")
+            if value and researched_job.get(field) != value:
+                researched_job[field] = value
+                changed = True
+        # Keep the original publisher/company source available for audit, but
+        # never replace it with an inferred employer name.
+        if _clean(research.get("publisher_type")) and researched_job.get("publisher_type") != _clean(research.get("publisher_type")):
+            researched_job["publisher_type"] = _clean(research.get("publisher_type"))
+            changed = True
+        manifest["job"] = researched_job
+    if changed:
+        manifest["generated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        write_job_manifest(package, manifest)
+
+    # The Markdown snapshot is a human-readable projection only.  Rewrite
+    # its identity lines from the reconciled manifest so a model cannot read a
+    # stale lane/tier/publisher and treat it as a second source of truth.
+    snapshot = package / "job_snapshot.md"
+    if snapshot.is_file() and isinstance(manifest.get("job"), dict):
+        job = manifest["job"]
+        replacements = {
+            "Role": _clean(job.get("role_display") or job.get("role_material")),
+            # ``Company`` means the verified hiring employer.  A recruiter is
+            # shown separately as ``Publisher`` and is never silently copied
+            # into the company field.
+            "Company": _clean(job.get("company_out") or job.get("employer_name") or job.get("company_source")) or "未披露公司",
+            "Publisher": _clean(job.get("publisher_name")) or "未披露公司",
+            "Publisher Type": _clean(job.get("publisher_type")) or "unknown",
+            "Employer": _clean(job.get("employer_name")) or "—",
+            "Lane": lane,
+            "Tier": str(tier.get("label") or "待审"),
+        }
+        try:
+            lines = snapshot.read_text(encoding="utf-8").splitlines()
+            output: list[str] = []
+            seen: set[str] = set()
+            for line in lines:
+                match = re.match(r"^(Role|Company|Publisher|Publisher Type|Employer|Lane|Tier):\s*.*$", line)
+                if match:
+                    key = match.group(1)
+                    output.append(f"{key}: {replacements[key]}")
+                    seen.add(key)
+                else:
+                    output.append(line)
+            for key in ("Role", "Company", "Publisher", "Publisher Type", "Employer", "Lane", "Tier"):
+                if key not in seen:
+                    output.append(f"{key}: {replacements[key]}")
+            if output != lines:
+                from tools.io_utils import atomic_write_text
+
+                atomic_write_text(snapshot, "\n".join(output).rstrip() + "\n")
+        except (OSError, UnicodeError):
+            pass
+    return manifest
+
+
 def _jd_info(root: Path, url: str, jd_text: str) -> dict[str, Any]:
     text = str(jd_text or "").strip()
     source = "package_or_input"

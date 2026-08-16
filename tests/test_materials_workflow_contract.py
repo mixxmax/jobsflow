@@ -139,8 +139,8 @@ def test_base_sync_separates_facts_anchor_and_capability_upper(tmp_path, monkeyp
     assert base["forbidden_claims"]
 
 
-def test_clean_clone_selected_job_to_materials_pipeline(tmp_path, monkeypatch):
-    """Exercise the documented selected-job handoff without private files."""
+def test_legacy_selected_job_materials_pipeline_is_blocked(tmp_path, monkeypatch):
+    """The compatibility CLI cannot become a second materials entrypoint."""
     monkeypatch.setattr(setup, "REPO", tmp_path)
     monkeypatch.setattr(setup, "extract_name", lambda text: "Example User")
     monkeypatch.setattr(setup, "extract_phone", lambda text: "+852 0000 0000")
@@ -176,52 +176,13 @@ def test_clean_clone_selected_job_to_materials_pipeline(tmp_path, monkeypatch):
         )
 
     assert materials_main(["base", "sync", "--lane", "A"]) == 0
-    jd = (
-        "The Operations Analyst will develop, implement and monitor operational "
-        "programmes, document workflows, coordinate review checkpoints with business "
-        "stakeholders, and improve reporting quality through responsible automation. "
-        "The role partners with teams to maintain reliable controls and clear records."
-    )
-    jd_path = tmp_path / "jd.txt"
-    jd_path.write_text(jd, encoding="utf-8")
     # Package creation is the confirmed entry boundary; materials helpers may
-    # not create it implicitly from a tracker row.
+    # not create it implicitly from a tracker row.  The old tailor/pipeline
+    # names are now fail-closed so a model cannot browse another package or
+    # hand-write a second canonical/document path.
     create_package_from_tracker(root, "A0-005")
-    assert materials_main(["jd", "set", "--job-id", "A0-005", "--file", str(jd_path)]) == 0
-
-    package = _pkg(None, job_id="A0-005")
-    assert package is not None
-    assert materials_main(["pipeline", "--job-id", "A0-005", "--lane", "A"]) == 4
-    assert (package / "company_research_request.json").exists()
-    save_company_research(
-        package,
-        {
-            "company": "Acme",
-            "nature": "Private operations technology company",
-            "business": "Workflow and reporting software for business teams",
-            "role_priorities": ["Develop and monitor operational programmes"],
-            "verified_signals": [
-                {
-                    "claim": "Acme provides workflow and reporting software.",
-                    "source_url": "https://example.com/about",
-                    "source_type": "company_website",
-                }
-            ],
-            "interest_angles": ["Interest in reliable workflow infrastructure."],
-            "uncertainties": [],
-        },
-        root=root,
-    )
-    assert materials_main(["pipeline", "--job-id", "A0-005", "--lane", "A"]) == 0
-    assert (package / "tailor_plan.json").exists()
-    assert (package / "materials_status.md").exists()
-    manifest = json.loads((package / "job_manifest.json").read_text(encoding="utf-8"))
-    plan = json.loads((package / "tailor_plan.json").read_text(encoding="utf-8"))
-    assert manifest["job_id"] == "A0-005"
-    assert plan["job_manifest"]["job_id"] == "A0-005"
-    assert manifest["artifacts"]["resume"]["status"] == "plan_ready"
-    assert json.loads((package / "application_preflight.json").read_text(encoding="utf-8"))["ready_for_apply"]
-    assert "develop, implement and monitor" in read_jd(package, root)
+    assert materials_main(["pipeline", "--job-id", "A0-005", "--lane", "A"]) == 2
+    assert materials_main(["tailor", "--package", str(_pkg(None, job_id="A0-005")), "--lane", "A"]) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -318,3 +279,37 @@ def test_materials_jobsdb_browser_uses_single_attempt(tmp_path, monkeypatch):
 
     assert captured.get("retry") == 0
     assert captured.get("retry_delay") == 0
+
+
+def test_pending_role_confirmation_blocks_planning(tmp_path):
+    """A multi-role title without a user selection must not reach planning."""
+    import json
+
+    from tools.workflow.package_context import PackageContextLoader
+
+    workspace = tmp_path / "JobSearch_2026"
+    package = workspace / "01_Masters" / "F_general_legal" / "核心" / "F0-091_未投_TestCo"
+    package.mkdir(parents=True)
+    manifest = {
+        "schema_version": 1,
+        "job_id": "F0-091",
+        "job": {
+            "role_display": "Paralegal / Legal Assistant",
+            "role_material": "Paralegal",
+            "role_primary": "Paralegal",
+            "role_selection": {
+                "selection_mode": "deterministic_first_variant",
+                "ambiguity_status": "pending_confirmation",
+                "confirmation_needed": True,
+            },
+            "publisher_type": "employer",
+            "publisher_name": "TestCo",
+            "employer_name": "TestCo",
+            "url": "https://example.com/job/1",
+        },
+    }
+    (package / "job_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    (package / "jd_full.md").write_text("Role description with several responsibilities.", encoding="utf-8")
+
+    ctx = PackageContextLoader(workspace).load("F0-091")
+    assert "role_confirmation_required" in ctx.blockers

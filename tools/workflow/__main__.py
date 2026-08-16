@@ -11,7 +11,25 @@ from uuid import uuid4
 from tools.workflow.adapters.scan import default_scan_runner
 from tools.workflow.engine import dispatch
 from tools.workflow.fresh_store import FileFreshStore, default_fresh_store
-from tools.workflow.materials_orchestrator import reset as reset_materials, status as materials_status
+
+
+def _materials_engine_info() -> dict[str, str]:
+    """Return the only supported materials engine and prove it is product code."""
+
+    from tools.workflow.materials_vnext import MaterialsEngine
+    from tools.workflow.materials_vnext.contracts import ENGINE_VERSION
+
+    module_path = Path(__import__(MaterialsEngine.__module__, fromlist=["__file__"]).__file__).resolve()
+    product_root = Path(__file__).resolve().parents[2]
+    expected_root = (product_root / "tools" / "workflow" / "materials_vnext").resolve()
+    if expected_root not in module_path.parents:
+        raise RuntimeError("materials_engine_not_from_product_line")
+    return {
+        "engine": "materials-vnext",
+        "engine_version": ENGINE_VERSION,
+        "entrypoint": "python3 -m tools.workflow",
+        "module": str(module_path),
+    }
 
 
 def _workspace(ns: argparse.Namespace) -> Path:
@@ -28,6 +46,40 @@ def _load_store(path: Path | None, title: str, workspace: Path):
     title = str(data.get("title") or title or path.stem)
     rows = list(data.get("rows") or [])
     return FileFreshStore(workspace, title, rows)
+
+
+def _materials_submission_blocker(
+    workspace: Path,
+    job_id: str,
+    supplied: Path,
+    *,
+    phase: str,
+) -> dict[str, object] | None:
+    """Reject model response files outside the current-job staging scope.
+
+    The response file path is part of the workflow binding, not a convenience
+    hint.  Checking it before reading JSON prevents a harness from copying a
+    plan/transform from another job or from an arbitrary temporary file while
+    still presenting it as the current job's model output.
+    """
+
+    from tools.workflow.materials_drafting_context import expected_submission_path
+    from tools.workflow.package_context import PackageContextLoader
+
+    ctx = PackageContextLoader(Path(workspace)).load(str(job_id))
+    if not ctx.package:
+        return {"status": "blocked", "job_id": str(job_id), "blockers": ["package_missing"]}
+    expected = expected_submission_path(Path(ctx.package), phase=phase)
+    supplied_path = Path(supplied).expanduser().resolve()
+    if expected is None or supplied_path != expected.resolve():
+        return {
+            "status": "blocked",
+            "job_id": str(job_id),
+            "blockers": ["drafting_submission_path_invalid"],
+            "expected_submission": str(expected) if expected else "",
+            "submitted_path": str(supplied_path),
+        }
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -76,8 +128,8 @@ def main(argv: list[str] | None = None) -> int:
         default="run",
     )
     materials.add_argument("--job-id", default="")
-    materials.add_argument("--plan", type=Path, help="Model materials_plan.v1 JSON")
-    materials.add_argument("--content", type=Path, help="Structured canonical CV/CL JSON")
+    materials.add_argument("--plan", type=Path, help="JSON planning response for the current frozen job bundle")
+    materials.add_argument("--content", type=Path, help="Bounded baseline transform JSON (not a full CV/CL replacement)")
     materials.add_argument("--patch", type=Path, help="Finding-scoped canonical repair JSON")
     materials.add_argument("--resolution", type=Path, help="Accept/dispute decisions for current audit findings")
     materials.add_argument(
@@ -86,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Register an already generated draft or PDF before audit/format",
     )
-    materials.add_argument("--scope", choices=["audit", "draft", "render", "all"], default="audit")
+    materials.add_argument("--scope", choices=["audit", "draft", "render", "all"], default="all")
     materials.add_argument("--confirm-reset", action="store_true")
     materials.add_argument("--strict-audit", action="store_true", help="Require a real independent CV/CL audit result")
     materials.add_argument("--engine", choices=["libreoffice", "auto", "spire"], default="libreoffice")
@@ -183,7 +235,24 @@ def main(argv: list[str] | None = None) -> int:
             if not package:
                 out = {"status": "blocked", "blockers": ["package_missing"], "job_id": args.job_id}
             else:
-                out = materials_status(Path(package))
+                from tools.workflow.materials_vnext.store import load_run
+                from tools.workflow.materials_vnext.migration import migration_blocker
+
+                vnext_run = load_run(Path(package))
+                legacy = None if vnext_run else migration_blocker(workspace, Path(package), args.job_id)
+                out = (
+                    {"status": "succeeded", "job_id": args.job_id, "materials_run": vnext_run}
+                    if vnext_run
+                    else (
+                        {**legacy, "job_id": args.job_id, "materials_run": None}
+                        if legacy
+                        else {"status": "succeeded", "job_id": args.job_id, "phase": "idle", "materials_run": None}
+                    )
+                )
+                try:
+                    out.update(_materials_engine_info())
+                except (ImportError, RuntimeError) as exc:
+                    out = {"status": "blocked", "job_id": args.job_id, "blockers": ["materials_engine_unavailable"], "error": str(exc)}
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 0 if out.get("status") not in {"blocked", "failed"} else 2
         if args.materials_cmd == "reset":
@@ -192,8 +261,31 @@ def main(argv: list[str] | None = None) -> int:
             package = PackageContextLoader(workspace).load(args.job_id).package
             if not package:
                 out = {"status": "blocked", "blockers": ["package_missing"], "job_id": args.job_id}
+            elif args.scope != "all":
+                out = {
+                    "status": "blocked",
+                    "job_id": args.job_id,
+                    "blockers": ["materials_reset_scope_must_be_all"],
+                    "required": "materials reset --scope all --confirm-reset",
+                }
+            elif not args.confirm_reset:
+                out = {
+                    "status": "preview",
+                    "job_id": args.job_id,
+                    "next_action": "repeat_with_--confirm-reset",
+                }
+                try:
+                    out.update(_materials_engine_info())
+                except (ImportError, RuntimeError) as exc:
+                    out = {"status": "blocked", "job_id": args.job_id, "blockers": ["materials_engine_unavailable"], "error": str(exc)}
             else:
-                out = reset_materials(Path(package), scope=args.scope, confirm=args.confirm_reset)
+                from tools.workflow.materials_vnext import MaterialsEngine
+
+                out = MaterialsEngine().handle({"job_id": args.job_id, "stage": "reset"}, workspace=workspace)
+                try:
+                    out.update(_materials_engine_info())
+                except (ImportError, RuntimeError) as exc:
+                    out = {"status": "blocked", "job_id": args.job_id, "blockers": ["materials_engine_unavailable"], "error": str(exc)}
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 0 if out.get("status") in {"preview", "reset"} else 2
         if args.materials_cmd == "batch":
@@ -211,7 +303,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.materials_cmd == "draft":
             payload["stage"] = "canonical"
             if args.content:
-                payload["canonical_draft"] = json.loads(Path(args.content).read_text(encoding="utf-8"))
+                blocker = _materials_submission_blocker(
+                    workspace,
+                    args.job_id,
+                    args.content,
+                    phase="tailoring",
+                )
+                if blocker:
+                    print(json.dumps(blocker, ensure_ascii=False, indent=2))
+                    return 2
+                payload["model_transform"] = json.loads(Path(args.content).read_text(encoding="utf-8"))
         elif args.materials_cmd == "repair":
             payload["stage"] = "repair"
             if args.patch:
@@ -237,6 +338,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.strict_audit:
             payload["strict_audit"] = True
         if args.plan:
+            blocker = _materials_submission_blocker(
+                workspace,
+                args.job_id,
+                args.plan,
+                phase="planning",
+            )
+            if blocker:
+                print(json.dumps(blocker, ensure_ascii=False, indent=2))
+                return 2
             payload["model_plan"] = json.loads(Path(args.plan).read_text(encoding="utf-8"))
     elif action == "apply":
         payload["job_id"] = args.job_id
@@ -296,10 +406,21 @@ def main(argv: list[str] | None = None) -> int:
                     workspace, args.fresh_title, {"backend": args.backend}
                 )
 
+    if action in {"materials", "audit", "format", "apply"}:
+        payload["materials_engine"] = "vnext"
+        try:
+            payload["materials_engine_info"] = _materials_engine_info()
+        except (ImportError, RuntimeError) as exc:
+            out = {"status": "blocked", "blockers": ["materials_engine_unavailable"], "error": str(exc)}
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 2
+
     runner = None
     if action == "scan" and not payload.get("dry_run") and not payload.get("fixture"):
         runner = default_scan_runner
     out = dispatch(action, workspace=workspace, store=store, payload=payload, runner=runner)
+    if action in {"materials", "audit", "format", "apply"} and isinstance(payload.get("materials_engine_info"), dict):
+        out.update(payload["materials_engine_info"])
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0 if out.get("status") in {"succeeded", "planned"} else 2
 

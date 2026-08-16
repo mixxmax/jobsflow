@@ -7,30 +7,17 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from tools.io_utils import atomic_write_json
 from tools.workflow.contracts import result
-from tools.workflow.package_context import PackageContextLoader
-from tools.workflow.artifact_manifest import discover_outbound
-from tools.workflow.plan_gate import PACKET_NAME, write_validated_plan
-from tools.workflow.task_packet import build_task_packet, evaluate_model_output
-from tools.workflow.materials_memory import load_lessons
-from tools.workflow.materials_metadata import metadata_violations
-from tools.workflow.materials_orchestrator import (
-    build_audit_task_packet,
-    ensure_run,
-    load_run,
-    record_audit_result,
-    resolve_findings,
-)
-from tools.workflow.materials_draft import (
-    apply_finding_scoped_patch,
-    canonical_draft_task_schema,
-    compile_canonical_draft,
-    load_canonical_draft,
-    save_canonical_draft,
-)
-from tools.workflow.materials_renderer import convert_rendered_pdfs, render_canonical_docx
-from tools.workflow.auditor_dispatch import dispatch_configured_auditor
+# The large pre-vNext adapter body below is deliberately left in place as
+# rollback source, but none of its imports are loaded by the product path.
+# ``WorkflowEngine`` forces ``materials_engine=vnext`` before this adapter is
+# called, and the live branch imports only ``materials_vnext``.
+
+
+def _drafting_staging_root(workspace: Path) -> Path:
+    """Return the isolated model-facing context root for this runtime."""
+
+    return Path(workspace) / "02_Tracker" / "workflow" / "materials_drafting_contexts"
 
 
 def _automatic_audit(package: Path, task: dict[str, Any], *, timeout: int = 900) -> dict[str, Any]:
@@ -69,12 +56,47 @@ def _automatic_audit(package: Path, task: dict[str, Any], *, timeout: int = 900)
 
 def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = None, dry_run: bool = False) -> dict[str, Any]:
     payload = payload or {}
+    if str(payload.get("materials_engine") or "").casefold() == "vnext":
+        from tools.workflow.materials_vnext import MaterialsEngine
+
+        if workspace is None:
+            return result(status="blocked", rule_ids=["MAT-VNEXT-001"], blockers=["workspace_required"])
+        out = MaterialsEngine().handle(payload, workspace=workspace, dry_run=dry_run)
+        out.setdefault("rule_ids", ["MAT-VNEXT-001"])
+        out.setdefault("engine", "materials-vnext")
+        out.setdefault("engine_version", "materials-vnext-1")
+        return out
+    # Frozen compatibility body below is intentionally unreachable from the
+    # product gateway.  It remains in this module only so historical private
+    # packages can be inspected or recovered by an explicitly maintained
+    # migration tool; new models and runtime calls must never author through
+    # the retired chain.
+    return result(
+        status="blocked",
+        rule_ids=["MAT-VNEXT-001"],
+        blockers=["legacy_materials_entrypoint_disabled"],
+        next_action="use_python3_-m_tools.workflow_materials_vnext",
+        engine="materials-vnext",
+        engine_version="materials-vnext-1",
+    )
+
+    # ---- frozen legacy adapter (backup only; never reached) ----
     job_id = str(payload.get("job_id") or "")
     if workspace is None:
         return result(
             status="blocked",
             rule_ids=["MAT-001"],
             blockers=["package_missing"],
+            generate_materials=False,
+        )
+    runtime_instructions = ensure_runtime_instruction_delegates(workspace)
+    if runtime_instructions.get("status") != "ready":
+        return result(
+            status="blocked",
+            after_state="idle",
+            rule_ids=["MAT-001"],
+            blockers=["runtime_instruction_conflict"],
+            conflicts=list(runtime_instructions.get("conflicts") or []),
             generate_materials=False,
         )
     ctx = PackageContextLoader(workspace).load(job_id)
@@ -113,11 +135,48 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
                 status="blocked",
                 after_state="plan_validated",
                 rule_ids=["MAT-004"],
-                blockers=["canonical_draft_required"],
-                draft_schema=canonical_draft_task_schema(job_id=job_id),
+                blockers=["baseline_transform_required"],
+                draft_schema=baseline_transform_task_schema(
+                    load_content_baseline(package),
+                    job_id=job_id,
+                    jd_anchors=plan_jd_anchor_catalog(plan),
+                ),
+            )
+        if str(raw_draft.get("artifact_type") or "") != "jobsflow_baseline_transform":
+            return result(
+                status="blocked",
+                after_state="plan_validated",
+                rule_ids=["MAT-004"],
+                blockers=["canonical_draft_invalid"],
+                error="baseline_transform_required: submit a bounded delta, not a replacement CV/CL",
+            )
+        binding_errors = validate_submission_binding(
+            raw_draft,
+            load_drafting_scope(package, phase="tailoring"),
+        )
+        if binding_errors:
+            return result(
+                status="blocked",
+                after_state="plan_validated",
+                rule_ids=["MAT-004"],
+                blockers=["drafting_submission_unbound"],
+                error=", ".join(binding_errors),
+                next_action="edit_current_drafting_workspace_response",
             )
         producer_context_id = str(payload.get("producer_context_id") or f"producer-{uuid4().hex[:12]}")
         try:
+            content_baseline = build_content_baseline(
+                workspace=workspace,
+                package=package,
+                lane=ctx.lane,
+            )
+            raw_draft = apply_baseline_transform(
+                content_baseline,
+                raw_draft,
+                job_id=job_id,
+                context=ctx.to_dict(),
+                plan=plan,
+            )
             draft = save_canonical_draft(
                 package,
                 raw_draft,
@@ -126,8 +185,18 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
                     "jd": str(ctx.input_hashes.get("jd") or ""),
                     "profile": str(ctx.input_hashes.get("profile") or ""),
                     "plan": str(plan.get("plan_sha256") or plan.get("report_hash") or ""),
+                    "baseline": str(content_baseline.get("baseline_sha256") or ""),
                 },
                 producer_context_id=producer_context_id,
+            )
+            # Freeze the model transform as the immutable original of this
+            # generation; every later repair appends to the replay ledger so
+            # a draft reset replays the repaired content, never the old
+            # defective response.
+            save_original_transform(
+                package,
+                payload["canonical_draft"],
+                baseline_sha256=str(content_baseline.get("baseline_sha256") or ""),
             )
             task = build_audit_task_packet(
                 package,
@@ -184,9 +253,17 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
             return result(status="blocked", after_state="content_passed", blockers=["package_missing"], rule_ids=["MAT-004"])
         try:
             rendered = render_canonical_docx(Path(ctx.package), workspace, force=bool(payload.get("force")))
+            email = render_application_email(Path(ctx.package), workspace)
         except ValueError as exc:
             return result(status="blocked", after_state="content_passed", blockers=[str(exc)], rule_ids=["MAT-004"])
-        return result(status="succeeded", after_state="docx_generated", side_effects=["render_canonical_docx"], rule_ids=["MAT-004"], render=rendered)
+        return result(
+            status="succeeded",
+            after_state="docx_generated",
+            side_effects=["render_canonical_docx", "application_email"],
+            rule_ids=["MAT-004"],
+            render=rendered,
+            application_email=email,
+        )
     if stage in {"pdf", "convert"}:
         if not ctx.package:
             return result(status="blocked", after_state="content_passed", blockers=["package_missing"], rule_ids=["MAT-004"])
@@ -198,17 +275,49 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
                 force=bool(payload.get("force")),
                 parallel=bool(payload.get("parallel", True)),
             )
+            email = render_application_email(Path(ctx.package), workspace)
         except (OSError, RuntimeError, ValueError) as exc:
             return result(status="failed", after_state="docx_generated", blockers=["pdf_conversion_failed"], error=str(exc), rule_ids=["MAT-004"])
-        return result(status="succeeded", after_state="pdf_generated", side_effects=["convert_docx_to_pdf"], rule_ids=["MAT-004"], conversion=converted)
+        return result(
+            status="succeeded",
+            after_state="pdf_generated",
+            side_effects=["convert_docx_to_pdf", "application_email"],
+            rule_ids=["MAT-004"],
+            conversion=converted,
+            application_email=email,
+        )
     if stage == "drafting":
-        if not ctx.package or not load_canonical_draft(Path(ctx.package)):
+        current_draft = load_canonical_draft(Path(ctx.package)) if ctx.package else {}
+        if not ctx.package or not current_draft:
             return result(
                 status="blocked",
                 after_state="plan_validated",
                 rule_ids=["MAT-004"],
                 blockers=["canonical_draft_required"],
                 next_action="submit_structured_canonical_draft",
+            )
+        if (
+            str(current_draft.get("compiled_from") or "") != "bounded_baseline_transform"
+            or int((current_draft.get("transform_summary") or {}).get("rewritten_blocks") or 0)
+            + int((current_draft.get("transform_summary") or {}).get("added_blocks") or 0)
+            < 1
+        ):
+            return result(
+                status="blocked",
+                after_state="plan_validated",
+                rule_ids=["MAT-004"],
+                blockers=["baseline_transform_required"],
+                next_action="submit_bounded_baseline_transform",
+            )
+        floor_errors = validate_content_floor(load_content_baseline(Path(ctx.package)), current_draft)
+        if floor_errors:
+            return result(
+                status="blocked",
+                after_state="plan_validated",
+                rule_ids=["MAT-004"],
+                blockers=["baseline_content_floor_invalid"],
+                error=", ".join(floor_errors),
+                next_action="resubmit_bounded_baseline_transform",
             )
         package = Path(ctx.package)
         try:
@@ -267,6 +376,21 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
             rule_ids=["MAT-004"],
             generate_materials=False,
         )
+    try:
+        content_baseline = build_content_baseline(
+            workspace=workspace,
+            package=Path(ctx.package),
+            lane=ctx.lane,
+        ) if ctx.package else {}
+    except (OSError, TypeError, ValueError) as exc:
+        return result(
+            status="blocked",
+            after_state="planning_pending",
+            rule_ids=["MAT-001", "MAT-004"],
+            blockers=["content_baseline_unavailable"],
+            error=str(exc),
+            generate_materials=False,
+        )
     packet = build_task_packet(
         "materials_plan",
         job_id=job_id,
@@ -282,6 +406,7 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
         input_hashes=ctx.input_hashes,
         context={
             **ctx.to_dict(),
+            "content_baseline": baseline_task_view(content_baseline) if content_baseline else {},
             "materials_lessons": load_lessons(workspace, lane=ctx.lane),
         },
     )
@@ -290,9 +415,43 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
         private = Path(workspace) / "02_Tracker" / "workflow" / "materials" / job_id
         private.mkdir(parents=True, exist_ok=True)
         atomic_write_json(private / PACKET_NAME, packet)
+        planning_schema = {
+            "schema_version": 1,
+            "name": MATERIALS_PLAN_SCHEMA["name"],
+            "required": list(MATERIALS_PLAN_SCHEMA["required"]),
+            "optional": list(MATERIALS_PLAN_SCHEMA["optional"]),
+            "match_type_allowed": list(MATERIALS_PLAN_SCHEMA["enums"]["match_type"]),
+            "jd_anchor_catalog": list((packet.get("draft_seed_schema") or {}).get("jd_anchor_catalog") or []),
+            "instruction": "Fill the current-job response template only; do not inspect a prior package for schema or anchor IDs.",
+        }
+        planning_workspace = prepare_drafting_workspace(
+            Path(ctx.package),
+            job_id=job_id,
+            phase="planning",
+            task_packet=packet,
+            response_schema=planning_schema,
+            staging_root=_drafting_staging_root(workspace),
+        )
+    else:
+        planning_workspace = {}
 
     model_plan = payload.get("model_plan") or payload.get("plan")
     if model_plan is not None:
+        if payload.get("require_drafting_binding"):
+            binding_errors = validate_submission_binding(
+                model_plan,
+                load_drafting_scope(Path(ctx.package), phase="planning") if ctx.package else {},
+            )
+            if binding_errors:
+                return result(
+                    status="blocked",
+                    after_state="planning_pending",
+                    rule_ids=["MAT-001"],
+                    blockers=["drafting_submission_unbound"],
+                    error=", ".join(binding_errors),
+                    drafting_workspace=planning_workspace,
+                    next_action="edit_current_drafting_workspace_response",
+                )
         evaluated = evaluate_model_output(model_plan, packet, previous_repairs=list(payload.get("previous_repairs") or []))
         if evaluated["status"] != "accepted":
             status = (
@@ -306,6 +465,7 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
                 rule_ids=["MAT-001", "MAT-002", "MAT-003"],
                 generate_materials=False,
                 task_packet=packet,
+                drafting_workspace=planning_workspace,
                 evaluation=evaluated,
             )
         plan_body = dict(evaluated.get("data") or {})
@@ -318,6 +478,7 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
                     job_id=job_id,
                     plan=plan_body,
                     context=ctx.to_dict(),
+                    content_baseline=content_baseline,
                 )
                 saved_seed = save_canonical_draft(
                     package,
@@ -326,6 +487,7 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
                     source_hashes={
                         "jd": str(ctx.input_hashes.get("jd") or ""),
                         "profile": str(ctx.input_hashes.get("profile") or ""),
+                        "baseline": str(content_baseline.get("baseline_sha256") or ""),
                     },
                     producer_context_id=str(payload.get("producer_context_id") or f"producer-{uuid4().hex[:12]}"),
                 )
@@ -337,11 +499,27 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
                     blockers=["canonical_seed_invalid"],
                     error=str(exc),
                     task_packet=packet,
+                    drafting_workspace=planning_workspace,
                     evaluation=evaluated,
-                    draft_schema=canonical_draft_task_schema(
+                    draft_schema=baseline_transform_task_schema(
+                        content_baseline,
                         job_id=job_id,
+                        jd_anchors=plan_jd_anchor_catalog(plan_body),
                     ),
                 )
+        draft_schema = baseline_transform_task_schema(
+            content_baseline,
+            job_id=job_id,
+            jd_anchors=plan_jd_anchor_catalog(plan_body),
+        )
+        tailoring_workspace = prepare_drafting_workspace(
+            Path(ctx.package),
+            job_id=job_id,
+            phase="tailoring",
+            task_packet=packet,
+            response_schema=draft_schema,
+            staging_root=_drafting_staging_root(workspace),
+        ) if ctx.package else {}
         return result(
             status="succeeded",
             after_state="plan_validated",
@@ -349,13 +527,14 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
                 rule_ids=["MAT-001", "MAT-004"],
             generate_materials=False,
             task_packet=packet,
+            drafting_workspace=tailoring_workspace,
             evaluation=evaluated,
             canonical_draft={
                 "path": str(Path(ctx.package) / "materials_draft.canonical.json") if ctx.package else "",
                 "sha256": saved_seed.get("canonical_sha256") if ctx.package else "",
                 "status": "seeded",
             },
-            draft_schema=canonical_draft_task_schema(job_id=job_id),
+            draft_schema=draft_schema,
         )
 
     if dry_run:
@@ -365,6 +544,7 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
             rule_ids=["MAT-001", "SCAN-001"],
             generate_materials=False,
             task_packet=packet,
+            drafting_workspace=planning_workspace,
         )
     return result(
         status="succeeded",
@@ -373,5 +553,6 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
         rule_ids=["MAT-001", "SCAN-001"],
         generate_materials=False,
         task_packet=packet,
+        drafting_workspace=planning_workspace,
         package=ctx.package,
     )

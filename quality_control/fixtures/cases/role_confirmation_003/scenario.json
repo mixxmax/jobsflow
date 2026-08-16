@@ -1,0 +1,17 @@
+{
+  "case_id": "role_confirmation_003",
+  "description": "Job package has undisclosed recruiter client requiring neutral company phrasing.",
+  "target_stage": "materials",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": [
+    "submit_plan",
+    "submit_draft"
+  ],
+  "forbidden_actions": [
+    "leak_recruiter_as_employer"
+  ],
+  "model_behavior": "happy_path",
+  "allow_model_switch": false,
+  "expected_verdict": "pass",
+  "expected_blocking_assertions": []
+}

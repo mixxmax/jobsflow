@@ -32,14 +32,18 @@ and how to tailor the application without giving up final control.
   follows the economy/balanced/coverage budget. Full JD text drives deep scoring,
   while unavailable text stays visible as `待审-JD不足` or
   `provisional_needs_jd` instead of disappearing silently.
-- **Audit CV/CL content before producing files:** the main model first saves a
-  structured canonical CV/CL. JobsFlow then automatically dispatches a child
-  agent in an independent context with only the cached JD, full CV/CL, and a
-  compact rule pack. It checks JD coverage, STAR structure, LLMO evidence
-  placement, cross-material consistency, fragments, and template residue. The
-  child agent does not inspect email, DOCX/PDF, or layout and cannot edit the
-  materials. The same model may audit in a separate context; no specific model
-  provider is required.
+- **Each lane master is the content baseline; audit CV/CL content before files:**
+  CV and Cover Letter are tailored independently from their respective masters
+  against one shared candidate profile and ability ceiling; neither document nor
+  another job package is an evidence source for the other. The main model submits
+  only the current job's bound JD-specific delta—rewrite,
+  reorder, merge, or add. Unchanged content is retained, while full replacement
+  and silent shrinkage are rejected. JobsFlow then dispatches an independent
+  child context that focuses on the delta and makes one compact full-CV/CL sweep
+  for JD coverage, STAR/LLMO placement, role/employer boundaries, consistency,
+  grammar, fragments, and template residue. It never audits email, DOCX/PDF, or
+  layout and cannot edit the materials; the host generates email deterministically
+  after CV/CL content passes.
 - **Bounded repairs and one fixed output path:** the child agent returns
   block-addressed findings, the main model repairs only affected content, and
   the independent audit verifies it again. Each job is capped at three audits;
@@ -282,10 +286,10 @@ model memory and not an ATS-score promise:
 
 - every fact-checked experience gets a stable `evidence_id`, allowed wording and forbidden inferences;
 - JD anchors are tiered and labelled `covered`, `partial`, `uncovered` or `prohibited_to_claim`;
-- the CV, cover letter and application email share one evidence graph and the same numeric facts;
+- CV, cover letter and application email share one profile fact source; CV/CL are validated independently, so a truthful number need not appear in both;
 - parseability is protected with selectable single-column text, standard sections and contact details outside images/text boxes/headers/footers;
 - QA metrics are internal engineering indicators, never an official ATS score or hiring prediction.
-- The main model first saves canonical CV/CL content with stable block IDs. JobsFlow then launches a compact independent audit over the full JD/CV/CL, internal coverage dispositions and compiled rules—never the long manuals, fact store, email, DOCX/PDF or layout. Unsupported requirements are marked `intentionally_omitted` internally and never turned into negative applicant disclosures. P0/P1 repairs can touch only finding-targeted blocks; DOCX/PDF are rendered after content passes. Each job has a three-audit cap, and the same unresolved finding trips a circuit breaker on its second appearance.
+- JobsFlow first freezes the lane master as the complete content baseline. The main model must submit a plan, then a JD-anchored bounded transform through the fixed `materials-vnext-1` gateway; the host retains unmentioned blocks and compiles the final canonical CV/CL. The independent child focuses on the before/after delta and performs one compact whole-document sweep for role selection, employer/recruiter boundaries, consistency, grammar and fragments—never the long manuals, fact store, email, DOCX/PDF or layout. Unsupported requirements stay internal as `intentionally_omitted`. P0/P1 repairs can touch only finding-targeted blocks; each job has a two-audit cap and a repeated-finding circuit breaker.
 - Audit patterns are retained as privacy-preserving production lessons, so later jobs in the same role family can avoid repeated mistakes.
 
 This gives models with different capability levels an executable boundary: the model

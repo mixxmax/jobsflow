@@ -28,7 +28,7 @@ COVERAGE_DISPOSITIONS = {"direct", "transferable", "intentionally_omitted"}
 MATERIALS_PLAN_SCHEMA = {
     "name": "materials_plan.v1",
     "required": ["task_type", "duties", "themes", "match_type"],
-    "optional": ["requirements", "jd_anchors", "coverage_dispositions", "draft", "draft_content", "materials_draft", "forbidden_claims", "claim_ledger"],
+    "optional": ["requirements", "jd_anchors", "coverage_dispositions", "forbidden_claims", "claim_ledger"],
     "enums": {
         "match_type": sorted(MATCH_TYPES),
         "coverage": sorted(CLAIM_KINDS),
@@ -73,6 +73,9 @@ def validate_plan_shape(value: Any) -> list[dict[str, Any]]:
         errors.append({"code": "plan_task_type_invalid", "field": "task_type"})
     if str(value.get("match_type") or "") not in MATCH_TYPES:
         errors.append({"code": "plan_match_type_invalid", "field": "match_type"})
+    for legacy_field in ("draft", "draft_content", "materials_draft"):
+        if legacy_field in value:
+            errors.append({"code": "plan_full_draft_not_allowed", "field": legacy_field})
     for index, claim in enumerate(value.get("claim_ledger") or []):
         if not isinstance(claim, dict):
             errors.append({"code": "plan_claim_not_object", "field": f"claim_ledger[{index}]"})
@@ -83,9 +86,6 @@ def validate_plan_shape(value: Any) -> list[dict[str, Any]]:
         for field in ("claim_id", "id", "kind", "assessment"):
             if claim.get(field) is not None and not isinstance(claim.get(field), str):
                 errors.append({"code": "plan_claim_field_not_text", "field": f"claim_ledger[{index}].{field}"})
-    draft = value.get("draft") or value.get("draft_content") or value.get("materials_draft")
-    if draft is not None and not isinstance(draft, dict):
-        errors.append({"code": "plan_draft_not_object", "field": "draft"})
     return errors
 
 P0_CODES = {
@@ -113,6 +113,7 @@ P1_CODES = {
     "page_count_exceeded",
     "company_interest_unsourced",
     "cl_repeats_cv",
+    "cover_letter_company_line_missing",
 }
 
 # P2 is advisory. It is recorded for learning and optional repair but never

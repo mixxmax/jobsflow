@@ -1,0 +1,21 @@
+# JobsFlow Quality Control Foundation (Optional Dependencies)
+#
+# Core quality_control package runs with 100% Python standard library.
+# The dependencies below are optional extensions for advanced external runners.
+
+# Schema validation acceleration (optional, pure-python fallback built-in)
+jsonschema>=4.20.0
+
+# Optional Promptfoo Matrix CLI integration
+# (Can also be executed via npx promptfoo@latest)
+# promptfoo
+
+# Optional Inspect AI multi-turn sandbox runner
+# inspect-ai>=0.3.0
+
+# Optional LLM-as-a-Judge semantic evaluators
+# deepeval>=1.0.0
+
+# Optional external trace sinks (Local JSONL sink is enabled by default)
+# langfuse>=2.0.0
+# opik>=1.0.0

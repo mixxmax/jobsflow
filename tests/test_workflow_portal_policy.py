@@ -20,6 +20,9 @@ def test_product_and_private_thresholds_are_declared():
     assert private["max_challenge_retries"] == 0
     assert product["cache_first"] is True
     assert product["allow_model_override"] is False
+    assert product["human_verification_handoff"] is False
+    assert private["human_verification_handoff"] is True
+    assert private["verification_timeout_seconds"] == 600
 
 
 def test_model_cannot_override_circuit_without_diagnostic_flag():
@@ -68,6 +71,7 @@ def test_private_profile_is_consumed_by_real_two_pass_breaker(tmp_path, monkeypa
     _rows, meta = run_two_pass([], repo=tmp_path, max_deep=0, sleep_s=0)
     assert meta["jobsdb_policy"]["profile"] == "private"
     assert meta["jobsdb_policy"]["challenge_threshold"] == 1
+    assert meta["jobsdb_policy"]["human_verification_handoff"] is True
     from tools.fresh_24h import portal_jd_browser
 
     assert portal_jd_browser._PORTAL_BUDGET_STATE["jobsdb"]["min_interval"] == 15

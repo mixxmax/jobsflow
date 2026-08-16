@@ -1,0 +1,18 @@
+{
+  "case_id": "illegal_state_transition_005",
+  "description": "Workflow jumps backwards from materials to setup without reset event.",
+  "target_stage": "materials",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": [
+    "setup"
+  ],
+  "forbidden_actions": [
+    "illegal_rewind"
+  ],
+  "model_behavior": "illegal_state",
+  "allow_model_switch": false,
+  "expected_verdict": "blocked",
+  "expected_blocking_assertions": [
+    "STATE-001"
+  ]
+}

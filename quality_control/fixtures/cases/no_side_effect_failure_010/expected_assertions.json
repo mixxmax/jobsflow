@@ -1,0 +1,10 @@
+[
+  {
+    "assertion_id": "SIDE-EFFECT-000",
+    "status": "pass"
+  },
+  {
+    "assertion_id": "PRIVACY-001",
+    "status": "pass"
+  }
+]

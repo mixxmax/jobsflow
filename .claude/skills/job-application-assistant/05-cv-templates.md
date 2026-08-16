@@ -5,8 +5,9 @@ generated PDFs belong in `JobSearch_2026/`.
 
 ## Source and output
 
-- Source of truth: canonical CV/CL content plus the latest fact-checked lane
-  DOCX master. The model submits content; it does not choose a renderer.
+- Source of truth: the latest fact-checked lane DOCX master as both semantic
+  content baseline and format template, plus the host-compiled canonical CV/CL.
+  The model submits only a bounded JD-specific delta; it does not choose a renderer.
 - Output: one-page A4 DOCX and PDF.
 - PDF engine: the fixed `python3 -m tools.workflow materials pdf` chain, which
   uses LibreOffice headless after the lane-master renderer.
@@ -24,7 +25,9 @@ generated PDFs belong in `JobSearch_2026/`.
 1. Run application preflight and resolve its blockers.
 2. Require a full JD and sourced company context.
 3. Use `evidence_map`; an empty capability mapping remains an explicit gap.
-4. Reorder or lightly rephrase only fact-checked bullets.
+4. Rewrite, reorder, merge or add a focused set of truthful JD-relevant blocks.
+   Unmentioned baseline content stays; never replace or silently shrink the
+   whole CV. Wording is not frozen verbatim.
 5. Never invent an achievement, metric, tool, qualification, or industry
    interest.
 6. Verify one page, readable text extraction, correct contact details, and the

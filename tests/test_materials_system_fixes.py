@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from tools.workflow.engine import dispatch
 from tools.workflow.entity_state import load_entity_state
-from tools.workflow.materials_draft import compile_canonical_draft, load_canonical_draft
+from tools.workflow.materials_draft import load_canonical_draft
 from tools.workflow.materials_orchestrator import reset
-from tools.workflow.testing_packages import build_package, build_workspace, canonical_fixture
+from tools.workflow.testing_packages import baseline_transform_fixture, build_package, build_workspace
+
+
+pytestmark = pytest.mark.legacy
 
 
 def _plan(package):
     return json.loads((package / "materials_plan.validated.json").read_text(encoding="utf-8"))
 
 
-def test_materials_plan_compiles_a_canonical_seed_without_manual_block_json(tmp_path):
+def test_materials_plan_rejects_the_legacy_full_draft_field(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws, with_outbound=False)
     plan = _plan(package)
@@ -36,25 +41,20 @@ def test_materials_plan_compiles_a_canonical_seed_without_manual_block_json(tmp_
         },
     }
     out = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "model_plan": plan})
-    assert out["status"] == "succeeded"
-    draft = load_canonical_draft(package)
-    assert draft["compiled_from"] == "plan_draft"
-    assert draft["cv"]["blocks"]
-    assert draft["cover_letter"]["blocks"]
-    assert all("C1" in (block.get("claim_ids") or []) for block in draft["cv"]["blocks"] if block["type"] == "bullet")
-    resumed = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "stage": "drafting"})
-    assert resumed["status"] == "succeeded"
-    assert resumed["audit_task_packet"]["audit_scope"] == "jd_mapping_and_presentation"
+    assert out["status"] == "repair"
+    assert out["evaluation"]["code"] == "plan_schema_invalid"
+    assert {item["code"] for item in out["evaluation"]["errors"]} == {"plan_full_draft_not_allowed"}
+    assert not load_canonical_draft(package)
 
 
-def test_materials_plan_without_draft_uses_bounded_claim_seed(tmp_path):
+def test_materials_plan_without_draft_still_uses_complete_lane_baseline(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws, with_outbound=False)
     plan = _plan(package)
     out = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "model_plan": plan})
     assert out["status"] == "succeeded"
     draft = load_canonical_draft(package)
-    assert draft["compiled_from"] == "claim_ledger_fallback"
+    assert draft["compiled_from"] == "lane_content_baseline"
     assert "direct experience" not in json.dumps(draft, ensure_ascii=False).casefold()
 
 
@@ -74,7 +74,7 @@ def test_materials_reset_rewinds_entity_state_to_plan_boundary(tmp_path):
     package = build_package(ws, with_outbound=False)
     plan = _plan(package)
     assert dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "model_plan": plan})["status"] == "succeeded"
-    drafted = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": canonical_fixture()})
+    drafted = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package)})
     assert drafted["status"] == "succeeded"
     assert load_entity_state(ws, "materials", "C0-001").phase == "content_audit_pending"
     reset(package, scope="audit", confirm=True)

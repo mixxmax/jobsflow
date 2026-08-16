@@ -1,0 +1,8 @@
+[
+  { "assertion_id": "SOP-001", "status": "pass" },
+  { "assertion_id": "STATE-001", "status": "pass" },
+  { "assertion_id": "SOP-005", "status": "pass" },
+  { "assertion_id": "SOP-007", "status": "pass" },
+  { "assertion_id": "SIDE-EFFECT-000", "status": "pass" },
+  { "assertion_id": "PRIVACY-001", "status": "pass" }
+]

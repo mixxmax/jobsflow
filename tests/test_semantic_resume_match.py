@@ -71,12 +71,14 @@ def test_deep_score_creates_pending_but_teaser_does_not(tmp_path, monkeypatch):
         for path in (tmp_path / "02_Tracker" / "semantic_matches" / "pending").glob("*.json")
     ]
     assert deep.semantic_source == "pending_fallback"
-    assert deep.semantic_pending_count == 2
+    # Company context and resume matching are one bounded review per job;
+    # lane selection is already deterministic/locked before this task.
+    assert deep.semantic_pending_count == 1
     assert "待处理" in deep.semantic_note
-    assert "语义任务待处理2项" in deep.reason
-    resume_tasks = [task for task in pending if task.get("task") == "semantic_resume_match"]
-    assert len(resume_tasks) == 1
-    task = resume_tasks[0]
+    assert "语义任务待处理1项" in deep.reason
+    review_tasks = [task for task in pending if task.get("task") == "semantic_job_review"]
+    assert len(review_tasks) == 1
+    task = review_tasks[0]
     assert "事实基线" in task["profile"]
     assert "能力上沿" in task["profile"]
     assert task["semantic_profile"]["upper_bound_level"] == "low"
@@ -120,7 +122,7 @@ def test_completed_upper_only_verdict_obeys_calibration_cap(tmp_path, monkeypatc
         json.loads(path.read_text(encoding="utf-8"))
         for path in (tmp_path / "02_Tracker" / "semantic_matches" / "pending").glob("*.json")
     ]
-    key = next(task["key"] for task in pending if task.get("task") == "semantic_resume_match")
+    key = next(task["key"] for task in pending if task.get("task") == "semantic_job_review")
 
     assert semantic_match_agent.cmd_complete(
         key, 5.0, "Only a potential transfer from the profile upper bound.", "upper_only"
@@ -158,7 +160,7 @@ def test_direct_verdict_is_not_limited_by_upper_bound(tmp_path, monkeypatch):
         json.loads(path.read_text(encoding="utf-8"))
         for path in (tmp_path / "02_Tracker" / "semantic_matches" / "pending").glob("*.json")
     ]
-    key = next(task["key"] for task in pending if task.get("task") == "semantic_resume_match")
+    key = next(task["key"] for task in pending if task.get("task") == "semantic_job_review")
     semantic_match_agent.cmd_complete(key, 5.0, "Directly supported by the facts anchor.", "direct")
     rescored = score_job(
         title="Operations Analyst",
@@ -190,16 +192,15 @@ def test_position_profile_task_returns_lane_and_company_brief(tmp_path, monkeypa
         json.loads(path.read_text(encoding="utf-8"))
         for path in (tmp_path / "02_Tracker" / "semantic_matches" / "pending").glob("*.json")
     ]
-    position = next(task for task in tasks if task.get("task") == "position_profile")
+    position = next(task for task in tasks if task.get("task") == "semantic_job_review")
     assert position["jd_cache"]["cache_key"]
     assert position["jd_cache"]["chars"] > 100
 
     assert semantic_match_agent.cmd_complete(
         position["key"],
-        0.0,
+        4.0,
         "公司业务性质与岗位范围共同决定分类",
-        "upper_only",
-        lane="A",
+        "direct",
         company_brief="Acme Pay 是提供跨境支付基础设施的金融科技公司",
     ) == 0
 

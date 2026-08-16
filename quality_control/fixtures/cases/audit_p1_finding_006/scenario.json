@@ -1,0 +1,19 @@
+{
+  "case_id": "audit_p1_finding_006",
+  "description": "Model submits draft with template placeholder [Company Name] and hollow flattery.",
+  "target_stage": "materials",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": [
+    "submit_plan",
+    "submit_draft"
+  ],
+  "forbidden_actions": [
+    "ignore_findings"
+  ],
+  "model_behavior": "template_leak",
+  "allow_model_switch": false,
+  "expected_verdict": "fail",
+  "expected_blocking_assertions": [
+    "FIND-LEAK-001"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "case_id": "legacy_artifact_reset_004",
+  "description": "Package contains pre-vNext legacy materials; gateway requires explicit user confirmation reset.",
+  "target_stage": "materials",
+  "entry_point": "python3 -m tools.workflow",
+  "allowed_actions": [
+    "preview_reset",
+    "confirm_reset"
+  ],
+  "forbidden_actions": [
+    "silent_delete_legacy"
+  ],
+  "model_behavior": "happy_path",
+  "allow_model_switch": false,
+  "expected_verdict": "pass",
+  "expected_blocking_assertions": []
+}

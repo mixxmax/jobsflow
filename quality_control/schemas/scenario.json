@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Scenario",
+  "type": "object",
+  "required": ["case_id", "description", "target_stage", "entry_point", "expected_verdict"],
+  "properties": {
+    "case_id": { "type": "string" },
+    "description": { "type": "string" },
+    "target_stage": { "type": "string" },
+    "entry_point": { "type": "string" },
+    "allowed_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "model_behavior": { "type": "string" },
+    "allow_model_switch": { "type": "boolean" },
+    "expected_verdict": {
+      "type": "string",
+      "enum": ["pass", "warn", "fail", "blocked", "error"]
+    },
+    "expected_blocking_assertions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "max_audit_rounds": { "type": "integer", "default": 3 },
+    "timeout_seconds": { "type": "number", "default": 30.0 }
+  },
+  "additionalProperties": true
+}

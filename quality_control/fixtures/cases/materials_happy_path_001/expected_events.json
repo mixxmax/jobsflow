@@ -1,0 +1,9 @@
+[
+  { "event_type": "run_started", "stage": "setup" },
+  { "event_type": "stage_started", "stage": "materials" },
+  { "event_type": "model_invoked", "stage": "materials" },
+  { "event_type": "audit_started", "stage": "materials" },
+  { "event_type": "audit_completed", "stage": "materials" },
+  { "event_type": "artifact_created", "stage": "materials" },
+  { "event_type": "stage_completed", "stage": "materials" }
+]

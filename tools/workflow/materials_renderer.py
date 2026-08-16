@@ -59,6 +59,33 @@ def _filename_component(value: str) -> str:
 
 
 def expected_filenames(package: Path, workspace: Path) -> dict[str, str]:
+    # A vNext generation freezes one entity contract. Renderer/filename code
+    # must not re-parse the manifest and accidentally turn a recruiter into
+    # the hiring company or revive an old long/alternate title.
+    vnext_bundle = Path(package) / "materials_vnext" / "current_job_bundle.json"
+    if vnext_bundle.is_file():
+        try:
+            value = json.loads(vnext_bundle.read_text(encoding="utf-8"))
+            entity = value.get("entity") if isinstance(value.get("entity"), dict) else {}
+            role_value = str(entity.get("role_primary") or "").strip()
+            target_value = str(entity.get("employer_name") or "").strip()
+            if not target_value and str(entity.get("recruiter_boundary") or "") == "direct_employer":
+                target_value = str(entity.get("application_target") or "").strip()
+            if str(entity.get("recruiter_boundary") or "").startswith("recruiter") and not target_value:
+                target_value = ""
+            if role_value:
+                role = _filename_component(role_value)
+                company = _filename_component(target_value)
+                candidate = _filename_component(_candidate_name(Path(workspace)))
+                prefix = " ".join(item for item in (candidate, company, role) if item).strip()
+                return {
+                    "cv_docx": f"{prefix} CV.docx",
+                    "cl_docx": f"{prefix} Cover Letter.docx",
+                    "cv_pdf": f"{prefix} CV.pdf",
+                    "cl_pdf": f"{prefix} Cover Letter.pdf",
+                }
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
     manifest = load_job_manifest(Path(package)) or {}
     job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
     role = _filename_component(str(job.get("role_material") or job.get("role_display") or "Application"))
@@ -295,10 +322,26 @@ def _split_label(text: str) -> tuple[str, str] | None:
 
 
 def _job_heading_parts(text: str) -> tuple[str, str | None]:
-    parts = re.split(r"\s{2,}|\t", text.strip(), maxsplit=1)
+    value = text.strip()
+    # Baseline compilation normalises ordinary whitespace, so a heading may
+    # arrive with one space instead of the master's tab/double-space
+    # delimiter.  Recognise a terminal date range independently of that
+    # delimiter and keep the renderer responsible for restoring the master's
+    # right-aligned tab.  This is intentionally bounded to common CV date
+    # forms; it must not mistake a year in a role title for a date column.
+    date = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}"
+    year = r"\d{4}"
+    date_suffix = re.compile(
+        rf"\s+(?P<date>(?:{date}|{year})\s*(?:-|–|—|to)\s*(?:Present|Current|{date}|{year})|(?:{date}|{year}))$",
+        re.IGNORECASE,
+    )
+    match = date_suffix.search(value)
+    if match and match.start() > 0:
+        return value[: match.start()].rstrip(), match.group("date").strip()
+    parts = re.split(r"\s{2,}|\t", value, maxsplit=1)
     if len(parts) == 2 and parts[1].strip():
         return parts[0].strip(), parts[1].strip()
-    return text.strip(), None
+    return value, None
 
 
 def _layout_units(document, *, material: str) -> float:
@@ -419,6 +462,8 @@ def _add_block(
     block_type = str(block.get("type") or "paragraph")
     text = str(block.get("text") or "").strip()
     section = str(block.get("section") or "").casefold()
+    presentation_role = str(block.get("presentation_role") or "").casefold()
+    source_style = str(block.get("source_style") or "")
 
     if material == "cv":
         if position == 0 and block_type in {"contact", "heading"}:
@@ -436,7 +481,7 @@ def _add_block(
             _add_run(paragraph, role, prototypes["job_heading"], 0)
             if date:
                 _add_run(paragraph, "\t" + date, prototypes["job_heading"], 1)
-        elif block_type == "bullet" and section == "core":
+        elif (presentation_role == "core_line" or (source_style == "Compact Line" and section == "core")):
             paragraph = _new_paragraph(document, prototypes["core"])
             label_body = _split_label(text)
             if label_body:
@@ -445,13 +490,11 @@ def _add_block(
                 _add_run(paragraph, separator + label_body[1], prototypes["core"], 1)
             else:
                 _add_run(paragraph, text, prototypes["core"], 1)
-        elif block_type == "bullet":
-            paragraph = _new_paragraph(document, prototypes["bullet"])
-            _add_run(paragraph, text, prototypes["bullet"])
-        elif section == "summary":
-            paragraph = _new_paragraph(document, prototypes["summary"])
-            _add_run(paragraph, text, prototypes["summary"])
-        elif section in {"education", "qualifications", "compact", "contact"}:
+        # Education and Qualifications are compact master lines, not
+        # experience bullets.  This branch deliberately precedes the generic
+        # bullet branch so a baseline block cannot lose its section styling
+        # merely because its semantic type is ``bullet`` for compatibility.
+        elif presentation_role == "compact_line" or source_style == "Compact Line" or section in {"education", "qualifications", "compact", "contact"}:
             paragraph = _new_paragraph(document, prototypes["compact"])
             if section == "education" and ", " in text:
                 label, body = text.split(", ", 1)
@@ -463,6 +506,12 @@ def _add_block(
                 _add_run(paragraph, body, prototypes["compact"], 1)
             else:
                 _add_run(paragraph, text, prototypes["compact"], 1)
+        elif block_type == "bullet":
+            paragraph = _new_paragraph(document, prototypes["bullet"])
+            _add_run(paragraph, text, prototypes["bullet"])
+        elif section == "summary":
+            paragraph = _new_paragraph(document, prototypes["summary"])
+            _add_run(paragraph, text, prototypes["summary"])
         else:
             paragraph = _new_paragraph(document, prototypes["summary"])
             _add_run(paragraph, text, prototypes["summary"])
@@ -528,7 +577,15 @@ def _render_document(
 
 def _template_paths(package: Path, workspace: Path) -> dict[str, Path]:
     manifest = load_job_manifest(Path(package)) or {}
-    lane = str(manifest.get("lane") or Path(package).parts[-3][:1] or "").upper()
+    lane = ""
+    bundle_path = Path(package) / "materials_vnext" / "current_job_bundle.json"
+    if bundle_path.is_file():
+        try:
+            bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+            lane = str(bundle.get("lane") or "").upper()
+        except (OSError, json.JSONDecodeError, TypeError):
+            lane = ""
+    lane = lane or str(manifest.get("lane") or Path(package).parts[-3][:1] or "").upper()
     cv = find_latest_master_docx(lane, workspace)
     cl = find_latest_cl_master_docx(lane, workspace)
     if cv is None:
@@ -566,6 +623,18 @@ def render_canonical_docx(package: Path, workspace: Path, *, force: bool = False
     draft = load_canonical_draft(package)
     if not draft:
         raise ValueError("canonical_draft_missing")
+    if (
+        draft.get("baseline_sha256")
+        and str(draft.get("artifact_type") or "") != "jobsflow_canonical_cv_cl"
+        and str(draft.get("compiled_from") or "") != "bounded_baseline_transform"
+    ):
+        raise ValueError("baseline_transform_required")
+    if draft.get("baseline_sha256") and str(draft.get("artifact_type") or "") != "jobsflow_canonical_cv_cl":
+        from tools.workflow.materials_baseline import load_content_baseline, validate_content_floor
+
+        floor_errors = validate_content_floor(load_content_baseline(package), draft)
+        if floor_errors:
+            raise ValueError("baseline_content_floor_invalid:" + ",".join(floor_errors))
     if not _audit_current(package):
         raise ValueError("content_audit_not_current")
     names = expected_filenames(package, workspace)
@@ -637,7 +706,13 @@ def convert_rendered_pdfs(
 
     def run_pair(pair):
         docx, pdf = pair
-        return convert(docx, pdf, engine=engine, force=force, sanitize_metadata=True)
+        # render_canonical_docx already normalizes core properties and records
+        # the resulting DOCX hash in materials_render_receipt.json.  Running
+        # sanitize_docx_metadata again here rewrites the ZIP and invalidates
+        # that receipt before the format gate can read it.  Conversion is
+        # therefore a pure DOCX -> PDF step; any metadata change must go
+        # through render and produce a new receipt.
+        return convert(docx, pdf, engine=engine, force=force, sanitize_metadata=False)
 
     if parallel:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobsflow-pdf") as pool:
@@ -677,6 +752,26 @@ def _template_style_findings(package: Path, names: dict[str, str]) -> list[dict[
     if receipt.get("renderer_version") != RENDERER_VERSION:
         findings.append({"code": "template_binding_missing", "artifact": "docx", "evidence": "render receipt is not template-bound"})
     template_paths = receipt.get("template_paths") if isinstance(receipt.get("template_paths"), dict) else {}
+    recorded_templates = receipt.get("template_sha256") if isinstance(receipt.get("template_sha256"), dict) else {}
+    if template_paths and not recorded_templates:
+        findings.append({
+            "code": "template_receipt_hash_missing",
+            "artifact": "docx",
+            "evidence": "render receipt has no lane-master hash binding",
+        })
+    for material, raw_path in template_paths.items():
+        template_path = Path(str(raw_path))
+        if not template_path.is_file():
+            findings.append({"code": "template_binding_missing", "artifact": material, "evidence": "template source unavailable"})
+            continue
+        recorded = str(recorded_templates.get(material) or "")
+        live = container_hash(template_path)
+        if recorded and recorded != live:
+            findings.append({
+                "code": "template_changed_after_render",
+                "artifact": material,
+                "evidence": "lane master changed after DOCX render; rerender through the fixed gateway",
+            })
     for material, key in (("cv", "cv_docx"), ("cover_letter", "cl_docx")):
         path = Path(package) / names[key]
         if not path.is_file():
@@ -741,6 +836,143 @@ def _template_style_findings(package: Path, names: dict[str, str]) -> list[dict[
             ppr = prototypes[name].get("ppr")
             return ppr is not None and ppr.find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}" + local_name) is not None
 
+        def direct_ppr_signature(element) -> tuple[Any, ...]:
+            """Compare layout-bearing direct properties, excluding spacing.
+
+            Visual-balance compensation intentionally adjusts ``w:spacing``
+            between blocks.  Tabs, numbering, indentation and alignment are
+            template-owned and must remain byte-equivalent to the prototype.
+            """
+
+            if element is None:
+                return ()
+            wanted = {"tabs", "numPr", "ind", "jc", "keepNext", "pageBreakBefore"}
+            return tuple(xml_signature(child) for child in element if str(child.tag).rsplit("}", 1)[-1] in wanted)
+
+        def prototype_direct_ppr_signature(name: str) -> tuple[Any, ...]:
+            return direct_ppr_signature(prototypes[name].get("ppr"))
+
+        def expected_run_index(prototype_name: str, actual_index: int, actual_count: int) -> int:
+            runs = prototypes[prototype_name].get("rprs") or []
+            if not runs:
+                return 0
+            # Compact/core one-run blocks are emitted with the evidence/body
+            # run (index 1) by _add_block; split label/body blocks preserve
+            # their corresponding prototype run indices.
+            if actual_count == 1 and prototype_name in {"compact", "core"} and len(runs) > 1:
+                return 1
+            return min(actual_index, len(runs) - 1)
+
+        def expected_prototype(block: dict[str, Any], position: int) -> str:
+            """Map a canonical block to the host-owned master prototype.
+
+            This mapping is deliberately derived from baseline metadata first
+            and only falls back to the legacy semantic fields for old fixture
+            drafts.  A model cannot select a style by changing its prose.
+            """
+
+            block_type = str(block.get("type") or "paragraph")
+            section_name = str(block.get("section") or "").casefold()
+            presentation = str(block.get("presentation_role") or "").casefold()
+            source_style = str(block.get("source_style") or "")
+            if position == 0 and block_type in {"contact", "heading"}:
+                return "title"
+            if block_type == "contact":
+                return "contact"
+            if material == "cv":
+                if presentation == "target_role" or section_name == "target_role":
+                    return "summary"
+                if presentation == "section_heading" or (
+                    block_type == "heading"
+                    and section_name in {"summary", "core", "experience", "education", "qualifications"}
+                    and not block.get("experience_id")
+                ):
+                    return "section"
+                if presentation == "job_heading" or (block_type == "heading" and section_name == "experience"):
+                    return "job_heading"
+                if presentation == "core_line" or (source_style == "Compact Line" and section_name == "core"):
+                    return "core"
+                if presentation == "compact_line" or source_style == "Compact Line" or section_name in {"education", "qualifications", "compact", "contact"}:
+                    return "compact"
+                if presentation == "experience_bullet" or block_type == "bullet":
+                    return "bullet"
+                if section_name == "summary":
+                    return "summary"
+                return "summary"
+            if presentation == "subject" or section_name == "subject" or str(block.get("text") or "").lstrip().casefold().startswith("re:"):
+                return "subject"
+            if block_type == "contact":
+                return "contact"
+            if block_type == "bullet" or section_name == "pillar":
+                return "bullet"
+            if block_type == "signoff" or section_name in {"date", "recipient", "signoff"}:
+                return "compact"
+            return "body"
+
+        # The style name check below is not enough: a generic model can copy
+        # the style catalogue while putting every paragraph in Normal.  Walk
+        # every canonical block in order and compare the live paragraph to the
+        # exact lane prototype.  This catches section/education/date drift in
+        # all jobs, not just the first representative paragraph.
+        canonical = load_canonical_draft(Path(package))
+        canonical_blocks = [
+            item for item in ((canonical.get(material) or {}).get("blocks") or [])
+            if isinstance(item, dict)
+        ]
+        if canonical_blocks and len(document.paragraphs) < len(canonical_blocks):
+            findings.append({"code": "template_block_count_failed", "artifact": key, "evidence": f"expected={len(canonical_blocks)} actual={len(document.paragraphs)}"})
+        for position, block in enumerate(canonical_blocks):
+            if position >= len(document.paragraphs):
+                break
+            paragraph = document.paragraphs[position]
+            prototype_name = expected_prototype(block, position)
+            prototype = prototypes.get(prototype_name)
+            if prototype is None:
+                findings.append({"code": "template_prototype_missing", "artifact": key, "evidence": prototype_name})
+                continue
+            expected_style = str(prototype.get("style") or "")
+            if str(paragraph.style.name) != expected_style:
+                findings.append({
+                    "code": "template_block_style_failed",
+                    "artifact": key,
+                    "evidence": f"{block.get('id')}: expected={expected_style} actual={paragraph.style.name}",
+                })
+            if direct_ppr_signature(paragraph._p.pPr) != prototype_direct_ppr_signature(prototype_name):
+                findings.append({
+                    "code": "template_block_layout_failed",
+                    "artifact": key,
+                    "evidence": f"{block.get('id')}: direct paragraph layout differs from lane master",
+                })
+            if paragraph.runs and prototype.get("rprs"):
+                run_format_errors = []
+                for run_index, run in enumerate(paragraph.runs):
+                    expected_index = expected_run_index(prototype_name, run_index, len(paragraph.runs))
+                    if rpr_signature(run) != prototype_rpr_signature(prototype_name, expected_index):
+                        run_format_errors.append(str(run_index))
+                if run_format_errors:
+                    findings.append({
+                        "code": "template_block_direct_format_failed",
+                        "artifact": key,
+                        "evidence": f"{block.get('id')}: prototype={prototype_name} runs={','.join(run_format_errors)}",
+                    })
+            if prototype_name == "job_heading":
+                _, date_text = _job_heading_parts(str(block.get("text") or ""))
+                if date_text:
+                    if "\t" not in paragraph.text or not has_ppr_tag(paragraph, "tabs"):
+                        findings.append({
+                            "code": "template_job_heading_date_tab_failed",
+                            "artifact": key,
+                            "evidence": f"{block.get('id')}: date column is not tab-bound",
+                        })
+                    if len(paragraph.runs) >= 2 and rpr_signature(paragraph.runs[1]) != prototype_rpr_signature(prototype_name, 1):
+                        findings.append({
+                            "code": "template_job_heading_date_format_failed",
+                            "artifact": key,
+                            "evidence": f"{block.get('id')}: date run differs from lane master",
+                        })
+            if prototype_name in {"bullet", "core"} and prototype_has_ppr_tag(prototype_name, "numPr") and not has_ppr_tag(paragraph, "numPr"):
+                findings.append({"code": "template_block_numbering_failed", "artifact": key, "evidence": str(block.get("id") or "")})
+
         if not document.paragraphs:
             findings.append({"code": "template_direct_format_missing", "artifact": key, "evidence": "document has no paragraphs"})
             continue
@@ -787,6 +1019,46 @@ def mechanical_format_gate(package: Path, workspace: Path) -> dict[str, Any]:
     package = Path(package)
     names = expected_filenames(package, workspace)
     findings: list[dict[str, str]] = []
+    receipt = _load(package / RENDER_RECEIPT_NAME)
+    recorded_docx = receipt.get("docx_hashes") if isinstance(receipt.get("docx_hashes"), dict) else {}
+    live_docx = {
+        key: container_hash(package / names[key])
+        for key in ("cv_docx", "cl_docx")
+        if (package / names[key]).is_file()
+    }
+    if recorded_docx and recorded_docx != live_docx:
+        findings.append({
+            "code": "render_receipt_hash_mismatch",
+            "artifact": "docx",
+            "evidence": "render receipt does not match the live DOCX; rerender through the fixed gateway",
+        })
+    elif not recorded_docx and any(path.is_file() for path in (package / names["cv_docx"], package / names["cl_docx"])):
+        findings.append({
+            "code": "render_receipt_missing",
+            "artifact": "docx",
+            "evidence": "DOCX exists without a renderer receipt",
+        })
+    # The vNext artifact receipt is written only after DOCX/PDF format passes;
+    # an older receipt must never be allowed to describe a new generation.
+    for artifact_receipt_path in (
+        package / "materials_vnext" / "artifact_hashes.json",
+        package / "artifact_hashes.json",
+    ):
+        artifact_receipt = _load(artifact_receipt_path)
+        recorded_files = artifact_receipt.get("files") if isinstance(artifact_receipt.get("files"), dict) else {}
+        if not recorded_files:
+            continue
+        live_files = {
+            name: container_hash(package / name)
+            for name in recorded_files
+            if (package / name).is_file()
+        }
+        if live_files != recorded_files:
+            findings.append({
+                "code": "artifact_receipt_hash_mismatch",
+                "artifact": artifact_receipt_path.name,
+                "evidence": "artifact hash receipt does not match the live outbound files; rerun render/PDF/format",
+            })
     for key in ("cv_docx", "cl_docx", "cv_pdf", "cl_pdf"):
         path = package / names[key]
         if not path.is_file():

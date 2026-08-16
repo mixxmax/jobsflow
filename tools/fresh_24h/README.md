@@ -52,6 +52,11 @@ Deep rows expose `语义匹配来源`, `语义待处理数` and pending task key
 preview may show a conservatively capped `pending_fallback`, but formal push
 blocks until those tasks are completed and the score is rerun. Use
 `--allow-pending-semantic` only for an explicitly marked diagnostic push.
+The two deep semantic layers (lane/position profile and resume matching) must
+both be complete. After a rerun, `two_pass_score.py` refreshes the matching
+workflow run's scored hash and pending status from its own sidecar (and
+reconciles the legacy scan summary when present); do not edit
+`scan_runs/<run_id>/run.json` manually.
 
 `temp` scans only since the last successful refresh; `daily` scans about 24
 hours. Add `--no-record` to preview without changing state.

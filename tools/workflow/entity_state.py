@@ -31,17 +31,23 @@ ENTITY_TRANSITIONS: dict[str, dict[str, set[str]]] = {
         "archived": set(),
     },
     "materials": {
-        "idle": {"context_loaded", "planning_pending", "plan_validated"},
+        "idle": {"context_loaded", "planning_pending", "plan_validated", "inputs_frozen", "plan_ready"},
         "context_loaded": {"inputs_validated", "planning_pending"},
         "inputs_validated": {"planning_pending"},
-        "planning_pending": {"plan_validated"},
+        "planning_pending": {"plan_validated", "inputs_frozen", "plan_ready"},
+        "inputs_frozen": {"plan_ready", "blocked", "content_audit_pending"},
+        "plan_ready": {"transformed", "blocked", "content_audit_pending"},
+        "transformed": {"content_audit_pending", "blocked"},
         # A configured independent worker may complete the audit inside the
         # canonical-draft action.  The event still records the audit receipt;
         # allowing this direct edge avoids a fake intermediate command whose
         # only purpose would be advancing state.
         "plan_validated": {"drafting", "content_audit_pending", "content_passed"},
         "drafting": {"content_audit_pending"},
-        "content_audit_pending": {"content_passed"},
+        "content_audit_pending": {"content_passed", "repair_required", "audit_review_required", "blocked"},
+        "repair_required": {"transformed", "content_audit_pending", "audit_review_required", "blocked"},
+        "audit_review_required": {"inputs_frozen"},
+        "blocked": {"inputs_frozen", "plan_ready", "content_audit_pending"},
         "content_passed": {"docx_generated", "pdf_generated"},
         "docx_generated": {"pdf_generated"},
         "pdf_generated": {"format_passed"},
@@ -233,8 +239,8 @@ ACTION_DESTINATIONS: dict[str, set[str]] = {
     "scan": {"scan_requested", "scan_completed", "scan_degraded", "scan_failed"},
     "push": {"pushed_to_fresh", "semantic_pending"},
     "promote": {"promoted_retained"},
-    "materials": {"planning_pending", "plan_validated", "content_audit_pending", "docx_generated", "pdf_generated"},
-    "audit": {"content_passed"},
+    "materials": {"planning_pending", "plan_validated", "inputs_frozen", "plan_ready", "transformed", "content_audit_pending", "repair_required", "audit_review_required", "blocked", "docx_generated", "pdf_generated"},
+    "audit": {"content_passed", "repair_required", "audit_review_required", "blocked"},
     "format": {"format_passed"},
     "apply": {"apply_ready"},
     "archive_preview": {"archive_pending_confirmation"},

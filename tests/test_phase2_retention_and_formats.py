@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tools.io_utils import atomic_write_json, atomic_write_text
 from tools.workflow.engine import dispatch
 from tools.workflow.entity_state import load_entity_state
@@ -65,6 +67,7 @@ def test_push_merges_and_keeps_old_fresh_rows(tmp_path):
     assert any(is_assigned_job_id(job_id) for job_id in ids)
 
 
+@pytest.mark.legacy
 def test_editing_cv_or_plan_invalidates_apply_ready(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws)
@@ -144,6 +147,7 @@ def test_two_temp_scans_use_distinct_run_ids(tmp_path):
     assert load_entity_state(ws, "scan", "scan-bbbb2222").phase == "scan_completed"
 
 
+@pytest.mark.legacy
 def test_apply_accepts_docx_pdf_and_markdown_email(tmp_path):
     from docx import Document
 

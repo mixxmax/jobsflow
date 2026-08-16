@@ -130,7 +130,7 @@ def _write_test_lane_templates(ws: Path) -> None:
     contact.alignment = WD_ALIGN_PARAGRAPH.CENTER
     format_run(contact.add_run("Hong Kong | test@example.test"), size=9, bold=True, color="4B4B4B")
     summary = cv.add_paragraph()
-    format_run(summary.add_run("Summary prototype"), size=9.5)
+    format_run(summary.add_run("Summary prototype with IELTS 7.5 English."), size=9.5)
     section = cv.add_paragraph(style="Resume Section")
     format_run(section.add_run("PROFESSIONAL SUMMARY"), size=11, bold=True, color="17365D")
     compact = cv.add_paragraph(style="Compact Line")
@@ -167,6 +167,10 @@ def _write_test_lane_templates(ws: Path) -> None:
     format_run(compact.add_run("[Date]"), size=10.5)
     subject = cl.add_paragraph()
     format_run(subject.add_run("Re: Application for [Role]"), size=11, bold=True, color="17365D")
+    recipient = cl.add_paragraph(style="Letter Compact")
+    format_run(recipient.add_run("Hiring Manager"), size=10.5)
+    company = cl.add_paragraph(style="Letter Compact")
+    format_run(company.add_run("[Company]"), size=10.5)
     body = cl.add_paragraph(style="Letter Body")
     format_run(body.add_run("Dear Hiring Manager,"), size=11)
     letter_bullet = cl.add_paragraph(style="Letter Bullet")
@@ -186,7 +190,7 @@ def prepare_package_for_apply(ws: Path, job_id: str = "C0-001") -> None:
     drafted = dispatch(
         "materials",
         workspace=ws,
-        payload={"job_id": job_id, "canonical_draft": canonical_fixture(job_id)},
+        payload={"job_id": job_id, "canonical_draft": baseline_transform_fixture(package, job_id)},
     )
     assert drafted["status"] == "succeeded"
     task = drafted["audit_task_packet"]
@@ -250,6 +254,55 @@ def canonical_fixture(job_id: str = "C0-001") -> dict:
                 {"id": "cl-signoff", "type": "signoff", "text": "Yours sincerely,\nCandidate", "claim_ids": []},
             ]
         },
+    }
+
+
+def baseline_transform_fixture(package: Path, job_id: str = "C0-001") -> dict:
+    """Small JD-specific delta used by public-workflow tests."""
+
+    from tools.workflow.materials_baseline import load_content_baseline
+    from tools.workflow.materials_drafting_context import load_drafting_scope
+
+    baseline = load_content_baseline(package)
+    if not baseline:
+        raise ValueError("test content baseline missing; run the materials planning seam first")
+    cv_blocks = (baseline.get("cv") or {}).get("blocks") or []
+    cv_target = next((item for item in cv_blocks if item.get("type") == "bullet"), None)
+    if cv_target is None:
+        cv_target = next((item for item in cv_blocks if item.get("type") == "paragraph"), None)
+    cl_target = next(
+        (item for item in reversed((baseline.get("cover_letter") or {}).get("blocks") or []) if item.get("type") in {"bullet", "paragraph"}),
+        None,
+    )
+    if not cv_target or not cl_target:
+        raise ValueError("test content baseline lacks editable CV/CL blocks")
+    scope = load_drafting_scope(package, phase="tailoring")
+    return {
+        "schema_version": 1,
+        "artifact_type": "jobsflow_baseline_transform",
+        "job_id": job_id,
+        "baseline_sha256": baseline["baseline_sha256"],
+        "drafting_context_id": str(scope.get("context_id") or ""),
+        "drafting_input_fingerprint": str(scope.get("input_fingerprint") or ""),
+        "changes": [
+            {
+                "material": "cv",
+                "baseline_id": cv_target["id"],
+                "action": "rewrite",
+                "text": "Paralegal candidate who reviewed vendor contracts for a payments team and translated findings into accurate operational checklists and reliable stakeholder follow-up.",
+                "jd_anchor_ids": ["JD-001"],
+                "priority": 1,
+            },
+            {
+                "material": "cover_letter",
+                "baseline_id": cl_target["id"],
+                "action": "rewrite",
+                "text": "Contract review: I translated vendor-contract findings into practical operational follow-up, bringing accurate documentation and dependable coordination to the Paralegal role at Acme.",
+                "jd_anchor_ids": ["JD-001"],
+                "priority": 1,
+            },
+        ],
+        "additions": [],
     }
 
 

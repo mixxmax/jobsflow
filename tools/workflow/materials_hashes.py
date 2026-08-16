@@ -176,6 +176,25 @@ def audit_coverage_dispositions(package: Path) -> dict[str, str]:
     return {}
 
 
+def content_baseline_fingerprint(package: Path) -> str:
+    """Hash the frozen lane content master without trusting its self-digest."""
+
+    try:
+        value = json.loads((Path(package) / "materials_baseline.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(value, dict):
+        return ""
+    payload = {
+        key: item
+        for key, item in value.items()
+        if key not in {"created_at", "baseline_sha256"}
+    }
+    return sha256_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    )
+
+
 def audit_input_fingerprint(
     *,
     package: Path,
@@ -196,6 +215,7 @@ def audit_input_fingerprint(
     payload = {
         "jd_sha256": sha256_text(normalize_text(jd_text)),
         "semantic_material_hashes": semantic_material_hashes(package),
+        "content_baseline_sha256": content_baseline_fingerprint(package),
         "rules_digest": rules_digest,
         "lessons_digest": lessons_digest,
         "coverage_dispositions": audit_coverage_dispositions(package),
@@ -210,6 +230,7 @@ def audit_context_fingerprint(
     lessons_digest: str = "",
     claim_contract: dict[str, Any] | None = None,
     coverage_dispositions: dict[str, str] | None = None,
+    content_baseline_sha256: str = "",
 ) -> str:
     """Fingerprint stable inputs while deliberately excluding draft text.
 
@@ -223,6 +244,7 @@ def audit_context_fingerprint(
         "jd_sha256": sha256_text(normalize_text(jd_text)),
         "rules_digest": rules_digest,
         "lessons_digest": lessons_digest,
+        "content_baseline_sha256": str(content_baseline_sha256 or ""),
         "coverage_dispositions": dict(coverage_dispositions or {}),
     }
     return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))

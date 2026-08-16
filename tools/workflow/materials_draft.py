@@ -1,4 +1,8 @@
-"""Canonical CV/Cover Letter content and finding-scoped repair contract.
+"""Frozen legacy canonical CV/Cover Letter compatibility module.
+
+The product gateway compiles vNext canonical content from its bounded
+baseline transform.  This module is retained for migration/rollback only;
+new authoring behavior must not be added here.
 
 The canonical JSON is the only editable source for tailored CV/CL content.
 DOCX and PDF files are derived artifacts created only after the independent
@@ -25,9 +29,12 @@ REPAIR_RECEIPT_NAME = "materials_repair_receipt.json"
 DRAFT_SCHEMA_VERSION = 1
 BLOCK_TYPES = {"heading", "contact", "paragraph", "bullet", "signoff"}
 MATERIAL_KEYS = ("cv", "cover_letter")
+# A canonical draft is already past host substitution.  Any remaining
+# bracketed/template token is therefore unresolved input, not prose that the
+# drafting model may silently reinterpret.  Keeping this broader than the
+# public template vocabulary also makes custom user masters fail visibly.
 _PLACEHOLDER_RE = re.compile(
-    r"\[(?:company|role|date|jd|anchor|insert|replace|tbd|todo)[^\]]*\]|"
-    r"\b(?:TBD|TODO|YOUR NAME|COMPANY_NAME)\b",
+    r"\[[^\]]+\]|\{[^}]+\}|\b(?:TBD|TODO|YOUR NAME|COMPANY_NAME)\b",
     re.I,
 )
 
@@ -136,7 +143,11 @@ def validate_canonical_draft(
                 errors.append(f"canonical_placeholder:{block_id or position}")
             # ``claim_ids`` is legacy metadata.  It may be retained for
             # provenance, but v2 does not require or authorize it.
-        if substantive < (120 if material == "cv" else 100):
+        # A lane master is the approved content floor.  Once a draft is bound
+        # to that complete baseline, completeness is enforced by block
+        # coverage rather than an arbitrary character threshold (which is
+        # both easy to pad and hostile to concise masters).
+        if not draft.get("baseline_sha256") and substantive < (120 if material == "cv" else 100):
             errors.append(f"canonical_{material}_too_shallow")
     return sorted(set(errors))
 
@@ -162,6 +173,11 @@ def save_canonical_draft(
         }
     )
     errors = validate_canonical_draft(normalized, job_id=job_id, allowed_claim_ids=allowed_claim_ids)
+    from tools.workflow.materials_baseline import load_content_baseline, validate_content_floor
+
+    content_baseline = load_content_baseline(package)
+    if content_baseline:
+        errors.extend(validate_content_floor(content_baseline, normalized))
     if errors:
         raise ValueError("invalid canonical draft: " + ", ".join(errors))
     current = load_canonical_draft(package)
@@ -175,118 +191,10 @@ def save_canonical_draft(
     return normalized
 
 
-def canonical_draft_task_schema(*, job_id: str, claim_ids: list[str] | None = None) -> dict[str, Any]:
-    """Small schema handed to the drafting model; no manuals or workspace dump."""
-
-    return {
-        "schema_version": DRAFT_SCHEMA_VERSION,
-        "artifact_type": "jobsflow_canonical_cv_cl",
-        "job_id": job_id,
-        "documents": {
-            "cv": {"blocks": "ordered array of {id,type,text,jd_anchor_ids,section,experience_id,priority}"},
-            "cover_letter": {"blocks": "ordered array of {id,type,text,jd_anchor_ids,section,experience_id,priority}"},
-        },
-        "allowed_block_types": sorted(BLOCK_TYPES),
-        "rules": [
-            "Return complete CV and Cover Letter content, not DOCX/PDF or email.",
-            "Use stable unique block IDs and retain section/experience/priority/JD-anchor metadata.",
-            "Do not include placeholders, internal notes, formatting instructions, or active self-disqualification.",
-            "When the truthful draft would be unusually sparse for the selected lane, add one or two concise JD-relevant details supported by the confirmed profile; never add filler or invented facts.",
-            "The fixed renderer may adjust inter-block spacing for visual balance; do not choose another template, alter fonts, stretch text, or edit PDF output.",
-        ],
-        "layout_contract": {
-            "underfill": "truthful JD-relevant detail first, bounded renderer spacing second",
-            "overfill": "tighten or reorder existing truthful blocks before rendering",
-            "one_page": True,
-        },
-    }
-
-
 def _compact_text(value: Any) -> str:
     """Normalize model text without changing its meaning or inventing facts."""
 
     return " ".join(str(value or "").split()).strip()
-
-
-def _claim_catalog(plan: dict[str, Any], claim_contract: dict[str, Any] | None) -> list[dict[str, str]]:
-    """Return the frozen claim text/IDs used by the deterministic seed compiler.
-
-    Older plans often omitted ``claim_id`` even though the claim contract
-    assigned one.  Matching by position is safe here because the contract is
-    built from the same ordered ledger; it removes a needless JSON repair
-    round while keeping the contract as the source of truth.
-    """
-
-    contract_claims = [
-        item for item in (claim_contract or {}).get("claims", []) if isinstance(item, dict)
-    ]
-    rows: list[dict[str, str]] = []
-    for index, raw in enumerate(plan.get("claim_ledger") or []):
-        if not isinstance(raw, dict):
-            continue
-        contract = contract_claims[index] if index < len(contract_claims) else {}
-        claim_id = _compact_text(raw.get("claim_id") or raw.get("id") or contract.get("claim_id"))
-        text = _compact_text(raw.get("text") or raw.get("claim") or contract.get("text"))
-        if claim_id and text:
-            rows.append(
-                {
-                    "claim_id": claim_id,
-                    "text": text,
-                    "priority": str(raw.get("priority") or raw.get("evidence_priority") or index + 1),
-                    "experience_id": _compact_text(raw.get("experience_id") or raw.get("experience")),
-                    "jd_anchor_ids": ",".join(_claim_refs(raw.get("jd_anchor_ids") or raw.get("jd_anchor_id"))),
-                }
-            )
-    # A plan may contain no ledger text but a valid contract can still carry a
-    # bounded claim.  Copying it is safer than manufacturing a candidate fact.
-    if not rows:
-        rows = [
-            {
-                "claim_id": _compact_text(item.get("claim_id")),
-                "text": _compact_text(item.get("text")),
-                "priority": str(item.get("priority") or index + 1),
-                "experience_id": _compact_text(item.get("experience_id")),
-                "jd_anchor_ids": ",".join(_claim_refs(item.get("jd_anchor_ids"))),
-            }
-            for index, item in enumerate(contract_claims)
-            if _compact_text(item.get("claim_id")) and _compact_text(item.get("text"))
-        ]
-    return rows
-
-
-def _claim_refs(value: Any, *, fallback: str = "") -> list[str]:
-    if isinstance(value, str):
-        values = [value]
-    elif isinstance(value, list):
-        values = value
-    else:
-        values = []
-    refs = [_compact_text(item) for item in values if _compact_text(item)]
-    return refs or ([fallback] if fallback else [])
-
-
-def _seed_block(
-    *,
-    block_id: str,
-    block_type: str,
-    text: Any,
-    claim_ids: list[str] | None = None,
-    jd_anchor_ids: list[str] | None = None,
-    section: str = "",
-    experience_id: str = "",
-    priority: int | str | None = None,
-) -> dict[str, Any]:
-    normalized_priority: int | str = priority if priority is not None else 0
-    return {
-        "id": block_id,
-        "type": block_type if block_type in BLOCK_TYPES else "paragraph",
-        "text": _compact_text(text),
-        "claim_ids": list(claim_ids or []),
-        "jd_anchor_ids": list(jd_anchor_ids or []),
-        "section": _compact_text(section),
-        "experience_id": _compact_text(experience_id),
-        "priority": normalized_priority,
-    }
 
 
 def _default_block_metadata(material: str, block_type: str, position: int) -> dict[str, Any]:
@@ -337,231 +245,27 @@ def _normalize_draft_metadata(draft: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _normalize_seed_blocks(
-    raw_blocks: Any,
-    *,
-    material: str,
-    allowed_claim_ids: set[str] | None = None,
-    claim_rows: list[dict[str, str]] | None = None,
-) -> list[dict[str, Any]]:
-    if not isinstance(raw_blocks, list):
-        return []
-    output: list[dict[str, Any]] = []
-    for index, raw in enumerate(raw_blocks):
-        if isinstance(raw, str):
-            raw = {"text": raw}
-        if not isinstance(raw, dict):
-            continue
-        text = _compact_text(raw.get("text") or raw.get("content"))
-        if not text:
-            continue
-        block_id = _compact_text(raw.get("id")) or f"{material}-block-{index + 1:02d}"
-        block_type = _compact_text(raw.get("type")) or ("bullet" if material == "cv" else "paragraph")
-        refs = _claim_refs(raw.get("claim_ids") or raw.get("claim_id"))
-        if not refs:
-            # If the model omitted an ID, associate the sentence only with an
-            # exact/near-exact frozen claim.  Generic role language remains
-            # uncited instead of being silently treated as evidence.
-            folded = text.casefold()
-            refs = [
-                row["claim_id"]
-                for row in (claim_rows or [])
-                if row["text"].casefold() in folded or folded in row["text"].casefold()
-            ][:1]
-        defaults = _default_block_metadata(material, block_type, index)
-        output.append(
-            _seed_block(
-                block_id=block_id,
-                block_type=block_type,
-                text=text,
-                claim_ids=refs,
-                jd_anchor_ids=[_compact_text(item) for item in (raw.get("jd_anchor_ids") or []) if _compact_text(item)],
-                section=_compact_text(raw.get("section") or defaults["section"]),
-                experience_id=_compact_text(raw.get("experience_id") or defaults["experience_id"]),
-                priority=raw.get("priority") if raw.get("priority") is not None else defaults["priority"],
-            )
-        )
-    return output
-
-
 def compile_canonical_draft(
     *,
     job_id: str,
     plan: dict[str, Any],
     context: dict[str, Any],
-    claim_contract: dict[str, Any] | None = None,
+    content_baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compile a complete canonical CV/CL draft from a validated plan.
-
-    The model may provide a small ``draft`` object containing prose, but it no
-    longer has to hand-assemble schema-version fields, block IDs, or claim
-    contract plumbing.  If prose is absent, a conservative evidence-backed
-    seed is generated from the frozen ledger.  No new candidate fact is ever
-    created by this compiler; a missing role, name, or claim fails closed.
-    """
+    """Compile the host-owned canonical seed from the lane content baseline."""
 
     if not isinstance(plan, dict):
         raise ValueError("canonical_seed_plan_invalid")
-    context = dict(context or {})
-    role = _compact_text(context.get("role_primary") or context.get("role") or "")
-    candidate_name = _compact_text(context.get("candidate_name"))
-    if not role:
-        raise ValueError("canonical_seed_role_missing")
-    if not candidate_name:
-        raise ValueError("candidate_name_missing")
-    contract = claim_contract if isinstance(claim_contract, dict) else {}
-    claim_rows = _claim_catalog(plan, contract)
-    allowed_claim_ids = {
-        _compact_text(item.get("claim_id"))
-        for item in (contract.get("claims") or [])
-        if isinstance(item, dict) and _compact_text(item.get("claim_id"))
-    } or {row["claim_id"] for row in claim_rows}
+    if not content_baseline:
+        raise ValueError("content_baseline_required")
+    from tools.workflow.materials_baseline import canonical_from_baseline
 
-    publisher_type = _compact_text(context.get("publisher_type")).casefold()
-    employer = _compact_text(context.get("employer_name") or context.get("company_out"))
-    application_target = employer if publisher_type not in {"recruiter", "agency"} else ""
-    duties = [_compact_text(item) for item in (context.get("duties") or context.get("anchors") or []) if _compact_text(item)]
-    duty = duties[0] if duties else f"the core responsibilities of the {role} position"
-    jd_anchor_catalog = [
-        {"id": f"JD-{index + 1:03d}", "text": value, "priority": index + 1}
-        for index, value in enumerate(duties[:12])
-    ] or [{"id": "JD-001", "text": duty, "priority": 1}]
-    primary_anchor_id = str(jd_anchor_catalog[0]["id"])
-    first_claim = claim_rows[0] if claim_rows else {
-        "claim_id": "",
-        "text": f"experience relevant to {duty}",
-        "priority": 1,
-        "experience_id": "experience-01",
-        "jd_anchor_ids": primary_anchor_id,
-    }
-    value_phrase = "careful, evidence-backed support and dependable follow-through"
-    target_phrase = f" at {application_target}" if application_target else ""
-
-    raw_draft = plan.get("draft") or plan.get("draft_content") or plan.get("materials_draft") or {}
-    if not isinstance(raw_draft, dict):
-        raw_draft = {}
-    raw_cv = raw_draft.get("cv") if isinstance(raw_draft.get("cv"), dict) else {}
-    raw_cl = raw_draft.get("cover_letter") if isinstance(raw_draft.get("cover_letter"), dict) else {}
-
-    cv_raw_blocks = raw_cv.get("blocks")
-    if not isinstance(cv_raw_blocks, list):
-        cv_raw_blocks = []
-        if _compact_text(raw_cv.get("heading")):
-            cv_raw_blocks.append({"id": "cv-heading", "type": "heading", "text": raw_cv.get("heading")})
-        if _compact_text(raw_cv.get("summary")):
-            cv_raw_blocks.append({"id": "cv-summary", "type": "paragraph", "text": raw_cv.get("summary")})
-        for item in raw_cv.get("bullets") or []:
-            cv_raw_blocks.append(item if isinstance(item, dict) else {"text": item, "type": "bullet"})
-    cv_blocks = _normalize_seed_blocks(
-        cv_raw_blocks, material="cv", allowed_claim_ids=allowed_claim_ids, claim_rows=claim_rows
+    return canonical_from_baseline(
+        content_baseline,
+        job_id=job_id,
+        context=context,
+        plan=plan,
     )
-    for block in cv_blocks:
-        if block.get("type") in {"paragraph", "bullet"} and not block.get("jd_anchor_ids"):
-            block["jd_anchor_ids"] = [primary_anchor_id]
-    if not cv_blocks:
-        cv_blocks = [
-            _seed_block(block_id="cv-heading", block_type="heading", text=role, section="header", priority=0),
-            _seed_block(
-                block_id="cv-summary",
-                block_type="paragraph",
-                text=f"{role} professional with {first_claim['text']} and a focus on {value_phrase}.",
-                claim_ids=[first_claim["claim_id"]] if first_claim.get("claim_id") else [],
-                jd_anchor_ids=[primary_anchor_id],
-                section="summary",
-                priority=1,
-            ),
-        ]
-        for index, row in enumerate(claim_rows[:8], start=1):
-            row_anchors = [item for item in str(row.get("jd_anchor_ids") or "").split(",") if item] or [primary_anchor_id]
-            cv_blocks.append(
-                _seed_block(
-                    block_id=f"cv-claim-{index:02d}",
-                    block_type="bullet",
-                    text=row["text"],
-                    claim_ids=[row["claim_id"]] if row.get("claim_id") else [],
-                    jd_anchor_ids=row_anchors,
-                    section="experience",
-                    experience_id=row.get("experience_id") or f"experience-{index:02d}",
-                    priority=row.get("priority") or index + 1,
-                )
-            )
-    else:
-        # A compact heading/summary is deterministic scaffolding if the model
-        # supplied only bullets.  It is not a new fact claim.
-        if not any(item.get("type") == "heading" for item in cv_blocks):
-            cv_blocks.insert(0, _seed_block(block_id="cv-heading", block_type="heading", text=role, section="header", priority=0))
-        if not any(item.get("type") == "paragraph" for item in cv_blocks):
-            cv_blocks.insert(
-                1,
-                _seed_block(
-                    block_id="cv-summary",
-                    block_type="paragraph",
-                    text=f"{role} professional with evidence-backed experience relevant to {duty}.",
-                    claim_ids=[first_claim["claim_id"]] if first_claim.get("claim_id") else [],
-                    jd_anchor_ids=[primary_anchor_id],
-                    section="summary",
-                    priority=1,
-                ),
-            )
-
-    cl_blocks = _normalize_seed_blocks(
-        raw_cl.get("blocks"), material="cover_letter", allowed_claim_ids=allowed_claim_ids, claim_rows=claim_rows
-    )
-    for block in cl_blocks:
-        if block.get("type") in {"paragraph", "bullet"} and not block.get("jd_anchor_ids"):
-            block["jd_anchor_ids"] = [primary_anchor_id]
-    if not cl_blocks:
-        opening = _compact_text(raw_cl.get("opening")) or (
-            f"I am applying for the {role} role{target_phrase}. The position's focus on {duty} connects with "
-            f"my experience: {first_claim['text']}"
-        )
-        paragraphs = [_compact_text(item) for item in (raw_cl.get("paragraphs") or []) if _compact_text(item)]
-        if not paragraphs:
-            paragraphs = [
-                f"I can bring {value_phrase} to this work, using the bounded experience described above without overstating ownership."
-            ]
-        cl_blocks = [
-            _seed_block(
-                block_id="cl-opening",
-                block_type="paragraph",
-                text=opening,
-                claim_ids=[first_claim["claim_id"]] if first_claim.get("claim_id") else [],
-                jd_anchor_ids=[primary_anchor_id],
-                section="opening",
-                priority=1,
-            )
-        ]
-        for index, paragraph in enumerate(paragraphs, start=1):
-            cl_blocks.append(
-                _seed_block(
-                    block_id=f"cl-paragraph-{index:02d}",
-                    block_type="paragraph",
-                    text=paragraph,
-                    claim_ids=[first_claim["claim_id"]] if index == 1 and first_claim.get("claim_id") else [],
-                    jd_anchor_ids=[primary_anchor_id],
-                    section="body",
-                    priority=index + 1,
-                )
-            )
-        signoff = _compact_text(raw_cl.get("signoff")) or f"Yours sincerely, {candidate_name}"
-        cl_blocks.append(_seed_block(block_id="cl-signoff", block_type="signoff", text=signoff, section="closing", priority=len(cl_blocks) + 1))
-    elif not any(item.get("type") == "signoff" for item in cl_blocks):
-        cl_blocks.append(_seed_block(block_id="cl-signoff", block_type="signoff", text=f"Yours sincerely, {candidate_name}", section="closing", priority=len(cl_blocks) + 1))
-
-    return {
-        "schema_version": DRAFT_SCHEMA_VERSION,
-        "artifact_type": "jobsflow_canonical_cv_cl",
-        "job_id": str(job_id),
-        "compiled_from": "plan_draft" if raw_draft else ("claim_ledger_fallback" if claim_rows else "minimal_role_seed"),
-        "jd_anchors": jd_anchor_catalog,
-        # Planning-only coverage decisions travel with the canonical source so
-        # an isolated auditor can distinguish a truthful omission from a
-        # forgotten JD response.  The renderer consumes only document blocks,
-        # therefore this metadata can never leak into CV/CL prose.
-        "coverage_dispositions": dict(plan.get("coverage_dispositions") or {}),
-        "cv": {"blocks": cv_blocks},
-        "cover_letter": {"blocks": cl_blocks},
-    }
 
 
 def _active_blocking_findings(package: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -663,6 +367,15 @@ def apply_finding_scoped_patch(package: Path, patch: dict[str, Any]) -> dict[str
         source_hashes=dict(draft.get("source_hashes") or {}),
         producer_context_id=str(draft.get("producer_context_id") or ""),
     )
+    from tools.workflow.materials_generation import append_repair_patch
+
+    append_repair_patch(
+        package,
+        {"changes": changes},
+        finding_ids=sorted(covered),
+        before_sha256=before_digest,
+        after_sha256=str(updated.get("canonical_sha256") or ""),
+    )
     receipt = {
         "schema_version": 1,
         "job_id": draft.get("job_id"),
@@ -676,3 +389,69 @@ def apply_finding_scoped_patch(package: Path, patch: dict[str, Any]) -> dict[str
     }
     atomic_write_json(package / REPAIR_RECEIPT_NAME, receipt)
     return {"draft": updated, "receipt": receipt}
+
+
+def replay_effective_transform(
+    package: Path,
+    *,
+    context: dict[str, Any],
+    plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rebuild the canonical draft from the frozen baseline transform ledger.
+
+    This is the compatibility/resume seam for the product-line bounded
+    transform path.  It never asks a model to regenerate prose and therefore
+    cannot resurrect the pre-repair draft after a reset.
+    """
+
+    package = Path(package)
+    # vNext keeps the authoritative generation under ``materials_vnext``.
+    # If a caller is using this legacy compatibility seam after a vNext run,
+    # replay that frozen state directly instead of reconstructing a second
+    # canonical document with the retired compiler.  The root mirrors are
+    # inspection-only projections.
+    vnext_state = package / "materials_vnext"
+    vnext_canonical = vnext_state / "canonical.json"
+    vnext_effective = vnext_state / "effective_transform.json"
+    vnext_run = vnext_state / "materials_run.json"
+    if vnext_canonical.is_file() and vnext_effective.is_file():
+        canonical = _load(vnext_canonical)
+        effective = _load(vnext_effective)
+        run = _load(vnext_run)
+        if canonical and effective:
+            return {
+                "generation_id": str(run.get("generation_id") or effective.get("generation_id") or ""),
+                "canonical": canonical,
+                "effective_transform": effective,
+            }
+    from tools.workflow.materials_baseline import apply_baseline_transform, load_content_baseline
+    from tools.workflow.materials_generation import current_generation_id, effective_transform
+
+    baseline = load_content_baseline(package)
+    transform = effective_transform(package)
+    if not baseline:
+        raise ValueError("content_baseline_missing")
+    if not transform:
+        raise ValueError("effective_transform_missing")
+    job_id = str(context.get("job_id") or "").strip()
+    if not job_id:
+        raise ValueError("replay_job_id_missing")
+    canonical = apply_baseline_transform(
+        baseline,
+        transform,
+        job_id=job_id,
+        context=dict(context),
+        plan=dict(plan or {}),
+    )
+    updated = save_canonical_draft(
+        package,
+        canonical,
+        job_id=job_id,
+        source_hashes=dict(canonical.get("source_hashes") or {}),
+        producer_context_id=str(canonical.get("producer_context_id") or ""),
+    )
+    return {
+        "generation_id": current_generation_id(package),
+        "canonical": updated,
+        "effective_transform": transform,
+    }

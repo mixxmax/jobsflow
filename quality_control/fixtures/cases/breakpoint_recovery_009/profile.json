@@ -1,0 +1,21 @@
+{
+  "candidate_name": "Synthetic Candidate",
+  "title": "Senior Systems Engineer",
+  "summary": "Experienced engineer with deep background in automation and quality control.",
+  "skills": [
+    "Python",
+    "Architecture",
+    "CI/CD",
+    "Quality Control"
+  ],
+  "experience": [
+    {
+      "company": "Synthetic Corp",
+      "role": "Senior Engineer",
+      "period": "2022 - Present",
+      "bullets": [
+        "Led quality automation pipeline with zero leakage."
+      ]
+    }
+  ]
+}

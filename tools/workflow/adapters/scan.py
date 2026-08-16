@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import csv
+import json
 import os
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -53,6 +54,116 @@ def write_run_record(
     run_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(run_dir / "run.json", meta)
     return meta
+
+
+def _read_scored_semantic_meta(scored_path: Path) -> tuple[int, list[str]]:
+    """Read semantic completion from the scorer's own sidecar metadata.
+
+    The scan summary is produced before the two-pass scorer runs and therefore
+    cannot be the source of truth after a semantic rerun.  The scorer sidecar
+    is the authoritative post-score record; the older scan sidecar remains a
+    compatibility fallback for fixtures and pre-v2 artifacts.
+    """
+
+    candidates = [
+        Path(scored_path).with_suffix(".json"),
+        Path(scored_path).with_name(Path(scored_path).name.replace("_twopass_scored.csv", "_run.json")),
+    ]
+    for sidecar in candidates:
+        if not sidecar.is_file():
+            continue
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if "semantic_pending_rows" not in data and "semantic_pending_tasks" not in data:
+            continue
+        try:
+            count = int(data.get("semantic_pending_rows") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        tasks = [str(item) for item in (data.get("semantic_pending_tasks") or []) if str(item).strip()]
+        return count, tasks
+    return 0, []
+
+
+def refresh_run_records_for_scored_artifact(
+    workspace: Path,
+    scored_path: Path,
+    *,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """Refresh the official run binding after a scorer/semantic rerun.
+
+    This updates only the run's scored artifact hash/path and semantic status;
+    it never advances the refresh cursor or writes a tracker projection.  A
+    semantic rerun therefore has one supported registration path instead of
+    forcing callers to edit ``run.json`` or bypass ``/push``.
+    """
+
+    workspace = Path(workspace).expanduser().resolve()
+    scored = Path(scored_path).expanduser().resolve()
+    if not scored.is_file():
+        return []
+    pending_rows, pending_tasks = _read_scored_semantic_meta(scored)
+    refreshed: list[dict[str, Any]] = []
+    # v2 workflow runs are the preferred source.  The legacy scan summary is
+    # still an official compatibility record because ``temp_two_pass.sh`` and
+    # older runtimes use it when committing the refresh cursor.  Updating only
+    # the new record would leave that writer with a stale hash and make a
+    # successful semantic rerun look unverified.
+    run_paths = list(
+        (workspace / "02_Tracker" / "workflow" / "scan_runs").glob("*/run.json")
+    )
+    run_paths.extend((workspace / "02_Tracker").glob("fresh_24h_*_run.json"))
+    for run_path in sorted(run_paths):
+        try:
+            data = json.loads(run_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        recorded = Path(str(data.get("scored_path") or ""))
+        if not recorded.is_absolute():
+            # Workflow records are workspace-relative; legacy summaries are
+            # tracker-relative.  Accept both representations when matching.
+            candidates = [(workspace / recorded).resolve(), (workspace / "02_Tracker" / recorded).resolve()]
+            recorded = next((candidate for candidate in candidates if candidate == scored), candidates[0])
+        if recorded != scored:
+            continue
+        is_workflow_run = run_path.parent.parent.name == "scan_runs"
+        if is_workflow_run:
+            data["scored_path"] = str(scored.relative_to(workspace)) if scored.is_relative_to(workspace) else str(scored)
+        else:
+            # Preserve the legacy summary's path convention to avoid changing
+            # downstream readers that resolve it relative to 02_Tracker.
+            original = str(data.get("scored_path") or "")
+            data["scored_path"] = original if original else str(scored)
+        data["scored_hash"] = file_sha256(scored)
+        data["scored_hash_updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        data["semantic_pending_rows"] = pending_rows
+        data["semantic_pending_tasks"] = pending_tasks
+        data["semantic_layers"] = {
+            "lane_classification": not any(
+                str(task).split(":", 1)[0] in {"position_profile", "lane_classify"}
+                for task in pending_tasks
+            ),
+            "resume_match": not any(
+                str(task).split(":", 1)[0] == "semantic_resume_match"
+                for task in pending_tasks
+            ),
+        }
+        data["semantic_status"] = "semantic_ready" if pending_rows == 0 else "semantic_pending"
+        data["semantic_updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if status:
+            data["status"] = status
+        elif is_workflow_run and data.get("status") in {"scan_completed", "scored", "semantic_pending", "semantic_ready"}:
+            data["status"] = "semantic_ready" if pending_rows == 0 else "semantic_pending"
+        atomic_write_json(run_path, data)
+        refreshed.append(data)
+    return refreshed
 
 
 def _preview_rows(scored_path: Path) -> list[dict[str, str]]:
@@ -157,6 +268,7 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
         run_id=run_id,
         mode=mode,
         scored_path=scored,
+        status="semantic_pending" if pending_rows else "semantic_ready",
         semantic_pending_rows=pending_rows,
         semantic_pending_tasks=pending_tasks,
         extra={
@@ -271,6 +383,7 @@ def _execute_fixture(workspace: Path | None, payload: dict[str, Any], mode: str)
         run_id=run_id,
         mode=mode,
         scored_path=csv_path,
+        status="semantic_pending" if pending else "semantic_ready",
         semantic_pending_rows=len(pending),
         semantic_pending_tasks=[
             str(job.get("job_id") or job.get("url") or "") for job in pending
@@ -299,11 +412,4 @@ def _newest(paths) -> Path | None:
 
 
 def _pending_from_sidecar(scored: Path) -> tuple[int, list[str]]:
-    sidecar = scored.with_name(scored.name.replace("_twopass_scored.csv", "_run.json"))
-    if not sidecar.is_file():
-        return 0, []
-    try:
-        data = __import__("json").loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return 0, []
-    return int(data.get("semantic_pending_rows") or 0), list(data.get("semantic_pending_tasks") or [])
+    return _read_scored_semantic_meta(scored)

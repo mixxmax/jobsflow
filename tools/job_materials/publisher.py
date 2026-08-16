@@ -19,6 +19,11 @@ from tools.job_materials.role_titles import normalize_role_for_material
 
 PUBLISHER_TYPES = {"employer", "recruiter", "unknown"}
 
+# Bump when classification signals or resolution rules change; the version is
+# recorded in entity contracts and cache keys so stale classifications and
+# derived artifacts are rebuilt rather than silently reused.
+PUBLISHER_CLASSIFIER_VERSION = 2
+
 # These are deliberately broad signals, not proof by themselves.  The final
 # classification records the signals and can be confirmed by company research.
 RECRUITER_NAME_PATTERNS = (

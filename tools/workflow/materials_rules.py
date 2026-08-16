@@ -13,9 +13,12 @@ import hashlib
 import json
 from typing import Any, Iterable
 
-# v2 removes the former claim/evidence authorization layer.  Existing packets
-# must be regenerated so an old fact-bound audit can never be silently reused.
-RULES_VERSION = "materials-rules-v2"
+# v5 keeps the bounded lane-master delta as the primary review target while
+# restoring a lightweight whole-document entity and language sweep. Existing
+# packets must be regenerated because a delta-only audit cannot verify role,
+# employer/recruiter boundaries or sentence integrity across the final CV/CL.
+# CV and CL are parallel profile projections: omission in one is not conflict.
+RULES_VERSION = "materials-rules-v5"
 
 # Keep this list compact.  A rule may point back to the handbook section for a
 # human, but the auditor receives the executable wording below.
@@ -24,19 +27,28 @@ COMPILED_RULES: tuple[dict[str, Any], ...] = (
         "rule_id": "POS-001",
         "severity": "P0",
         "scope": ["cv", "cover_letter"],
-        "check": "The CV and Cover Letter must clearly name and position the selected role; the CV must make the role fit legible within a quick first read.",
-        "evidence": "Quote the role heading/summary and the JD-aligned positioning that makes the target role apparent.",
-        "repair": "add or tighten the target-role heading and opening positioning without inventing facts",
+        "check": "The CV and Cover Letter must clearly use entity_contract.role_primary and make its fit legible within a quick first read. For an overlong or top-level slash title, use the host-selected primary role rather than inventing another abbreviation or cramming every alternative into outbound materials; preserve a substantive parenthetical exactly unless the recorded user override selected a shorter title.",
+        "evidence": "Compare the role wording in both documents with entity_contract.role_primary and quote the heading/opening that establishes the target role.",
+        "repair": "use the selected primary role consistently and tighten the opening positioning without inventing facts",
         "source": "materials-quality-handbook:role-positioning",
     },
     {
         "rule_id": "HYG-001",
         "severity": "P0",
         "scope": ["cv", "cover_letter"],
-        "check": "No placeholders, fragments, template residue, empty possessives, internal notes, scores, prompts, recruiter/agency leakage, or active self-disqualification may remain; a recruiter name must not appear as the hiring employer. This rule overrides MAP-001 whenever a missing requirement has no truthful positive response.",
+        "check": "No placeholders, accidental fragments or cut-off sentences, template residue, empty possessives, internal notes, scores, prompts, recruiter/agency boundary leakage, or active self-disqualification may remain. Intentional compact CV labels are allowed. A recruiter/publisher must not be presented as the hiring employer or Cover Letter addressee; a recruiter name that is independently part of genuine candidate history is not a leak merely because the names match. If the actual employer is undisclosed, use neutral role or business wording. This rule overrides MAP-001 whenever a missing requirement has no truthful positive response.",
         "evidence": "Quote the exact leaked, malformed, placeholder, or negative self-disclosure text.",
         "repair": "delete the residue or negative disclosure, and keep only a clean role-relevant statement",
         "source": "materials-quality-handbook:output-hygiene",
+    },
+    {
+        "rule_id": "BASE-001",
+        "severity": "P1",
+        "scope": ["cv", "cover_letter"],
+        "check": "Review the bounded tailoring delta, not the unchanged master. A rewrite, reorder, merge or addition may substantially improve wording for JD fit, STAR clarity or LLMO placement, but every referenced baseline block must keep its semantic evidence and stable facts, metrics, experience and education; the content floor may not be silently reduced.",
+        "evidence": "Cite the delta target, its before/after text and the affected JD anchor; identify the specific evidence lost, distorted or insufficiently tailored.",
+        "repair": "revise only the affected delta so it preserves the baseline evidence while improving JD-specific positioning",
+        "source": "materials-quality-handbook:bounded-baseline-tailoring",
     },
     {
         "rule_id": "MAP-001",
@@ -69,10 +81,19 @@ COMPILED_RULES: tuple[dict[str, Any], ...] = (
         "rule_id": "CON-001",
         "severity": "P1",
         "scope": ["cv", "cover_letter"],
-        "check": "CV and Cover Letter must remain consistent on role, employer boundary, numbers, dates, languages, and responsibility scope.",
-        "evidence": "Quote both conflicting passages; absence of an optional employer or language is not itself a contradiction.",
+        "check": "CV and Cover Letter are parallel materials sourced from the same profile and must not contradict one another on role, employer boundary, the meaning/value of a shared number or date, language level, or responsibility scope. A truthful fact may appear in only one material; omission from the other is not a contradiction and one document is never the evidence authority for the other.",
+        "evidence": "Quote two passages that make genuinely conflicting claims about the same fact. Do not report a finding merely because a number, employer detail, language or other optional fact appears in only one material.",
         "repair": "keep the narrower, internally consistent wording",
         "source": "materials-quality-handbook:cross-material-consistency",
+    },
+    {
+        "rule_id": "EDT-001",
+        "severity": "P1",
+        "scope": ["cv", "cover_letter"],
+        "check": "The final CV and Cover Letter must use complete, grammatical and natural sentences or intentional CV fragments; no cut-off clause, dangling punctuation, duplicated replacement text, broken possessive, or syntactically damaged edit may remain.",
+        "evidence": "Quote the smallest affected sentence or block and identify the concrete grammar, truncation or edit-integrity problem.",
+        "repair": "repair only the affected wording while preserving its evidence and JD purpose",
+        "source": "materials-quality-handbook:language-and-edit-integrity",
     },
     {
         "rule_id": "CL-001",

@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TakeoverAck",
+  "type": "object",
+  "required": [
+    "handoff_id",
+    "acknowledged",
+    "understood_stage",
+    "acknowledged_findings_count",
+    "proposed_action"
+  ],
+  "properties": {
+    "handoff_id": { "type": "string" },
+    "acknowledged": { "type": "boolean" },
+    "understood_stage": { "type": "string" },
+    "acknowledged_findings_count": { "type": "integer", "minimum": 0 },
+    "proposed_action": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["accepted", "rejected", "clarification_needed"]
+    }
+  },
+  "additionalProperties": true
+}

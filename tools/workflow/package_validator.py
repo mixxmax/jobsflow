@@ -235,10 +235,14 @@ class MaterialsPackageValidator:
             "email_text": email_text,
             "cv_filename": cv_pdf.name if cv_pdf else "",
             "cl_filename": cl_pdf.name if cl_pdf else "",
-            "language_levels": (packet.get("outbound") or {}).get("language_levels")
-            or _extract_language_levels(cv_text, cl_text, email_text),
-            "numbers": (packet.get("outbound") or {}).get("numbers")
-            or _extract_numbers(cv_text, cl_text, email_text),
+            # Validate live artifacts. Cached outbound summaries in an old
+            # task packet must never hide a number or language change.
+            "language_levels": _extract_language_levels(cv_text, cl_text, email_text),
+            "numbers": _extract_numbers(cv_text, cl_text, email_text),
+            # CV and CL are parallel projections of one shared profile. Each
+            # is checked against facts/evidence plus its own current lane
+            # baseline; neither document is the authority for the other.
+            "approved_numbers": _approved_numbers_from_packet(packet),
             "required_attachments": required,
             "existing_files": attachments + [p.name for p in package.iterdir() if p.is_file()],
         }
@@ -310,6 +314,54 @@ class MaterialsPackageValidator:
                             f"outbound material is missing verified {missing}",
                         )
                     )
+
+        # The lane master is a semantic content floor, not merely a style
+        # source.  If it changes after drafting/rendering, or the canonical
+        # draft no longer traceably represents every baseline block, the old
+        # audit and derived files cannot remain apply-ready.
+        from tools.workflow.materials_baseline import load_content_baseline, validate_content_floor
+        from tools.workflow.materials_draft import load_canonical_draft
+
+        content_baseline = load_content_baseline(package)
+        canonical = load_canonical_draft(package)
+        if content_baseline:
+            floor_errors = validate_content_floor(content_baseline, canonical)
+            if floor_errors:
+                findings.append(
+                    _finding(
+                        "MAT-004",
+                        "P0",
+                        "baseline_content_floor_invalid",
+                        "materials_baseline.json",
+                        ", ".join(floor_errors),
+                    )
+                )
+
+        # The recipient/company identity line is a host-owned CL header
+        # contract.  A disclosed employer must be present in the recipient
+        # block itself; it is not enough for a model to mention the company
+        # somewhere in a body paragraph.  For a recruiter with an undisclosed
+        # client, no employer line is required and the publisher name remains
+        # forbidden by the existing hygiene/entity checks.
+        if employer and isinstance(canonical, dict):
+            recipient_blocks = [
+                block
+                for block in ((canonical.get("cover_letter") or {}).get("blocks") or [])
+                if isinstance(block, dict) and str(block.get("section") or "").casefold() == "recipient"
+            ]
+            if not any(
+                _normalized_token(employer) in _normalized_token(str(block.get("text") or ""))
+                for block in recipient_blocks
+            ):
+                findings.append(
+                    _finding(
+                        "MAT-004",
+                        "P1",
+                        "cover_letter_company_line_missing",
+                        "cover_letter",
+                        "disclosed employer must be in the host-managed recipient/company line",
+                    )
+                )
 
         if not cv_text.strip():
             findings.append(_finding("MAT-004", "P0", "missing_cv", "cv", "CV DOCX/TXT/PDF text missing"))
@@ -570,3 +622,53 @@ def _extract_numbers(cv: str, cl: str, email: str) -> dict[str, list[str]]:
         return re.findall(r"\d+(?:\.\d+)?", date.sub(" ", text or ""))
 
     return {"cv": grab(cv), "cl": grab(cl), "email": grab(email)}
+
+
+def _approved_numbers_from_packet(packet: dict[str, Any]) -> list[str]:
+    """Extract numeric facts from trusted current-job profile sources only."""
+
+    texts: list[str] = []
+    baseline_source_seen = False
+
+    def add_text(value: Any) -> None:
+        if isinstance(value, str):
+            if value.strip():
+                texts.append(value)
+            return
+        if not isinstance(value, dict):
+            return
+        for key in ("text", "claim", "canonical_text"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                texts.append(item)
+
+    for node in packet.get("evidence_nodes") or []:
+        add_text(node)
+    profile = packet.get("candidate_profile") if isinstance(packet.get("candidate_profile"), dict) else {}
+    for fact in profile.get("confirmed_facts") or []:
+        add_text(fact)
+    for anchor in profile.get("facts_anchor") or []:
+        add_text(anchor)
+    # Deliberately exclude capability_upper: it supports semantic matching and
+    # bounded transferable framing, never a numeric experience claim.
+    baseline = packet.get("content_baseline") if isinstance(packet.get("content_baseline"), dict) else {}
+    for material in ("cv", "cover_letter"):
+        value = baseline.get(material) if isinstance(baseline.get(material), dict) else {}
+        if value.get("blocks"):
+            baseline_source_seen = True
+        for block in value.get("blocks") or []:
+            add_text(block)
+    # Transitional packets produced before the vNext bundle exposed
+    # ``candidate_profile``/``content_baseline`` carry a cached outbound
+    # summary.  Treat only the cached CV projection as a bounded baseline
+    # fallback (never the CL or email projection, which could contain a
+    # model-added number).  New packets always take the profile/baseline path
+    # above, so this branch cannot become an authority override for them.
+    if not baseline_source_seen:
+        cached = packet.get("outbound") if isinstance(packet.get("outbound"), dict) else {}
+        cached_numbers = cached.get("numbers") if isinstance(cached.get("numbers"), dict) else {}
+        for value in cached_numbers.get("cv") or []:
+            if isinstance(value, (str, int, float)):
+                texts.append(str(value))
+    joined = "\n".join(texts)
+    return sorted(set(_extract_numbers(joined, "", "")["cv"]))

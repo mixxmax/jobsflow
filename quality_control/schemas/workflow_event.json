@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorkflowEvent",
+  "type": "object",
+  "required": ["run_id", "event_id", "event_type", "timestamp", "stage", "source"],
+  "properties": {
+    "run_id": { "type": "string" },
+    "event_id": { "type": "string" },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "run_started",
+        "stage_started",
+        "stage_completed",
+        "stage_blocked",
+        "model_invoked",
+        "model_switched",
+        "artifact_created",
+        "artifact_changed",
+        "audit_started",
+        "audit_completed",
+        "reset_requested",
+        "run_completed"
+      ]
+    },
+    "timestamp": { "type": "string" },
+    "stage": { "type": "string" },
+    "source": { "type": "string" },
+    "data": { "type": "object" },
+    "input_hash": { "type": "string" },
+    "output_hash": { "type": "string" },
+    "error_code": { "type": "string" }
+  },
+  "additionalProperties": true
+}
