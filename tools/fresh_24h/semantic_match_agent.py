@@ -163,10 +163,18 @@ def cmd_complete(
     lane: str | None = None,
     company_brief: str | None = None,
 ) -> int:
+    """Write the single per-job semantic verdict.
+
+    The lane letter is locked at pass-1 and is never part of a verdict;
+    ``--lane`` is accepted only for legacy lane task files and ignored for
+    the review.
+    """
     t = _load(key)
     task = str(t.get("task") or "semantic_resume_match")
+    done = done_dir()
+    done.mkdir(parents=True, exist_ok=True)
     if task in {"lane_classify", "position_profile"}:
-        # Position-profile tasks carry lane + optional company brief, no resume score.
+        # Legacy lane task files carry lane + optional company brief only.
         if lane is None:
             print(f"ERROR: {task} task needs --lane A-G", file=sys.stderr)
             return 2
@@ -174,8 +182,6 @@ def cmd_complete(
         if lane not in "ABCDEFG":
             print("ERROR: --lane must be A-G", file=sys.stderr)
             return 2
-        done = done_dir()
-        done.mkdir(parents=True, exist_ok=True)
         verdict = {
             "task": task,
             "key": key,
@@ -185,29 +191,27 @@ def cmd_complete(
             "lane_label": t.get("lane_labels", {}).get(lane, lane),
             "note": note,
         }
-        if task == "position_profile" and company_brief:
+        if company_brief:
             verdict["company_brief"] = company_brief
         _persist_verdict(key, verdict)
-        extra = f" company_brief={verdict.get('company_brief', '')[:30]}..." if verdict.get("company_brief") else ""
-        print(f"completed {key}: lane={verdict['letter']} ({verdict['lane_label']}){extra}")
-        print("Re-run scoring to pick up the lane verdict.")
+        print(f"completed {key}: lane={verdict['letter']} ({verdict['lane_label']})")
+        print("Re-run scoring to pick up the verdict.")
         return 0
     if not 1.0 <= score <= 5.0:
         print("ERROR: --score must be 1.0..5.0", file=sys.stderr)
         return 2
     score = _bounded_score(score, basis, t.get("semantic_profile") or {})
-    done = done_dir()
-    done.mkdir(parents=True, exist_ok=True)
     verdict = {
         "key": key,
         "title": t.get("title"),
         "company": t.get("company"),
-        "letter": t.get("letter"),
         "resume_match": score,
         "basis": basis,
         "calibration_level": (t.get("semantic_profile") or {}).get("upper_bound_level", "medium"),
         "note": note,
     }
+    if company_brief:
+        verdict["company_brief"] = company_brief
     _persist_verdict(key, verdict)
     print(f"completed {key}: resume_match={verdict['resume_match']}")
     print("Re-run scoring to pick up the verdict (e.g. two_pass_score.py).")

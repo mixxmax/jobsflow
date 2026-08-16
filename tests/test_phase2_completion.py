@@ -17,7 +17,7 @@ from tools.workflow.engine import dispatch
 from tools.workflow.entity_state import load_entity_state
 from tools.workflow.fresh_store import LocalCsvFreshStore, default_fresh_store
 from tools.workflow.package_validator import MaterialsPackageValidator
-from tools.workflow.testing_packages import build_package, build_workspace, prepare_package_for_apply, canonical_fixture, write_minimal_pdf
+from tools.workflow.testing_packages import baseline_transform_fixture, build_package, build_workspace, prepare_package_for_apply, write_minimal_pdf
 
 
 def _scored_run(ws: Path, run_id: str = "run-completion") -> None:
@@ -180,7 +180,7 @@ def test_cli_entrypoints_drive_the_complete_synthetic_chain(tmp_path):
             "jobs": [{"job_id": "C0-001", "title": "Paralegal", "company": "Acme", "score": "4.2"}],
         },
     )
-    plan = package / "materials_plan.validated.json"
+    source_plan = package / "materials_plan.validated.json"
     from tools.workflow.__main__ import main
 
     assert main(["scan", "--workspace", str(ws), "--fixture", str(fixture)]) == 0
@@ -203,9 +203,21 @@ def test_cli_entrypoints_drive_the_complete_synthetic_chain(tmp_path):
             preview["proposal_id"],
         ]
     ) == 0
+    first_materials = dispatch("materials", workspace=ws, payload={"job_id": "C0-001"})
+    assert first_materials["status"] == "succeeded"
+    assert main(["materials", "--workspace", str(ws), "--job-id", "C0-001"]) == 0
+    plan = Path(first_materials["drafting_workspace"]["response_file"])
+    bound_plan = json.loads(plan.read_text(encoding="utf-8"))
+    bound_plan.update(json.loads(source_plan.read_text(encoding="utf-8")))
+    atomic_write_json(plan, bound_plan)
     assert main(["materials", "--workspace", str(ws), "--job-id", "C0-001", "--plan", str(plan)]) == 0
-    canonical = tmp_path / "canonical.json"
-    atomic_write_json(canonical, canonical_fixture())
+    # The plan submission returns the new tailoring response path.  Resolve it
+    # through the product gateway rather than reconstructing a package-local
+    # path (the live path is an isolated current-job staging directory).
+    planned = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "model_plan": bound_plan})
+    assert planned["status"] == "succeeded"
+    canonical = Path(planned["drafting_workspace"]["response_file"])
+    atomic_write_json(canonical, baseline_transform_fixture(package))
     assert main(["materials", "draft", "--workspace", str(ws), "--job-id", "C0-001", "--content", str(canonical)]) == 0
     task = json.loads((package / "materials_audit_task.json").read_text(encoding="utf-8"))
     audit_result = tmp_path / "audit_result.json"
@@ -229,3 +241,45 @@ def test_valid_package_cannot_bypass_material_state_chain(tmp_path):
     assert out["status"] == "blocked"
     assert "content_audit_missing" in out["blockers"]
     assert load_entity_state(ws, "materials", "C0-001").phase == "idle"
+
+
+def test_refresh_commit_registers_post_semantic_rescored_hash(tmp_path):
+    """The official semantic flow rescoring must not strand the push gate.
+
+    After semantic verdicts the scored CSV is rerun by design, so its bytes
+    differ from the hash captured at scan completion. The commit step must
+    register the new artifact hash on the run record (same scored path) and
+    still record the refresh, instead of returning None forever.
+    """
+    import hashlib
+
+    ws = build_workspace(tmp_path)
+    tracker = ws / "02_Tracker"
+    scored = tracker / "fresh_24h_2026-08-16_twopass_scored.csv"
+    scored.write_text("岗位编号,链接\nC0-902,https://example.test/902\n", encoding="utf-8")
+    summary = tracker / "fresh_24h_2026-08-16_run.json"
+    atomic_write_json(
+        summary,
+        {
+            "mode": "temp",
+            "hours": 24,
+            "day": "2026-08-16",
+            "scored_path": str(scored),
+            "scored_hash": "0" * 64,
+            "window": {
+                "since": "2026-08-16T08:00:00Z",
+                "until": "2026-08-16T09:00:00Z",
+            },
+            "counts": {"new": 1},
+            "candidates_csv": str(tracker / "fresh_24h_2026-08-16.csv"),
+        },
+    )
+    from tools.workflow.refresh_commit import commit_refresh_after_score
+
+    result = commit_refresh_after_score(workspace=ws, mode="temp")
+    assert result is not None, "post-semantic rerun must still commit the cursor"
+
+    updated = json.loads(summary.read_text(encoding="utf-8"))
+    new_hash = hashlib.sha256(scored.read_bytes()).hexdigest()
+    assert updated["scored_hash"] == new_hash
+    assert updated.get("scored_hash_updated_at")

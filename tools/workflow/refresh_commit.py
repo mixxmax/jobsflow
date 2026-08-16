@@ -94,7 +94,21 @@ def commit_refresh_after_score(
 
         actual_hash = hashlib.sha256(scored.read_bytes()).hexdigest()
         if actual_hash != expected_hash:
-            return None
+            # A semantic rerun legitimately changes the scored CSV after the
+            # initial scan record was written.  Reconcile the official record
+            # through the single scan adapter rather than asking a model (or a
+            # caller) to edit ``run.json`` by hand.  If the artifact is not
+            # bound to an existing run/summary, fail closed as before.
+            from tools.workflow.adapters.scan import refresh_run_records_for_scored_artifact
+
+            refresh_run_records_for_scored_artifact(Path(workspace), scored)
+            if run_id:
+                summary = _read_json(workflow_run)
+            else:
+                summary = _read_json(newest_scan_run_json(tracker))
+            expected_hash = str(summary.get("scored_hash") or "")
+            if not expected_hash or actual_hash != expected_hash:
+                return None
     window = summary.get("window") if isinstance(summary.get("window"), dict) else {}
     counts = summary.get("counts") if isinstance(summary.get("counts"), dict) else {}
     completed_through = summary.get("scan_window_until") or window.get("until")
