@@ -245,8 +245,29 @@ def pending_semantic_rows(rows: list[dict]) -> list[dict]:
     """
     pending = []
     for row in rows:
+        # Internal scorer fields are kept out of the user-facing tracker but
+        # survive long enough for the in-memory run summary.  They are the
+        # most precise representation when one of the two semantic layers is
+        # pending while the other has already completed.
+        layer_flags = (
+            row.get("_semantic_lane_pending"),
+            row.get("_semantic_resume_pending"),
+            row.get("semantic_lane_pending"),
+            row.get("semantic_resume_pending"),
+        )
+        if any(str(flag).strip().casefold() in {"1", "true", "yes", "pending"} for flag in layer_flags):
+            pending.append(row)
+            continue
+        raw_tasks = row.get("_semantic_pending_tasks") or row.get("semantic_pending_tasks")
+        if isinstance(raw_tasks, (list, tuple, set)):
+            if any(str(task).strip() for task in raw_tasks):
+                pending.append(row)
+                continue
+        elif str(raw_tasks or "").strip():
+            pending.append(row)
+            continue
         try:
-            count = int(str(row.get("语义待处理数") or "0"))
+            count = int(str(row.get("_semantic_pending_count") or row.get("semantic_pending_count") or row.get("语义待处理数") or "0"))
         except (TypeError, ValueError):
             count = 0
         if count > 0 or str(row.get("语义匹配来源") or "").strip() == "pending_fallback":
@@ -664,6 +685,29 @@ def deep_enrich_hit(
             fetch_kwargs["retry"] = max(0, int(jobsdb_retry))
             fetch_kwargs["timeout_ms"] = 25000
         fres = fetch_jd_body(url, **fetch_kwargs)
+        recovery = h.get("_jobsdb_human_recovery")
+        recovery_status = None
+        recovery_navigations = 0
+        initial_attempts = int(getattr(fres, "attempts", 0) or 0)
+        if (
+            "jobsdb.com" in portal_host
+            and recovery is not None
+            and (
+                getattr(fres, "fail_reason", None) in {"challenge", "blocked"}
+                or getattr(fres, "detail_reason", None) == "circuit_open"
+            )
+        ):
+            recovered = recovery.recover(
+                url,
+                circuit=circuit,
+                cache_root=repo,
+            )
+            recovery_status = str(getattr(recovery, "status", "failed"))
+            recovery_navigations = int(
+                getattr(recovery, "navigation_count", 0) or 0
+            )
+            if recovered.ok and recovered.text and recovered.content_validated:
+                fres = recovered
         if fres.ok and fres.text:
             h["_enrich"] = {
                 "mode": "browser",
@@ -672,7 +716,7 @@ def deep_enrich_hit(
                 "portal": fres.portal,
                 "selector": fres.selector,
                 "desc_len": fres.chars,
-                "attempts": fres.attempts,
+                "attempts": initial_attempts + recovery_navigations,
                 "retried": fres.retried,
                 "last_reason": fres.last_reason,
                 "session_mode": fres.session_mode,
@@ -683,6 +727,8 @@ def deep_enrich_hit(
                 "fail_reason": fres.fail_reason,
                 "detail_reason": fres.detail_reason,
                 "failure_cached": fres.failure_cached,
+                "manual_recovery_status": recovery_status,
+                "manual_recovery_navigations": recovery_navigations,
             }
             h["teaser"] = fres.text[:3000]
             h["_deep_jd_full"] = fres.text
@@ -714,6 +760,8 @@ def deep_enrich_hit(
             "recommended_action": getattr(fres, "recommended_action", None),
             "state_saved": getattr(fres, "state_saved", False),
             "session_mode": getattr(fres, "session_mode", "snapshot"),
+            "manual_recovery_status": recovery_status,
+            "manual_recovery_navigations": recovery_navigations,
             "url": url,
         }
         if getattr(fres, "detail_reason", None) in {"circuit_open", "budget_exhausted"}:
@@ -818,6 +866,9 @@ def run_two_pass(
         "jobsdb_rate_limited_count": 0,
         "jobsdb_degraded_count": 0,
         "jobsdb_failure_cache_hits": 0,
+        "jobsdb_manual_recovery_attempted": 0,
+        "jobsdb_manual_recovery_success": 0,
+        "jobsdb_manual_recovery_status": "disabled",
         "enrich_errors": [],
         "jobsdb_detail_status": None,
     }
@@ -973,6 +1024,29 @@ def run_two_pass(
         0, len(network_candidates) - len(selected_network)
     )
 
+    # Lane lock boundary: a job crossing pass-1 into deep review (network
+    # selection or a cache hit) gets its lane letter assigned exactly once,
+    # keyed by canonical URL. Later rescoring, semantic tasks and tracker
+    # entry reuse the locked letter and never re-decide it.
+    try:
+        from tools.fresh_24h.lane_registry import lock_lane
+
+        for candidate, score in gated:
+            if id(candidate) not in selected_network_ids and not candidate.get(
+                "_pass1_cache_hit"
+            ):
+                continue
+            url = str(candidate.get("url") or "").strip()
+            if not url:
+                continue
+            pass1_letter = str(getattr(score, "resume_ver", "") or "").strip().upper()
+            if pass1_letter and pass1_letter in "ABCDEFG":
+                candidate["_locked_lane"] = lock_lane(
+                    repo, url, pass1_letter, initial_score=float(score.score)
+                )
+    except Exception:
+        pass  # the registry is an optimisation of truth, never a scan abort
+
     # Pass 2 — deep JD then rescore (cap network jobs, not cache reads). LinkedIn detail is
     # fetched through one serial Bun worker for the jobs that can actually
     # consume the deep-fetch budget; this removes one process startup per job.
@@ -1008,9 +1082,11 @@ def run_two_pass(
 
     jobsdb_retry = 0
     jobsdb_cache_first = True
+    jobsdb_recovery = None
     try:
         from portal_jd_browser import (  # type: ignore
             BrowserSessionPool,
+            JobsdbHumanVerificationRecovery,
             PortalCircuitBreaker,
             default_circuit_state_path,
             reset_portal_budget,
@@ -1053,7 +1129,28 @@ def run_two_pass(
                 "max_challenge_retries": jobsdb_config["max_challenge_retries"],
                 "cache_first": jobsdb_config["cache_first"],
                 "max_requests_per_scan": jobsdb_config["max_requests_per_scan"],
+                "human_verification_handoff": jobsdb_config[
+                    "human_verification_handoff"
+                ],
             }
+            if bool(jobsdb_config.get("human_verification_handoff")):
+                try:
+                    jobsdb_recovery = JobsdbHumanVerificationRecovery(
+                        verification_timeout_seconds=int(
+                            jobsdb_config.get("verification_timeout_seconds") or 600
+                        ),
+                        before_visible=lambda: browser_pool.discard_session("jobsdb"),
+                        on_validated_session=lambda session: browser_pool.replace_session(
+                            "jobsdb", session
+                        ),
+                    )
+                    browser_pool.configure_jobsdb_profile(jobsdb_recovery.profile_dir)
+                    meta["jobsdb_manual_recovery_status"] = "not_attempted"
+                except (OSError, ValueError, TypeError):
+                    # Recovery is an optional private handoff.  Its setup must
+                    # never disable the portal breaker or abort scoring.
+                    jobsdb_recovery = None
+                    meta["jobsdb_manual_recovery_status"] = "unavailable"
         except (OSError, ValueError, TypeError):
             jobsdb_circuit = None
     except ImportError:
@@ -1088,6 +1185,8 @@ def run_two_pass(
                         h["_browser_session"] = session
                 if jobsdb_circuit is not None and "jobsdb.com" in portal_host:
                     h["_browser_fetch_circuit"] = jobsdb_circuit
+                if jobsdb_recovery is not None and "jobsdb.com" in portal_host:
+                    h["_jobsdb_human_recovery"] = jobsdb_recovery
                 try:
                     text2, depth = _run_deep_enrich(
                         h,
@@ -1111,6 +1210,7 @@ def run_two_pass(
                     text2, depth = h.get("teaser") or "", "teaser_fallback"
                 h.pop("_browser_session", None)
                 h.pop("_browser_fetch_circuit", None)
+                h.pop("_jobsdb_human_recovery", None)
                 h.pop("_linkedin_batch_used", None)
                 if depth == "deep":
                     meta["deep_ok"] += 1
@@ -1149,6 +1249,12 @@ def run_two_pass(
                             meta["jobsdb_degraded_count"] += 1
                         if enrich.get("failure_cached"):
                             meta["jobsdb_failure_cache_hits"] += 1
+                        recovery_status = enrich.get("manual_recovery_status")
+                        if recovery_status:
+                            meta["jobsdb_manual_recovery_attempted"] = 1
+                            meta["jobsdb_manual_recovery_status"] = recovery_status
+                            if recovery_status == "succeeded":
+                                meta["jobsdb_manual_recovery_success"] = 1
                 network_attempted = enrich_mode not in {
                     "cache",
                     "ctgoodjobs_skip_browser",
@@ -1261,6 +1367,17 @@ def run_two_pass(
                 # Labels already in the external vocabulary pass through.
                 row["JD深度"] = _INTERNAL_TO_EXTERNAL_DEPTH.get(depth, depth)
             row["评估状态"] = row_status
+            pending_tasks_for_row = list(getattr(sc2, "semantic_pending_tasks", ()) or ())
+            row["_semantic_pending_count"] = len(pending_tasks_for_row)
+            row["_semantic_pending_tasks"] = ";".join(str(item) for item in pending_tasks_for_row)
+            row["_semantic_lane_pending"] = any(
+                str(item).split(":", 1)[0] in {"position_profile", "lane_classify"}
+                for item in pending_tasks_for_row
+            )
+            row["_semantic_resume_pending"] = any(
+                str(item).split(":", 1)[0] == "semantic_resume_match"
+                for item in pending_tasks_for_row
+            )
             if provisional:
                 row["_provisional_needs_jd"] = True
                 meta["provisional_needs_jd"] += 1
@@ -1278,6 +1395,8 @@ def run_two_pass(
             browser_pool.close()
 
     if jobsdb_circuit is not None:
+        if jobsdb_recovery is not None:
+            meta["jobsdb_manual_recovery_status"] = jobsdb_recovery.status
         snapshot = jobsdb_circuit.snapshot()
         retry_not_before = snapshot.get("retry_not_before")
         meta["jobsdb_detail_status"] = {
@@ -1289,6 +1408,9 @@ def run_two_pass(
             "rate_limited_count": meta["jobsdb_rate_limited_count"],
             "degraded_count": meta["jobsdb_degraded_count"],
             "failure_cache_hits": meta["jobsdb_failure_cache_hits"],
+            "manual_recovery_status": meta["jobsdb_manual_recovery_status"],
+            "manual_recovery_attempted": meta["jobsdb_manual_recovery_attempted"],
+            "manual_recovery_success": meta["jobsdb_manual_recovery_success"],
             "circuit_state": snapshot.get("state"),
             "retry_not_before": (
                 datetime.fromtimestamp(
@@ -1608,6 +1730,20 @@ def main(argv: list[str] | None = None) -> int:
         contains_all_deep_scores=not args.hide_below_final and not only_keys,
     )
     atomic_write_json(meta_path, meta)
+
+    # If this scorer is servicing a workflow scan run, refresh that run's
+    # official artifact binding now.  This is deliberately after the final
+    # CSV and scorer sidecar are written, so semantic reruns update
+    # ``scored_hash`` and both-layer pending state through one product-owned
+    # path; no caller should edit run.json or bypass /push.
+    try:
+        from tools.workflow.adapters.scan import refresh_run_records_for_scored_artifact
+
+        refresh_run_records_for_scored_artifact(_workspace_root(repo), out)
+    except (OSError, TypeError, ValueError):
+        # A standalone scorer remains usable outside the workflow gateway.
+        # There is simply no run record to refresh in that mode.
+        pass
 
     print("job IDs: none in preview (persistent IDs are assigned only after confirmed push)")
     print(

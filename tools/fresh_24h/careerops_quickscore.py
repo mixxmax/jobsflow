@@ -330,7 +330,7 @@ def load_scoring_profile(repo: Path | None = None) -> dict[str, Any]:
     return profile
 
 
-def _semantic_resume_match(
+def _semantic_job_review(
     *,
     title: str,
     company: str,
@@ -341,22 +341,23 @@ def _semantic_resume_match(
     jd_url: str = "",
     jd_cache_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Agent-in-the-loop semantic resume-match (deep-JD pass only).
+    """One agent-in-the-loop semantic review per job (deep-JD pass only).
 
-    Does NOT call an external LLM API. Instead it writes a request file to
-    <tracker>/semantic_matches/pending/<key>.json containing the fixed lane
-    capability profile + the JD. The agent currently executing the task (the
-    same model doing the job search work) reads these pending files, applies its
-    own semantic understanding, and writes back resume_match (1-5) + note.
+    Produces ``company_brief`` plus ``resume_match``/``basis``/``note`` in a
+    single verdict keyed by ``(title, company)``.  The lane letter is locked
+    at the pass-1 boundary and passed in only to select the capability
+    profile; the verdict never re-decides the lane.
+
+    Does NOT call an external LLM API.  The executing agent reads the pending
+    request file, applies its own semantic understanding, and writes the
+    single verdict back.
 
     Returns:
-      - ``{"resume": score, "source": "done", ...}`` when an already-completed
-        verdict file exists for this job.
-      - ``{"source": "pending", ...}`` when the task is waiting for the agent.
-        The caller keeps a deterministic keyword score only as a visible,
-        conservative fallback until the task is completed.
-      - None when no verified capability base is available, so no semantic task
-        should be created.
+      - ``{"resume", "basis", "note", "company_brief", "source": "done"}``
+        when a completed verdict exists.
+      - ``{"source": "pending", "pending_key", "fallback_cap", "note"}`` when
+        the task awaits the agent (caller keeps a conservative fallback).
+      - None when no verified capability base exists.
     """
     jobsearch_root = _jobsearch_root(repo)
     jd_payload = jd_full or jd_text or ""
@@ -423,38 +424,25 @@ def _semantic_resume_match(
     done_dir = tracker / "semantic_matches" / "done"
     pending_dir = tracker / "semantic_matches" / "pending"
 
-    # If an agent already filled in a verdict, use it — but ONLY when the
-    # verdict was made against the SAME lane profile. A verdict written under
-    # an earlier letter (e.g. A) must not be reused after the lane has been
-    # re-classified (e.g. C): the resume score would silently come from the
-    # wrong capability profile. Stale verdicts are discarded and re-pended
-    # under the current letter so lane and resume always agree.
     done_file = done_dir / f"{key}.json"
     if done_file.exists():
         try:
             verdict = json.loads(done_file.read_text(encoding="utf-8"))
-            verdict_letter = str(verdict.get("letter") or "").strip().upper()
-            if verdict_letter == letter:
-                score = float(verdict.get("resume_match"))
-                basis = str(verdict.get("basis") or "upper_only").casefold()
-                score = _semantic_score_cap(cap, score, basis)
-                note = str(verdict.get("note") or "")
-                return {
-                    "resume": score,
-                    "note": f"语义简历匹配({letter})[{basis}]：{note}",
-                    "basis": basis,
-                    "source": "done",
-                    "pending_key": "",
-                }
-            # Stale verdict under a different lane → discard and re-pend.
-            try:
-                done_file.unlink()
-            except OSError:
-                pass
+            score = float(verdict.get("resume_match"))
+            basis = str(verdict.get("basis") or "upper_only").casefold()
+            score = _semantic_score_cap(cap, score, basis)
+            note = str(verdict.get("note") or "")
+            return {
+                "resume": score,
+                "note": f"语义简历匹配({letter})[{basis}]：{note}",
+                "basis": basis,
+                "company_brief": str(verdict.get("company_brief") or "").strip(),
+                "source": "done",
+                "pending_key": "",
+            }
         except (OSError, ValueError, TypeError):
             pass
 
-    # Otherwise emit a pending request for the executing agent to fill in.
     pending_fallback_cap = 4.0
     try:
         pending_fallback_cap = min(
@@ -466,7 +454,7 @@ def _semantic_resume_match(
     try:
         pending_dir.mkdir(parents=True, exist_ok=True)
         pending = {
-            "task": "semantic_resume_match",
+            "task": "semantic_job_review",
             "key": key,
             "title": title,
             "company": company,
@@ -479,129 +467,17 @@ def _semantic_resume_match(
                 "transfer_score_cap": transfer_cap,
                 "pending_fallback_cap": pending_fallback_cap,
             },
-            # This is the text already fetched by deep_enrich_hit.  It is a
-            # bounded payload for weaker models, never a second portal fetch.
             "jd_snippet": jd_payload[:12000],
             "jd_cache": cache_meta,
             "instruction": (
-                "用你的语义理解，判断上方「求职意向画像」对 JD 核心职责的支持度。"
+                "对上方职位做一次语义复核，输出两项：\n"
+                "1) company_brief：一句话中文公司简介（含公司主营/行业，30-60字），"
+                "基于公司名称与 JD 背景。\n"
+                "2) resume_match：判断「求职意向画像」对 JD 核心职责的支持度。"
                 "先把依据标成 direct（事实基线直接支持）、transferable（相邻能力可迁移）、"
                 "upper_only（只来自能力上沿）或 none。能力上沿不得当作已拥有实操经验；禁止夸大。"
                 "写入 resume_match(1.0-5.0 一位小数)、basis 和 note(一句话中文结论)。"
-            ),
-            "status": "pending",
-        }
-        pending_file = pending_dir / f"{key}.json"
-        # Rewrite when missing OR when the pending task was generated under an
-        # older lane letter — a stale profile payload must not be judged.
-        rewrite = not pending_file.exists()
-        if not rewrite:
-            try:
-                _old = json.loads(pending_file.read_text(encoding="utf-8"))
-                rewrite = str(_old.get("letter") or "").strip().upper() != letter
-            except (OSError, ValueError):
-                rewrite = True
-        if rewrite:
-            pending_file.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-
-    # A valid capability base exists but no verdict does not count as a
-    # completed semantic result. Keep the deterministic score only as a
-    # visibly marked, conservative fallback until the task is completed.
-    return {
-        "resume": None,
-        "note": (
-            f"语义简历匹配({letter})待处理：当前为关键词回退，"
-            f"回退上限{pending_fallback_cap:.1f}"
-        ),
-        "source": "pending",
-        "pending_key": f"semantic_resume_match:{key}",
-        "fallback_cap": pending_fallback_cap,
-    }
-
-
-def _semantic_task_key(title: str, company: str) -> str:
-    raw = f"{title}|{company}".strip().casefold()
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-
-
-def _semantic_position_profile(
-    *,
-    title: str,
-    company: str,
-    jd_text: str,
-    profile: dict[str, Any],
-    repo: Path | None = None,
-    jd_full: str | None = None,
-    jd_url: str = "",
-    jd_cache_meta: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
-    """Agent-in-the-loop position profiling (deep-JD pass only).
-
-    Combines lane classification + company brief into ONE request so the
-    executing agent judges the position holistically:
-      - what the company actually does (business nature drives the lane),
-      - what the role's scope is (job function), and produces two outputs:
-        letter (A-G lane) + company_brief (one-line company intro for the sheet).
-
-    Returns ``{"letter", "company_brief", "note"}`` when a verdict exists, or
-    a ``source=pending`` marker while the task awaits completion. The caller
-    falls back to the deterministic lane and company brief in the latter case.
-    """
-    track_mapping = profile.get("track_mapping") if isinstance(profile.get("track_mapping"), dict) else {}
-    lane_labels = {k: v for k, v in track_mapping.items() if k in "ABCDEFG"}
-    if not lane_labels:
-        return None
-    jobsearch_root = _jobsearch_root(repo)
-    tracker = jobsearch_root / "02_Tracker"
-    done_dir = tracker / "semantic_matches" / "done"
-    pending_dir = tracker / "semantic_matches" / "pending"
-    key = "lane_" + _semantic_task_key(title, company)
-
-    done_file = done_dir / f"{key}.json"
-    if done_file.exists():
-        try:
-            verdict = json.loads(done_file.read_text(encoding="utf-8"))
-            letter = str(verdict.get("letter") or "").strip().upper()
-            if letter in "ABCDEFG":
-                return {
-                    "letter": letter,
-                    "company_brief": str(verdict.get("company_brief") or "").strip(),
-                    "note": str(verdict.get("note") or "").strip(),
-                }
-        except (OSError, ValueError):
-            pass
-
-    jd_payload = jd_full or jd_text or ""
-    cache_meta = dict(jd_cache_meta or {})
-    cache_meta.setdefault("url", jd_url)
-    cache_meta.setdefault("chars", len(jd_payload))
-    if jd_url:
-        cache_meta.setdefault("cache_key", hashlib.sha256(jd_url.encode("utf-8")).hexdigest()[:16])
-    cache_meta.setdefault("source", "deep_enrich")
-    try:
-        pending_dir.mkdir(parents=True, exist_ok=True)
-        labels_txt = "\n".join(f"  {k}: {v}" for k, v in lane_labels.items())
-        pending = {
-            "task": "position_profile",
-            "key": key,
-            "title": title,
-            "company": company,
-            "lane_labels": lane_labels,
-            "jd_snippet": jd_payload[:12000],
-            "jd_cache": cache_meta,
-            "instruction": (
-                "对上方职位做定性分析。分两步：\n"
-                "1) 先判断公司性质：根据公司名称（+JD 里的公司背景）判断这家公司的主营业务/行业/业务本质"
-                "（例如：加密交易所、传统银行、国际律所、SaaS 公司、投资机构等）。\n"
-                "2) 再判断职位类型：结合职位名称与 JD 工作范围，判断其本质属于哪个求职画像类别。\n"
-                "可选类别：\n"
-                + labels_txt
-                + "\n规则：公司业务本质最具决定性（如加密/数字资产/Web3 业务优先 G，传统金融机构合规优先 C）；"
-                "其次是职位工作范围（AML/合规/风险→C，诉讼→A，商事/合同→B 等）。\n"
-                "输出 JSON：letter(单个字母 A-G)、company_brief(一句话中文公司简介，含公司主营/行业，30-60字)、"
-                "note(一句话中文理由，说明公司性质+职位类型如何决定该分类)。"
+                "岗位的 lane（{letter}）已由系统锁定，不要重新判定。"
             ),
             "status": "pending",
         }
@@ -610,33 +486,22 @@ def _semantic_position_profile(
             pending_file.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
+
     return {
+        "resume": None,
+        "note": (
+            f"语义简历匹配({letter})待处理：当前为关键词回退，"
+            f"回退上限{pending_fallback_cap:.1f}"
+        ),
         "source": "pending",
-        "pending_key": f"position_profile:{key}",
+        "pending_key": f"semantic_job_review:{key}",
+        "fallback_cap": pending_fallback_cap,
     }
 
 
-def _jobsearch_root(repo: Path | None = None) -> Path:
-    configured = os.environ.get("JOBSEARCH_ROOT")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    if repo is not None:
-        root = Path(repo).expanduser().resolve()
-        return root if root.name == "JobSearch_2026" else root / "JobSearch_2026"
-    return Path(__file__).resolve().parents[2] / "JobSearch_2026"
-
-
-def _semantic_score_cap(cap: dict[str, Any], score: float, basis: str) -> float:
-    """Apply a deterministic upper-bound guard to an agent verdict."""
-    semantic = cap.get("semantic_profile") if isinstance(cap.get("semantic_profile"), dict) else {}
-    level = str(semantic.get("upper_bound_level") or "medium").casefold()
-    caps = {
-        "low": {"direct": 5.0, "transferable": 4.0, "upper_only": 3.5, "none": 2.5},
-        "medium": {"direct": 5.0, "transferable": 4.5, "upper_only": 4.0, "none": 2.5},
-        "high": {"direct": 5.0, "transferable": 5.0, "upper_only": 4.5, "none": 2.5},
-    }
-    cap_value = caps.get(level, caps["medium"]).get(basis, caps["medium"]["upper_only"])
-    return max(1.0, min(cap_value, round(float(score), 1)))
+def _semantic_task_key(title: str, company: str) -> str:
+    raw = f"{title}|{company}".strip().casefold()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def score_job(
@@ -787,38 +652,32 @@ def score_job(
                         break
 
     letter = rule_letter
+    # Lane is decided once at the pass-1 deep-review boundary and locked by
+    # canonical URL. Deep scoring reuses the locked letter; keyword rules and
+    # the semantic position profile no longer re-decide it here.
+    if repo is not None and jd_url:
+        try:
+            from tools.fresh_24h.lane_registry import lookup_lane
+
+            locked = lookup_lane(Path(repo), jd_url)
+            if locked in "ABCDEFG":
+                letter = locked
+        except Exception:
+            pass
     company_brief_override = ""
     semantic_pending_tasks: list[str] = []
-    if _is_deep_depth(jd_depth):
-        pos = _semantic_position_profile(
-            title=title,
-            company=company,
-            jd_text=teaser or "",
-            profile=profile,
-            repo=repo,
-            jd_full=jd_full,
-            jd_url=jd_url,
-            jd_cache_meta=jd_cache_meta,
-        )
-        if pos is not None:
-            if pos.get("source") == "pending":
-                semantic_pending_tasks.append(pos.get("pending_key") or "position_profile")
-            elif str(pos.get("letter") or "").upper() in "ABCDEFG":
-                letter = str(pos["letter"]).upper()
-                company_brief_override = pos.get("company_brief") or ""
     mapping = profile.get("track_mapping") if isinstance(profile.get("track_mapping"), dict) else {}
     track = str(mapping.get(letter) or f"Track {letter}")
 
-    # Semantic resume matching: on deep-JD pass, ask the executing agent to judge how well the
-    # candidate's capability profile (facts anchor + capability upper) supports the
-    # JD's core duties, instead of naive keyword-hit counting. On failure falls
-    # back to the keyword-hit score and flags it.
+    # One semantic review per job: company brief + resume match in a single
+    # verdict.  The lane letter is already locked at pass-1 and is only used
+    # here to select the capability profile.
     semantic_note = None
     semantic_source = "not_applicable"
     semantic_basis = ""
     semantic_cap_notes: list[str] = []
     if _is_deep_depth(jd_depth):
-        sem = _semantic_resume_match(
+        sem = _semantic_job_review(
             title=title,
             company=company,
             jd_text=teaser or "",
@@ -844,6 +703,7 @@ def score_job(
                 if sem.get("pending_key"):
                     semantic_pending_tasks.append(str(sem["pending_key"]))
             semantic_note = sem.get("note")
+            company_brief_override = str(sem.get("company_brief") or "") or company_brief_override
         else:
             semantic_source = "keyword_fallback"
 
