@@ -155,16 +155,31 @@ Their actual queries and relevance rules are candidate- and profession-specific.
   uncached detail requests then degrade to `paste_needed` until the cooldown
   (429 honours the response `Retry-After`) or a manual recovery. The scan
   budget is one JobsDB detail navigation at a time, at least 15 s apart, at
-  most 10 per scan. Manual verification is explicit and independent of TTY:
-  `--headed --interactive-verification [--user-data-dir <dir>]`, and state is
-  saved only after a real JD validates. Cookie files never belong in the
-  repository or tracker output; rows record JD depth as
+  most 10 per scan. In the private runtime, the first Cloudflare challenge
+  pauses JobsDB and may trigger one bounded recovery over CDP: the user's own
+  running daily Chrome (started with `--remote-debugging-port=9222`) receives
+  the URL in its real profile, the user clears any live challenge in that
+  window, and only a structurally validated real JD closes the circuit and
+  resumes the queue. Cloudflare binds its clearance to the real browsing
+  profile, so a clean dedicated-profile Chrome or a Playwright-launched
+  Chromium is never used for verification and never counts as a recovery.
+  Interactive verification can never run in a headless context, and recovery
+  never copies cookies into a second browser-state file.
+  Browser profiles and cookie files never belong in the repository or tracker
+  output; rows record JD depth as
   `full`/`cache`/`teaser`/`paste_needed`, and a teaser is never treated as a
   full JD.
 - Deep position profiling creates a separate `position_profile` task containing
-  the cached JD, company/role context and lane labels. Its completed verdict may
-  set the lane and a sourced-or-explicitly-unverified `company_brief`; otherwise
-  deterministic lane and company-brief fallbacks remain in force.
+  the cached JD, company/role context and lane labels. Its completed verdict
+  supplies a sourced-or-explicitly-unverified `company_brief` only; the lane
+  letter is never re-decided by it.
+- The lane letter (A-G) is assigned exactly once, when a job clears pass-1 and
+  is selected for deep review (network selection or a cache hit). The letter is
+  locked in `02_Tracker/lane_registry.json` keyed by canonical URL. Deep
+  rescoring, semantic tasks and tracker entry reuse the locked letter;
+  keyword rules and profile verdicts cannot drift it, and later wording
+  changes to a title or company name never re-open the decision. Tracker
+  entry appends only the tier digit and sequence number to the locked letter.
 - Localized salary values use the shared conservative parser. Decimal commas,
   dotted/space thousands, common currency labels and amount suffixes (`k`,
   `M`, `B`, `千`, `万`, `亿`) are normalized before scoring. A hyphen between two
@@ -244,7 +259,7 @@ Their actual queries and relevance rules are candidate- and profession-specific.
 Generate materials only after the user selects a job.
 
 ```bash
-python3 -m tools.job_materials pipeline --package "..." --lane A
+python3 -m tools.workflow materials --job-id <JOB-ID>
 ```
 
 - Require a full JD for high-quality tailoring. If it cannot be retrieved, ask the
@@ -254,6 +269,12 @@ python3 -m tools.job_materials pipeline --package "..." --lane A
   reliable source is available, use JD-only/role context rather than guessing.
 - Build a JD requirement map and connect every customized claim to verified résumé
   evidence. Unrelated evidence does not count.
+- Search, scoring, assessment and materials consume one shared private candidate
+  profile. The current-job materials task packet carries its confirmed facts,
+  lane `facts_anchor`, calibrated `capability_upper` and scoring/intention view;
+  changing the executing model or harness never changes that source. The ability
+  ceiling may widen retrieval and transferable framing but never becomes a claim
+  of completed experience.
 - Keep stable user-confirmed profile facts (for example GPA, education and work
   history) in the private fact store with stable IDs. A user-confirmed fact needs
   traceability to that ID, not a new external citation for every job. Model-derived
@@ -266,8 +287,28 @@ python3 -m tools.job_materials pipeline --package "..." --lane A
 - Optimize evidence density and reading order (summary/role-leading evidence)
   without keyword stuffing. LLMO is parseability and evidence alignment, not
   model-memory writing or an ATS score guarantee.
-- Tailoring may reorder, select and conservatively rephrase evidence; it may not
-  invent duties, outcomes, tools, qualifications or motivation.
+- The lane's latest CV and Cover Letter masters are semantic content masters as
+  well as format templates. The host freezes their ordered blocks as the package
+  content floor. The product vNext gateway accepts only a bounded JD-specific
+  transform: replace, reorder or append_after. Wording may change materially
+  where useful; this is not a verbatim lock. Unmentioned blocks remain, and
+  every baseline block must have one traceable final disposition so stable
+  experience, education, metrics and evidence cannot silently disappear.
+- CV and Cover Letter are parallel outputs. Each is transformed only from its own
+  lane master and validated against the same shared profile; neither document is
+  evidence for the other. A truthful number may appear in only one output without
+  creating a contradiction. Reading another job package, prior canonical draft or
+  prior audit to infer a current schema/anchor/wording is outside the supported
+  workflow and its artifact is rejected by current-job context binding.
+- A focused delta is the default. More than roughly 35% touched baseline blocks
+  routes to stronger review; more than 60% is treated as a replacement-equivalent
+  transform and fails closed. This scope control does not require verbatim text.
+- Tailoring may replace or reorder existing blocks and append a small number of
+  truthful JD-relevant blocks; it may not replace the whole CV/CL, silently
+  reduce the semantic content floor, or invent duties, outcomes, tools,
+  qualifications or motivation. The retired merge/add response contract is
+  retained only as a migration compatibility reader and is never emitted by
+  the product gateway.
 - The tailored cover letter should use the existing company-interest slot for one
   compact 1–2 sentence role/industry-match paragraph: role requirement or business
   context → fact-checked candidate evidence → value contribution. Use real JD
@@ -325,24 +366,37 @@ python3 -m tools.job_materials pipeline --package "..." --lane A
   `intentionally_omitted`. It satisfies the coverage decision without creating
   outbound gap prose; `HYG-001` takes precedence over `MAP-001`, and the child
   auditor may not request a negative disclosure as a repair.
-- Before a package is sent, run the manifest-aware release gate:
-  `python3 -m tools.job_materials validate --package <path>`. It checks the
+- Before a package is sent, run the manifest-aware release gates through
+  `python3 -m tools.workflow format --job-id <JOB-ID>` and
+  `python3 -m tools.workflow apply --job-id <JOB-ID>`. They check the
   recruiter/employer boundary, ID-to-tier routing, outbound language residue,
   incomplete sentences and the Cover Letter page budget. The gate reports
   failures; it does not silently rewrite user-owned DOCX files.
 
-### 5.1 Materials orchestrator v2
+### 5.1 Materials vNext (the only product materials chain)
 
-The material lifecycle is a finite, resumable run. A compact, versioned audit
-rule pack and a canonical CV/CL draft are created before rendering. A validated
-`materials_plan.v1` may contain prose under `draft`; the host assigns canonical
-block IDs and placement metadata. Models therefore do not hand-assemble
-canonical hashes or bypass the fixed renderer. User-confirmed profile facts are
+The material lifecycle is a finite, resumable run. Before drafting, the host
+extracts and freezes the selected lane masters as a complete content baseline.
+A validated plan is followed by a small `jobsflow_baseline_transform`; the host
+applies its replacements, reordering and bounded additions while retaining every
+unmentioned block, then produces the full internal canonical CV/CL with stable
+block IDs and placement metadata. Models therefore do not copy or rebuild the
+whole document, hand-assemble canonical hashes, or bypass the fixed renderer.
+The vNext gateway first freezes `current_job_bundle` and the two parallel lane
+baselines inside the job package. `--plan` must be submitted before `--content`;
+the latter is a bounded transform (`replace`, `reorder`, `append_after`), not a
+full canonical replacement. The host owns paths, hashes and canonical
+compilation; stale bundle or transform inputs are rejected.
+User-confirmed profile facts are
 accepted as stable inputs; the semantic audit is not an authorization ledger
 and does not reject a real fact merely because it lacks a separate evidence ID.
 An optional mechanical factcheck may report numerical discrepancies separately.
-The independent child receives only the JD, CV/CL text, placement metadata and
-compact rules; it never receives Email, PDF/DOCX/format data, filenames,
+The independent child receives only the JD, final CV/CL text, the bounded
+before/after delta, the compact role/employer entity contract, placement metadata
+and compact rules. It spends most reasoning on the delta and then makes one
+whole-document P0/P1 sweep for role selection, recruiter/employer boundaries,
+consistency, grammar, fragments, truncation and template residue. It never
+receives Email, PDF/DOCX/format data, filenames,
 metadata, lane/scoring context, or the private evidence/profile store.
 
 Canonical CV/CL blocks carry `section`, `experience_id`, `priority` and
@@ -359,11 +413,13 @@ page count/text layer, DOCX styles/fonts, filenames, metadata or other format
 production details. P0/P1 findings block; P2 is advisory and never blocks PDF
 by itself. The child reports `content_gate`; it does not certify PDF readiness.
 After the child passes, the host renders the canonical content through the
-fixed DOCX templates, converts to PDF, and runs deterministic page/text-layer,
+fixed DOCX templates, deterministically writes `application_email.txt` from the
+verified current-job entity contract, converts to PDF, and runs page/text-layer,
 filename and metadata checks. The host computes PDF/format `ready_for_pdf` and
 final `apply_ready`; a model-provided boolean is never trusted. The run allows
-at most three audit attempts and stops with `audit_loop_detected` or
-`audit_review_required` when the same finding repeats or the budget is reached.
+at most three audit calls (the first audit plus two repair attempts) and stops
+with `audit_loop_detected` or `audit_review_required` when the same finding
+repeats or the budget is reached.
 After drafting, the gateway automatically creates the child task and does not
 ask the user to approve dispatch. A configured model-neutral command may be
 run with `audit --strict --auto-audit`; otherwise the host model launches a
@@ -373,8 +429,8 @@ Use the resumable public seam when recovering a material run:
 
 ```bash
 python3 -m tools.workflow materials status --job-id <JOB-ID>
-python3 -m tools.workflow materials reset --job-id <JOB-ID> --scope audit
-python3 -m tools.workflow materials reset --job-id <JOB-ID> --scope audit --confirm-reset
+python3 -m tools.workflow materials reset --job-id <JOB-ID> --scope all
+python3 -m tools.workflow materials reset --job-id <JOB-ID> --scope all --confirm-reset
 ```
 
 Reset archives the old run under the package `.history/`; it does not silently
@@ -382,8 +438,8 @@ delete a previous audit. It also rewinds the matching per-job materials entity
 state to the exact plan boundary, so a reset cannot leave the package and state
 machine out of sync. Metadata-only changes use a separate metadata hash and
 do not trigger a new semantic audit when the metadata passes the deterministic
-metadata gate. A change to normalized CV/CL text, JD, memory lessons or audit
-rules invalidates the semantic result. Findings are copied to a
+metadata gate. A change to normalized CV/CL text, the frozen content baseline,
+JD, memory lessons or audit rules invalidates the semantic result. Findings are copied to a
 privacy-preserving lessons ledger for later runs; the ledger stores patterns
 and repairs, never candidate facts or document text.
 
