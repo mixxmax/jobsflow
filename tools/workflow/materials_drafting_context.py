@@ -59,8 +59,7 @@ def _response_template(
         "job_id": job_id,
         "baseline_sha256": str(response_schema.get("baseline_sha256") or ""),
         **binding,
-        "changes": [],
-        "additions": [],
+        "operations": [],
     }
 
 

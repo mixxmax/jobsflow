@@ -233,6 +233,33 @@ def main(argv: list[str] | None = None) -> int:
         store = _load_store(args.fixture, args.fresh_title, workspace)
     elif action == "materials":
         payload["job_id"] = args.job_id
+        if args.content and args.materials_cmd != "draft":
+            out = {
+                "status": "blocked",
+                "job_id": args.job_id,
+                "blockers": ["materials_content_requires_draft"],
+                "required": "materials draft --content <current response file>",
+            }
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 2
+        if args.materials_cmd == "draft" and not args.content:
+            out = {
+                "status": "blocked",
+                "job_id": args.job_id,
+                "blockers": ["materials_draft_content_required"],
+                "required": "materials draft --content <current response file>",
+            }
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 2
+        if args.plan and args.materials_cmd not in {"run"}:
+            out = {
+                "status": "blocked",
+                "job_id": args.job_id,
+                "blockers": ["materials_plan_requires_run"],
+                "required": "materials run --plan <current response file>",
+            }
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 2
         if args.materials_cmd == "status":
             package = None
             from tools.workflow.package_context import PackageContextLoader
@@ -268,22 +295,34 @@ def main(argv: list[str] | None = None) -> int:
             if not package:
                 out = {"status": "blocked", "blockers": ["package_missing"], "job_id": args.job_id}
             elif args.scope != "all":
-                out = {
-                    "status": "blocked",
-                    "job_id": args.job_id,
-                    "blockers": ["materials_reset_scope_must_be_all"],
-                    "required": "materials reset --scope all --confirm-reset",
-                }
-            elif not args.confirm_reset:
-                out = {
-                    "status": "preview",
-                    "job_id": args.job_id,
-                    "next_action": "repeat_with_--confirm-reset",
-                }
-                try:
-                    out.update(_materials_engine_info())
-                except (ImportError, RuntimeError) as exc:
-                    out = {"status": "blocked", "job_id": args.job_id, "blockers": ["materials_engine_unavailable"], "error": str(exc)}
+                from tools.workflow.materials_vnext.store import load_run
+
+                vnext_run = load_run(Path(package))
+                if not vnext_run:
+                    out = {
+                        "status": "blocked",
+                        "job_id": args.job_id,
+                        "blockers": ["materials_reset_scope_requires_vnext_run"],
+                        "required": "materials reset --scope all --confirm-reset",
+                    }
+                elif not args.confirm_reset:
+                    out = {
+                        "status": "preview",
+                        "job_id": args.job_id,
+                        "scope": args.scope,
+                        "next_action": "repeat_with_--confirm-reset",
+                    }
+                else:
+                    from tools.workflow.materials_vnext import MaterialsEngine
+
+                    out = MaterialsEngine().handle(
+                        {"job_id": args.job_id, "stage": "reset", "scope": args.scope},
+                        workspace=workspace,
+                    )
+                    try:
+                        out.update(_materials_engine_info())
+                    except (ImportError, RuntimeError) as exc:
+                        out = {"status": "blocked", "job_id": args.job_id, "blockers": ["materials_engine_unavailable"], "error": str(exc)}
             else:
                 from tools.workflow.materials_vnext import MaterialsEngine
 

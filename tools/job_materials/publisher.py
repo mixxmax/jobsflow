@@ -206,6 +206,10 @@ def classify_publisher(
     )
     client_from_jd = extract_disclosed_employer(jd_text)
     employer = explicit_employer or client_from_jd
+    if explicit_type in {"recruiter", "agency", "staffing", "search_firm"} and employer and publisher and _norm(employer) == _norm(publisher):
+        # The publisher's own name is not a verified client. Treat an explicit
+        # same-name employer as undisclosed instead of externalizing the agency.
+        employer = ""
     source = _clean(source_url or research.get("source_url"))
     signals: list[str] = []
 

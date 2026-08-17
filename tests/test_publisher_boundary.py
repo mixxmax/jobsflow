@@ -78,7 +78,20 @@ def test_company_research_request_keeps_publisher_and_client_separate():
     assert request["inputs"]["employer_name"] == "Acme Holdings"
 
 
-def test_outbound_filenames_omit_agency_and_use_verified_client():
+def test_recruiter_classification_rejects_agency_as_its_own_employer():
+    result = classify_publisher(
+        publisher_name="Taylor Root",
+        publisher_type="recruiter",
+        employer_name="Taylor Root",
+    )
+
+    assert result["publisher_type"] == "recruiter"
+    assert result["employer_name"] == ""
+    assert result["application_target"] == ""
+    assert result["agency_name_must_not_be_externalized"] is True
+
+
+
     result = classify_publisher(
         publisher_name="Michael Page",
         publisher_type="recruiter",

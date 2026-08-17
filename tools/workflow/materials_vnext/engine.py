@@ -214,6 +214,7 @@ def _plan_packet(
         "transform_schema": {
             "schema_version": 1,
             "operations": "[{material, action: replace|append_after|reorder, target_id, before_text/after_text or block, jd_anchor_ids}]",
+            "allowed_actions": ["replace", "append_after", "reorder"],
         },
     }
 
@@ -261,8 +262,7 @@ def _drafting_workspace(
             "unmentioned_blocks": "retain",
             "deletion_allowed": False,
             "allowed_actions": ["replace", "append_after", "reorder"],
-            "changes": "array of JD-anchored replacements/reorders",
-            "additions": "array of concise JD-anchored blocks",
+            "operations": "[{material, action: replace|append_after|reorder, target_id, before_text/after_text or block, jd_anchor_ids}]",
             "instruction": (
                 "Use the lane baseline as the content master. Return only the bounded "
                 "JD-specific delta; do not rebuild or silently shorten the CV or Cover Letter."
@@ -518,7 +518,16 @@ class MaterialsEngine:
             if legacy is not None:
                 return {**legacy, "engine": "materials-vnext", "engine_version": "materials-vnext-1"}
         if stage in {"reset", "restart"}:
-            out = reset(package)
+            scope = text(payload.get("scope") or "all").casefold()
+            if scope not in {"audit", "draft", "render", "all"}:
+                scope = "all"
+            out = reset(package, scope=scope)
+            target_phase = {
+                "audit": "content_audit_pending",
+                "draft": "plan_ready",
+                "render": "content_passed",
+                "all": "idle",
+            }[scope]
             try:
                 from tools.workflow.entity_state import reset_entity_state
 
@@ -526,8 +535,8 @@ class MaterialsEngine:
                     Path(workspace),
                     "materials",
                     job_id,
-                    target_phase="idle",
-                    reason="materials_vnext_reset",
+                    target_phase=target_phase,
+                    reason=f"materials_vnext_reset:{scope}",
                 )
                 out["projected_entity_phase"] = projected.phase
                 out["projected_entity_revision"] = projected.revision
@@ -989,6 +998,35 @@ class MaterialsEngine:
                 }
 
         if patch is None:
+            # A model-facing, bound response may omit host-owned fields.
+            # Complete them from the frozen baseline before any material
+            # coverage, JD-anchor or content-preservation validation runs, so
+            # a single submission reports every actionable error at once and
+            # a sparse-but-correct response is not rejected for fields the
+            # host owns.  Only the public bound-response path (CLI
+            # ``draft --content``) is normalized; the historical
+            # in-process ``canonical_draft``/``transform`` compatibility
+            # callers keep their original spelling byte-for-byte.
+            if (
+                payload.get("model_transform") is not None
+                and text(transform.get("artifact_type")) == "jobsflow_baseline_transform"
+            ):
+                from tools.workflow.materials_vnext.transform import normalize_transform_operations
+
+                normalized_ops, normalize_errors = normalize_transform_operations(
+                    transform, bundle.get("baseline") or {}
+                )
+                if normalize_errors:
+                    return {
+                        "status": "blocked",
+                        "after_state": run.get("phase"),
+                        "blockers": ["bounded_transform_invalid"],
+                        "errors": normalize_errors,
+                        "error": ", ".join(normalize_errors),
+                        "engine": "materials-vnext",
+                    }
+                transform = dict(transform)
+                transform["operations"] = normalized_ops
             # A model-facing, bound response must touch both parallel
             # materials.  The in-process legacy adapter remains permissive for
             # old fixture callers, but a real response file cannot silently

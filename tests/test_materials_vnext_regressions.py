@@ -126,6 +126,39 @@ def test_renderer_uses_master_compact_style_for_education_and_date_tabs(tmp_path
     assert rpr_shape(document.paragraphs[1].runs[1]._r.rPr) == rpr_shape(prototypes["job_heading"]["rprs"][1])
 
 
+def test_cover_letter_pillar_preserves_label_separator(tmp_path):
+    ws = build_workspace(tmp_path)
+    master = ws / "01_Masters" / "C_track" / "cl_master_C_test_v1.docx"
+    template = Document(str(master))
+    prototypes = _template_prototypes(template, material="cover_letter")
+    document = Document(str(master))
+    body = document._element.body
+    for child in list(body):
+        if child.tag.rsplit("}", 1)[-1] != "sectPr":
+            body.remove(child)
+
+    _add_block(
+        document,
+        {
+            "id": "pillar",
+            "type": "bullet",
+            "text": "Contract review - translated findings",
+            "section": "pillar",
+            "presentation_role": "baseline_block",
+            "source_style": "Letter Bullet",
+        },
+        material="cover_letter",
+        position=0,
+        prototypes=prototypes,
+    )
+
+    assert document.paragraphs[0].text == "Contract review - translated findings"
+    assert [run.text for run in document.paragraphs[0].runs] == [
+        "Contract review",
+        " - translated findings",
+    ]
+
+
 def test_baseline_numeric_evidence_loss_is_blocked_before_child_audit(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws, with_outbound=False)

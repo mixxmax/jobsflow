@@ -4,6 +4,7 @@ from tools.job_materials.manifest import (
     build_job_manifest,
     load_job_manifest,
     refresh_job_manifest,
+    reconcile_package_metadata,
     update_manifest_from_payload,
     write_job_manifest,
 )
@@ -95,7 +96,51 @@ def test_manifest_consumes_confirmed_company_research_on_refresh(tmp_path):
     assert manifest["job"]["company_out"] == "Acme Payments"
 
 
-def test_manifest_preserves_substantive_parenthetical_and_sanitizes_filename_without_dash(tmp_path):
+def test_manifest_recruiter_research_clears_stale_employer_projection(tmp_path):
+    root = tmp_path / "JobSearch_2026"
+    package = root / "01_Masters" / "F_track" / "核心" / "F0-043_未投_Taylor_Root"
+    package.mkdir(parents=True)
+    stale = build_job_manifest(
+        root=root,
+        package=package,
+        row=_row(
+            **{
+                "岗位编号": "F0-043",
+                "公司": "Taylor Root",
+                "发布者": "Taylor Root",
+                "发布者类型": "recruiter",
+            }
+        ),
+        jd_text="Support capital markets transactions and due diligence.",
+    )
+    stale["job"]["publisher_type"] = "recruiter"
+    stale["job"]["publisher_name"] = "Taylor Root"
+    stale["job"]["employer_name"] = "Taylor Root"
+    stale["job"]["company_out"] = "Taylor Root"
+    stale["outbound"]["company_name"] = "Taylor Root"
+    write_job_manifest(package, stale)
+    (package / "company_research.json").write_text(
+        json.dumps(
+            {
+                "publisher_type": "recruiter",
+                "publisher_name": "Taylor Root",
+                "employer_name": "",
+                "company_out": "",
+                "quality": {"ready_for_tailoring": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    reconciled = reconcile_package_metadata(root, package)
+    job = reconciled["job"]
+    assert job["publisher_name"] == "Taylor Root"
+    assert job["employer_name"] == ""
+    assert job["company_out"] == ""
+    assert reconciled["outbound"].get("company_name", "") == ""
+
+
     root = tmp_path / "JobSearch_2026"
     package = root / "01_Masters" / "A_track" / "核心" / "A0-021_未投_Acme"
     package.mkdir(parents=True)

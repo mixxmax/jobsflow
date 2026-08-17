@@ -174,53 +174,69 @@ def load_audit_result(package: Path) -> dict[str, Any]:
     return value or load(Path(package) / "materials_audit.json")
 
 
-def archive_known_outputs(package: Path) -> str:
+def archive_known_outputs(package: Path, *, scope: str = "all") -> str:
     package = Path(package)
-    history = package / ".history" / f"materials-vnext-reset-{uuid4().hex[:10]}"
-    names = {
-        # Legacy material-chain state. A vNext reset archives these files so
-        # the next initialization cannot rediscover the same old generation.
-        "materials_run.json",
-        "materials_plan.validated.json",
-        "materials_transform.original.json",
-        "materials_transform.effective.json",
-        "repair_patch.jsonl",
-        "materials_task_packet.json",
-        "materials_draft.canonical.json",
-        "materials_audit_task.json",
-        "materials_audit.json",
-        "materials_audit.md",
-        "materials_audit_evidence.json",
-        "materials_repair_task.json",
-        "materials_repair_receipt.json",
-        "materials_render_receipt.json",
-        "materials_format_report.json",
-        "artifact_hashes.json",
-        "claim_contract.json",
-        "application_email.txt",
-        "application_email.md",
+    allowed = {"audit", "draft", "render", "all"}
+    if scope not in allowed:
+        raise ValueError(f"scope must be one of {sorted(allowed)}")
+    common = {
+        "materials_audit_task.json", "materials_audit.json", "materials_audit.md",
+        "materials_audit_evidence.json", "materials_repair_task.json",
+        "materials_repair_receipt.json", "materials_audit_resolution.json",
     }
-    candidates = [path for path in package.iterdir() if path.is_file() and (path.name in names or ((path.suffix.casefold() in {".docx", ".pdf"}) and (" cv" in path.name.casefold() or " cover letter" in path.name.casefold())))]
+    names = {
+        "audit": common,
+        "draft": common | {"materials_draft.canonical.json", "materials_render_receipt.json", "materials_format_report.json", "artifact_hashes.json", "application_email.txt", "application_email.md"},
+        "render": {"materials_render_receipt.json", "materials_format_report.json", "artifact_hashes.json", "application_email.txt", "application_email.md"},
+        "all": common | {"materials_run.json", "materials_draft.canonical.json", "materials_render_receipt.json", "materials_format_report.json", "artifact_hashes.json", "application_email.txt", "application_email.md", "materials_plan.validated.json", "materials_task_packet.json", "materials_transform.original.json", "materials_transform.original.meta.json", "materials_transform.effective.json", "repair_patch.jsonl", "claim_contract.json"},
+    }[scope]
+    history = package / ".history" / f"materials-vnext-reset-{scope}-{uuid4().hex[:10]}"
+    candidates = [
+        path for path in package.iterdir()
+        if path.is_file() and (path.name in names or (scope in {"draft", "render", "all"} and path.suffix.casefold() in {".docx", ".pdf"}))
+    ]
+    state = package / STATE_DIR_NAME
+    state_names = {
+        "audit": {AUDIT_TASK_NAME, AUDIT_RESULT_NAME},
+        "draft": {CANONICAL_NAME, EFFECTIVE_NAME, AUDIT_TASK_NAME, AUDIT_RESULT_NAME, FORMAT_NAME},
+        "render": {FORMAT_NAME},
+        "all": set(),
+    }[scope]
+    state_candidates = []
+    if state.is_dir():
+        if scope == "all":
+            state_candidates.append(state)
+        else:
+            state_candidates.extend(path for path in state.iterdir() if path.is_file() and path.name in state_names)
+    candidates.extend(state_candidates)
     if candidates:
         history.mkdir(parents=True, exist_ok=True)
         for path in candidates:
             shutil.move(str(path), str(history / path.name))
-            sidecar = path.with_suffix(path.suffix + ".jobsflow.json")
-            if sidecar.is_file():
-                shutil.move(str(sidecar), str(history / sidecar.name))
-    state = package / STATE_DIR_NAME
-    if state.is_dir():
-        history.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(state), str(history / state.name))
+            if path.is_file():
+                sidecar = path.with_suffix(path.suffix + ".jobsflow.json")
+                if sidecar.is_file():
+                    shutil.move(str(sidecar), str(history / sidecar.name))
     return str(history) if history.is_dir() else ""
 
 
-def reset(package: Path) -> dict[str, Any]:
-    archived = archive_known_outputs(Path(package))
+def reset(package: Path, *, scope: str = "all") -> dict[str, Any]:
+    archived = archive_known_outputs(Path(package), scope=scope)
+    target_phase = "content_passed" if scope == "render" else ("plan_ready" if scope == "draft" else ("content_audit_pending" if scope == "audit" else "idle"))
+    if scope != "all":
+        run = load_run(package)
+        if run:
+            run["phase"] = target_phase
+            if scope == "audit":
+                run["audit_result_sha256"] = ""
+            if scope in {"audit", "draft"}:
+                run["audit_attempts"] = 0
+            save_run(package, run)
     return {
         "status": "reset",
+        "scope": scope,
         "archived_path": archived,
-        "phase": "idle",
+        "phase": target_phase,
         "side_effects": ["archive_material_generation_outputs"],
     }
 

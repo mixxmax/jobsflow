@@ -78,6 +78,38 @@ def test_materials_planning_exposes_only_a_current_job_drafting_workspace(tmp_pa
     assert "C0-120" not in staged_text
 
 
+def test_tailoring_workspace_uses_the_same_operations_contract_as_the_task_packet(tmp_path):
+    workspace = build_workspace(tmp_path)
+    package = build_package(workspace, "C0-001", with_outbound=False)
+    planning = dispatch("materials", workspace=workspace, payload={"job_id": "C0-001"})
+    plan_path = Path(planning["drafting_workspace"]["response_file"])
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan.update(
+        {
+            "duties": ["Draft vendor contracts"],
+            "requirements": [],
+            "themes": ["contracts"],
+            "match_type": "transferable",
+        }
+    )
+    planned = dispatch(
+        "materials",
+        workspace=workspace,
+        payload={"job_id": "C0-001", "model_plan": plan},
+    )
+
+    root = Path(planned["drafting_workspace"]["root"])
+    response = json.loads((root / "baseline_transform.response.json").read_text(encoding="utf-8"))
+    schema = json.loads((root / "response_schema.json").read_text(encoding="utf-8"))
+    packet = json.loads((root / "task_packet.json").read_text(encoding="utf-8"))
+
+    assert response["operations"] == []
+    assert "changes" not in response
+    assert "additions" not in response
+    assert schema["operations"] == packet["transform_schema"]["operations"]
+    assert schema["allowed_actions"] == packet["transform_schema"]["allowed_actions"]
+
+
 def test_current_job_packet_carries_shared_profile_and_lane_capability_upper(tmp_path):
     workspace = build_workspace(tmp_path)
     build_package(workspace, "C0-001", with_outbound=False)
@@ -232,3 +264,84 @@ def test_cli_accepts_materials_responses_only_from_the_returned_current_job_file
     blocked = json.loads(capsys.readouterr().out)
     assert blocked["blockers"] == ["drafting_submission_path_invalid"]
     assert blocked["expected_submission"].endswith("baseline_transform.response.json")
+
+
+def test_cli_allows_scoped_reset_only_for_existing_vnext_runs(tmp_path, capsys):
+    from tools.workflow.__main__ import main
+
+    workspace = build_workspace(tmp_path)
+    build_package(workspace, "C0-001", with_outbound=False)
+    assert main(["materials", "run", "--workspace", str(workspace), "--job-id", "C0-001"]) == 0
+    capsys.readouterr()
+
+    assert main(
+        [
+            "materials",
+            "reset",
+            "--workspace",
+            str(workspace),
+            "--job-id",
+            "C0-001",
+            "--scope",
+            "render",
+        ]
+    ) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["status"] == "preview"
+    assert preview["scope"] == "render"
+
+    assert main(
+        [
+            "materials",
+            "reset",
+            "--workspace",
+            str(workspace),
+            "--job-id",
+            "C0-001",
+            "--scope",
+            "render",
+            "--confirm-reset",
+        ]
+    ) == 0
+    confirmed = json.loads(capsys.readouterr().out)
+    assert confirmed["status"] == "reset"
+    assert confirmed["scope"] == "render"
+
+
+def test_cli_rejects_materials_files_on_commands_that_would_ignore_them(tmp_path, capsys):
+    from tools.workflow.__main__ import main
+
+    workspace = build_workspace(tmp_path)
+    build_package(workspace, "C0-001", with_outbound=False)
+    ignored_content = tmp_path / "ignored-transform.json"
+    atomic_write_json(ignored_content, {"operations": []})
+
+    assert main(
+        [
+            "materials",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--job-id",
+            "C0-001",
+            "--content",
+            str(ignored_content),
+        ]
+    ) == 2
+    blocked = json.loads(capsys.readouterr().out)
+    assert blocked["blockers"] == ["materials_content_requires_draft"]
+    assert blocked["required"] == "materials draft --content <current response file>"
+
+    assert main(
+        [
+            "materials",
+            "draft",
+            "--workspace",
+            str(workspace),
+            "--job-id",
+            "C0-001",
+        ]
+    ) == 2
+    blocked = json.loads(capsys.readouterr().out)
+    assert blocked["blockers"] == ["materials_draft_content_required"]
+    assert blocked["required"] == "materials draft --content <current response file>"

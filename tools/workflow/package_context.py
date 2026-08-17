@@ -291,13 +291,21 @@ class PackageContextLoader:
         # agency's own name must never surface as the employer; only a
         # separately verified company_out/employer_name is eligible.
         if ctx.publisher_type in {"recruiter", "agency"}:
-            ctx.employer_name = str(
-                research.get("company_out")
-                or research.get("employer_name")
-                or job.get("company_out")
-                or job.get("employer_name")
-                or ""
-            )
+            # An explicit recruiter research record with an empty employer is
+            # an authoritative undisclosed-client decision. Do not resurrect
+            # a stale company_out/employer_name from the tracker manifest.
+            if isinstance(research, dict) and "employer_name" in research:
+                ctx.employer_name = str(
+                    research.get("company_out") or research.get("employer_name") or research.get("application_target") or ""
+                )
+            else:
+                ctx.employer_name = str(
+                    research.get("company_out")
+                    or research.get("employer_name")
+                    or job.get("company_out")
+                    or job.get("employer_name")
+                    or ""
+                )
         else:
             ctx.employer_name = str(
                 research.get("company_out")

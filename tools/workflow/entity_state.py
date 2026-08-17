@@ -290,6 +290,21 @@ def action_allowed_from(
     if (
         action == "materials"
         and entity_type == "materials"
+        and payload.get("materials_engine") == "vnext"
+        and stage in {"render", "docx", "docx_generated"}
+        and phase in {"docx_generated", "pdf_generated", "format_passed", "apply_ready"}
+    ):
+        return True
+    if (
+        action == "format"
+        and entity_type == "materials"
+        and payload.get("materials_engine") == "vnext"
+        and phase in {"format_passed", "apply_ready"}
+    ):
+        return True
+    if (
+        action == "materials"
+        and entity_type == "materials"
         and stage in {"pdf", "convert", "pdf_generated"}
         and phase in {"pdf_generated", "format_passed", "apply_ready"}
     ):

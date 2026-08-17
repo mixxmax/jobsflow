@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from tools.workflow.engine import dispatch
-from tools.workflow.entity_state import load_entity_state
+from tools.workflow.entity_state import action_allowed_from, load_entity_state
 from tools.workflow.package_validator import MaterialsPackageValidator
 from tools.workflow.task_packet import evaluate_model_output
 from tools.workflow.testing_packages import JD, build_package, build_workspace, prepare_package_for_apply
@@ -123,6 +123,20 @@ def test_cli_scan_without_fixture_injects_real_runner(tmp_path, monkeypatch):
     assert called["workspace"] == str(tmp_path)
 
 
+def test_existing_vnext_late_stage_requests_reach_idempotence_gate():
+    payload = {"stage": "render", "materials_engine": "vnext"}
+    assert action_allowed_from("materials", "materials", "pdf_generated", payload)
+    assert action_allowed_from("materials", "materials", "format_passed", payload)
+    assert action_allowed_from("materials", "materials", "apply_ready", payload)
+
+    format_payload = {"stage": "format", "materials_engine": "vnext"}
+    assert action_allowed_from("format", "materials", "format_passed", format_payload)
+    assert action_allowed_from("format", "materials", "apply_ready", format_payload)
+
+
+def test_legacy_late_stage_requests_remain_blocked_without_vnext_marker():
+    assert not action_allowed_from("materials", "materials", "pdf_generated", {"stage": "render"})
+    assert not action_allowed_from("format", "materials", "format_passed", {"stage": "format"})
 def test_illegal_scan_state_does_not_write_artifacts(tmp_path):
     ws = build_workspace(tmp_path)
     from tools.io_utils import atomic_write_json

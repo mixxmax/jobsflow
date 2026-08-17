@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+from pathlib import Path
+
 from tools.workflow.engine import dispatch
 from tools.workflow import __main__ as workflow_cli
 from tools.workflow.adapters import apply as apply_adapter
@@ -17,7 +19,7 @@ from tools.workflow.materials_vnext.engine import MaterialsEngine
 from tools.workflow.materials_vnext.migration import migration_blocker
 from tools.workflow.materials_vnext.store import load_run
 from tools.workflow.entity_state import load_entity_state, reset_entity_state
-from tools.workflow.testing_packages import build_package, build_workspace
+from tools.workflow.testing_packages import build_package, build_workspace, prepare_package_for_apply
 
 
 def _bundle(ws, package):
@@ -206,6 +208,92 @@ def test_vnext_repair_recompiles_current_material_lists(tmp_path):
     assert load_run(package)["phase"] == "content_audit_pending"
 
 
+def _tailoring_response(ws, package, operations):
+    out = MaterialsEngine().handle({"job_id": "C0-001", "stage": "plan"}, workspace=ws)
+    assert out["status"] == "succeeded"
+    response_file = Path(out["drafting_workspace"]["response_file"])
+    response = json.loads(response_file.read_text(encoding="utf-8"))
+    response["operations"] = operations
+    return response
+
+
+def test_vnext_host_completes_material_and_before_text_from_baseline(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    bundle, _ = _bundle(ws, package)
+    baseline = bundle["baseline"]
+    cv_block = next(
+        item
+        for item in baseline["cv"]["blocks"]
+        if not item.get("host_managed") and item.get("type") in {"paragraph", "bullet"}
+    )
+    cl_block = next(
+        item
+        for item in baseline["cover_letter"]["blocks"]
+        if not item.get("host_managed") and item.get("type") in {"paragraph", "bullet"}
+    )
+    response = _tailoring_response(
+        ws,
+        package,
+        [
+            {
+                "action": "replace",
+                "target_id": cv_block["id"],
+                "after_text": cv_block["text"] + " This supports contract review.",
+                "jd_anchor_ids": ["JD-001"],
+            },
+            {
+                "action": "replace",
+                "target_id": cl_block["id"],
+                "after_text": cl_block["text"] + " This explains the match.",
+                "jd_anchor_ids": ["JD-001"],
+            },
+        ],
+    )
+
+    out = MaterialsEngine().handle({"job_id": "C0-001", "model_transform": response}, workspace=ws)
+
+    assert out["status"] == "succeeded"
+    stored = json.loads((package / "materials_transform.original.json").read_text(encoding="utf-8"))
+    by_target = {op["target_id"]: op for op in stored["operations"]}
+    assert by_target[cv_block["id"]]["material"] == "cv"
+    assert by_target[cl_block["id"]]["material"] == "cover_letter"
+    assert by_target[cv_block["id"]]["before_text"] == cv_block["text"]
+    assert by_target[cl_block["id"]]["before_text"] == cl_block["text"]
+
+
+def test_vnext_host_does_not_overwrite_an_explicit_wrong_before_text(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    bundle, _ = _bundle(ws, package)
+    baseline = bundle["baseline"]
+    cv_block = next(
+        item
+        for item in baseline["cv"]["blocks"]
+        if not item.get("host_managed") and item.get("type") in {"paragraph", "bullet"}
+    )
+    response = _tailoring_response(
+        ws,
+        package,
+        [
+            {
+                "action": "replace",
+                "target_id": cv_block["id"],
+                "before_text": "an outdated baseline sentence",
+                "after_text": "replacement",
+                "jd_anchor_ids": ["JD-001"],
+            }
+        ],
+    )
+
+    out = MaterialsEngine().handle({"job_id": "C0-001", "model_transform": response}, workspace=ws)
+
+    assert out["status"] == "blocked"
+    assert any("operation_before_text_mismatch" in error for error in (out.get("errors") or []))
+    assert not (package / "materials_transform.original.json").exists()
+    assert not (package / "materials_vnext" / "audit_task.json").exists()
+
+
 def test_gateway_forces_vnext_only_for_public_cli_flag(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws, with_outbound=False)
@@ -288,6 +376,43 @@ def test_legacy_material_state_returns_explicit_vnext_reset_action(tmp_path):
     assert reset["status"] == "reset"
     assert not (package / "materials_run.json").exists()
     assert list((package / ".history").glob("materials-vnext-reset-*/materials_run.json"))
+
+
+def test_vnext_render_reset_preserves_canonical_and_audit_then_allows_rerender(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    prepare_package_for_apply(ws)
+    run_before = load_run(package)
+    canonical_before = (package / "materials_vnext" / "canonical.json").read_bytes()
+    audit_before = (package / "materials_vnext" / "audit_result.json").read_bytes()
+    assert run_before["phase"] == "format_passed"
+    assert any(path.suffix == ".docx" for path in package.iterdir())
+    assert any(path.suffix == ".pdf" for path in package.iterdir())
+
+    reset = MaterialsEngine().handle(
+        {"job_id": "C0-001", "stage": "reset", "scope": "render"},
+        workspace=ws,
+    )
+
+    assert reset["status"] == "reset"
+    assert reset["scope"] == "render"
+    assert reset["phase"] == "content_passed"
+    assert reset["projected_entity_phase"] == "content_passed"
+    assert load_run(package)["phase"] == "content_passed"
+    assert load_run(package)["generation_id"] == run_before["generation_id"]
+    assert (package / "materials_vnext" / "canonical.json").read_bytes() == canonical_before
+    assert (package / "materials_vnext" / "audit_result.json").read_bytes() == audit_before
+    assert not any(path.suffix in {".docx", ".pdf"} for path in package.iterdir())
+    assert not (package / "materials_render_receipt.json").exists()
+    assert not (package / "materials_format_report.json").exists()
+
+    rendered = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": "C0-001", "stage": "render"},
+    )
+    assert rendered["status"] == "succeeded"
+    assert rendered["after_state"] == "docx_generated"
 
 
 def test_vnext_reset_archives_generation_and_rewinds_projection(tmp_path):

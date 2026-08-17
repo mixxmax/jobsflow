@@ -189,15 +189,11 @@ def reconcile_package_metadata(root: Path, package: Path) -> dict[str, Any]:
         changed = True
     manifest["paths"] = paths
 
-    # Company research is the only verified source for publisher/employer
-    # classification after a package is created.  Propagate its structured
-    # result into the manifest projection before any materials bundle is
-    # frozen.  This closes the historical split where ``company set`` updated
-    # research.json but the manifest continued to say ``unknown`` until a
-    # later hand edit.  Empty research fields never erase an existing value.
     research = _package_company_research(package)
     researched_job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
     if research:
+        research_type = _clean(research.get("publisher_type") or research.get("type"))
+        explicit_recruiter = research_type.casefold() in {"recruiter", "agency", "staffing", "search_firm"}
         for field, keys in {
             "publisher_type": ("publisher_type", "type"),
             "publisher_name": ("publisher_name", "publisher"),
@@ -205,14 +201,20 @@ def reconcile_package_metadata(root: Path, package: Path) -> dict[str, Any]:
             "employer_name": ("employer_name", "company_out", "application_target"),
         }.items():
             value = next((_clean(research.get(key)) for key in keys if _clean(research.get(key))), "")
-            if value and researched_job.get(field) != value:
+            # For an explicitly recruiter-owned research record, an empty
+            # employer is an authoritative undisclosed-client decision and
+            # must erase stale outbound projections from an earlier run.
+            if explicit_recruiter and field in {"company_out", "employer_name"}:
+                value = ""
+            if researched_job.get(field) != value:
                 researched_job[field] = value
                 changed = True
-        # Keep the original publisher/company source available for audit, but
-        # never replace it with an inferred employer name.
-        if _clean(research.get("publisher_type")) and researched_job.get("publisher_type") != _clean(research.get("publisher_type")):
-            researched_job["publisher_type"] = _clean(research.get("publisher_type"))
-            changed = True
+        if explicit_recruiter:
+            outbound = manifest.get("outbound") if isinstance(manifest.get("outbound"), dict) else {}
+            if outbound.get("company_name"):
+                outbound["company_name"] = ""
+                manifest["outbound"] = outbound
+                changed = True
         manifest["job"] = researched_job
     if changed:
         manifest["generated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -341,10 +343,16 @@ def build_job_manifest(
         publisher_type = research_type
     if research_publisher:
         publisher_name = research_publisher
-    if research_employer:
+    if research_type.casefold() in {"recruiter", "agency", "staffing", "search_firm"}:
+        # An explicit recruiter record owns the empty employer decision; never
+        # retain a stale row-level employer/company value.
         employer_name = research_employer
-    if research_company:
-        company_source = research_company
+        company_source = research_company or company_source
+    else:
+        if research_employer:
+            employer_name = research_employer
+        if research_company:
+            company_source = research_company
     jd = _jd_info(root, url, jd_text)
     jd_for_classification = str(jd.pop("_text", "") or jd_text or "")
     classification = classify_publisher(

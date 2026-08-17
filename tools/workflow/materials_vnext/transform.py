@@ -75,6 +75,83 @@ def _ops(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return normalized
 
 
+def normalize_transform_operations(
+    transform: dict[str, Any],
+    baseline: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Complete host-owned transform fields from the frozen baseline.
+
+    A model-facing response may legitimately omit ``material`` and
+    ``before_text``: the baseline block ID is globally unique per material and
+    the exact current text is host-owned.  This normalizer fills those fields
+    deterministically and migrates the historical ``changes``/``additions``
+    envelopes into the single ``operations`` contract.  An explicit but wrong
+    ``before_text`` is never overwritten; it fails closed with a precise
+    mismatch error so a stale model cannot silently replace the wrong text.
+    """
+
+    raw = transform.get("operations")
+    if raw is None:
+        raw = transform.get("changes")
+    additions = transform.get("additions")
+    if not isinstance(raw, list):
+        raw = []
+    if not isinstance(additions, list):
+        additions = []
+    blocks: list[dict[str, Any]] = []
+    for material in MATERIALS:
+        blocks.extend((baseline.get(material) or {}).get("blocks") or [])
+    by_id = {text(item.get("id")): item for item in blocks if text(item.get("id"))}
+
+    operations: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            errors.append(f"operation_not_object:{index}")
+            continue
+        operation = dict(item)
+        target_id = text(operation.get("target_id") or operation.get("block_id") or operation.get("baseline_id"))
+        block = by_id.get(target_id)
+        if block is None:
+            errors.append(f"operation_target_unresolvable:{index}:{target_id or ''}")
+            continue
+        action = text(operation.get("action")).casefold()
+        if not operation.get("material"):
+            operation["material"] = "cv" if target_id.startswith("cv-") else "cover_letter"
+        if action == "replace":
+            before = text(operation.get("before_text"))
+            if not before:
+                operation["before_text"] = text(block.get("text"))
+            elif before != text(block.get("text")):
+                errors.append(f"operation_before_text_mismatch:{index}:{target_id}")
+                continue
+        operations.append(operation)
+
+    for index, item in enumerate(additions):
+        if not isinstance(item, dict):
+            errors.append(f"addition_not_object:{index}")
+            continue
+        block = item.get("block")
+        if not isinstance(block, dict) or not text(block.get("text")):
+            errors.append(f"addition_block_missing:{index}")
+            continue
+        anchor = text(item.get("after_id") or item.get("target_id"))
+        if anchor and anchor in by_id:
+            operations.append(
+                {
+                    "action": "append_after",
+                    "material": "cv" if anchor.startswith("cv-") else "cover_letter",
+                    "target_id": anchor,
+                    "block": block,
+                }
+            )
+        elif anchor:
+            errors.append(f"operation_append_anchor_missing:{index}:{anchor}")
+        else:
+            errors.append(f"operation_append_anchor_missing:{index}")
+    return operations, sorted(set(errors))
+
+
 def _protected_evidence_tokens(value: Any) -> set[str]:
     """Return small, deterministic evidence markers that must not vanish.
 

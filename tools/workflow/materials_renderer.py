@@ -24,7 +24,7 @@ from tools.workflow.materials_metadata import metadata_violations, sanitize_docx
 
 RENDER_RECEIPT_NAME = "materials_render_receipt.json"
 FORMAT_REPORT_NAME = "materials_format_report.json"
-RENDERER_VERSION = "canonical-template-docx-v3"
+RENDERER_VERSION = "canonical-template-docx-v4"
 
 TEMPLATE_STYLES: dict[str, tuple[str, ...]] = {
     "cv": ("Resume Section", "Job Heading", "Resume Bullet", "Compact Line"),
@@ -308,14 +308,14 @@ def _add_run(paragraph, text: str, prototype: dict[str, Any] | None, run_index: 
 
 
 def _split_label(text: str) -> tuple[str, str] | None:
-    # Core-expertise and CL pillar prototypes use a coloured/bold label run
-    # followed by a normal evidence run.  Preserve the delimiter in the label.
-    match = re.match(r"^(.+?)\s+-\s+(.+)$", text.strip())
+    # The normal evidence run owns the delimiter so the final paragraph text
+    # remains byte-for-byte equivalent to the canonical block.
+    match = re.match(r"^(.+?)(\s+-\s+)(.+)$", text.strip())
     if match:
-        return match.group(1).rstrip(), match.group(2).lstrip()
-    match = re.match(r"^(.+?:)\s*(.+)$", text.strip())
+        return match.group(1).rstrip(), match.group(2) + match.group(3).lstrip()
+    match = re.match(r"^(.+?:)(\s*)(.+)$", text.strip())
     if match:
-        return match.group(1), match.group(2)
+        return match.group(1), match.group(2) + match.group(3)
     return None
 
 
@@ -484,8 +484,7 @@ def _add_block(
             label_body = _split_label(text)
             if label_body:
                 _add_run(paragraph, label_body[0], prototypes["core"], 0)
-                separator = " - " if re.search(r"\s+-\s+", text) else " "
-                _add_run(paragraph, separator + label_body[1], prototypes["core"], 1)
+                _add_run(paragraph, label_body[1], prototypes["core"], 1)
             else:
                 _add_run(paragraph, text, prototypes["core"], 1)
         # Education and Qualifications are compact master lines, not
@@ -528,7 +527,7 @@ def _add_block(
             label_body = _split_label(text)
             if label_body:
                 _add_run(paragraph, label_body[0], prototypes["bullet"], 0)
-                _add_run(paragraph, " " + label_body[1], prototypes["bullet"], 1)
+                _add_run(paragraph, label_body[1], prototypes["bullet"], 1)
             else:
                 _add_run(paragraph, text, prototypes["bullet"])
         elif block_type == "signoff" or section in {"date", "recipient", "signoff"}:
