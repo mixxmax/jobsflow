@@ -17,7 +17,13 @@ from urllib.parse import urlparse
 from tools.job_materials.filename_policy import build_filename_stem
 
 
-PUBLISHER_TYPES = {"employer", "recruiter", "unknown"}
+# Keep this vocabulary in one place.  A number of downstream consumers use the
+# publisher/employer boundary to decide whether a name may appear in an
+# outbound filename or recipient line.  Treating only ``recruiter`` and
+# ``agency`` as recruiter-like creates a silent leak for staffing/search-firm
+# records.
+RECRUITER_TYPES = frozenset({"recruiter", "agency", "staffing", "search_firm"})
+PUBLISHER_TYPES = {"employer", *RECRUITER_TYPES, "unknown"}
 
 # Bump when classification signals or resolution rules change; the version is
 # recorded in entity contracts and cache keys so stale classifications and
@@ -202,11 +208,13 @@ def classify_publisher(
     explicit_employer = _clean(
         employer_name
         or research.get("employer_name")
+        or research.get("company_out")
+        or research.get("application_target")
         or publisher_record.get("employer_name")
     )
     client_from_jd = extract_disclosed_employer(jd_text)
     employer = explicit_employer or client_from_jd
-    if explicit_type in {"recruiter", "agency", "staffing", "search_firm"} and employer and publisher and _norm(employer) == _norm(publisher):
+    if explicit_type in RECRUITER_TYPES and employer and publisher and _norm(employer) == _norm(publisher):
         # The publisher's own name is not a verified client. Treat an explicit
         # same-name employer as undisclosed instead of externalizing the agency.
         employer = ""
@@ -265,13 +273,13 @@ def classify_publisher(
     # the agency as the employer.
     if kind == "employer" and not employer:
         employer = publisher
-    if kind != "recruiter" and employer and not publisher:
+    if kind not in RECRUITER_TYPES and employer and not publisher:
         publisher = employer
 
     # An unresolved relationship must not produce a named outbound target,
     # even if an inconsistent input happens to contain an employer field.
     application_target = employer if kind != "unknown" and employer else ""
-    if kind == "recruiter" and not employer:
+    if kind in RECRUITER_TYPES and not employer:
         target_label = "undisclosed client"
     elif application_target:
         target_label = application_target
@@ -288,7 +296,7 @@ def classify_publisher(
         "confidence": confidence,
         "signals": signals,
         "source_url": source,
-        "agency_name_must_not_be_externalized": kind == "recruiter",
+        "agency_name_must_not_be_externalized": kind in RECRUITER_TYPES,
         "cover_letter_company_policy": (
             "name_verified_employer_only"
             if application_target
@@ -350,7 +358,7 @@ def build_material_filenames(
         separator="_",
     )
     stem = str(stem_info.get("stem") or "Application")
-    omitted = publisher if kind == "recruiter" and publisher else ""
+    omitted = publisher if kind in RECRUITER_TYPES and publisher else ""
     return {
         "cv_docx": f"{stem}_CV.docx",
         "cover_letter_docx": f"{stem}_Cover_Letter.docx",

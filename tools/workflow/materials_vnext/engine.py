@@ -79,6 +79,25 @@ def _artifact_hashes(package: Path, names: dict[str, str]) -> dict[str, str]:
     return {name: _file_hash(Path(package) / name) for name in (names.get("cv_docx"), names.get("cl_docx"), names.get("cv_pdf"), names.get("cl_pdf"), "application_email.txt") if name}
 
 
+def _format_artifacts_current(package: Path, workspace: Path, run: dict[str, Any]) -> bool:
+    """Check the immutable mechanical receipt without rerunning a gate."""
+
+    try:
+        from tools.workflow.materials_renderer import expected_filenames
+
+        names = expected_filenames(package, workspace)
+        report = load_json(state_dir(package) / "format_report.json")
+        receipt = load_json(state_dir(package) / "artifact_hashes.json")
+        return bool(
+            report.get("format_passed")
+            and receipt.get("generation_id") == run.get("generation_id")
+            and receipt.get("canonical_sha256") == run.get("canonical_sha256")
+            and receipt.get("files") == _artifact_hashes(package, names)
+        )
+    except (OSError, ValueError, RuntimeError, TypeError):
+        return False
+
+
 def _package(workspace: Path, job_id: str) -> Path:
     from tools.workflow.package_context import PackageContextLoader
 
@@ -521,7 +540,7 @@ class MaterialsEngine:
             scope = text(payload.get("scope") or "all").casefold()
             if scope not in {"audit", "draft", "render", "all"}:
                 scope = "all"
-            out = reset(package, scope=scope)
+            out = reset(package, scope=scope, workspace=Path(workspace), job_id=job_id)
             target_phase = {
                 "audit": "content_audit_pending",
                 "draft": "plan_ready",
@@ -715,13 +734,35 @@ class MaterialsEngine:
         if stage in {"render", "docx", "docx_generated"}:
             if not audit_current(package, run):
                 return {"status": "blocked", "blockers": ["content_audit_not_current"], "engine": "materials-vnext", "after_state": run.get("phase")}
+            current_phase = str(run.get("phase") or "")
+            if current_phase in {"pdf_generated", "format_passed", "apply_ready"}:
+                # A late retry must never regenerate DOCX and then report a
+                # backward phase.  Reuse a current render; if it is missing or
+                # stale, require the explicit render reset before rebuilding.
+                from tools.workflow.materials_renderer import render_artifacts_current
+
+                if not render_artifacts_current(package, Path(workspace)):
+                    return {
+                        "status": "blocked",
+                        "after_state": current_phase,
+                        "blockers": ["render_rebuild_requires_reset"],
+                        "next_action": "materials reset --scope render --confirm-reset",
+                        "engine": "materials-vnext",
+                    }
+                return {
+                    "status": "succeeded",
+                    "after_state": current_phase,
+                    "render": {"status": "cached", "idempotent": True},
+                    "idempotent": True,
+                    "engine": "materials-vnext",
+                }
             try:
                 from tools.workflow.materials_renderer import render_canonical_docx
 
                 rendered = render_canonical_docx(package, Path(workspace), force=bool(payload.get("force")))
             except (OSError, ValueError, RuntimeError) as exc:
                 return {"status": "blocked", "blockers": ["docx_render_failed"], "error": str(exc), "engine": "materials-vnext"}
-            run.update({"phase": "docx_generated"})
+            run.update({"phase": current_phase if current_phase == "docx_generated" else "docx_generated"})
             save_run(package, run)
             _write_email(package, bundle)
             return {
@@ -790,7 +831,25 @@ class MaterialsEngine:
             return {"status": "succeeded", "after_state": "pdf_generated", "conversion": converted, "engine": "materials-vnext"}
 
         if stage in {"format", "mechanical_format"}:
-            if run.get("phase") not in {"pdf_generated", "format_passed"}:
+            current_phase = str(run.get("phase") or "")
+            if current_phase in {"format_passed", "apply_ready"}:
+                if not _format_artifacts_current(package, Path(workspace), run):
+                    return {
+                        "status": "blocked",
+                        "after_state": current_phase,
+                        "blockers": ["format_recheck_requires_render_reset"],
+                        "next_action": "materials reset --scope render --confirm-reset",
+                        "engine": "materials-vnext",
+                    }
+                return {
+                    "status": "succeeded",
+                    "after_state": current_phase,
+                    "format": {"status": "cached", "idempotent": True},
+                    "format_passed": True,
+                    "idempotent": True,
+                    "engine": "materials-vnext",
+                }
+            if current_phase not in {"pdf_generated"}:
                 return {"status": "blocked", "blockers": ["pdf_not_generated"], "engine": "materials-vnext", "after_state": run.get("phase")}
             try:
                 from tools.workflow.materials_renderer import mechanical_format_gate

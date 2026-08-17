@@ -12,8 +12,8 @@ python3 -m tools.workflow materials --job-id C0-005
 
 如果包内检测到旧材料链状态（例如旧的 `apply_ready`、`materials_run.json` 或旧
 canonical 产物），入口会返回 `legacy_material_state_requires_vnext_reset`，并给出
-reset preview/confirm 命令。模型不得自行删除文件或绕过状态机；必须先把 blocker
-报告给用户，得到明确确认后，才可执行 `materials reset --scope all --confirm-reset`。
+reset preview/confirm 命令。模型不得自行删除文件或绕过状态机；所有 reset scope（包括
+破坏性最大的 `all`）都必须先 preview，只有明确带 `--confirm-reset` 才能执行。
 
 缺完整 JD、事实、assessment、preflight 或正式岗位编号时必须停止。扫描阶段不生成材料，用户
 明确入表后才可按永久编号制作。
@@ -124,9 +124,17 @@ python3 -m tools.workflow apply --job-id C0-005
 
 ```bash
 python3 -m tools.workflow materials status --job-id C0-005
+python3 -m tools.workflow materials reset --job-id C0-005 --scope render
+python3 -m tools.workflow materials reset --job-id C0-005 --scope render --confirm-reset
 python3 -m tools.workflow materials reset --job-id C0-005 --scope all --confirm-reset
 python3 -m tools.workflow materials batch --jobs C0-005 C1-006 --batch-action pdf --max-workers 3
 ```
+
+`audit` 只归档旧审计/修复交接，保留 canonical；`render` 只归档本轮已登记的
+DOCX/PDF、email 和机械回执；`draft` 归档 canonical、transform、修复和下游产物，
+保留冻结的 bundle/baseline/plan 并等待新的 bounded transform；`all` 归档整代状态。
+未被当前 render receipt 或 artifact receipt 登记的用户附件不会因为扩展名是 DOCX/PDF
+而被批量移动。
 
 独立 worker 通过 `JOBSFLOW_AUDITOR_FAST_COMMAND`、`JOBSFLOW_AUDITOR_STRONG_COMMAND` 或兼容的
 `JOBSFLOW_AUDITOR_COMMAND` 配置。系统自动调用，不向用户逐次确认。没有 provider 时返回

@@ -45,7 +45,9 @@ def run_preflight(*, bundle: dict[str, Any], canonical: dict[str, Any], effectiv
     entity = bundle.get("entity") if isinstance(bundle.get("entity"), dict) else {}
     role = text(entity.get("role_primary"))
     publisher = text(entity.get("publisher_name"))
-    recruiter = text(entity.get("publisher_type")).casefold() in {"recruiter", "agency", "staffing", "search_firm"}
+    from tools.job_materials.publisher import RECRUITER_TYPES
+
+    recruiter = text(entity.get("publisher_type")).casefold() in RECRUITER_TYPES
     baseline = bundle.get("baseline") if isinstance(bundle.get("baseline"), dict) else {}
     texts = _texts(canonical)
     operations = []

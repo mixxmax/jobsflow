@@ -114,7 +114,9 @@ def _entity(ctx: MaterialsContext) -> JobEntity:
     # A recruiter is a publisher, never the application target.  If the
     # client is undisclosed, keep the target neutral and do not leak the
     # agency name into the outbound entity.
-    if publisher_type in {"recruiter", "agency", "staffing", "search_firm"}:
+    from tools.job_materials.publisher import RECRUITER_TYPES
+
+    if publisher_type in RECRUITER_TYPES:
         application_target = employer or "Hiring Team"
         boundary = "recruiter_client_undisclosed" if not employer else "recruiter_to_employer"
     else:

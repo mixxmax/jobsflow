@@ -385,6 +385,12 @@ def test_vnext_render_reset_preserves_canonical_and_audit_then_allows_rerender(t
     run_before = load_run(package)
     canonical_before = (package / "materials_vnext" / "canonical.json").read_bytes()
     audit_before = (package / "materials_vnext" / "audit_result.json").read_bytes()
+    rendered_names = set(
+        json.loads((package / "materials_render_receipt.json").read_text(encoding="utf-8"))
+        .get("filenames", {}).values()
+    )
+    user_attachment = package / "user-provided-attachment.docx"
+    user_attachment.write_bytes(b"not a generated artifact")
     assert run_before["phase"] == "format_passed"
     assert any(path.suffix == ".docx" for path in package.iterdir())
     assert any(path.suffix == ".pdf" for path in package.iterdir())
@@ -402,9 +408,12 @@ def test_vnext_render_reset_preserves_canonical_and_audit_then_allows_rerender(t
     assert load_run(package)["generation_id"] == run_before["generation_id"]
     assert (package / "materials_vnext" / "canonical.json").read_bytes() == canonical_before
     assert (package / "materials_vnext" / "audit_result.json").read_bytes() == audit_before
-    assert not any(path.suffix in {".docx", ".pdf"} for path in package.iterdir())
+    assert not any((package / name).exists() for name in rendered_names)
     assert not (package / "materials_render_receipt.json").exists()
     assert not (package / "materials_format_report.json").exists()
+    assert not (package / "materials_vnext" / "format_report.json").exists()
+    assert not (package / "materials_vnext" / "artifact_hashes.json").exists()
+    assert user_attachment.is_file()
 
     rendered = dispatch(
         "materials",

@@ -65,7 +65,9 @@ def audit_outbound(package: Path) -> dict[str, Any]:
     publisher_type = str(job.get("publisher_type") or "unknown").casefold()
     publisher_name = str(job.get("publisher_name") or "").strip()
     findings: list[dict[str, Any]] = []
-    if not role or not employer or publisher_type == "unknown":
+    from tools.job_materials.publisher import RECRUITER_TYPES
+
+    if not role or publisher_type == "unknown" or (publisher_type not in RECRUITER_TYPES and not employer):
         findings.append({"rule_id": "MAT-004", "severity": "P0", "code": "entity_contract_incomplete"})
 
     found = discover_outbound(package)
@@ -78,7 +80,7 @@ def audit_outbound(package: Path) -> dict[str, Any]:
         if path is None or not _text(Path(path)).strip():
             findings.append({"rule_id": "MAT-004", "severity": "P0", "code": f"independent_missing_{label}"})
 
-    recruiter_needle = _fold(publisher_name) if publisher_type in {"recruiter", "agency"} else ""
+    recruiter_needle = _fold(publisher_name) if publisher_type in RECRUITER_TYPES else ""
     for path in all_outbound_files(package):
         path = Path(path)
         text = _text(path)

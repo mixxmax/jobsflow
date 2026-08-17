@@ -14,6 +14,7 @@ from tools.io_utils import atomic_write_json, atomic_write_stream
 from tools.job_urls import normalize_job_url
 from tools.spreadsheet_safety import neutralize_spreadsheet_formula
 from tools.fresh_24h.batch_mark import BEIGE_RGB, demote_previous_batch
+from tools.workflow.tracker_formats import apply_material_status_formats
 
 
 def rows_digest(rows: list[dict[str, Any]], *, title: str = "", headers: list[str] | None = None) -> str:
@@ -187,9 +188,22 @@ def _format_entry_rows(
             }
         )
     if not requests:
-        return False
-    spreadsheet.batch_update({"requests": requests})
-    return True
+        formatted = False
+    else:
+        spreadsheet.batch_update({"requests": requests})
+        formatted = True
+    # The V-column dropdown and row-level 已投递 rule are initialized through
+    # the same workflow path as beige batch formatting.  This is deliberately
+    # called for both creation and later append/migration writes: the helper
+    # replaces validation idempotently and avoids duplicate green rules when
+    # Sheets metadata is available.
+    status_result = apply_material_status_formats(
+        spreadsheet,
+        ws,
+        headers,
+        total_rows=total_rows,
+    )
+    return bool(formatted or status_result.get("applied"))
 
 
 @dataclass
@@ -694,13 +708,34 @@ class GSheetFreshStore:
                 cols=max(30, len(base)),
             )
             self._worksheet.update([base], value_input_option="RAW")
+            # The first fresh24 tab creation is the canonical format boundary:
+            # initialize the status dropdown and row-level 已投递 rule before
+            # any entry rows are inserted.  Later append/migration paths also
+            # call _format_entry_rows, so they preserve the same contract.
+            _format_entry_rows(
+                self._worksheet,
+                headers=base,
+                total_rows=0,
+            )
         return self._worksheet
 
+    @staticmethod
+    def _default_headers() -> list[str]:
+        from tools.fresh_24h.careerops_quickscore import SHEET_HEADERS
+
+        return list(SHEET_HEADERS)
+
     def read_active(self) -> FreshSnapshot:
-        ws = self._ensure_worksheet()
+        # A preview/confirmation proposal must not create a remote worksheet.
+        # The first actual append or protected replacement calls
+        # _ensure_worksheet(), which is the single format-initialization
+        # boundary for the day's fresh24 tab.
+        if self._worksheet is None:
+            return FreshSnapshot(title=self.title, headers=self._default_headers(), rows=[])
+        ws = self._worksheet
         values = ws.get_all_values()
         if not values:
-            return FreshSnapshot(title=self.title, headers=[], rows=[])
+            return FreshSnapshot(title=self.title, headers=self._default_headers(), rows=[])
         headers = list(values[0])
         rows = [dict(zip(headers, row + [""] * max(0, len(headers) - len(row)))) for row in values[1:]]
         return FreshSnapshot(title=self.title, headers=headers, rows=rows)

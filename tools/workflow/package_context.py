@@ -290,11 +290,15 @@ class PackageContextLoader:
         # A recruitment agency is a publisher, not the hiring employer.  The
         # agency's own name must never surface as the employer; only a
         # separately verified company_out/employer_name is eligible.
-        if ctx.publisher_type in {"recruiter", "agency"}:
+        from tools.job_materials.publisher import RECRUITER_TYPES
+
+        if ctx.publisher_type in RECRUITER_TYPES:
             # An explicit recruiter research record with an empty employer is
             # an authoritative undisclosed-client decision. Do not resurrect
             # a stale company_out/employer_name from the tracker manifest.
-            if isinstance(research, dict) and "employer_name" in research:
+            if isinstance(research, dict) and any(
+                key in research for key in ("employer_name", "company_out", "application_target")
+            ):
                 ctx.employer_name = str(
                     research.get("company_out") or research.get("employer_name") or research.get("application_target") or ""
                 )

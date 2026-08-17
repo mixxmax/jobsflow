@@ -308,6 +308,36 @@ def test_cli_allows_scoped_reset_only_for_existing_vnext_runs(tmp_path, capsys):
     assert confirmed["scope"] == "render"
 
 
+def test_cli_all_reset_is_preview_first_and_requires_confirmation(tmp_path, capsys):
+    from tools.workflow.__main__ import main
+
+    workspace = build_workspace(tmp_path)
+    package = build_package(workspace, "C0-001", with_outbound=False)
+    assert main(["materials", "run", "--workspace", str(workspace), "--job-id", "C0-001"]) == 0
+    capsys.readouterr()
+
+    assert main(
+        [
+            "materials", "reset", "--workspace", str(workspace),
+            "--job-id", "C0-001", "--scope", "all",
+        ]
+    ) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["status"] == "preview"
+    assert preview["requires_confirmation"] is True
+    assert (package / "materials_vnext").is_dir()
+
+    assert main(
+        [
+            "materials", "reset", "--workspace", str(workspace),
+            "--job-id", "C0-001", "--scope", "all", "--confirm-reset",
+        ]
+    ) == 0
+    confirmed = json.loads(capsys.readouterr().out)
+    assert confirmed["status"] == "reset"
+    assert not (package / "materials_vnext").exists()
+
+
 def test_cli_rejects_materials_files_on_commands_that_would_ignore_them(tmp_path, capsys):
     from tools.workflow.__main__ import main
 

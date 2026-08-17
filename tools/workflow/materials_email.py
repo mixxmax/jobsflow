@@ -15,6 +15,7 @@ from typing import Any
 
 from tools.io_utils import atomic_write_json, atomic_write_text
 from tools.job_materials.manifest import load_job_manifest
+from tools.job_materials.publisher import RECRUITER_TYPES
 
 EMAIL_NAME = "application_email.txt"
 EMAIL_RECEIPT_NAME = "materials_email_receipt.json"
@@ -60,13 +61,15 @@ def render_application_email(package: Path, workspace: Path) -> dict[str, Any]:
     # A recruitment agency is a publisher, not the hiring employer.  The
     # agency's own name must never appear as the recipient/company line; only
     # a separately verified employer (company_out/employer_name) is eligible.
-    if publisher_type in {"recruiter", "agency"}:
-        employer = _clean(
-            research.get("company_out")
-            or research.get("employer_name")
-            or job.get("company_out")
-            or job.get("employer_name")
-        )
+    if publisher_type in RECRUITER_TYPES:
+        if any(key in research for key in ("company_out", "employer_name", "application_target")):
+            employer = _clean(
+                research.get("company_out")
+                or research.get("employer_name")
+                or research.get("application_target")
+            )
+        else:
+            employer = _clean(job.get("company_out") or job.get("employer_name"))
     else:
         employer = _clean(
             research.get("company_out")

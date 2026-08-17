@@ -14,6 +14,7 @@ from tools.workflow.materials_schema import (
     NEGATIVE_SELF_DISCLOSURE_PATTERNS,
 )
 from tools.workflow.materials_state import compute_apply_ready
+from tools.job_materials.publisher import RECRUITER_TYPES
 
 _DIRECT_RE = re.compile("|".join(DIRECT_CLAIM_PATTERNS), re.I)
 _PLACEHOLDER_RE = re.compile("|".join(PLACEHOLDER_PATTERNS), re.I)
@@ -73,7 +74,7 @@ def validate_materials_packet(
     outbound = packet.get("outbound") or {}
     publisher_type = str(packet.get("publisher_type") or "")
     publisher_name = _norm(packet.get("publisher_name"))
-    if publisher_type in {"recruiter", "agency"} and publisher_name:
+    if publisher_type in RECRUITER_TYPES and publisher_name:
         needle = _folded(publisher_name)
         for field in ("cv_filename", "cl_filename"):
             if needle and needle in _folded(outbound.get(field)):

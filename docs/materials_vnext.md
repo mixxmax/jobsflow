@@ -80,7 +80,26 @@ strong command can be supplied through `JOBSFLOW_AUDITOR_FAST_COMMAND` and
 
 ## Recovery
 
-`materials reset --confirm-reset` archives the entire vNext generation and
-known derived outputs together, including the old entity-state projection.
-It never deletes the JD, profile or lane masters. A new generation cannot mix
-an old bundle with a new JD, role or master.
+Reset is always preview-first, including the destructive `all` scope:
+
+```bash
+python3 -m tools.workflow materials reset --job-id <JOB-ID> --scope all
+python3 -m tools.workflow materials reset --job-id <JOB-ID> --scope all --confirm-reset
+```
+
+The scoped meanings are fixed:
+
+- `audit`: archives the audit result/task and repair handoff, while retaining the
+  canonical CV/CL for a fresh content audit;
+- `render`: archives only the current render receipt, mechanical receipts,
+  deterministic email and artifacts registered by those receipts; it preserves
+  canonical content and the audit;
+- `draft`: archives canonical, original/effective transforms, repair state and
+  all downstream artifacts, while retaining the frozen bundle/baseline/plan and
+  requiring a new bounded transform;
+- `all`: archives the whole generation and rewinds the matching entity state.
+
+Unregistered user DOCX/PDF attachments are not swept merely because of their
+file extension. Every confirmed reset archives rather than silently deletes the
+previous generation, and never touches the JD, profile or lane masters. A new
+generation cannot mix an old bundle with a new JD, role or master.

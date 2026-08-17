@@ -7,6 +7,10 @@ from pathlib import Path
 
 from tools.workflow.fresh_store import FreshSnapshot, GSheetFreshStore, MemoryFreshStore
 from tools.workflow.sync import SyncCoordinator
+from tools.workflow.tracker_formats import (
+    MATERIAL_STATUS_OPTIONS,
+    build_material_status_format_requests,
+)
 from tools.workflow.engine import dispatch
 from tools.workflow.adapters.scan import write_run_record
 from tools.workflow.__main__ import main as workflow_main
@@ -166,7 +170,20 @@ def test_gsheet_append_path_inserts_rows_without_clear_or_full_update():
 
 
 def test_gsheet_entry_append_demotes_old_batch_and_formats_new_rows():
-    headers = ["岗位编号", "职位", "公司", "链接", "CareerOps分数", "本轮新增", "批次", "入表时间", "行号"]
+    headers = [f"字段{i}" for i in range(28)]
+    for index, name in {
+        0: "岗位编号",
+        1: "职位",
+        2: "公司",
+        3: "链接",
+        4: "CareerOps分数",
+        5: "本轮新增",
+        6: "批次",
+        7: "入表时间",
+        8: "行号",
+        21: "材料状态",
+    }.items():
+        headers[index] = name
     old = {
         "岗位编号": "C0-001",
         "职位": "Old",
@@ -207,6 +224,101 @@ def test_gsheet_entry_append_demotes_old_batch_and_formats_new_rows():
         == {"red": 1.0, "green": 0.95, "blue": 0.8}
         for request in store.worksheet.spreadsheet.format_requests[0]["requests"]
     )
+    status_payloads = [
+        payload
+        for payload in store.worksheet.spreadsheet.format_requests
+        if any("setDataValidation" in request for request in payload["requests"])
+    ]
+    assert len(status_payloads) == 1
+    status_requests = status_payloads[0]["requests"]
+    validation = next(item["setDataValidation"] for item in status_requests)
+    assert validation["range"]["startColumnIndex"] == 21  # column V
+    assert [
+        item["userEnteredValue"]
+        for item in validation["rule"]["condition"]["values"]
+    ] == list(MATERIAL_STATUS_OPTIONS)
+    green_rule = next(
+        item["addConditionalFormatRule"]
+        for item in status_requests
+        if "addConditionalFormatRule" in item
+    )
+    assert green_rule["rule"]["booleanRule"]["condition"]["values"] == [
+        {"userEnteredValue": '=$V2="已投递"'}
+    ]
+
+
+def test_material_status_format_contract_is_fixed_to_column_v():
+    headers = [f"字段{i}" for i in range(28)]
+    headers[21] = "材料状态"
+    requests = build_material_status_format_requests(
+        sheet_id=77,
+        headers=headers,
+        total_rows=4,
+    )
+    validation = requests[0]["setDataValidation"]
+    assert validation["range"] == {
+        "sheetId": 77,
+        "startRowIndex": 1,
+        "endRowIndex": 100,
+        "startColumnIndex": 21,
+        "endColumnIndex": 22,
+    }
+    assert any("addConditionalFormatRule" in request for request in requests)
+
+
+def test_first_fresh_sheet_creation_initializes_status_contract():
+    headers = [f"字段{i}" for i in range(28)]
+    headers[21] = "材料状态"
+
+    class CreatingWorksheet:
+        id = 88
+
+        def __init__(self, spreadsheet):
+            self.spreadsheet = spreadsheet
+            self.updated = []
+
+        def update(self, values, **kwargs):
+            self.updated.append((values, kwargs))
+
+    class CreatingSpreadsheet(FakeSpreadsheet):
+        def add_worksheet(self, **kwargs):
+            self.created = kwargs
+            self.worksheet = CreatingWorksheet(self)
+            return self.worksheet
+
+    store = object.__new__(GSheetFreshStore)
+    store.title = "fresh_24h_2026-08-17"
+    store._worksheet = None
+    store._spreadsheet = CreatingSpreadsheet()
+    worksheet = store._ensure_worksheet(headers)
+
+    assert worksheet is store._spreadsheet.worksheet
+    assert store._spreadsheet.created["title"] == "fresh_24h_2026-08-17"
+    assert any(
+        "setDataValidation" in request
+        for payload in store._spreadsheet.format_requests
+        for request in payload["requests"]
+    )
+
+
+def test_gsheet_preview_read_does_not_create_empty_tab():
+    class NoCreateSpreadsheet:
+        def __init__(self):
+            self.created = False
+
+        def add_worksheet(self, **kwargs):
+            self.created = True
+            raise AssertionError("preview must not create a worksheet")
+
+    store = object.__new__(GSheetFreshStore)
+    store.title = "fresh_24h_2026-08-17"
+    store._worksheet = None
+    store._spreadsheet = NoCreateSpreadsheet()
+    snapshot = store.read_active()
+
+    assert snapshot.rows == []
+    assert snapshot.headers[21] == "材料状态"
+    assert store._spreadsheet.created is False
 
 
 def test_remote_change_is_not_silently_overwritten(tmp_path):

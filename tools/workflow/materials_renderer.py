@@ -615,6 +615,27 @@ def _receipt_current(
     return True
 
 
+def render_artifacts_current(package: Path, workspace: Path) -> bool:
+    """Return whether the existing DOCX render is safe to reuse.
+
+    This is deliberately read-only.  The vNext engine uses it before allowing
+    a late ``render`` retry from a PDF/format/apply phase; calling the renderer
+    itself there could archive valid artifacts and then regress the run phase.
+    """
+
+    package = Path(package)
+    try:
+        draft = load_canonical_draft(package)
+        if not draft:
+            return False
+        names = expected_filenames(package, Path(workspace))
+        templates = _template_paths(package, Path(workspace))
+        digest = str(draft.get("canonical_sha256") or canonical_digest(draft))
+        return _receipt_current(package, names, digest, templates)
+    except (OSError, ValueError, RuntimeError, TypeError):
+        return False
+
+
 def render_canonical_docx(package: Path, workspace: Path, *, force: bool = False) -> dict[str, Any]:
     package = Path(package)
     draft = load_canonical_draft(package)

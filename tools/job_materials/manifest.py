@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.io_utils import atomic_write_json
-from tools.job_materials.publisher import classify_publisher
+from tools.job_materials.publisher import RECRUITER_TYPES, classify_publisher
 from tools.job_materials.role_titles import (
     build_role_title_contract,
     normalize_role_for_material,
@@ -193,7 +193,7 @@ def reconcile_package_metadata(root: Path, package: Path) -> dict[str, Any]:
     researched_job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
     if research:
         research_type = _clean(research.get("publisher_type") or research.get("type"))
-        explicit_recruiter = research_type.casefold() in {"recruiter", "agency", "staffing", "search_firm"}
+        explicit_recruiter = research_type.casefold() in RECRUITER_TYPES
         for field, keys in {
             "publisher_type": ("publisher_type", "type"),
             "publisher_name": ("publisher_name", "publisher"),
@@ -203,16 +203,16 @@ def reconcile_package_metadata(root: Path, package: Path) -> dict[str, Any]:
             value = next((_clean(research.get(key)) for key in keys if _clean(research.get(key))), "")
             # For an explicitly recruiter-owned research record, an empty
             # employer is an authoritative undisclosed-client decision and
-            # must erase stale outbound projections from an earlier run.
-            if explicit_recruiter and field in {"company_out", "employer_name"}:
-                value = ""
+            # must erase stale outbound projections from an earlier run.  A
+            # non-empty value is a verified disclosed client and must survive.
             if researched_job.get(field) != value:
                 researched_job[field] = value
                 changed = True
         if explicit_recruiter:
             outbound = manifest.get("outbound") if isinstance(manifest.get("outbound"), dict) else {}
-            if outbound.get("company_name"):
-                outbound["company_name"] = ""
+            verified_employer = _clean(researched_job.get("company_out") or researched_job.get("employer_name"))
+            if outbound.get("company_name") != verified_employer:
+                outbound["company_name"] = verified_employer
                 manifest["outbound"] = outbound
                 changed = True
         manifest["job"] = researched_job
@@ -231,7 +231,10 @@ def reconcile_package_metadata(root: Path, package: Path) -> dict[str, Any]:
             # ``Company`` means the verified hiring employer.  A recruiter is
             # shown separately as ``Publisher`` and is never silently copied
             # into the company field.
-            "Company": _clean(job.get("company_out") or job.get("employer_name") or job.get("company_source")) or "未披露公司",
+            # Never fall back to company_source for an undisclosed recruiter;
+            # that field is often the agency's display name.  A disclosed
+            # client remains eligible and is already present in company_out.
+            "Company": _clean(job.get("company_out") or job.get("employer_name")) or "未披露公司",
             "Publisher": _clean(job.get("publisher_name")) or "未披露公司",
             "Publisher Type": _clean(job.get("publisher_type")) or "unknown",
             "Employer": _clean(job.get("employer_name")) or "—",
@@ -337,13 +340,21 @@ def build_job_manifest(
     research = _package_company_research(package)
     research_type = _clean(research.get("publisher_type"))
     research_publisher = _clean(research.get("publisher_name"))
-    research_employer = _clean(research.get("employer_name"))
-    research_company = _clean(research.get("company") or research.get("company_out"))
+    research_employer = _clean(
+        research.get("employer_name")
+        or research.get("company_out")
+        or research.get("application_target")
+    )
+    research_company = _clean(
+        research.get("company")
+        or research.get("company_out")
+        or research.get("application_target")
+    )
     if research_type and research_type.casefold() != "unknown":
         publisher_type = research_type
     if research_publisher:
         publisher_name = research_publisher
-    if research_type.casefold() in {"recruiter", "agency", "staffing", "search_firm"}:
+    if research_type.casefold() in RECRUITER_TYPES:
         # An explicit recruiter record owns the empty employer decision; never
         # retain a stale row-level employer/company value.
         employer_name = research_employer
@@ -473,7 +484,7 @@ def build_job_manifest(
         },
         "outbound": {
             "company_name": company_out,
-            "publisher_name_omitted": bool(classification.get("publisher_type") == "recruiter"),
+            "publisher_name_omitted": bool(classification.get("publisher_type") in RECRUITER_TYPES),
             "filename_policy": "verified employer only; never use unresolved publisher",
             "material_language": _row_value(row, "材料语言", "material_language") or "en",
         },

@@ -16,8 +16,11 @@ from tools.workflow.materials_renderer import (
 from tools.workflow.materials_vnext.baseline import compile_baseline
 from tools.workflow.materials_vnext.bundle import bundle_path
 from tools.workflow.materials_vnext.engine import MaterialsEngine
+from tools.workflow.materials_vnext.transform import normalize_transform_operations
 from tools.workflow.package_context import PackageContextLoader
 from tools.workflow.testing_packages import build_package, build_workspace, prepare_package_for_apply
+from tools.workflow.engine import dispatch
+from tools.workflow.materials_vnext.store import append_patch, load_run
 
 
 def _plan_and_bundle(ws, package):
@@ -240,3 +243,89 @@ def test_format_gate_rejects_docx_changed_after_render_receipt(tmp_path):
     report = mechanical_format_gate(package, ws)
     assert report["status"] == "failed"
     assert any(item["code"] == "render_receipt_hash_mismatch" for item in report["findings"])
+
+
+def test_sparse_transform_infers_material_from_real_base_ids(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    bundle = _plan_and_bundle(ws, package)
+    cv = next(item for item in bundle["baseline"]["cv"]["blocks"] if not item.get("host_managed"))
+    cl = next(item for item in bundle["baseline"]["cover_letter"]["blocks"] if not item.get("host_managed"))
+    operations, errors = normalize_transform_operations(
+        {
+            "operations": [
+                {"action": "replace", "target_id": cv["id"], "after_text": cv["text"] + " tailored"},
+                {"action": "replace", "target_id": cl["id"], "after_text": cl["text"] + " tailored"},
+            ]
+        },
+        bundle["baseline"],
+    )
+    assert errors == []
+    assert {item["material"] for item in operations} == {"cv", "cover_letter"}
+    assert next(item for item in operations if item["target_id"] == cv["id"])["material"] == "cv"
+    assert next(item for item in operations if item["target_id"] == cl["id"])["material"] == "cover_letter"
+
+
+def test_late_render_and_format_retries_are_cached_without_phase_regression(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws)
+    prepare_package_for_apply(ws)
+    before = load_run(package)
+    assert before["phase"] == "format_passed"
+
+    rerender = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "stage": "render"})
+    assert rerender["status"] == "succeeded"
+    assert rerender["after_state"] == "format_passed"
+    assert rerender["idempotent"] is True
+    assert load_run(package)["phase"] == "format_passed"
+
+    reformat = dispatch("format", workspace=ws, payload={"job_id": "C0-001"})
+    assert reformat["status"] == "succeeded"
+    assert reformat["after_state"] == "format_passed"
+    assert reformat["idempotent"] is True
+
+
+def test_late_render_with_missing_docx_requires_explicit_render_reset(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws)
+    prepare_package_for_apply(ws)
+    names = json.loads((package / "materials_render_receipt.json").read_text(encoding="utf-8"))["filenames"]
+    (package / names["cv_docx"]).unlink()
+    before = load_run(package)
+    out = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "stage": "render"})
+    assert out["status"] == "blocked"
+    assert out["blockers"] == ["render_rebuild_requires_reset"]
+    assert load_run(package)["phase"] == before["phase"] == "format_passed"
+
+
+def test_scoped_audit_reset_archives_repair_handoff_state(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws)
+    prepare_package_for_apply(ws)
+    append_patch(package, {"schema_version": 1, "operation": "test-repair"})
+    assert (package / "materials_vnext" / "repair_patches.jsonl").is_file()
+
+    reset = MaterialsEngine().handle(
+        {"job_id": "C0-001", "stage": "reset", "scope": "audit"},
+        workspace=ws,
+    )
+    assert reset["status"] == "reset"
+    assert not (package / "materials_vnext" / "repair_patches.jsonl").exists()
+    assert list((package / ".history").glob("materials-vnext-reset-audit-*/repair_patches.jsonl"))
+
+
+def test_draft_reset_archives_external_staging_contexts(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    planned = MaterialsEngine().handle({"job_id": "C0-001", "stage": "plan"}, workspace=ws)
+    assert planned["status"] == "succeeded"
+    staging = ws / "02_Tracker" / "workflow" / "materials_drafting_contexts" / "C0-001"
+    assert staging.is_dir()
+
+    reset = MaterialsEngine().handle(
+        {"job_id": "C0-001", "stage": "reset", "scope": "draft"},
+        workspace=ws,
+    )
+    assert reset["status"] == "reset"
+    assert not staging.exists()
+    assert list((package / ".history").glob("materials-vnext-reset-draft-*/materials_drafting_contexts/C0-001"))

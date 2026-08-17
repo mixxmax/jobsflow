@@ -141,6 +141,52 @@ def test_manifest_recruiter_research_clears_stale_employer_projection(tmp_path):
     assert reconciled["outbound"].get("company_name", "") == ""
 
 
+def test_manifest_recruiter_research_preserves_disclosed_client(tmp_path):
+    root = tmp_path / "JobSearch_2026"
+    package = root / "01_Masters" / "F_track" / "核心" / "F0-044_未投_Taylor_Root"
+    package.mkdir(parents=True)
+    stale = build_job_manifest(
+        root=root,
+        package=package,
+        row=_row(
+            **{
+                "岗位编号": "F0-044",
+                "公司": "Taylor Root",
+                "发布者": "Taylor Root",
+                "发布者类型": "recruiter",
+            }
+        ),
+        jd_text="Support capital markets transactions and due diligence.",
+    )
+    write_job_manifest(package, stale)
+    (package / "job_snapshot.md").write_text(
+        "Role: Compliance Officer\nCompany: Taylor Root\nPublisher: Taylor Root\nPublisher Type: recruiter\nEmployer: Taylor Root\n",
+        encoding="utf-8",
+    )
+    (package / "company_research.json").write_text(
+        json.dumps(
+            {
+                "publisher_type": "recruiter",
+                "publisher_name": "Taylor Root",
+                "employer_name": "Acme Holdings",
+                "company_out": "Acme Holdings",
+                "application_target": "Acme Holdings",
+                "quality": {"ready_for_tailoring": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    reconciled = reconcile_package_metadata(root, package)
+    assert reconciled["job"]["employer_name"] == "Acme Holdings"
+    assert reconciled["job"]["company_out"] == "Acme Holdings"
+    assert reconciled["outbound"]["company_name"] == "Acme Holdings"
+    snapshot = (package / "job_snapshot.md").read_text(encoding="utf-8")
+    assert "Company: Acme Holdings" in snapshot
+    assert "Company: Taylor Root" not in snapshot
+
+
     root = tmp_path / "JobSearch_2026"
     package = root / "01_Masters" / "A_track" / "核心" / "A0-021_未投_Acme"
     package.mkdir(parents=True)

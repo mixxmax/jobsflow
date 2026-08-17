@@ -79,6 +79,11 @@ and how to tailor the application without giving up final control.
 - **Lane and ID boundaries are explicit:** deep review locks a URL to one lane;
   scan previews have no persistent job ID. Only confirmed `/push` allocates the
   next lane/tier sequence and binds the tracker row to its package.
+- **Material status formatting is fixed:** when a fresh24 worksheet is first
+  created, code installs the V-column `材料状态` dropdown with fixed status
+  values. Choosing `已投递` turns the entire row green through conditional
+  formatting; later appends inherit this contract and models cannot choose the
+  column, options, or colors.
 
 - **Fewer wrong applications and fewer silent misses:** pass 1 schedules work;
   the full JD determines the final score, while insufficient-JD rows stay visible.
@@ -428,6 +433,9 @@ For an explicit entry, the confirmed batch is always placed at the top of the
 fresh tab (row 2), marked `本轮新增=是` with its batch and entry time, and
 highlighted beige in Google Sheets. Older batches are automatically marked
 `本轮新增=否` / `较早入表`; the model cannot change this ordering or styling.
+The same first-creation format contract adds the V-column material-status
+dropdown and the row-level green rule for `已投递`; local CSV preserves the
+status values but cannot display Sheets dropdowns or colors.
 
 Each package also has a private `job_manifest.json` hand-off contract. JobsFlow
 regenerates role/JD keywords, safe filenames and dependency fingerprints there,

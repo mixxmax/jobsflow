@@ -28,6 +28,8 @@ Usage examples:
 
 from __future__ import annotations
 
+from tools.job_materials.publisher import RECRUITER_TYPES
+
 import argparse
 import json
 import re
@@ -734,7 +736,7 @@ def cmd_company(args: argparse.Namespace) -> int:
         outbound = dict(manifest.get("outbound") or {})
         if job.get("company_out"):
             outbound["company_name"] = job["company_out"]
-        outbound["publisher_name_omitted"] = job.get("publisher_type") == "recruiter"
+        outbound["publisher_name_omitted"] = job.get("publisher_type") in RECRUITER_TYPES
         manifest["outbound"] = outbound
         write_job_manifest(package, manifest)
     print(

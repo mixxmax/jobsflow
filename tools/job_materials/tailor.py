@@ -22,7 +22,7 @@ from tools.io_utils import atomic_write_json, atomic_write_text
 from tools.job_materials.jd_store import jd_meta
 from tools.job_materials.llmo import build_llmo_contract
 from tools.job_materials.paths import find_latest_cl_master_docx, find_latest_master_docx
-from tools.job_materials.publisher import build_material_filenames, classify_publisher
+from tools.job_materials.publisher import RECRUITER_TYPES, build_material_filenames, classify_publisher
 from tools.job_materials.role_titles import build_role_title_contract
 from tools.fresh_24h.job_assessment import assessment_context
 
@@ -656,7 +656,7 @@ def build_tailored_payload(
     for signal in verified_signals:
         if not application_target or not isinstance(signal, dict):
             continue
-        if publisher_type == "recruiter":
+        if publisher_type in RECRUITER_TYPES:
             haystack = " ".join(
                 str(signal.get(key) or "")
                 for key in ("claim", "source_url", "source_type")
@@ -671,7 +671,7 @@ def build_tailored_payload(
         for angle in (research.get("interest_angles") or [])
         if str(angle).strip()
         and not (
-            publisher_type == "recruiter"
+            publisher_type in RECRUITER_TYPES
             and publisher_key
             and publisher_key
             in re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(angle).casefold())

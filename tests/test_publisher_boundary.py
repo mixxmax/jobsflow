@@ -91,6 +91,18 @@ def test_recruiter_classification_rejects_agency_as_its_own_employer():
     assert result["agency_name_must_not_be_externalized"] is True
 
 
+def test_staffing_and_search_firm_are_recruiter_boundaries():
+    for publisher_type in ("staffing", "search_firm"):
+        result = classify_publisher(
+            publisher_name="External Search",
+            publisher_type=publisher_type,
+            employer_name="",
+        )
+        assert result["publisher_type"] == publisher_type
+        assert result["application_target"] == ""
+        assert result["agency_name_must_not_be_externalized"] is True
+
+
 
     result = classify_publisher(
         publisher_name="Michael Page",

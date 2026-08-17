@@ -58,8 +58,9 @@ deterministic host artifact created after the CV/CL content audit.
 If a package contains a pre-vNext material generation, the gateway reports
 `legacy_material_state_requires_vnext_reset` with a preview and confirmation
 command. Agents must not delete legacy files or infer permission to reset;
-after explicit user confirmation they may invoke the fixed `--scope all`
-reset, which archives the old generation before retrying vNext.
+after explicit user confirmation they may invoke a scoped reset. Every scope,
+including `--scope all`, is preview-first; only the matching
+`--confirm-reset` command archives the old generation before retrying vNext.
 
 ## /scan 模式
 

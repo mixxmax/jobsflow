@@ -323,10 +323,25 @@ def main(argv: list[str] | None = None) -> int:
                         out.update(_materials_engine_info())
                     except (ImportError, RuntimeError) as exc:
                         out = {"status": "blocked", "job_id": args.job_id, "blockers": ["materials_engine_unavailable"], "error": str(exc)}
+            elif not args.confirm_reset:
+                # Every reset scope, including the destructive full-generation
+                # reset, is preview-first.  The old ``all`` branch invoked the
+                # engine immediately and therefore allowed a model or copied
+                # command to archive a live generation without confirmation.
+                out = {
+                    "status": "preview",
+                    "job_id": args.job_id,
+                    "scope": args.scope,
+                    "next_action": "repeat_with_--confirm-reset",
+                    "requires_confirmation": True,
+                }
             else:
                 from tools.workflow.materials_vnext import MaterialsEngine
 
-                out = MaterialsEngine().handle({"job_id": args.job_id, "stage": "reset"}, workspace=workspace)
+                out = MaterialsEngine().handle(
+                    {"job_id": args.job_id, "stage": "reset", "scope": args.scope},
+                    workspace=workspace,
+                )
                 try:
                     out.update(_materials_engine_info())
                 except (ImportError, RuntimeError) as exc:

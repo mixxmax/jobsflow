@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.job_materials.role_titles import build_role_title_contract
+from tools.job_materials.publisher import RECRUITER_TYPES
 
 
 REQUIRED_FILES = (
@@ -307,7 +308,7 @@ def validate_manifest_contract(
     company_token = _normalized_token(company_out)
     for path in outbound:
         name_token = _normalized_token(path.name)
-        if publisher_type == "recruiter" and publisher_token and publisher_token in name_token:
+        if publisher_type in RECRUITER_TYPES and publisher_token and publisher_token in name_token:
             errors.append(f"{path.name}: recruiter/agency name leaked into outbound filename")
         if path.suffix.lower() == ".pdf":
             page_limit = max_pages if "cover" in path.name.casefold() else None
@@ -318,7 +319,7 @@ def validate_manifest_contract(
             errors.append(f"{path.name}: could not read outbound material ({error})")
             continue
         if text:
-            if publisher_type == "recruiter" and publisher_token:
+            if publisher_type in RECRUITER_TYPES and publisher_token:
                 if publisher_token in _normalized_token(text):
                     errors.append(f"{path.name}: recruiter/agency name leaked into outbound text")
             if role and _normalized_token(role) not in _normalized_token(text):

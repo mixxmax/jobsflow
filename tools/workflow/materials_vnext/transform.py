@@ -98,10 +98,16 @@ def normalize_transform_operations(
         raw = []
     if not isinstance(additions, list):
         additions = []
-    blocks: list[dict[str, Any]] = []
+    # Baseline IDs are intentionally opaque (currently ``base-cv-*`` and
+    # ``base-cl-*``).  Do not infer the material from a prefix: a model-facing
+    # sparse response may omit ``material`` and must still be routed according
+    # to the frozen baseline's authoritative block map.
+    by_id: dict[str, tuple[str, dict[str, Any]]] = {}
     for material in MATERIALS:
-        blocks.extend((baseline.get(material) or {}).get("blocks") or [])
-    by_id = {text(item.get("id")): item for item in blocks if text(item.get("id"))}
+        for item in _blocks(baseline, material):
+            block_id = text(item.get("id"))
+            if block_id:
+                by_id[block_id] = (material, item)
 
     operations: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -111,13 +117,14 @@ def normalize_transform_operations(
             continue
         operation = dict(item)
         target_id = text(operation.get("target_id") or operation.get("block_id") or operation.get("baseline_id"))
-        block = by_id.get(target_id)
-        if block is None:
+        entry = by_id.get(target_id)
+        if entry is None:
             errors.append(f"operation_target_unresolvable:{index}:{target_id or ''}")
             continue
+        material, block = entry
         action = text(operation.get("action")).casefold()
         if not operation.get("material"):
-            operation["material"] = "cv" if target_id.startswith("cv-") else "cover_letter"
+            operation["material"] = material
         if action == "replace":
             before = text(operation.get("before_text"))
             if not before:
@@ -137,10 +144,11 @@ def normalize_transform_operations(
             continue
         anchor = text(item.get("after_id") or item.get("target_id"))
         if anchor and anchor in by_id:
+            material = by_id[anchor][0]
             operations.append(
                 {
                     "action": "append_after",
-                    "material": "cv" if anchor.startswith("cv-") else "cover_letter",
+                    "material": material,
                     "target_id": anchor,
                     "block": block,
                 }

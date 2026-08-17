@@ -174,7 +174,35 @@ def load_audit_result(package: Path) -> dict[str, Any]:
     return value or load(Path(package) / "materials_audit.json")
 
 
-def archive_known_outputs(package: Path, *, scope: str = "all") -> str:
+def _recorded_artifact_names(package: Path) -> set[str]:
+    """Return only artifacts registered by the current render generation.
+
+    Reset must not sweep arbitrary user attachments merely because they happen
+    to end in ``.docx`` or ``.pdf``.  The render receipt and artifact receipt
+    are the host-owned inventories; unregistered files remain in place.
+    """
+
+    names: set[str] = set()
+    for candidate in (
+        Path(package) / "materials_render_receipt.json",
+        Path(package) / "artifact_hashes.json",
+        state_dir(Path(package)) / "artifact_hashes.json",
+    ):
+        value = load(candidate)
+        files = value.get("filenames") if isinstance(value.get("filenames"), dict) else {}
+        names.update(str(item) for item in files.values() if str(item).strip())
+        hashes = value.get("files") if isinstance(value.get("files"), dict) else {}
+        names.update(str(item) for item in hashes if str(item).strip())
+    return names
+
+
+def archive_known_outputs(
+    package: Path,
+    *,
+    scope: str = "all",
+    workspace: Path | None = None,
+    job_id: str = "",
+) -> str:
     package = Path(package)
     allowed = {"audit", "draft", "render", "all"}
     if scope not in allowed:
@@ -184,22 +212,33 @@ def archive_known_outputs(package: Path, *, scope: str = "all") -> str:
         "materials_audit_evidence.json", "materials_repair_task.json",
         "materials_repair_receipt.json", "materials_audit_resolution.json",
     }
+    derived = {
+        "materials_draft.canonical.json", "materials_render_receipt.json",
+        "materials_format_report.json", "artifact_hashes.json",
+        "application_email.txt", "application_email.md",
+        "materials_plan.validated.json", "materials_task_packet.json",
+        "materials_transform.original.json", "materials_transform.original.meta.json",
+        "materials_transform.effective.json", "repair_patch.jsonl", "repair_patches.jsonl",
+        "materials_transform.json", "claim_contract.json",
+    }
     names = {
         "audit": common,
-        "draft": common | {"materials_draft.canonical.json", "materials_render_receipt.json", "materials_format_report.json", "artifact_hashes.json", "application_email.txt", "application_email.md"},
+        # A draft reset preserves the frozen bundle/baseline and plan, but
+        # archives every authoring/canonical/repair/render projection so an
+        # old response cannot be replayed accidentally.
+        "draft": common | derived,
         "render": {"materials_render_receipt.json", "materials_format_report.json", "artifact_hashes.json", "application_email.txt", "application_email.md"},
-        "all": common | {"materials_run.json", "materials_draft.canonical.json", "materials_render_receipt.json", "materials_format_report.json", "artifact_hashes.json", "application_email.txt", "application_email.md", "materials_plan.validated.json", "materials_task_packet.json", "materials_transform.original.json", "materials_transform.original.meta.json", "materials_transform.effective.json", "repair_patch.jsonl", "claim_contract.json"},
+        "all": common | derived | {"materials_run.json"},
     }[scope]
+    if scope in {"draft", "render", "all"}:
+        names |= _recorded_artifact_names(package)
     history = package / ".history" / f"materials-vnext-reset-{scope}-{uuid4().hex[:10]}"
-    candidates = [
-        path for path in package.iterdir()
-        if path.is_file() and (path.name in names or (scope in {"draft", "render", "all"} and path.suffix.casefold() in {".docx", ".pdf"}))
-    ]
+    candidates = [path for path in package.iterdir() if path.is_file() and path.name in names]
     state = package / STATE_DIR_NAME
     state_names = {
-        "audit": {AUDIT_TASK_NAME, AUDIT_RESULT_NAME},
-        "draft": {CANONICAL_NAME, EFFECTIVE_NAME, AUDIT_TASK_NAME, AUDIT_RESULT_NAME, FORMAT_NAME},
-        "render": {FORMAT_NAME},
+        "audit": {AUDIT_TASK_NAME, AUDIT_RESULT_NAME, PATCHES_NAME},
+        "draft": {TRANSFORM_NAME, EFFECTIVE_NAME, CANONICAL_NAME, AUDIT_TASK_NAME, AUDIT_RESULT_NAME, PATCHES_NAME, FORMAT_NAME, "artifact_hashes.json"},
+        "render": {FORMAT_NAME, "artifact_hashes.json"},
         "all": set(),
     }[scope]
     state_candidates = []
@@ -209,7 +248,12 @@ def archive_known_outputs(package: Path, *, scope: str = "all") -> str:
         else:
             state_candidates.extend(path for path in state.iterdir() if path.is_file() and path.name in state_names)
     candidates.extend(state_candidates)
-    if candidates:
+    staging = None
+    if workspace is not None and job_id and scope in {"draft", "all"}:
+        candidate = Path(workspace) / "02_Tracker" / "workflow" / "materials_drafting_contexts" / str(job_id)
+        if candidate.is_dir():
+            staging = candidate
+    if candidates or staging is not None:
         history.mkdir(parents=True, exist_ok=True)
         for path in candidates:
             shutil.move(str(path), str(history / path.name))
@@ -217,11 +261,21 @@ def archive_known_outputs(package: Path, *, scope: str = "all") -> str:
                 sidecar = path.with_suffix(path.suffix + ".jobsflow.json")
                 if sidecar.is_file():
                     shutil.move(str(sidecar), str(history / sidecar.name))
+        if staging is not None:
+            target = history / "materials_drafting_contexts" / str(job_id)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staging), str(target))
     return str(history) if history.is_dir() else ""
 
 
-def reset(package: Path, *, scope: str = "all") -> dict[str, Any]:
-    archived = archive_known_outputs(Path(package), scope=scope)
+def reset(
+    package: Path,
+    *,
+    scope: str = "all",
+    workspace: Path | None = None,
+    job_id: str = "",
+) -> dict[str, Any]:
+    archived = archive_known_outputs(Path(package), scope=scope, workspace=workspace, job_id=job_id)
     target_phase = "content_passed" if scope == "render" else ("plan_ready" if scope == "draft" else ("content_audit_pending" if scope == "audit" else "idle"))
     if scope != "all":
         run = load_run(package)

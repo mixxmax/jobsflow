@@ -246,6 +246,13 @@ Their actual queries and relevance rules are candidate- and profession-specific.
   `本轮新增=否` / `较早入表` and its old highlight is cleared. Local CSV uses
   the same ordering and markers. A model may not append a confirmed batch to
   the bottom or choose a different visual convention.
+- **The fresh24 status format is initialized by code on the first tab creation.**
+  The `材料状态` field is fixed to column V for the current tracker schema. The
+  Google Sheets projection installs a dropdown (`未做` / `已定制` / `已投递` /
+  `面试中` / `已结束` / `已录用`) from row 2 onward. Selecting `已投递`
+  applies the green background to the entire row through a conditional-format
+  rule. Append-only pushes and schema migrations reassert the same contract;
+  they do not ask the model to create, move, or restyle the status field.
 - Persistent job numbers are allocated from the workspace-local
   `02_Tracker/workflow/id_counters.json`, one latest sequence per lane/tier
   prefix (for example `C0`). The counter is advanced only after explicit entry
@@ -444,6 +451,12 @@ python3 -m tools.workflow materials status --job-id <JOB-ID>
 python3 -m tools.workflow materials reset --job-id <JOB-ID> --scope all
 python3 -m tools.workflow materials reset --job-id <JOB-ID> --scope all --confirm-reset
 ```
+
+Every reset scope is preview-first, including `all`; execution without the
+explicit `--confirm-reset` flag is prohibited. `audit` preserves canonical
+content for a new audit, `render` preserves canonical/audit and removes only
+registered render artifacts, and `draft` clears canonical/transform/downstream
+state while retaining the frozen input bundle, baseline and plan.
 
 Reset archives the old run under the package `.history/`; it does not silently
 delete a previous audit. It also rewinds the matching per-job materials entity
