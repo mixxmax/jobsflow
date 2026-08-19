@@ -156,6 +156,16 @@ python3 -m pip install --require-hashes -r requirements.lock
 python3 setup.py --doctor
 ```
 
+换模型或换执行平台时，先运行只读检查：
+
+```bash
+python3 -m tools.workflow doctor
+python3 -m tools.workflow doctor --strict-materials
+```
+
+它会把“环境可用”和“材料基础版已激活”分开报告；缺少基础版时只允许继续检索，
+不会让 `/materials` 静默使用空白模板。
+
 跟你的 AI 助手說：
 
 ```
@@ -174,6 +184,27 @@ python3 setup.py --doctor
 - 選 **先檢索** → 直接掃新職位
 
 > 沒有 AI 助手？終端運行 `python3 setup.py --resume-folder ~/Documents/my-cv` 也可以。
+
+### 基礎版不是可選附件，而是材料鏈的品質地基
+
+產品線不把“基礎版簡歷”當成模型自由寫的一次性文本。`/setup` 會為每個 lane 建立私有
+`base_requests/<lane>/request.json`，當前模型只需按照其中的固定 schema 填寫
+`response.json`；主機再做事实锚点、数字、必需 section、STAR 最低结构、占位符与负面自述检查，
+并用产品自带的匿名格式契约生成 DOCX。
+
+```bash
+python3 -m tools.workflow base status
+python3 -m tools.workflow base init --lane A
+python3 -m tools.workflow base generate --lane A \
+  --content JobSearch_2026/00_Profile/base_requests/A/response.json
+python3 -m tools.workflow base confirm --lane A       # 预览
+python3 -m tools.workflow base confirm --lane A --confirm
+```
+
+未确认的 `draft_*` 不会被材料链使用；确认后才成为 `master_*.docx` 和
+`cl_master_*.docx`。CV 与 Cover Letter 分别从各自的基础版生成，具体岗位只做有限增量定制，
+不会让模型从空白文档自由排版。格式契约保存在
+[`templates/base_format_contract.json`](templates/base_format_contract.json)，个人内容仍只在本地实例保存。
 
 ### 3. 開始用
 
@@ -211,6 +242,8 @@ python3 setup.py --doctor
 
 ```text
 簡歷/意向 → setup / intent → 已確認畫像、搜索詞、權重與 lane 映射
+                                  │
+                     base request → 結構化基礎 CV/CL → 預覽確認激活
                                   │
                                   ▼
        scan：檢索 → 初評調度 → 緩存優先深取 → 深評 → lane 按 URL 鎖定

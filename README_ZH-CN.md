@@ -175,6 +175,27 @@ python3 setup.py --doctor
 
 > 没有 AI 助手？终端运行 `python3 setup.py --resume-folder ~/Documents/my-cv` 也可以。
 
+### 基础版是材料链的质量地基
+
+`/setup` 会为每个方向建立私有的结构化基础版任务包。模型只填写
+`JobSearch_2026/00_Profile/base_requests/<lane>/response.json`，系统负责事实锚点、数字、必需
+section、STAR 最低结构、占位符和负面自述检查，并用产品格式契约生成 DOCX。未确认的
+`draft_*` 不会被 `/materials` 采用；必须先预览再确认激活为 `master_*.docx` 和
+`cl_master_*.docx`：
+
+```bash
+python3 -m tools.workflow doctor
+python3 -m tools.workflow base status
+python3 -m tools.workflow base init --lane A
+python3 -m tools.workflow base generate --lane A \
+  --content JobSearch_2026/00_Profile/base_requests/A/response.json
+python3 -m tools.workflow base confirm --lane A       # 预览
+python3 -m tools.workflow base confirm --lane A --confirm
+```
+
+CV 和 Cover Letter 是两份平行基础版，具体岗位只提交有限 JD 增量。匿名格式契约见
+[`templates/base_format_contract.json`](templates/base_format_contract.json)。
+
 ### 3. 开始用
 
 ```

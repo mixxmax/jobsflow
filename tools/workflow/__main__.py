@@ -1,4 +1,4 @@
-"""python3 -m tools.workflow <scan|push|materials|apply|promote|archive>"""
+"""python3 -m tools.workflow <doctor|base|scan|push|materials|apply|promote|archive>"""
 
 from __future__ import annotations
 
@@ -95,6 +95,15 @@ def main(argv: list[str] | None = None) -> int:
     scan.add_argument("--mode", default="temp")
     scan.add_argument("--hours", default="")
     scan.add_argument("--fixture", type=Path)
+
+    base = sub.add_parser("base", parents=[common], help="Build and activate lane CV/CL masters")
+    base.add_argument("base_cmd", nargs="?", choices=["status", "init", "generate", "confirm"], default="status")
+    base.add_argument("--lane", default="", help="Lane letter; omit for all lanes on init/status")
+    base.add_argument("--content", type=Path, help="The fixed private base response path")
+    base.add_argument("--confirm", action="store_true", help="Confirm the prior base preview")
+
+    doctor = sub.add_parser("doctor", parents=[common], help="Read-only environment and base readiness check")
+    doctor.add_argument("--strict-materials", action="store_true", help="Return non-zero until every configured lane has an active base pair")
 
     push = sub.add_parser("push", parents=[common], help="Preview or confirm entry of a completed scan run")
     push.add_argument("--mode", default="temp")
@@ -201,6 +210,45 @@ def main(argv: list[str] | None = None) -> int:
     store = None
     action = args.action
     payload: dict = {"dry_run": bool(getattr(args, "dry_run", False))}
+
+    if action == "doctor":
+        import setup as setup_module
+        from tools.workflow.base_onboarding import status as base_status
+
+        out = setup_module.doctor_snapshot()
+        # Environment checks belong to the product checkout, while base
+        # readiness belongs to the explicitly selected runtime workspace.
+        # This prevents a new model's clean-clone handoff from accidentally
+        # reading the developer's private JobSearch_2026 instance.
+        runtime_base = base_status(workspace)
+        out = dict(out)
+        checks = dict(out.get("checks") or {})
+        checks["tracker"] = bool(list((workspace / "02_Tracker").glob("hk_apply_list_*.csv")))
+        out["checks"] = checks
+        out["failed"] = [name for name, ready in checks.items() if not ready]
+        out["ready"] = not out["failed"]
+        out["workflow_ready"] = out["ready"]
+        out["materials_base"] = runtime_base
+        out["materials_ready"] = bool(runtime_base.get("ready"))
+        if getattr(args, "strict_materials", False) and not out.get("materials_ready"):
+            out = dict(out)
+            out["next_action"] = "prepare_base_masters"
+            out["strict_materials_blocked"] = True
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0 if out.get("ready") and (not getattr(args, "strict_materials", False) or out.get("materials_ready")) else 2
+
+    if action == "base":
+        from tools.workflow.base_onboarding import handle as handle_base
+
+        out = handle_base(
+            workspace,
+            args.base_cmd,
+            args.lane,
+            args.content,
+            bool(args.confirm),
+        )
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0 if out.get("status") in {"initialized", "drafted", "preview", "activated"} or out.get("ready") else 2
 
     if action == "scan":
         payload["mode"] = args.mode

@@ -70,17 +70,39 @@ python3 setup.py \
 表头。若模型遗漏字段、输出非法类型或权重错误，系统保留确定性 fallback；
 不得手工绕过验证。已有数据行的 tracker 不会被隐式改表。
 
-### 3. 询问下一步
+### 3. 建立基础版（材料链的必经入口）
+
+`/setup` 会为每个已配置 lane 写入一个私有的
+`JobSearch_2026/00_Profile/base_requests/<lane>/request.json`。这是给当前执行模型的最小任务包，
+里面包含用户确认的事实、lane 侧重点、固定输出 schema 和产品格式契约。模型只需把结构化内容
+写入同目录的 `response.json`，不需要自己创建 DOCX、选择字体或猜文件路径。
+
+推荐固定顺序：
+
+```bash
+python3 -m tools.workflow base init --lane A
+# 按 request.json 的 required_output 填写同目录 response.json
+python3 -m tools.workflow base generate --lane A \
+  --content JobSearch_2026/00_Profile/base_requests/A/response.json
+python3 -m tools.workflow base confirm --lane A       # 只预览
+python3 -m tools.workflow base confirm --lane A --confirm
+```
+
+系统会在激活前检查事实锚点、数字、必需 section、STAR 最低结构、占位符/负面自述和固定样式。
+未确认的文件只叫 `draft_*`，不会被 `/materials` 选作 lane master；只有显式确认后才会变成
+`master_*.docx` / `cl_master_*.docx`。CV 和 Cover Letter 是两份平行基础版，不能互相当作事实来源。
+
+### 4. 询问下一步
 
 问用户：
 
 > 先做基础版简历（按个性化 A-F 方向），还是先检索新职位？
 
-基础版：
+基础版（也可在 setup 结束后继续）：
 
 ```bash
-python3 -m tools.job_materials base sync --lane <字母>
-python3 -m tools.job_materials base factcheck --lane <字母>
+python3 -m tools.workflow base status
+python3 -m tools.workflow base init --lane <字母>
 ```
 
 检索：执行 `/scan`。

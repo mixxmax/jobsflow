@@ -27,6 +27,8 @@ All agents (Claude, Cursor, Codex, etc.) must read and obey:
 | `/materials` | 为选定岗位生成投递材料 | 用户点名要投某岗 |
 | `/apply` | 验证材料并进入投递确认（不自动提交） | 材料完成后 |
 | `/intent` | 预览、确认并增量修改求职意向、扫描深度或保留偏好 | 求职方向或成本/清单偏好变化时 |
+| `base` | 生成、质检、预览并确认 lane 的 CV/CL 基础版 | `/setup` 后、首次使用 `/materials` 前 |
+| `doctor` | 只读检查环境、私有工作区和基础版就绪状态 | 新模型接手或更换执行平台时 |
 
 High-level commands go through `python3 -m tools.workflow <action>` first.
 That gateway enforces policy, confirmation and side-effect boundaries. The
@@ -91,6 +93,12 @@ must be thin delegates to `python3 -m tools.workflow`. GitHub is a published sna
 product line with runtime data excluded.
 - Tracker sync uses the local ledger as the source of truth; CSV/Sheets are verified projections, and remote changes require reconcile or explicit pull
 
+Base onboarding is also product-owned: `python3 -m tools.workflow base` creates
+the fixed private request/response paths, validates structured CV/CL content,
+renders anonymous lane masters and requires preview plus explicit confirmation
+before activation. A model may not create a blank document or choose a legacy
+renderer.
+
 ## Quality control bridge
 
 The tracked `quality_control/` package is the synthetic admission and replay
@@ -116,9 +124,10 @@ See `docs/tracker_defaults.md` for:
 
 | File | Purpose |
 |------|---------|
-| `python3 -m tools.workflow` | Unified gateway: scan/push/promote/materials/apply/archive |
+| `python3 -m tools.workflow` | Unified gateway: doctor/base/scan/push/promote/materials/apply/archive |
 | `tools/workflow/` | Policy registry, state machine, confirmations, task packets |
 | `tools/workflow/materials_vnext/` | Product materials engine: lane baseline → bounded transform → CV/CL audit → template render |
+| `tools/workflow/base_onboarding.py` | First-run structured lane-base request, validation, anonymous DOCX render and activation |
 | `tools/workflow/materials_orchestrator.py` | Frozen legacy compatibility adapter; retained for migration/rollback only and not a product entrypoint |
 | `tools/workflow/materials_baseline.py` / `materials_rules.py` | Lane content floor, bounded tailoring delta and compact audit SOP |
 | `tools/workflow/auditor_dispatch.py` | Optional model-neutral child-auditor dispatch; no vendor is required |

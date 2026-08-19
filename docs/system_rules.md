@@ -75,6 +75,26 @@ columns, exceed limits, invent candidate facts or write into tracked product
 configuration. Invalid output keeps the deterministic fallback. An existing
 tracker with data rows is never migrated implicitly.
 
+### Base CV/CL onboarding gate
+
+The first-run materials path is deterministic as well. Setup writes one private
+`base_requests/<lane>/request.json` per configured lane. The model returns only
+the documented structured `jobsflow_base_response` in that lane's fixed
+`response.json` path. It may not create a blank DOCX, select a renderer, or
+copy another package as an example.
+
+The host checks fact/evidence anchors, numeric claims, required sections,
+minimum STAR shape, placeholders and negative self-disclosure before rendering
+the draft with the product-owned anonymous format contract. Draft files are
+named `draft_*` and are not eligible for material generation. A preview and
+explicit confirmation are required before they become active
+`master_*.docx`/`cl_master_*.docx` lane masters. CV and Cover Letter are
+parallel baselines and neither is allowed to supply facts for the other.
+
+`python3 -m tools.workflow base status` is the machine-readable readiness
+check. A selected lane without an activated pair of masters is a hard blocker
+for `/materials`; scanning and tracker operations may continue independently.
+
 `/setup` also asks the user to calibrate semantic resume matching as low
 (conservative), medium (balanced) or high (broader). This setting is private and
 only changes how far `capability_upper` may support a JD comparison. It never

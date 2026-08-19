@@ -1,0 +1,48 @@
+{
+  "version": "jobsflow-base-format-v1",
+  "purpose": "Product-owned anonymous contract for first-run lane CV/Cover Letter masters",
+  "page": {
+    "size": "A4",
+    "single_column": true,
+    "text_layer_required": true
+  },
+  "cv": {
+    "styles": [
+      "Resume Section",
+      "Job Heading",
+      "Resume Bullet",
+      "Compact Line"
+    ],
+    "body_font": "Calibri",
+    "body_size_pt": 10.5,
+    "heading_color": "17365D",
+    "job_heading_color": "1C1C1C",
+    "heading_bold": true,
+    "max_pages": 1,
+    "required_sections": [
+      "Summary",
+      "Core Expertise",
+      "Experience",
+      "Education"
+    ]
+  },
+  "cover_letter": {
+    "styles": [
+      "Letter Body",
+      "Letter Bullet",
+      "Letter Compact"
+    ],
+    "body_font": "Calibri",
+    "body_size_pt": 10.5,
+    "heading_color": "17365D",
+    "heading_bold": true,
+    "max_pages": 1,
+    "required_parts": [
+      "opening",
+      "evidence",
+      "closing"
+    ]
+  },
+  "activation": "preview_then_confirm",
+  "model_boundary": "The model supplies structured content only; the host creates DOCX/PDF and owns all paths."
+}

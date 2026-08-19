@@ -256,6 +256,16 @@ def run_doctor() -> int:
     (ok if tracker_ready else warn)(
         "tracker: ready" if tracker_ready else "tracker missing; run python3 setup.py"
     )
+    try:
+        from tools.workflow.base_onboarding import status as base_status
+
+        base_snapshot = base_status(REPO / "JobSearch_2026")
+        if base_snapshot.get("ready"):
+            ok("materials base CV/CL: all configured lanes ready")
+        else:
+            warn("materials base CV/CL: pending; run python3 -m tools.workflow base status")
+    except Exception as exc:
+        warn(f"materials base CV/CL: unavailable ({exc})")
     failed = [name for name, ready in checks.items() if not ready]
     if failed:
         print("\nFix core Python packages with: python3 -m pip install -r requirements.lock")
@@ -316,6 +326,18 @@ def doctor_snapshot() -> dict[str, Any]:
     checks["tracker"] = bool(
         list((REPO / "JobSearch_2026" / "02_Tracker").glob("hk_apply_list_*.csv"))
     )
+    try:
+        from tools.workflow.base_onboarding import status as base_status
+
+        base_snapshot = base_status(REPO / "JobSearch_2026")
+        materials_base_ready = bool(base_snapshot.get("ready"))
+    except Exception:
+        base_snapshot = {"ready": False, "lanes": [], "next_action": "base_init_or_generate_and_confirm"}
+        materials_base_ready = False
+    # Keep the historical ``ready`` field focused on environment/setup so a
+    # user can still scan before making every lane base.  Expose the stricter
+    # materials gate separately; /materials itself remains fail-closed when a
+    # selected lane has no activated master.
     failed = [name for name, ready in checks.items() if not ready]
     repair_commands = []
     for name in failed:
@@ -338,9 +360,18 @@ def doctor_snapshot() -> dict[str, Any]:
     return {
         "schema_version": 1,
         "ready": not failed,
+        "workflow_ready": not failed,
+        "materials_ready": materials_base_ready,
+        "materials_base": base_snapshot,
         "checks": checks,
         "failed": failed,
-        "next_action": "continue" if not failed else "repair_failed_checks",
+        "next_action": (
+            "continue"
+            if not failed and materials_base_ready
+            else "prepare_base_masters"
+            if not failed
+            else "repair_failed_checks"
+        ),
         "repair_commands": repair_commands,
     }
 
@@ -583,8 +614,20 @@ def classify_profession(intent: str, resume_text: str) -> dict[str, Any]:
 
     def category_scores(text: str) -> dict[str, int]:
         lowered = text.casefold()
+
+        def hit(term: str) -> bool:
+            # Short abbreviations such as ``PR`` must be whole tokens.  A
+            # substring check turns ordinary words like ``prepared`` into a
+            # marketing signal and can route a new user's entire setup into
+            # the wrong lane family.  Longer bilingual terms remain
+            # intentionally tolerant of normal resume prose.
+            value = str(term).casefold()
+            if len(value) <= 3 or re.fullmatch(r"[a-z0-9]+", value):
+                return bool(re.search(rf"(?<![a-z0-9]){re.escape(value)}(?![a-z0-9])", lowered))
+            return value in lowered
+
         return {
-            category: sum(1 for term in terms if term in lowered)
+            category: sum(1 for term in terms if hit(term))
             for category, terms in category_terms.items()
         }
 
@@ -1042,14 +1085,33 @@ def generate_config(
     for line in re.split(r"\n\s*\n|\n", str(resume_text or "")):
         claim = re.sub(r"^\s*[-*•]\s*", "", line).strip()
         claim = re.sub(r"\s+", " ", claim)
-        if len(claim) < 40 or claim.casefold() in seen_claims:
+        # Do not drop short but meaningful facts (GPA, degree, language,
+        # certification, employer/title or a concise skill).  The previous
+        # 40-character cutoff silently erased exactly the fields that later
+        # base CV/CL generation needs.  Contact-only lines are already stored
+        # in config.personal.json and are not evidence claims.
+        if (
+            len(claim) < 8
+            or claim.casefold() in seen_claims
+            or re.fullmatch(r"(?:https?://\S+|[^\s@]+@[^\s@]+\.[^\s@]+|[+()\d\- .]{7,})", claim)
+        ):
             continue
         seen_claims.add(claim.casefold())
         digest = hashlib.sha256(claim.casefold().encode("utf-8")).hexdigest()[:10].upper()
+        lower_claim = claim.casefold()
+        if re.search(r"\b(gpa|grade|bachelor|master|phd|jd|llm|mba|degree|本科|硕士|博士)\b", lower_claim):
+            claim_type = "education"
+        elif re.search(r"\b(certificate|certification|language|english|cantonese|mandarin|ielts|toefl|证书|语言|英语|粤语|普通话)\b", lower_claim):
+            claim_type = "qualification"
+        elif re.search(r"\b(19|20)\d{2}\b|\b(present|current|至今)\b", lower_claim):
+            claim_type = "experience_or_date"
+        else:
+            claim_type = "experience_or_skill"
         records.append(
             {
                 "evidence_id": f"EVID-{digest}",
                 "claim": claim,
+                "section": claim_type,
                 "entities": [],
                 "metrics": re.findall(r"\d+(?:[.,]\d+)*\+?%?", claim),
                 "contexts": [],
@@ -1173,6 +1235,20 @@ def generate_config(
         [item["name"] for item in schema["columns"]],
     )
     ok(f"{tracker_path.name} -> ready for first /scan")
+
+    # Prepare one bounded base-CV/CL request per lane.  This is a private
+    # onboarding artifact: it contains the user's evidence IDs/claims and is
+    # written only under the ignored runtime workspace.  It does not create
+    # an active master automatically; activation remains preview + explicit
+    # confirmation so an incomplete or weak model response cannot become the
+    # source for /materials.
+    try:
+        from tools.workflow.base_onboarding import prepare_requests
+
+        request_paths = prepare_requests(REPO / "JobSearch_2026")
+        ok(f"base onboarding -> {len(request_paths)} lane request(s) ready; fill and confirm before /materials")
+    except Exception as exc:
+        warn(f"base onboarding request preparation deferred: {exc}")
 
     # .env
     env_path = REPO / ".env"
@@ -1361,9 +1437,10 @@ def main(argv: list[str] | None = None) -> int:
     path = ask_yes_no("你想先做什么？\n  先做基础版简历（按刚才说的方向分 A-F 版本）\n  还是先开始检索新职位？\n  输入 y 先做基础版，n 先检索", default=False)
     if path:
         print(f"\n  好，先做基础版。方向字母映射已经生成了，运行：")
-        print(f"    python3 -m tools.job_materials base sync --lane <字母>")
-        print(f"    python3 -m tools.job_materials base factcheck --lane <字母>")
-        print(f"  或者让 AI 帮你：/base <字母>")
+        print(f"    python3 -m tools.workflow base init --lane <字母>")
+        print(f"    # 按 00_Profile/base_requests/<字母>/request.json 填写 response.json")
+        print(f"    python3 -m tools.workflow base generate --lane <字母> --content JobSearch_2026/00_Profile/base_requests/<字母>/response.json")
+        print(f"    python3 -m tools.workflow base confirm --lane <字母>  # 先预览，再加 --confirm 激活")
     else:
         print(f"\n  好，先检索。运行：")
         print(f"    /scan             扫新职位")

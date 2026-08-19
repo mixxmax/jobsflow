@@ -148,6 +148,17 @@ python3 setup.py --resume-folder ~/Documents/my-cv
 python3 setup.py --install-portals
 ```
 
+When switching models or harnesses, run the read-only handoff check first:
+
+```bash
+python3 -m tools.workflow doctor
+python3 -m tools.workflow doctor --strict-materials
+```
+
+The report separates environment readiness from activated lane-base readiness;
+scan may continue while a missing base is prepared, but `/materials` cannot
+silently use a blank or unconfirmed template.
+
 Then use:
 
 ```text
@@ -165,6 +176,29 @@ tracker columns based on the user's résumé evidence, stated constraints and
 industry context. The proposal is constrained by a machine-readable schema and
 is written only to the private workspace; invalid output falls back to the
 deterministic cross-industry configuration.
+
+Before `/materials`, each lane needs an activated CV and Cover Letter master.
+Setup creates a fixed private request containing the user's evidence, lane
+emphasis, structured response schema and the anonymous format contract. The
+model supplies content only; the host validates and renders the DOCX, then
+requires an explicit preview/confirmation before activation:
+
+```bash
+python3 -m tools.workflow base status
+python3 -m tools.workflow base init --lane A
+# fill JobSearch_2026/00_Profile/base_requests/A/response.json
+python3 -m tools.workflow base generate --lane A \
+  --content JobSearch_2026/00_Profile/base_requests/A/response.json
+python3 -m tools.workflow base confirm --lane A       # preview
+python3 -m tools.workflow base confirm --lane A --confirm
+```
+
+Unconfirmed `draft_*` files cannot be selected by the materials engine. The
+activated `master_*.docx` and `cl_master_*.docx` are separate parallel
+baselines; per-job tailoring is a bounded JD delta and never starts from a
+blank document. The product contract is tracked in
+[`templates/base_format_contract.json`](templates/base_format_contract.json),
+while candidate facts remain in the private runtime.
 
 Setup also asks two separate workflow questions: economy/balanced/coverage for
 network scan depth, and loose/standard/selective for final-list retention. The
