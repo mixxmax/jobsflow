@@ -49,11 +49,9 @@ def _entry_batch_snapshot(current: "FreshSnapshot", rows: list[dict[str, Any]]) 
     if any("行号" in row for row in merged):
         for row_number, row in enumerate(merged, start=2):
             row["行号"] = str(row_number)
-    return FreshSnapshot(
-        title=current.title,
-        headers=_headers_for_rows(merged, current.headers),
-        rows=merged,
-    )
+    headers = _headers_for_rows(merged, current.headers)
+    normalized = [{header: row.get(header, "") for header in headers} for row in merged]
+    return FreshSnapshot(title=current.title, headers=headers, rows=normalized)
 
 
 def _already_inserted(current: "FreshSnapshot", rows: list[dict[str, Any]]) -> bool:
@@ -527,10 +525,23 @@ class LocalCsvFreshStore:
         self.archive_dir = self.root / "archives"
         self.clear_calls = 0
         if rows is not None or not self.active_path.is_file():
+            if rows is None:
+                # A real local fresh tab follows the same canonical schema as
+                # Google Sheets from its first write, including V-column
+                # ``材料状态``.  This prevents the CSV fallback from silently
+                # creating a compact, differently ordered header.
+                try:
+                    from tools.fresh_24h.careerops_quickscore import SHEET_HEADERS
+
+                    headers = list(SHEET_HEADERS)
+                except (ImportError, AttributeError):
+                    headers = ["岗位编号", "职位", "公司", "链接", "材料状态"]
+            else:
+                headers = _headers_for_rows(rows or [])
             self._write_active(
                 FreshSnapshot(
                     title=title,
-                    headers=_headers_for_rows(rows or []),
+                    headers=headers,
                     rows=list(rows or []),
                 )
             )

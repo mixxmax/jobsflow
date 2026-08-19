@@ -703,10 +703,12 @@ def append_to_tracker(
             existing_rows = list(reader)
 
     ids = list(existing_ids)
-    # allocate per track letter counters
+    # Legacy helper retained for compatibility only.  It still follows the
+    # product invariant: one shared three-digit sequence per lane letter;
+    # the tier digit is not a second counter.
     counters: dict[str, int] = {}
     for i in ids:
-        m = re.match(r"^([A-G])0-(\d+)$", i or "")
+        m = re.match(r"^([A-G])[0-3]-(\d+)$", i or "")
         if m:
             letter, num = m.group(1), int(m.group(2))
             counters[letter] = max(counters.get(letter, 0), num)
@@ -715,7 +717,11 @@ def append_to_tracker(
         letter = (h.track_hint or "F")[0].upper()
         if letter not in "ABCDEFG":
             letter = "F"
+        if letter == "B":
+            letter = "F"
         counters[letter] = counters.get(letter, 0) + 1
+        if counters[letter] > 999:
+            raise ValueError(f"job_id_sequence_exhausted:{letter}")
         jid = f"{letter}0-{counters[letter]:03d}"
         ids.append(jid)
         posted_day = ""
@@ -745,7 +751,7 @@ def append_to_tracker(
                 "发布日期": posted_day,
                 "简历版本": letter,
                 "版本说明": "待映射",
-                "材料状态": "未做",
+                "材料状态": "未制作",
                 "工作时间风险": "未评估",
                 "映射理由": f"auto-append fresh_24h {iso_now()}; flags={flags}",
                 "CareerOps分数": "",

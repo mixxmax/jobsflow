@@ -73,6 +73,7 @@ SYSTEM_FIELDS = frozenset(
         "company_brief",
         "language_gate",
         "salary_review",
+        "材料状态",
         "provisional_needs_jd",
         "待审-JD不足",
     }
@@ -126,17 +127,41 @@ def _hash(value: Any) -> str:
 
 
 def _row_key(row: dict[str, Any]) -> str | None:
-    url = normalize_job_url(str(row.get("链接") or row.get("url") or "").strip())
-    if url:
-        return f"url:{url}"
     job_id = str(row.get("岗位编号") or row.get("job_id") or "").strip()
     if job_id:
         return f"id:{job_id}"
+    url = normalize_job_url(str(row.get("链接") or row.get("url") or "").strip())
+    if url:
+        return f"url:{url}"
     return None
 
 
 def _row_map(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {key: dict(row) for row in rows if (key := _row_key(row))}
+
+
+def _align_local_rows_to_projection(
+    local_rows: Iterable[dict[str, Any]],
+    projection_rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Preserve projection columns when an older local ledger lacks them.
+
+    A status-only update may be the first write after a tracker schema gained
+    a column.  The local ledger remains authoritative for values it knows, but
+    the last verified projection is authoritative for the already-verified
+    shape and blank system fields.  Aligning the rows before the merge avoids
+    a false read-back digest mismatch and does not import an unverified remote
+    change (the precondition diff has already run).
+    """
+
+    projected = _row_map(projection_rows)
+    aligned: list[dict[str, Any]] = []
+    for row in local_rows:
+        key = _row_key(row)
+        base = dict(projected.get(key, {})) if key else {}
+        base.update(dict(row))
+        aligned.append(base)
+    return aligned
 
 
 def _snapshot_payload(snapshot: FreshSnapshot) -> dict[str, Any]:
@@ -501,8 +526,12 @@ class SyncCoordinator:
                 "report_path": report_path,
             }
 
+        aligned_local_rows = _align_local_rows_to_projection(
+            local_before.rows,
+            target_before.rows,
+        )
         existing_keys = {
-            _row_key(row) for row in local_before.rows if _row_key(row)
+            _row_key(row) for row in aligned_local_rows if _row_key(row)
         }
         append_rows = [
             dict(row)
@@ -514,7 +543,7 @@ class SyncCoordinator:
         # ledger and every projection agree that only the newly entered rows
         # are marked ``本轮新增=是``.  The store applies the same transition to
         # its live projection immediately before inserting the rows.
-        merge_base_rows = [dict(row) for row in local_before.rows]
+        merge_base_rows = [dict(row) for row in aligned_local_rows]
         if append_rows and any((row.get("本轮新增") or "") == "是" for row in append_rows):
             demote_previous_batch(merge_base_rows)
         merged_rows, stats = merge_system_rows(merge_base_rows, incoming)
@@ -552,10 +581,15 @@ class SyncCoordinator:
             # the local ledger in the same order so its digest remains the
             # projection's digest.
             pass
+        merged_headers = _headers_for_rows(
+            merged_rows,
+            list(target_before.headers)
+            + [header for header in local_before.headers if header not in target_before.headers],
+        )
         merged = FreshSnapshot(
             title=title,
-            headers=_headers_for_rows(merged_rows, local_before.headers),
-            rows=merged_rows,
+            headers=merged_headers,
+            rows=[{header: row.get(header, "") for header in merged_headers} for row in merged_rows],
         )
         op_id = operation_id or f"sync-{uuid4().hex[:12]}"
         existing = None

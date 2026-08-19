@@ -1138,7 +1138,7 @@ def build_tracker_row(
         posted,
         sc.resume_ver,
         sc.resume_note,
-        "未做",
+        "未制作",
         sc.company_brief_override or company_brief(hit.get("company") or "—", hit.get("teaser") or ""),
         f"{sc.score:.2f}",
         sc.grade,

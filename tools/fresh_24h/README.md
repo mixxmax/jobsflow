@@ -42,8 +42,10 @@ python3 -m tools.workflow push --run-id <scan-run-id> --local-only --confirm <pr
 The first workflow push command is write-free and assigns no permanent job IDs.
 Only the second command, with the same unexpired proposal, merges selected
 scored rows into the local CSV or optional Google Sheets projection. Permanent
-IDs are assigned at that boundary. Direct legacy tracker-writing scripts are
-disabled.
+IDs are assigned at that boundary. The sequence is exactly three digits and
+is shared by the lane letter across tiers: `C0-001` is followed by `C1-002`
+or `C2-002`, never by a second tier-local `001`. Direct legacy
+tracker-writing scripts are disabled.
 The optional `--select` is applied only during the write-free preview and is
 bound into the proposal; confirmation cannot silently broaden or replace that
 selection. A confirmation may omit `--run-id` because the gateway restores the

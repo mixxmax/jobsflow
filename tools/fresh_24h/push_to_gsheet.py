@@ -642,9 +642,9 @@ def _col_letter(idx: int) -> str:
 def setup_status_formats(ws, n_data_rows: int, headers: list[str], sh=None) -> None:
     """Set up 材料状态 dropdown + conditional formatting on every push.
 
-    - Data validation dropdown: 未做/已定制/已投递/面试中/已结束/已录用
+    - Data validation dropdown: 未制作/已制作/已投递/面试中/已结束/已录用
     - 已投递 -> entire row dark green (highest priority CF)
-    - 已定制/面试中/已结束/已录用 -> 材料状态 cell background color
+    - 已制作/面试中/已结束/已录用 -> 材料状态 cell background color
     """
     if "材料状态" not in headers:
         return
@@ -673,7 +673,7 @@ def setup_status_formats(ws, n_data_rows: int, headers: list[str], sh=None) -> N
                     "type": "ONE_OF_LIST",
                     "values": [
                         {"userEnteredValue": v}
-                        for v in ["未做", "已定制", "已投递", "面试中", "已结束", "已录用"]
+                        for v in ["未制作", "已制作", "已投递", "面试中", "已结束", "已录用"]
                     ],
                 },
                 "showCustomUi": True,
@@ -709,7 +709,7 @@ def setup_status_formats(ws, n_data_rows: int, headers: list[str], sh=None) -> N
 
     # 3. Other statuses -> cell-level background on 材料状态 column only
     cell_colors = {
-        "已定制": {"red": 0.85, "green": 0.92, "blue": 1.0},
+        "已制作": {"red": 0.85, "green": 0.92, "blue": 1.0},
         "面试中": {"red": 1.0, "green": 0.95, "blue": 0.7},
         "已结束": {"red": 0.95, "green": 0.85, "blue": 0.85},
         "已录用": {"red": 0.75, "green": 0.95, "blue": 0.75},

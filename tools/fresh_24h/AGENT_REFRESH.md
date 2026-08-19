@@ -113,10 +113,12 @@ headless 会话事实，不含 cookie/请求头）。两段评分行的 `JD深�
 refresh and recent history. New rows use `本轮新增=是`, a batch ID and timestamp;
 older rows are demoted and lose new-batch styling.
 
-IDs use `{A-F direction}{0-3 tier}-{sequence}` (an optional G capability lane is
-allowed when private setup defines it). A-F meanings come from private setup,
-never from a built-in profession. Continue the maximum existing prefix;
-do not invent placeholder ranges.
+IDs use `{A-G direction}{0-3 tier}-{NNN}`. The three-digit sequence is shared
+by the lane letter across all tiers: after `C0-001`, the next C entry is
+`C1-002` or `C2-002`; the tier digit only routes the package. A-F meanings
+come from private setup, never from a built-in profession. Continue the latest
+lane counter and never invent placeholder ranges. Scan previews have no
+persistent ID; only confirmed entry allocates one.
 
 ## Required agent behavior
 

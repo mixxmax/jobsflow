@@ -189,7 +189,8 @@ Their actual queries and relevance rules are candidate- and profession-specific.
   rescoring, semantic tasks and tracker entry reuse the locked letter;
   keyword rules and profile verdicts cannot drift it, and later wording
   changes to a title or company name never re-open the decision. Tracker
-  entry appends only the tier digit and sequence number to the locked letter.
+  entry appends the tier digit and the next three-digit sequence from the
+  single counter for that lane letter; tiers never own separate counters.
 - Localized salary values use the shared conservative parser. Decimal commas,
   dotted/space thousands, common currency labels and amount suffixes (`k`,
   `M`, `B`, `千`, `万`, `亿`) are normalized before scoring. A hyphen between two
@@ -248,15 +249,21 @@ Their actual queries and relevance rules are candidate- and profession-specific.
   the bottom or choose a different visual convention.
 - **The fresh24 status format is initialized by code on the first tab creation.**
   The `材料状态` field is fixed to column V for the current tracker schema. The
-  Google Sheets projection installs a dropdown (`未做` / `已定制` / `已投递` /
+  Google Sheets projection installs a dropdown (`未制作` / `已制作` / `已投递` /
   `面试中` / `已结束` / `已录用`) from row 2 onward. Selecting `已投递`
   applies the green background to the entire row through a conditional-format
   rule. Append-only pushes and schema migrations reassert the same contract;
   they do not ask the model to create, move, or restyle the status field.
 - Persistent job numbers are allocated from the workspace-local
-  `02_Tracker/workflow/id_counters.json`, one latest sequence per lane/tier
-  prefix (for example `C0`). The counter is advanced only after explicit entry
-  confirmation. A preview may show proposed numbers but never consumes them.
+  `02_Tracker/workflow/id_counters.json`, one latest sequence per lane letter
+  (for example `C`). The tier digit in `C0`/`C1`/`C2` routes the package but
+  does not own a separate counter. Every emitted sequence is exactly three
+  digits (`001`, `056`, ...). The counter is advanced only after explicit
+  entry confirmation; a preview may show proposed numbers but never consumes
+  them.
+  After a materials run passes the content and mechanical gates, the host
+  writes `材料状态=已制作` to the bound tracker row. This is idempotent and
+  never downgrades a later state such as `已投递`.
   Existing package directories are also treated as occupied IDs, so deleting a
   tracker row cannot cause a later re-entry to reuse its material package ID.
 - A changed remote projection is never silently overwritten. Reconciliation

@@ -46,7 +46,7 @@ from job_assessment import (  # noqa: E402
     persist_job_assessment,
     profile_fingerprint,
 )
-from job_id import allocate_ids, max_prefix_from_ids  # noqa: E402
+from job_id import allocate_ids, max_lane_from_ids  # noqa: E402
 from linkedin_enrich import (  # noqa: E402
     DEEP_DESC_CHARS,
     DEEP_SLEEP_S,
@@ -448,7 +448,7 @@ def load_hits(csv_path: Path) -> list[dict]:
 
 
 def local_id_baseline(tracker: Path) -> dict[str, int]:
-    """Max per-prefix job numbers from local tracker CSVs (no Google credentials)."""
+    """Latest sequence per lane letter from local tracker CSVs."""
     ids: list[str] = []
     apply_lists = sorted(tracker.glob("hk_apply_list_*.csv"), reverse=True)
     paths: list[Path] = []
@@ -470,7 +470,7 @@ def local_id_baseline(tracker: Path) -> dict[str, int]:
                         ids.append(jid)
         except OSError:
             continue
-    return max_prefix_from_ids(ids)
+    return max_lane_from_ids(ids)
 
 
 def local_id_map(tracker: Path) -> dict[str, str]:
@@ -1475,7 +1475,7 @@ def _persist_deep_jds(rows: list[dict], repo: Path) -> None:
         url = (r.get("链接") or r.get("_deep_jd_url") or "").strip()
         # Before entry the row has only an internal preview key. Use it (or a
         # URL hash fallback) so deep JD cache files never masquerade as IDs.
-        if not re.fullmatch(r"[A-G][0-3]-\d{3,}", pid) and url and not pid.startswith("preview-"):
+        if not re.fullmatch(r"[A-G][0-3]-\d{3}", pid) and url and not pid.startswith("preview-"):
             pid = f"preview-{hashlib.sha256(url.encode('utf-8')).hexdigest()[:12]}"
         header = f"# JD - {pid}\n\n"
         if url:

@@ -15,7 +15,7 @@ from tools.io_utils import atomic_write_json
 from tools.workflow.adapters import push as push_adapter
 from tools.workflow.engine import dispatch
 from tools.workflow.entity_state import load_entity_state
-from tools.workflow.fresh_store import LocalCsvFreshStore, default_fresh_store
+from tools.workflow.fresh_store import FreshSnapshot, LocalCsvFreshStore, default_fresh_store
 from tools.workflow.package_validator import MaterialsPackageValidator
 from tools.workflow.testing_packages import baseline_transform_fixture, build_package, build_workspace, prepare_package_for_apply, write_minimal_pdf
 
@@ -61,6 +61,8 @@ def test_auto_backend_fails_safe_to_durable_csv_without_sheet_credentials(tmp_pa
     store.merge_incoming([{"岗位编号": "C0-902", "职位": "Role", "公司": "Acme", "链接": "https://example.test/902"}])
     assert store.read_active().row_count == 1
     assert store.active_path.is_file()
+    headers = store.read_active().headers
+    assert headers[21] == "材料状态"  # canonical V-column position
 
 
 def test_refresh_commit_uses_scan_window_until_not_scoring_finish(tmp_path):
@@ -157,14 +159,43 @@ def test_forged_receipt_without_independent_audit_is_rejected(tmp_path):
     assert "content_audit_missing" in {item["code"] for item in report["findings"]}
 
 
-def test_public_material_lifecycle_reaches_apply_ready_state(tmp_path):
+def test_public_material_lifecycle_reaches_apply_ready_state(tmp_path, monkeypatch):
     ws = build_workspace(tmp_path)
-    build_package(ws)
+    package = build_package(ws)
     prepare_package_for_apply(ws)
+    monkeypatch.setenv("JOBSFlow_FRESH_BACKEND", "csv")
+    title = "fresh_24h_2026-08-19"
+    row = {
+        "岗位编号": "C0-001",
+        "职位": "Paralegal",
+        "公司": "Acme",
+        "链接": "https://example.test/C0-001",
+        "材料状态": "未制作",
+    }
+    snapshot = FreshSnapshot(title=title, headers=list(row), rows=[row])
+    from tools.workflow.sync import TrackerLedger
+
+    TrackerLedger(ws, title).write(snapshot)
+    LocalCsvFreshStore(ws, title, [row])
+    atomic_write_json(
+        package / "package_binding.json",
+        {
+            "schema_version": 1,
+            "job_id": "C0-001",
+            "lane": "C",
+            "tier": {"code": "0", "label": "核心"},
+            "expected_relative_path": package.relative_to(ws).as_posix(),
+            "tracker_path": str(ws / "02_Tracker" / "workflow" / "ledger" / f"{title}.json"),
+        },
+    )
+
     out = dispatch("apply", workspace=ws, payload={"job_id": "C0-001"})
     assert out["status"] == "succeeded"
     assert out["apply_ready"] is True
     assert out["submitted"] is False
+    assert out["validation"]["tracker_material_status"]["status"] == "succeeded"
+    assert TrackerLedger(ws, title).read().rows[0]["材料状态"] == "已制作"
+    assert LocalCsvFreshStore(ws, title).read_active().rows[0]["材料状态"] == "已制作"
     state = load_entity_state(ws, "materials", "C0-001")
     assert state.phase == "apply_ready"
 

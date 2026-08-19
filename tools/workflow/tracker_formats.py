@@ -13,8 +13,13 @@ from typing import Any
 
 
 MATERIAL_STATUS_COLUMN = "材料状态"
-MATERIAL_STATUS_OPTIONS = ("未做", "已定制", "已投递", "面试中", "已结束", "已录用")
-TRACKER_FORMAT_VERSION = 1
+# The material lifecycle is a product invariant.  ``已制作`` is the only
+# completion value written by the materials gateway; older labels are not
+# emitted by new sheets or new material runs.
+MATERIAL_STATUS_OPTIONS = ("未制作", "已制作", "已投递", "面试中", "已结束", "已录用")
+MATERIAL_STATUS_COMPLETE = "已制作"
+MATERIAL_STATUS_FIELD = MATERIAL_STATUS_COLUMN
+TRACKER_FORMAT_VERSION = 2
 MATERIAL_STATUS_GREEN = {"red": 0.20, "green": 0.65, "blue": 0.20}
 
 
@@ -176,6 +181,8 @@ def apply_material_status_formats(
 
 __all__ = [
     "MATERIAL_STATUS_COLUMN",
+    "MATERIAL_STATUS_COMPLETE",
+    "MATERIAL_STATUS_FIELD",
     "MATERIAL_STATUS_GREEN",
     "MATERIAL_STATUS_OPTIONS",
     "TRACKER_FORMAT_VERSION",

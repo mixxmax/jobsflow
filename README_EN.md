@@ -78,12 +78,15 @@ and how to tailor the application without giving up final control.
   integrations are not part of the public release.
 - **Lane and ID boundaries are explicit:** deep review locks a URL to one lane;
   scan previews have no persistent job ID. Only confirmed `/push` allocates the
-  next lane/tier sequence and binds the tracker row to its package.
+  next three-digit sequence from the single counter for that lane letter (for
+  example `C0-001`, then `C1-002`); the tier digit routes the package but never
+  owns a second counter, and the tracker row is bound to its package.
 - **Material status formatting is fixed:** when a fresh24 worksheet is first
   created, code installs the V-column `材料状态` dropdown with fixed status
   values. Choosing `已投递` turns the entire row green through conditional
-  formatting; later appends inherit this contract and models cannot choose the
-  column, options, or colors.
+  formatting; after CV/CL and mechanical gates pass, the host writes `已制作` to
+  the bound row. Later appends inherit this contract and models cannot choose the
+  column, options, colors, or completion transition.
 
 - **Fewer wrong applications and fewer silent misses:** pass 1 schedules work;
   the full JD determines the final score, while insufficient-JD rows stay visible.

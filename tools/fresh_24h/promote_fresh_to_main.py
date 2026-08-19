@@ -107,7 +107,7 @@ def to_main_row(d: dict) -> dict:
             raw = d.get(h)
             out[h] = (raw or "").strip() if isinstance(raw, str) else ("" if raw is None else str(raw).strip())
     jid = out.get("岗位编号") or ""
-    if not out.get("层级") and re.match(r"^[A-G][012]-", jid):
+    if not out.get("层级") and re.match(r"^[A-G][0-3]-", jid):
         out["层级"] = {"0": "核心", "1": "一级", "2": "二级"}.get(jid[1], "")
     return out
 
@@ -226,13 +226,14 @@ def merge_rows(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], 
             old = by_id[jid]
             fresh_st = r.get("材料状态") or ""
             old_st = old.get("材料状态") or ""
-            if fresh_st == "已定制" and old_st not in {
+            if fresh_st in {"已定制", "已制作"} and old_st not in {
                 "已定制",
+                "已制作",
                 "已投",
                 "面试",
                 "已拒",
             }:
-                old["材料状态"] = "已定制"
+                old["材料状态"] = "已制作"
                 updated += 1
             continue
         if url and url in by_url:

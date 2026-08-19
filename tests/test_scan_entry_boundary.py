@@ -360,6 +360,26 @@ def test_entry_allocator_skips_ids_occupied_by_existing_material_packages(tmp_pa
     assert prepared[0]["岗位编号"] == "C0-002"
 
 
+def test_entry_allocator_seeds_shared_lane_counter_from_other_tier_package(tmp_path):
+    ws = build_workspace(tmp_path)
+    occupied = ws / "01_Masters" / "C_track" / "一级" / "C1-005_未投_Old_Role"
+    occupied.mkdir(parents=True)
+    prepared = prepare_rows_for_entry(
+        [
+            {
+                "职位": "New role",
+                "公司": "Acme",
+                "链接": "https://example.test/new-role-tier",
+                "CareerOps分数": "4.0",
+                "简历版本": "C",
+            }
+        ],
+        [],
+        workspace=ws,
+    )
+    assert prepared[0]["岗位编号"] == "C0-006"
+
+
 def test_entry_preview_does_not_consume_local_counter_and_confirm_advances_it(tmp_path):
     rows = [
         {
@@ -386,7 +406,40 @@ def test_entry_preview_does_not_consume_local_counter_and_confirm_advances_it(tm
             encoding="utf-8"
         )
     )
-    assert payload["latest"]["C0"] == 1
+    assert payload["schema_version"] == 2
+    assert payload["latest"]["C"] == 1
+
+
+def test_entry_allocator_uses_one_lane_sequence_across_tiers_and_three_digits():
+    rows = [
+        {"职位": "Core", "链接": "https://example.test/core", "简历版本": "C", "CareerOps分数": "4.0"},
+        {"职位": "Tier one", "链接": "https://example.test/one", "简历版本": "C", "CareerOps分数": "3.4", "CareerOps等级": "D"},
+        {"职位": "Tier two", "链接": "https://example.test/two", "简历版本": "C", "CareerOps分数": "2.8"},
+    ]
+    prepared = prepare_rows_for_entry(rows, [])
+    assert [row["岗位编号"] for row in prepared] == ["C0-001", "C1-002", "C2-003"]
+    assert all(len(row["岗位编号"].rsplit("-", 1)[1]) == 3 for row in prepared)
+
+
+def test_entry_allocator_bootstraps_legacy_prefix_counters_without_tier_collision(tmp_path):
+    counter_path = tmp_path / "02_Tracker" / "workflow" / "id_counters.json"
+    counter_path.parent.mkdir(parents=True)
+    counter_path.write_text(
+        json.dumps({"schema_version": 1, "latest": {"C0": 7, "C1": 11}}),
+        encoding="utf-8",
+    )
+    prepared = prepare_rows_for_entry(
+        [{"职位": "Next", "链接": "https://example.test/next", "简历版本": "C", "CareerOps分数": "4.0"}],
+        [],
+        workspace=tmp_path,
+    )
+    assert prepared[0]["岗位编号"] == "C0-012"
+
+
+def test_persistent_job_id_contract_requires_exactly_three_digits():
+    assert is_assigned_job_id("C0-001")
+    assert not is_assigned_job_id("C0-01")
+    assert not is_assigned_job_id("C0-1000")
 
 
 def test_stale_entry_preview_cannot_reuse_a_consumed_sequence(tmp_path):

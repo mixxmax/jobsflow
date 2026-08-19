@@ -60,7 +60,7 @@
     {
       "rule_id": "PUSH-002",
       "domain": "push",
-      "statement": "Persistent job IDs are allocated only at confirmed entry from the workspace-local per-prefix latest counter; previews never consume or reuse a sequence.",
+      "statement": "Persistent job IDs are allocated only at confirmed entry from one workspace-local latest counter per lane letter (A-G); the tier digit is routing only, every emitted sequence is exactly three digits, and previews never consume or reuse a sequence.",
       "level": "MUST",
       "autonomy": "A0",
       "enforcement": "code",

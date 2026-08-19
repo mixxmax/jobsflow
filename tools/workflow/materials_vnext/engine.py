@@ -79,6 +79,36 @@ def _artifact_hashes(package: Path, names: dict[str, str]) -> dict[str, str]:
     return {name: _file_hash(Path(package) / name) for name in (names.get("cv_docx"), names.get("cl_docx"), names.get("cv_pdf"), names.get("cl_pdf"), "application_email.txt") if name}
 
 
+def _sync_tracker_material_status(
+    *,
+    workspace: Path,
+    package: Path,
+    job_id: str,
+    generation_id: str,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Run the host-owned ``材料状态=已制作`` transition once gates pass."""
+
+    try:
+        from tools.workflow.material_status import mark_materials_created
+
+        return mark_materials_created(
+            workspace=Path(workspace),
+            package=Path(package),
+            job_id=job_id,
+            generation_id=generation_id,
+            dry_run=dry_run,
+        )
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        return {
+            "status": "blocked",
+            "reason": "tracker_status_sync_failed",
+            "error": str(exc),
+            "field": "材料状态",
+            "value": "已制作",
+        }
+
+
 def _format_artifacts_current(package: Path, workspace: Path, run: dict[str, Any]) -> bool:
     """Check the immutable mechanical receipt without rerunning a gate."""
 
@@ -862,6 +892,28 @@ class MaterialsEngine:
                 run.update({"phase": "pdf_generated", "last_error": "mechanical_format_gate_failed"})
                 save_run(package, run)
                 return {"status": "blocked", "after_state": "pdf_generated", "blockers": [item.get("code") for item in report.get("findings") or []], "format": report, "engine": "materials-vnext"}
+            tracker_status = _sync_tracker_material_status(
+                workspace=Path(workspace),
+                package=package,
+                job_id=job_id,
+                generation_id=str(run.get("generation_id") or ""),
+                dry_run=dry_run,
+            )
+            report["tracker_material_status"] = tracker_status
+            if tracker_status.get("status") == "blocked":
+                # The files are mechanically valid, but the product's
+                # completion transition was not committed. Keep the run at
+                # pdf_generated so a retry can finish the same format gate.
+                run.update({"phase": "pdf_generated", "last_error": "tracker_material_status_sync_failed"})
+                save_run(package, run)
+                return {
+                    "status": "blocked",
+                    "after_state": "pdf_generated",
+                    "blockers": ["tracker_material_status_sync_failed"],
+                    "format": report,
+                    "format_passed": False,
+                    "engine": "materials-vnext",
+                }
             from tools.workflow.materials_renderer import expected_filenames
 
             names = expected_filenames(package, Path(workspace))
@@ -915,6 +967,39 @@ class MaterialsEngine:
                 }
             except (OSError, ValueError, RuntimeError) as exc:
                 return {"status": "blocked", "blockers": ["apply_validation_failed"], "error": str(exc), "apply_ready": False, "engine": "materials-vnext"}
+            # The tracker status is a host-owned side effect of a *passed*
+            # materials run.  Never mark a failed/incomplete package as
+            # 已制作: the content/format gates must be green first. Models
+            # cannot decide when or how V-column is updated; the bound
+            # package/ledger determines the target and the sync coordinator
+            # projects the same value to CSV/Sheets.
+            tracker_status: dict[str, Any]
+            if not report.get("apply_ready"):
+                tracker_status = {
+                    "status": "not_attempted",
+                    "reason": "materials_gates_not_passed",
+                    "field": "材料状态",
+                    "value": "已制作",
+                }
+            else:
+                tracker_status = _sync_tracker_material_status(
+                    workspace=Path(workspace),
+                    package=package,
+                    job_id=job_id,
+                    generation_id=str(run.get("generation_id") or ""),
+                    dry_run=dry_run,
+                )
+            report["tracker_material_status"] = tracker_status
+            if tracker_status.get("status") == "blocked":
+                report.setdefault("findings", []).append(
+                    {
+                        "code": "tracker_material_status_sync_failed",
+                        "artifact": "材料状态",
+                        "evidence": tracker_status.get("reason") or "unknown",
+                    }
+                )
+                report["status"] = "failed"
+                report["apply_ready"] = False
             ready = bool(report.get("apply_ready"))
             if ready:
                 run.update({"phase": "apply_ready"})

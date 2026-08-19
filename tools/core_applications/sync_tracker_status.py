@@ -25,7 +25,7 @@ def sync_tracker_status(manifest_path: Path, csv_path: Path, xlsx_path: Path) ->
         if errs:
             blocked[j["url"]] = errs
         else:
-            passed[j["url"]] = "已定制"
+            passed[j["url"]] = "已制作"
 
     # Update CSV
     rows = []
@@ -35,10 +35,10 @@ def sync_tracker_status(manifest_path: Path, csv_path: Path, xlsx_path: Path) ->
         for row in reader:
             url = row.get("链接", "").strip()
             if url in passed:
-                row["材料状态"] = "已定制"
-            elif url in blocked:
-                row["材料状态"] = "待核实"
-            # F-grade exclusions keep "未做"
+                row["材料状态"] = "已制作"
+            # A blocked package stays at its existing status; ``待核实`` is
+            # not a valid V-column option and would violate the tracker
+            # contract.  F-grade exclusions likewise remain unchanged.
             rows.append(row)
 
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
@@ -65,9 +65,7 @@ def sync_tracker_status(manifest_path: Path, csv_path: Path, xlsx_path: Path) ->
             if cell_url:
                 url = str(cell_url).strip()
                 if url in passed:
-                    row[status_col - 1].value = "已定制"
-                elif url in blocked:
-                    row[status_col - 1].value = "待核实"
+                    row[status_col - 1].value = "已制作"
 
     wb.save(xlsx_path)
 

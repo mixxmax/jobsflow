@@ -3,7 +3,8 @@
 Scan artifacts deliberately carry no ``岗位编号``.  A URL (or, for a
 synthetic fixture, another stable row identity) is enough to review a result.
 When a user confirms a push, this module assigns the persistent ``A0-001``
-style ID using the current local tracker as the baseline.
+style ID using one lane-letter counter as the current local baseline.  The
+tier digit routes the package only; it never gets a separate sequence.
 """
 
 from __future__ import annotations
@@ -17,11 +18,16 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from tools.io_utils import atomic_write_json
-from tools.fresh_24h.job_id import allocate_ids, max_prefix_from_ids, parse_id
+from tools.fresh_24h.job_id import (
+    allocate_ids,
+    max_lane_from_ids,
+    parse_any_id,
+    parse_id,
+)
 from tools.job_urls import normalize_job_url
 
-FULL_JOB_ID = re.compile(r"^[A-G][0-3]-\d{3,}$")
-COUNTER_SCHEMA_VERSION = 1
+FULL_JOB_ID = re.compile(r"^[A-G][0-3]-\d{3}$")
+COUNTER_SCHEMA_VERSION = 2
 
 
 def is_assigned_job_id(value: Any) -> bool:
@@ -54,7 +60,7 @@ def _counter_ids_from_local_workspace(workspace: Path) -> list[str]:
             if not isinstance(row, dict):
                 continue
             value = row.get("岗位编号") or row.get("job_id")
-            if is_assigned_job_id(value):
+            if parse_any_id(str(value or "")):
                 values.append(str(value).strip())
 
     # Legacy/local CSV projections, including dated fresh tabs and the main
@@ -90,10 +96,11 @@ class IdCounterConflict(RuntimeError):
 
 
 class LocalIdCounterStore:
-    """Monotonic per-prefix counters for explicit tracker entry.
+    """Monotonic per-lane counters for explicit tracker entry.
 
-    The file stores only the latest number for each durable prefix (A0, F1,
-    etc.).  It is workspace-scoped, so the product line and private line never
+    The file stores only the latest number for each lane letter (A-G).  The
+    tier digit in ``A0-001`` routes the package but does not own a separate
+    sequence.  It is workspace-scoped, so product and private instances never
     share counters.  A small advisory lock prevents two local push processes
     from reserving the same number.
     """
@@ -138,18 +145,23 @@ class LocalIdCounterStore:
             return {}
         result: dict[str, int] = {}
         for prefix, value in latest.items():
-            if not re.fullmatch(r"[A-G][0-3]", str(prefix)):
+            raw = str(prefix).strip().upper()
+            # Read both the new lane-keyed schema and the old prefix-keyed
+            # schema so an existing private workspace migrates monotonically.
+            lane = raw[:1] if re.fullmatch(r"[A-G](?:[0-3])?", raw) else ""
+            if not lane:
                 continue
             try:
-                result[str(prefix)] = max(0, int(value))
+                result[lane] = max(result.get(lane, 0), int(value))
             except (TypeError, ValueError):
                 continue
         return result
 
     def _baseline(self, extra_ids: Iterable[str] = ()) -> dict[str, int]:
         counters = self._read_file()
-        seeded = max_prefix_from_ids(
-            [*_counter_ids_from_local_workspace(self.workspace), *extra_ids]
+        occupied = _occupied_package_ids(self.workspace)
+        seeded = max_lane_from_ids(
+            [*_counter_ids_from_local_workspace(self.workspace), *occupied, *extra_ids]
         )
         for prefix, number in seeded.items():
             counters[prefix] = max(counters.get(prefix, 0), number)
@@ -186,13 +198,12 @@ class LocalIdCounterStore:
                 parsed = parse_id(str(row.get("岗位编号") or row.get("job_id") or ""))
                 if not parsed:
                     continue
-                letter, digit, number = parsed
-                prefix = f"{letter}{digit}"
-                current = counters.get(prefix, 0)
-                candidate = str(row.get("岗位编号") or row.get("job_id") or "").strip()
+                letter, _digit, number = parsed
+                current = counters.get(letter, 0)
+                candidate = str(row.get("岗位编号") or row.get("job_id") or "").strip().upper()
                 if number <= current and row_identity(row) not in existing_identities:
                     raise IdCounterConflict(f"id_counter_conflict:{candidate}")
-                counters[prefix] = max(current, number)
+                counters[letter] = max(current, number)
             payload = {
                 "schema_version": COUNTER_SCHEMA_VERSION,
                 "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -234,7 +245,7 @@ def _occupied_package_ids(workspace: Path) -> set[str]:
         if not entry.is_dir():
             continue
         prefix = entry.name.split("_", 1)[0].strip()
-        if is_assigned_job_id(prefix):
+        if parse_any_id(prefix):
             ids.add(prefix)
     return ids
 
@@ -258,10 +269,10 @@ def prepare_rows_for_entry(
     if counter_store is not None:
         baseline = counter_store.baseline(existing)
     else:
-        baseline = max_prefix_from_ids(
+        baseline = max_lane_from_ids(
             str(row.get("岗位编号") or row.get("job_id") or "")
             for row in existing
-            if is_assigned_job_id(row.get("岗位编号") or row.get("job_id"))
+            if parse_any_id(str(row.get("岗位编号") or row.get("job_id") or ""))
         )
     existing_ids: dict[str, str] = {}
     for row in existing:
