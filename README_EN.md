@@ -25,7 +25,6 @@ and how to tailor the application without giving up final control.
 - **One canonical scan boundary:** `temp_two_pass.sh` is now a compatibility wrapper around the workflow gateway. Each run writes an official `run.json` binding the scan window, scored-artifact hash, semantic status, and cursor commit. When `run_id` is omitted, `/push` resolves only the newest official run—not a legacy `temp`/`daily` sentinel.
 - **Ledger identity is separate from projections:** the local workflow ledger is authoritative for row identity and IDs. A confirmed batch can be projected to CSV and Google Sheets without renumbering when one projection is empty. Push responses expose backend resolution and explicitly warn when `auto → local CSV` because Google configuration is incomplete.
 - **JobsDB recovery is actionable and bounded:** if daily Chrome does not expose CDP, the system does not pretend verification succeeded or retry forever. It writes a cookie-free manual-recovery handoff and a resumable command, deduplicates identical portal requests while preserving page/query aliases, and reports planned/deduplicated/error/filter diagnostics.
-- **Verification:** the full Python regression after this repair is `585 passed, 7 skipped, 41 deselected`; private workspace data, Google credentials, cookies, and runtime artifacts remain outside the public commit.
 
 ### Why JobsFlow?
 
