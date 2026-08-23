@@ -20,7 +20,7 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Today's update · 2026-08-23 · workflow reliability patch
+## 🆕 Latest update · 2026-08-23 · workflow reliability patch
 
 - **One canonical scan boundary:** `temp_two_pass.sh` is now a compatibility wrapper around the workflow gateway. Each run writes an official `run.json` binding the scan window, scored-artifact hash, semantic status, and cursor commit. When `run_id` is omitted, `/push` resolves only the newest official run—not a legacy `temp`/`daily` sentinel.
 - **Ledger identity is separate from projections:** the local workflow ledger is authoritative for row identity and IDs. A confirmed batch can be projected to CSV and Google Sheets without renumbering when one projection is empty. Push responses expose backend resolution and explicitly warn when `auto → local CSV` because Google configuration is incomplete.
@@ -158,8 +158,8 @@ CV + intent → setup → search → quick score → JD deep read
 
 ### Operational reliability and diagnostics
 
-The capabilities described in earlier updates are now workflow contracts, not
-model memory. `temp_two_pass.sh` is only a compatibility wrapper; the workflow
+These capabilities are now workflow contracts, not model memory.
+`temp_two_pass.sh` is only a compatibility wrapper; the workflow
 gateway owns the scan. Every run creates an official
 `scan_runs/<run-id>/run.json` binding the window, scored-artifact hash, semantic
 task status and refresh-cursor commit; the cursor is committed only after the

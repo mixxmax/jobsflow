@@ -34,7 +34,7 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 
 ---
 
-## 🆕 今日更新 · 2026-08-23 · workflow reliability patch
+## 🆕 最新更新 · 2026-08-23 · workflow reliability patch
 
 - **扫描入口已收敛**：`temp_two_pass.sh` 现在只是兼容入口，统一转到 workflow gateway；每轮生成绑定窗口、评分产物哈希、语义状态和游标提交的官方 `run.json`。省略 `run_id` 时只解析最新官方运行，不再误用旧的 `temp`/`daily` 状态哨兵。
 - **台账身份与投影已分离**：本地 workflow ledger 是岗位行身份和编号的权威来源；同一批已确认岗位可以安全投影到 CSV 和 Google Sheets，不会因为另一投影为空而重新编号。每次 push 都返回后端解析结果，配置缺失时明确警告 `auto → local CSV`。
@@ -245,7 +245,7 @@ CV 和 Cover Letter 是两份平行基础版，具体岗位只提交有限 JD �
 
 ### 运行可靠性与可诊断性
 
-旧版更新中介绍的能力现在都属于主流程契约，而不是模型记忆：`temp_two_pass.sh` 只是兼容入口，
+这些能力现在都属于主流程契约，而不是模型记忆：`temp_two_pass.sh` 只是兼容入口，
 实际扫描由 workflow gateway 执行。每轮扫描建立一个官方 `scan_runs/<run-id>/run.json`，绑定扫描窗口、
 评分产物哈希、语义任务状态和刷新游标；只有评分产物验证成功后才提交游标。`/push` 若未指定 `run_id`，
 只会解析最新官方运行，不会把历史 `temp`/`daily` 状态当成当前结果。运行记录同时保存计划请求、去重请求、

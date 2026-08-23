@@ -34,7 +34,7 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
 
 ---
 
-## 🆕 今日更新 · 2026-08-23 · workflow reliability patch
+## 🆕 最新更新 · 2026-08-23 · workflow reliability patch
 
 - **掃描入口已收斂**：`temp_two_pass.sh` 現在只是兼容入口，統一轉到 workflow gateway；每輪產生帶窗口、評分產物雜湊、語義狀態和游標提交的官方 `run.json`。省略 `run_id` 時只解析最新官方運行，不再誤用舊的 `temp`/`daily` 狀態哨兵。
 - **台帳身份與投影已分離**：本地 workflow ledger 是崗位行身份和編號的權威來源；同一批已確認職位可以安全投影到 CSV 和 Google Sheets，不會因另一個投影為空而重新編號。每次 push 都回報後端解析結果，配置缺失時明確警告 `auto → local CSV`。
@@ -257,7 +257,7 @@ python3 -m tools.workflow base confirm --lane A --confirm
 
 ### 運行可靠性與可診斷性
 
-舊版更新中介紹的能力現在都屬於主流程契約，而不是模型記憶：`temp_two_pass.sh` 只是兼容入口，
+這些能力現在都屬於主流程契約，而不是模型記憶：`temp_two_pass.sh` 只是兼容入口，
 實際掃描由 workflow gateway 執行。每輪掃描建立一個官方 `scan_runs/<run-id>/run.json`，綁定掃描窗口、
 評分產物雜湊、語義任務狀態和刷新游標；只有評分產物驗證成功後才提交游標。`/push` 若未指定
 `run_id`，只會解析最新官方運行，不會把歷史 `temp`/`daily` 狀態當成當前結果。運行記錄同時保存計劃
