@@ -319,7 +319,9 @@ def run_portal_batch(
                 "request_id": request["request_id"],
                 "query": request.get("term"),
                 "jobage": request.get("jobage", 9999),
-                "page": 1,
+                # Preserve the page budget. The old batch wire format always
+                # sent page=1, silently paying for duplicate first-page calls.
+                "page": request.get("page", 1),
                 "limit": request.get("limit", 15),
                 "location": request.get("location"),
             }
@@ -991,6 +993,9 @@ def main(argv: list[str] | None = None) -> int:
     work_items: list[dict[str, Any]] = []
     work_by_portal: dict[str, list[dict[str, Any]]] = {}
     portal_cfg_by_name: dict[str, dict[str, Any]] = {}
+    request_keys: dict[tuple[Any, ...], dict[str, Any]] = {}
+    request_deduped = 0
+    page_budgets = parse_page_budget(args.page_budget)
     for q in cfg.get("queries") or []:
         qid = q.get("id") or "q"
         track_hint = q.get("track_hint") or "F"
@@ -1004,8 +1009,18 @@ def main(argv: list[str] | None = None) -> int:
                 term = terms.get("linkedin") or terms.get("jobsdb")
             if not term:
                 continue
-            page_budgets = parse_page_budget(args.page_budget)
             for page in range(1, page_budgets.get(portal, 1) + 1):
+                request_key = (
+                    portal,
+                    str(term).strip(),
+                    int(hours_to_jobage(scan_hours, portal)),
+                    str(location if portal == "linkedin" else ""),
+                    int(page),
+                    int(args.limit_per_query),
+                )
+                canonical_request = request_keys.get(request_key)
+                if canonical_request is not None:
+                    request_deduped += 1
                 request = {
                     "request_id": f"{portal}:{page}:{len(work_items)}",
                     "_sequence": len(work_items),
@@ -1018,8 +1033,14 @@ def main(argv: list[str] | None = None) -> int:
                     "limit": args.limit_per_query,
                     "page": page,
                 }
+                if canonical_request is not None:
+                    # Keep the alias for deterministic lane/query attribution,
+                    # but reuse the canonical network response below.
+                    request["_network_request_id"] = canonical_request["request_id"]
+                else:
+                    request_keys[request_key] = request
+                    work_by_portal.setdefault(portal, []).append(request)
                 work_items.append(request)
-                work_by_portal.setdefault(portal, []).append(request)
             portal_cfg_by_name[portal] = pcfg
 
     worker_results: dict[str, list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]] = {}
@@ -1052,6 +1073,13 @@ def main(argv: list[str] | None = None) -> int:
     for rows in worker_results.values():
         for request, results, err in rows:
             responses[str(request["request_id"])] = (results, err)
+    for request in work_items:
+        canonical_id = str(request.get("_network_request_id") or "")
+        if canonical_id:
+            responses[str(request["request_id"])] = responses.get(
+                canonical_id,
+                ([], "canonical deduplicated request returned no response"),
+            )
 
     for request in work_items:
         portal = str(request["portal"])
@@ -1113,6 +1141,10 @@ def main(argv: list[str] | None = None) -> int:
                 "duplicate_count": counters.get("duplicate", 0),
                 "filtered_count": counters.get("reject", 0),
                 "error": err,
+                "network_reused": bool(request.get("_network_request_id")),
+                "network_request_id": str(
+                    request.get("_network_request_id") or request.get("request_id")
+                ),
                 "worker": "portal_batch" if portal in BATCH_PORTALS else "legacy_serial",
                 "session_reuse": portal == "ctgoodjobs",
                 "ct_cookie_expired": bool(
@@ -1189,7 +1221,10 @@ def main(argv: list[str] | None = None) -> int:
             "duplicate": sum(1 for h in all_hits if h.decision == "duplicate"),
             "reject": sum(1 for h in all_hits if h.decision == "reject"),
             "appended_to_tracker": len(appended),
+            "requests_planned": len(work_items),
+            "requests_deduped": request_deduped,
         },
+        "request_deduped": request_deduped,
         "calls": call_log,
         "errors": errors,
         "new_jobs": [asdict(h) for h in to_write],

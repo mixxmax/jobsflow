@@ -466,6 +466,30 @@ def test_recovery_failure_never_closes_circuit_or_uses_playwright(
     assert circuit_calls["reconciled"] == 0
 
 
+def test_recovery_endpoint_handoff_is_persisted_and_resumable(tmp_path):
+    class FakeRecoveryClass(browser.JobsdbHumanVerificationRecovery):
+        def _cdp_fetch(self, url):
+            return self._failure(
+                url,
+                "cdp_endpoint_unavailable",
+                recommended_action="start_chrome_with_debug_port",
+                manual_hint="quit Chrome and restart it with port 9222",
+                manual_command='open -na "Google Chrome" --args --remote-debugging-port=9222 ' + url,
+            )
+
+    recovery = FakeRecoveryClass(profile_dir=tmp_path / "profile")
+    result = recovery.recover(
+        "https://hk.jobsdb.com/job/223", cache_root=tmp_path
+    )
+
+    assert result.requires_user_action is True
+    assert recovery.status == "requires_user_action"
+    notice = tmp_path / "JobSearch_2026" / "02_Tracker" / "portal_state" / "jobsdb_manual_recovery.json"
+    payload = json.loads(notice.read_text(encoding="utf-8"))
+    assert payload["recommended_action"] == "start_chrome_with_debug_port"
+    assert "cookies" not in notice.read_text(encoding="utf-8").lower()
+
+
 def test_storage_state_path_must_be_inside_home(tmp_path):
     with pytest.raises(ValueError):
         browser._safe_storage_path(tmp_path / "state.json")

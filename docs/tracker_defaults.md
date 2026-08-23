@@ -70,7 +70,7 @@ write-free proposal, then confirm its proposal ID.
 |------|---------|--------|
 | Daily | `./tools/fresh_24h/fresh_24h_scan.sh daily` | Last ~24h |
 | **Temp** | `./tools/fresh_24h/fresh_24h_scan.sh temp` | **Since last refresh** |
-| **Recommended** (scan + two-pass) | `./tools/fresh_24h/temp_two_pass.sh temp` | Same + confirmed scan depth + retention preference |
+| **Recommended** (scan + two-pass) | `./tools/fresh_24h/temp_two_pass.sh temp` | Canonical workflow run: scan, score, hash-bound `run.json`, then cursor commit |
 
 State file: `fresh_refresh_state.json`
 
@@ -83,6 +83,15 @@ python3 -m tools.workflow push --run-id <scan-run-id>
 # After the user explicitly confirms the proposal:
 python3 -m tools.workflow push --run-id <scan-run-id> --confirm <proposal-id>
 ```
+
+The scan JSON prints the official `run_id`. If it is omitted, `/push` resolves
+the newest official run record rather than the historical `temp` state file.
+Every push response exposes `backend_resolution`; missing Google configuration
+is reported as an explicit auto→local-CSV warning. Add a private
+`JobSearch_2026/00_Profile/tracker_backend.json` with `backend`, `gsheet_id` and
+`google_application_credentials` to make the Google projection persistent.
+The local ledger remains authoritative, so projecting one confirmed run to a
+second backend preserves its existing lane ID.
 
 See `tools/fresh_24h/README.md` and `tools/fresh_24h/AGENT_REFRESH.md`.
 

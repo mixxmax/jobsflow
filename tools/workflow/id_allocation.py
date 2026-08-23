@@ -255,6 +255,7 @@ def prepare_rows_for_entry(
     existing_rows: Iterable[dict[str, Any]],
     *,
     workspace: Path | None = None,
+    authoritative_rows: Iterable[dict[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     """Return rows with persistent IDs allocated for a confirmed entry.
 
@@ -264,7 +265,22 @@ def prepare_rows_for_entry(
     confirmation checks before writing these rows.
     """
 
-    existing = [dict(row) for row in existing_rows]
+    # The local ledger is authoritative even when the selected projection is
+    # empty or stale (a common first-write case for a second backend). Put it
+    # first so a canonical URL keeps its already assigned ID; the remote
+    # snapshot only fills identities not present in the local ledger.
+    existing: list[dict[str, Any]] = []
+    seen_identities: set[str] = set()
+    for source in (authoritative_rows, existing_rows):
+        for raw in source:
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            identity = row_identity(row)
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            existing.append(row)
     counter_store = LocalIdCounterStore(workspace) if workspace is not None else None
     if counter_store is not None:
         baseline = counter_store.baseline(existing)

@@ -17,13 +17,13 @@ from tools.workflow.confirmation import (
     validate_proposal,
 )
 from tools.fresh_24h.batch_mark import hkt_now_str, make_batch_id, mark_new_rows, sort_fresh_rows
-from tools.workflow.fresh_store import default_fresh_store, rows_digest
+from tools.workflow.fresh_store import default_fresh_store, fresh_backend_resolution, rows_digest
 from tools.workflow.id_allocation import (
     IdCounterConflict,
     LocalIdCounterStore,
     prepare_rows_for_entry,
 )
-from tools.workflow.sync import SyncCoordinator
+from tools.workflow.sync import SyncCoordinator, TrackerLedger
 from tools.job_urls import normalize_job_url
 from tools.job_materials.packages import create_package_from_entry_row, validate_entry_row_binding
 
@@ -135,6 +135,15 @@ def _normalize_selection_key(value: str) -> str:
     return value.casefold()
 
 
+def _authoritative_rows(workspace: Path, title: str) -> list[dict[str, Any]]:
+    """Read the local ledger without bootstrapping it from a remote target."""
+
+    ledger = TrackerLedger(workspace, title)
+    if not ledger.exists():
+        return []
+    return [dict(row) for row in ledger.read().rows]
+
+
 def _entry_preview(
     *,
     workspace: Path,
@@ -147,11 +156,17 @@ def _entry_preview(
     mode: str = "temp",
     selection_keys: list[str] | None = None,
     source_row_count: int | None = None,
+    authoritative_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create a digest-bound, write-free proposal for a tracker entry."""
 
     target = target_snapshot or store.read_active()
-    prepared = prepare_rows_for_entry(rows, target.rows, workspace=workspace)
+    prepared = prepare_rows_for_entry(
+        rows,
+        target.rows,
+        workspace=workspace,
+        authoritative_rows=authoritative_rows or [],
+    )
     route_errors = [
         error
         for row in prepared
@@ -198,9 +213,15 @@ def _entry_preview(
     return proposal
 
 
-def _preview_result(proposal: dict[str, Any], *, target_digest: str, rule_ids: list[str]) -> dict[str, Any]:
+def _preview_result(
+    proposal: dict[str, Any],
+    *,
+    target_digest: str,
+    rule_ids: list[str],
+    backend_resolution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     rows = list(proposal.get("prepared_rows") or [])
-    return result(
+    out = result(
         status="planned",
         rule_ids=rule_ids,
         requires_confirmation=True,
@@ -222,6 +243,11 @@ def _preview_result(proposal: dict[str, Any], *, target_digest: str, rule_ids: l
             for row in rows
         ],
     )
+    if backend_resolution:
+        out["backend_resolution"] = backend_resolution
+        if backend_resolution.get("warning"):
+            out.setdefault("warnings", []).append(backend_resolution["warning"])
+    return out
 
 
 def handle(
@@ -284,6 +310,7 @@ def handle(
         or (proposal_hint or {}).get("target")
         or f"fresh_24h_{run.get('scan_day') or date.today().isoformat()}"
     )
+    backend_resolution = fresh_backend_resolution(workspace, payload)
     try:
         target = store or default_fresh_store(workspace, title, payload)
     except RuntimeError as exc:
@@ -292,8 +319,10 @@ def handle(
             blockers=[str(exc)],
             rule_ids=["PUSH-001", "FRESH-001"],
             backend=str(payload.get("backend") or "auto"),
+            backend_resolution=backend_resolution,
         )
     target_before = target.read_active()
+    authoritative_rows = _authoritative_rows(workspace, title)
 
     if not proposal_id:
         try:
@@ -310,6 +339,7 @@ def handle(
                 mode=str(run.get("mode") or payload.get("mode") or "temp"),
                 selection_keys=selection_keys,
                 source_row_count=source_row_count,
+                authoritative_rows=authoritative_rows,
             )
         except ValueError as exc:
             return result(
@@ -322,6 +352,7 @@ def handle(
             proposal,
             target_digest=target_before.digest,
             rule_ids=ENTRY_RULE_IDS,
+            backend_resolution=backend_resolution,
         )
 
     proposal = proposal_hint or confirmations.load(proposal_id)
@@ -415,7 +446,7 @@ def handle(
     try:
         LocalIdCounterStore(workspace).reserve_rows(
             prepared,
-            existing_rows=target_before.rows,
+            existing_rows=[*authoritative_rows, *target_before.rows],
         )
     except IdCounterConflict as exc:
         return result(
@@ -498,4 +529,6 @@ def handle(
         sync_target_digest=sync.get("target_after_digest"),
         proposal_id=proposal_id,
         package_paths=package_paths,
+        backend_resolution=backend_resolution,
+        warnings=([backend_resolution["warning"]] if backend_resolution.get("warning") else []),
     )

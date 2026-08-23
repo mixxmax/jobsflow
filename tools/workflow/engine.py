@@ -82,6 +82,13 @@ class WorkflowEngine:
             proposal = ConfirmationStore(Path(workspace)).load(str(confirmation_id or ""))
             if isinstance(proposal, dict) and str(proposal.get("run_id") or "").strip():
                 payload["run_id"] = str(proposal["run_id"])
+        if request.action == "push" and not str(payload.get("run_id") or "").strip():
+            # Never use the mode name (``temp``/``daily``) as a workflow
+            # entity. That legacy fallback pointed a new push at a stale mode
+            # state and produced an unexplained illegal_transition. The
+            # latest official run is only a convenience default; the adapter
+            # still verifies its scored hash and semantic status.
+            payload["run_id"] = _latest_scan_run_id(Path(workspace)) or "latest"
         # Keep the request object and the normalized adapter payload aligned
         # for the optional QC bridge and audit record.  Direct
         # ``WorkflowEngine.execute`` callers must receive the same forced
@@ -381,6 +388,27 @@ def _entity_for(action: str, payload: dict[str, Any], store) -> tuple[str, str]:
     if action in {"sync_status", "sync_reconcile", "sync_pull", "sync_retry"}:
         return "sync", str(payload.get("fresh_title") or payload.get("target") or "fresh_24h")
     return "scan", "latest"
+
+
+def _latest_scan_run_id(workspace: Path) -> str | None:
+    """Return the newest official run record, never a legacy mode sentinel."""
+
+    root = Path(workspace) / "02_Tracker" / "workflow" / "scan_runs"
+    if not root.is_dir():
+        return None
+    candidates = sorted(
+        root.glob("*/run.json"), key=lambda path: path.stat().st_mtime, reverse=True
+    )
+    for path in candidates:
+        try:
+            import json
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(payload, dict) and str(payload.get("run_id") or "").strip():
+            return str(payload["run_id"])
+    return None
 
 
 def _elapsed_ms(started: float) -> int:

@@ -138,6 +138,15 @@ Their actual queries and relevance rules are candidate- and profession-specific.
 | Assess | Persist structured strengths/gaps with JD/profile hashes under the private tracker |
 | Materials | Never auto-generate during scan |
 
+The supported scan boundary is the workflow gateway; the compatibility shell
+`tools/fresh_24h/temp_two_pass.sh` delegates to it. Every live run creates one
+official `02_Tracker/workflow/scan_runs/<run-id>/run.json` binding the window,
+scored CSV hash, semantic status and refresh-cursor commit. An omitted push run
+ID resolves only to the newest official run record, never to the legacy
+`temp`/`daily` state sentinel. Run diagnostics expose planned/deduplicated
+requests, portal errors, pass-1 drops, provisional rows and deep-fetch
+outcomes.
+
 - Promote copies matching rows into the main trackers and **keeps** the
   fresh tab. Archiving or clearing fresh is an A3 action:
   `python3 -m tools.workflow archive preview` then `archive confirm`.
@@ -195,6 +204,10 @@ Their actual queries and relevance rules are candidate- and profession-specific.
   Chromium is never used for verification and never counts as a recovery.
   Interactive verification can never run in a headless context, and recovery
   never copies cookies into a second browser-state file.
+  If the real Chrome CDP endpoint is unavailable, the result is an explicit
+  `requires_user_action` handoff with a cookie-free resume record at
+  `02_Tracker/portal_state/jobsdb_manual_recovery.json`; the same scan may be
+  rerun after the user starts the reported port and completes verification.
   Browser profiles and cookie files never belong in the repository or tracker
   output; rows record JD depth as
   `full`/`cache`/`teaser`/`paste_needed`, and a teaser is never treated as a
@@ -260,6 +273,14 @@ Their actual queries and relevance rules are candidate- and profession-specific.
   `02_Tracker/workflow/sync_operations/`. Full remote read-back remains the
   fallback for schema migrations, updates or reconciliation; the local ledger
   remains authoritative for ordinary entry.
+  The local ledger is also the ID/identity authority when a target projection
+  is empty. A scan can be projected to multiple backends with separate
+  proposals without renumbering its rows; each proposal still binds its
+  backend class and target digest. `backend_resolution` is returned on every
+  push and warns when `auto` falls back to local CSV because Sheets credentials
+  are missing. Private deployments may store the sheet ID and service-account
+  path in `00_Profile/tracker_backend.json`; secrets remain outside tracked
+  source.
 - **Entry presentation is a code-level invariant, not a model preference.**
   After an explicit `/push` confirmation, the new batch is inserted directly
   below the header (row 2), marked `本轮新增=是` with a batch ID and entry time,

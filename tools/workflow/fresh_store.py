@@ -692,8 +692,21 @@ class GSheetFreshStore:
     ) -> None:
         self.workspace = Path(workspace)
         self.title = title
-        self.sheet_id = str(sheet_id or os.environ.get("GSHEET_ID") or "")
-        self.credentials = Path(credentials or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "").expanduser()
+        config = _tracker_backend_config(self.workspace)
+        self.sheet_id = str(
+            sheet_id
+            or os.environ.get("GSHEET_ID")
+            or config.get("gsheet_id")
+            or config.get("spreadsheet_id")
+            or ""
+        )
+        self.credentials = Path(
+            credentials
+            or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            or config.get("google_application_credentials")
+            or config.get("service_account_key_file")
+            or ""
+        ).expanduser()
         if not self.sheet_id or not str(self.credentials) or not self.credentials.is_file():
             raise RuntimeError("gsheet_credentials_missing")
         try:
@@ -914,17 +927,94 @@ class GSheetFreshStore:
         raise RuntimeError("gsheet_archive_not_authorized")
 
 
+def _profile_dir(workspace: Path) -> Path:
+    workspace = Path(workspace)
+    if workspace.name == "JobSearch_2026":
+        return workspace / "00_Profile"
+    private = workspace / "JobSearch_2026" / "00_Profile"
+    return private if private.is_dir() else workspace / "00_Profile"
+
+
+def _tracker_backend_config(workspace: Path) -> dict[str, Any]:
+    """Read non-secret backend settings from the private profile, if present."""
+
+    profile = _profile_dir(Path(workspace))
+    for filename in ("tracker_backend.json", "config.personal.json"):
+        path = profile / filename
+        if not path.is_file():
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        nested = value.get("tracker_backend")
+        if isinstance(nested, dict):
+            return {**value, **nested}
+        return value
+    return {}
+
+
+def fresh_backend_resolution(
+    workspace: Path, payload: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Explain backend selection so an auto fallback is never silent."""
+
+    payload = payload or {}
+    config = _tracker_backend_config(Path(workspace))
+    payload_backend = str(payload.get("backend") or "").strip().casefold()
+    requested = (
+        payload_backend
+        if payload_backend and payload_backend != "auto"
+        else str(
+            os.environ.get("JOBSFlow_FRESH_BACKEND")
+            or config.get("backend")
+            or "auto"
+        ).strip().casefold()
+    )
+    if requested not in {"auto", "csv", "gsheet", "file"}:
+        requested = "auto"
+    env_sheet = bool(os.environ.get("GSHEET_ID"))
+    config_sheet = bool(config.get("gsheet_id") or config.get("spreadsheet_id"))
+    def _is_file(value: Any) -> bool:
+        try:
+            return bool(value) and Path(str(value)).expanduser().is_file()
+        except (OSError, TypeError, ValueError):
+            return False
+
+    credentials_present = _is_file(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")) or _is_file(
+        config.get("google_application_credentials") or config.get("service_account_key_file")
+    )
+    configured_gsheet = bool((env_sheet or config_sheet) and credentials_present)
+    if requested == "gsheet":
+        selected = "gsheet"
+    elif requested in {"csv", "file"}:
+        selected = "local_csv" if requested == "csv" else "file"
+    elif configured_gsheet:
+        selected = "gsheet"
+    else:
+        selected = "local_csv"
+    warning = ""
+    if requested == "auto" and selected == "local_csv":
+        warning = "auto_backend_fell_back_to_local_csv:configure_GSHEET_ID_and_GOOGLE_APPLICATION_CREDENTIALS_or_00_Profile/tracker_backend.json"
+    return {
+        "requested": requested,
+        "selected": selected,
+        "configured_gsheet": configured_gsheet,
+        "credentials_present": credentials_present,
+        "warning": warning,
+    }
+
+
 def default_fresh_store(workspace: Path, title: str, payload: dict[str, Any] | None = None):
     """Select a real push sink without allowing a model to invent a backend."""
-    payload = payload or {}
-    requested = str(payload.get("backend") or os.environ.get("JOBSFlow_FRESH_BACKEND") or "").strip().casefold()
-    if requested == "file":
+
+    resolution = fresh_backend_resolution(workspace, payload)
+    selected = resolution["selected"]
+    if selected == "file":
         return FileFreshStore(workspace, title)
-    if requested == "gsheet":
-        return GSheetFreshStore(workspace, title)
-    if requested == "csv":
-        return LocalCsvFreshStore(workspace, title)
-    if os.environ.get("GSHEET_ID") and os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+    if selected == "gsheet":
         return GSheetFreshStore(workspace, title)
     return LocalCsvFreshStore(workspace, title)
 

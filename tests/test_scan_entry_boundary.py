@@ -92,6 +92,80 @@ def test_push_preview_is_write_free_and_confirmation_allocates_id(tmp_path):
     assert is_assigned_job_id(store.read_active().rows[0]["岗位编号"])
 
 
+def test_push_without_run_id_uses_latest_official_run_not_mode_state(tmp_path):
+    from tools.workflow.fresh_store import MemoryFreshStore
+
+    ws = build_workspace(tmp_path)
+    scan = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "scan-latest-default",
+                "jobs": [{"title": "Latest role", "company": "Acme", "score": "4.0"}],
+            },
+        },
+    )
+    preview = dispatch(
+        "push",
+        workspace=ws,
+        store=MemoryFreshStore("fresh_latest_default", []),
+        payload={"fresh_title": "fresh_latest_default"},
+    )
+    assert preview["status"] == "planned"
+    assert preview["proposal"]["run_id"] == scan["run_id"]
+
+
+def test_same_scan_can_be_projected_to_second_backend_without_renumbering(tmp_path):
+    from tools.workflow.fresh_store import FileFreshStore, MemoryFreshStore
+
+    ws = build_workspace(tmp_path)
+    scan = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "scan-multi-projection",
+                "jobs": [{"title": "Projected role", "company": "Acme", "score": "4.0", "lane": "D"}],
+            },
+        },
+    )
+    first = MemoryFreshStore("fresh_multi_projection", [])
+    preview_a = dispatch(
+        "push",
+        workspace=ws,
+        store=first,
+        payload={"run_id": scan["run_id"], "fresh_title": first.title},
+    )
+    assert dispatch(
+        "push",
+        workspace=ws,
+        store=first,
+        payload={"confirmation_id": preview_a["proposal_id"]},
+    )["status"] == "succeeded"
+    assigned = first.read_active().rows[0]["岗位编号"]
+
+    second = FileFreshStore(ws, "fresh_multi_projection", [])
+    preview_b = dispatch(
+        "push",
+        workspace=ws,
+        store=second,
+        payload={"run_id": scan["run_id"], "fresh_title": second.title},
+    )
+    assert preview_b["status"] == "planned"
+    assert preview_b["proposed_ids"] == [assigned]
+    confirmed_b = dispatch(
+        "push",
+        workspace=ws,
+        store=second,
+        payload={"confirmation_id": preview_b["proposal_id"]},
+    )
+    assert confirmed_b["status"] == "succeeded"
+    assert second.read_active().rows[0]["岗位编号"] == assigned
+
+
 def test_confirmation_restores_bound_run_when_cli_omits_run_id(tmp_path):
     from tools.workflow.fresh_store import MemoryFreshStore
 

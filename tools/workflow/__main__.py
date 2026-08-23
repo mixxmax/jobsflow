@@ -94,6 +94,11 @@ def main(argv: list[str] | None = None) -> int:
     scan = sub.add_parser("scan", parents=[common], help="Execute a scan (use --dry-run to plan only)")
     scan.add_argument("--mode", default="temp")
     scan.add_argument("--hours", default="")
+    scan.add_argument(
+        "--gate",
+        default="",
+        help="Optional pass-1 score gate forwarded to the canonical scorer",
+    )
     scan.add_argument("--fixture", type=Path)
 
     base = sub.add_parser("base", parents=[common], help="Build and activate lane CV/CL masters")
@@ -254,6 +259,8 @@ def main(argv: list[str] | None = None) -> int:
         payload["mode"] = args.mode
         if args.hours:
             payload["hours"] = args.hours
+        if args.gate:
+            payload["gate"] = args.gate
         if args.fixture:
             payload["fixture"] = json.loads(Path(args.fixture).read_text(encoding="utf-8"))
         elif not payload.get("run_id"):

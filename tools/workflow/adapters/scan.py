@@ -247,6 +247,9 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
         "--repo",
         str(repo),
     ]
+    gate = payload.get("gate")
+    if gate not in {None, ""}:
+        score_cmd.extend(["--gate", str(gate)])
     score_proc = subprocess.run(score_cmd, cwd=str(REPO), env=env, capture_output=True, text=True)
     # Bind this run to the artifact named by this scan's summary.  Falling
     # back to the newest CSV could accidentally score/commit yesterday's
@@ -263,6 +266,33 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
             stderr=((score_proc.stderr or scan_proc.stderr) or "")[-500:],
         )
     pending_rows, pending_tasks = _pending_from_sidecar(scored)
+    score_meta = _read_json(Path(scored).with_suffix(".json")) or {}
+    scan_counts = scan_summary.get("counts") or {}
+    scan_errors = list(scan_summary.get("errors") or [])
+    diagnostics = {
+        "scan": {
+            "counts": scan_counts,
+            "errors": scan_errors,
+            "error_count": len(scan_errors),
+            "request_deduped": int(scan_summary.get("request_deduped") or 0),
+        },
+        "score": {
+            key: score_meta.get(key)
+            for key in (
+                "input",
+                "pass1_kept",
+                "pass1_dropped",
+                "provisional_needs_jd",
+                "final_kept",
+                "deep_attempted",
+                "deep_network_attempted",
+                "deep_ok",
+                "deep_unavailable",
+                "enrich_errors",
+            )
+            if key in score_meta
+        },
+    }
     meta = write_run_record(
         workspace,
         run_id=run_id,
@@ -282,6 +312,8 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
             "scan_window": scan_summary.get("window") or {},
             "scan_counts": scan_summary.get("counts") or {},
             "candidates_csv": scan_summary.get("candidates_csv"),
+            "scan_errors": scan_errors,
+            "diagnostics": diagnostics,
         },
     )
     committed = commit_refresh_after_score(workspace=workspace, mode=mode, run_id=run_id)
@@ -306,6 +338,7 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
         run=meta,
         scored_path=meta["scored_path"],
         preview_rows=_preview_rows(scored),
+        diagnostics=diagnostics,
     )
 
 

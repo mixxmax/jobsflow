@@ -22,7 +22,13 @@ ENTITY_TRANSITIONS: dict[str, dict[str, set[str]]] = {
         "scored": {"semantic_pending", "semantic_ready", "pushed_to_fresh"},
         "semantic_pending": {"semantic_ready"},
         "semantic_ready": {"pushed_to_fresh"},
-        "pushed_to_fresh": set(),
+        # A scan is an immutable source run, while fresh tabs are projections.
+        # Once one projection is written the same run may still be projected
+        # to another backend (for example local CSV and Google Sheets).  Keep
+        # the terminal business phase, but allow an idempotent same-phase
+        # push; the push adapter remains responsible for proposal/digest
+        # validation and duplicate suppression.
+        "pushed_to_fresh": {"pushed_to_fresh"},
     },
     "fresh": {
         "idle": {"promoted_retained", "archive_pending_confirmation"},

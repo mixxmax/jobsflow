@@ -135,6 +135,9 @@ class JdFetchResult:
     circuit_state: str | None = None
     retry_not_before: float | None = None
     recommended_action: str | None = None
+    requires_user_action: bool = False
+    manual_hint: str | None = None
+    manual_command: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1130,9 +1133,18 @@ class JobsdbHumanVerificationRecovery:
         self.attempted = False
         self.status = "not_attempted"
         self.navigation_count = 0
+        self.manual_hint: str | None = None
+        self.manual_command: str | None = None
 
     @staticmethod
-    def _failure(url: str, reason: str) -> JdFetchResult:
+    def _failure(
+        url: str,
+        reason: str,
+        *,
+        recommended_action: str = "wait_or_manual_verify",
+        manual_hint: str | None = None,
+        manual_command: str | None = None,
+    ) -> JdFetchResult:
         return JdFetchResult(
             ok=False,
             url=url,
@@ -1141,7 +1153,10 @@ class JobsdbHumanVerificationRecovery:
             detail_reason=reason,
             attempts=0,
             last_reason=reason,
-            recommended_action="wait_or_manual_verify",
+            recommended_action=recommended_action,
+            requires_user_action=bool(manual_hint or manual_command),
+            manual_hint=manual_hint,
+            manual_command=manual_command,
         )
 
     def _endpoint_alive(self) -> bool:
@@ -1188,6 +1203,8 @@ class JobsdbHumanVerificationRecovery:
             'open -na "Google Chrome" --args '
             f"--remote-debugging-port={self.debug_port} {url}"
         )
+        self.manual_hint = manual_hint
+        self.manual_command = manual_hint
         if not self._endpoint_alive():
             print(
                 "JobsDB 需要人工验证：调试端口未开，正在尝试以调试端口启动你的 "
@@ -1202,14 +1219,29 @@ class JobsdbHumanVerificationRecovery:
                     break
                 time.sleep(2.0)
             else:
-                return self._failure(url, "cdp_endpoint_unavailable")
+                self.status = "requires_user_action"
+                return self._failure(
+                    url,
+                    "cdp_endpoint_unavailable",
+                    recommended_action="start_chrome_with_debug_port",
+                    manual_hint=(
+                        "完全退出当前 Chrome（⌘Q），再在终端执行命令；完成验证后重新运行同一条扫描命令。"
+                    ),
+                    manual_command=manual_hint,
+                )
         with sync_playwright() as p:
             try:
                 remote = p.chromium.connect_over_cdp(
                     f"http://127.0.0.1:{self.debug_port}"
                 )
             except Exception:
-                return self._failure(url, "cdp_connect_failed")
+                return self._failure(
+                    url,
+                    "cdp_connect_failed",
+                    recommended_action="retry_cdp_after_manual_start",
+                    manual_hint="确认带 remote-debugging-port 的 Chrome 已启动后重试。",
+                    manual_command=manual_hint,
+                )
             try:
                 contexts = remote.contexts
                 if not contexts:
@@ -1289,7 +1321,14 @@ class JobsdbHumanVerificationRecovery:
             self.status = "failed"
             return self._failure(url, "cdp_recovery_error")
         if not (result.ok and result.content_validated):
-            self.status = "failed"
+            self.status = "requires_user_action" if result.requires_user_action else "failed"
+            if result.requires_user_action:
+                _write_manual_recovery_notice(
+                    url,
+                    result,
+                    cache_root or _default_cache_root(),
+                    debug_port=self.debug_port,
+                )
             return result
 
         from tools.fresh_24h.jd_cache import save_jd_cache
@@ -1303,6 +1342,7 @@ class JobsdbHumanVerificationRecovery:
         if circuit is not None:
             circuit.reconcile_success()
         _clear_failure(result.url or url, cache_root or _default_cache_root())
+        _clear_manual_recovery_notice(cache_root or _default_cache_root())
         result.detail_reason = "manual_recovery_cdp_user_chrome"
         self.status = "succeeded"
         return result
@@ -1509,6 +1549,48 @@ def default_circuit_state_path(repo: Path | None = None) -> Path:
     return workspace / "02_Tracker" / "portal_state" / "jobsdb_circuit.json"
 
 
+def _manual_recovery_notice_path(root: Path | None) -> Path:
+    cache_root = Path(root or _default_cache_root()).expanduser().resolve()
+    workspace = cache_root if cache_root.name == "JobSearch_2026" else cache_root / "JobSearch_2026"
+    return workspace / "02_Tracker" / "portal_state" / "jobsdb_manual_recovery.json"
+
+
+def _write_manual_recovery_notice(
+    url: str,
+    result: JdFetchResult,
+    root: Path | None,
+    *,
+    debug_port: int,
+) -> None:
+    """Persist a safe pause/resume handoff; never persist cookies or headers."""
+
+    path = _manual_recovery_notice_path(root)
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "status": "requires_user_action",
+        "portal": "jobsdb",
+        "url_sha256": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+        "detail_reason": result.detail_reason,
+        "recommended_action": result.recommended_action,
+        "manual_hint": result.manual_hint,
+        "manual_command": result.manual_command,
+        "debug_port": int(debug_port),
+        "resume": "rerun the same scan after starting Chrome with the debug port and completing verification",
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_manual_recovery_notice(root: Path | None) -> None:
+    try:
+        _manual_recovery_notice_path(root).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _failure_cache_path(url: str, root: Path | None) -> Path:
     cache_root = Path(root or _default_cache_root()).expanduser().resolve()
     workspace = cache_root if cache_root.name == "JobSearch_2026" else cache_root / "JobSearch_2026"
@@ -1587,6 +1669,11 @@ def _write_success_cache(result: JdFetchResult, root: Path | None) -> None:
 def _recommended_action(result: JdFetchResult) -> str:
     if result.ok:
         return "none"
+    if result.requires_user_action or result.detail_reason in {
+        "cdp_endpoint_unavailable",
+        "cdp_connect_failed",
+    }:
+        return result.recommended_action or "start_chrome_with_debug_port"
     if result.detail_reason in {"circuit_open", "budget_exhausted"}:
         return "wait_or_manual_verify"
     if result.fail_reason in {"challenge", "rate_limited", "blocked"}:
@@ -1848,6 +1935,9 @@ def _write_sanitized_diagnostics(path: Path, result: JdFetchResult, url: str) ->
         "circuit_state": result.circuit_state,
         "retry_not_before": result.retry_not_before,
         "recommended_action": result.recommended_action,
+        "requires_user_action": result.requires_user_action,
+        "manual_hint": result.manual_hint,
+        "manual_command": result.manual_command,
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

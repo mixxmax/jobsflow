@@ -42,16 +42,18 @@ else
 fi
 
 echo "=== 1) Scan (${MODE}${HOURS:+ hours=$ARG}) ==="
-python3 tools/fresh_24h/fresh_24h_scan.py --mode "$MODE" $HOURS --no-record
-
-echo ""
-echo "=== 2) Two-pass score (internal gate=$PASS1_GATE + configured depth/retention) ==="
+SCAN_ARGS=(python3 -m tools.workflow scan --mode "$MODE" --json)
+if [[ -n "$HOURS" ]]; then
+  # HOURS is deliberately kept as an argument array.  This avoids the old
+  # unquoted shell expansion and keeps the scan window bound to this run.
+  SCAN_ARGS+=(--hours "$ARG")
+fi
+if [[ "$PASS1_GATE" != "3.3" ]]; then
+  SCAN_ARGS+=(--gate "$PASS1_GATE")
+fi
+echo "    Canonical workflow run: scan → score → run.json → cursor commit"
 echo "    Cache hits use zero network budget; preferences come from private setup/intent"
-python3 tools/fresh_24h/two_pass_score.py --gate "$PASS1_GATE"
-
-echo ""
-echo "=== 3) Commit refresh cursor after scored artifact ==="
-python3 -c "from pathlib import Path; from tools.workflow.refresh_commit import commit_refresh_after_score; raise SystemExit(0 if commit_refresh_after_score(workspace=Path('JobSearch_2026'), mode='$MODE') is not None else 2)"
+"${SCAN_ARGS[@]}"
 
 echo ""
 echo "Done. Open JobSearch_2026/02_Tracker/*_twopass_scored.csv"

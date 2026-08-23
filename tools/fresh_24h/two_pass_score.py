@@ -708,6 +708,10 @@ def deep_enrich_hit(
             )
             if recovered.ok and recovered.text and recovered.content_validated:
                 fres = recovered
+            elif getattr(recovered, "requires_user_action", False):
+                # Preserve the actionable CDP handoff instead of replacing it
+                # with the less specific initial Cloudflare challenge.
+                fres = recovered
         if fres.ok and fres.text:
             h["_enrich"] = {
                 "mode": "browser",
@@ -729,6 +733,9 @@ def deep_enrich_hit(
                 "failure_cached": fres.failure_cached,
                 "manual_recovery_status": recovery_status,
                 "manual_recovery_navigations": recovery_navigations,
+                "requires_user_action": getattr(fres, "requires_user_action", False),
+                "manual_hint": getattr(fres, "manual_hint", None),
+                "manual_command": getattr(fres, "manual_command", None),
             }
             h["teaser"] = fres.text[:3000]
             h["_deep_jd_full"] = fres.text
@@ -758,6 +765,9 @@ def deep_enrich_hit(
             "circuit_state": getattr(fres, "circuit_state", None),
             "retry_not_before": getattr(fres, "retry_not_before", None),
             "recommended_action": getattr(fres, "recommended_action", None),
+            "requires_user_action": getattr(fres, "requires_user_action", False),
+            "manual_hint": getattr(fres, "manual_hint", None),
+            "manual_command": getattr(fres, "manual_command", None),
             "state_saved": getattr(fres, "state_saved", False),
             "session_mode": getattr(fres, "session_mode", "snapshot"),
             "manual_recovery_status": recovery_status,
@@ -869,6 +879,9 @@ def run_two_pass(
         "jobsdb_manual_recovery_attempted": 0,
         "jobsdb_manual_recovery_success": 0,
         "jobsdb_manual_recovery_status": "disabled",
+        "jobsdb_manual_recovery_requires_action": False,
+        "jobsdb_manual_recovery_hint": None,
+        "jobsdb_manual_recovery_command": None,
         "enrich_errors": [],
         "jobsdb_detail_status": None,
     }
@@ -1255,6 +1268,10 @@ def run_two_pass(
                             meta["jobsdb_manual_recovery_status"] = recovery_status
                             if recovery_status == "succeeded":
                                 meta["jobsdb_manual_recovery_success"] = 1
+                        if enrich.get("requires_user_action"):
+                            meta["jobsdb_manual_recovery_requires_action"] = True
+                            meta["jobsdb_manual_recovery_hint"] = enrich.get("manual_hint")
+                            meta["jobsdb_manual_recovery_command"] = enrich.get("manual_command")
                 network_attempted = enrich_mode not in {
                     "cache",
                     "ctgoodjobs_skip_browser",
@@ -1775,6 +1792,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"冷却至 {retry_info}，或运行人工验证恢复。",
                 file=sys.stderr,
             )
+        if jobsdb_status.get("manual_recovery_requires_action"):
+            print(
+                "jobsdb: 需要用户完成一次 CDP 人工恢复；"
+                f"{jobsdb_status.get('manual_recovery_hint') or '按提示启动带调试端口的 Chrome'}",
+                file=sys.stderr,
+            )
+            if jobsdb_status.get("manual_recovery_command"):
+                print(f"  resume command: {jobsdb_status['manual_recovery_command']}", file=sys.stderr)
     if meta.get("enrich_errors"):
         print(
             f"WARNING: enrich errors={len(meta['enrich_errors'])} "

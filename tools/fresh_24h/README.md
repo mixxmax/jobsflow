@@ -24,6 +24,8 @@ python3 tools/fresh_24h/validate_queries.py \
 ## Recommended workflow
 
 ```bash
+# Canonical scan boundary: creates one official scan_runs/<run-id>/run.json
+# and commits the refresh cursor only after the scored artifact is verified.
 ./tools/fresh_24h/temp_two_pass.sh temp
 python3 -m tools.workflow push --run-id <scan-run-id>
 # 用户只确认部分岗位时，按 URL/scan_id/已有岗位编号筛选
@@ -50,6 +52,15 @@ The optional `--select` is applied only during the write-free preview and is
 bound into the proposal; confirmation cannot silently broaden or replace that
 selection. A confirmation may omit `--run-id` because the gateway restores the
 run bound to the proposal.
+
+The local workflow ledger is authoritative for row identity and numbering even
+when a selected projection is empty. The same run can therefore be confirmed
+to a local CSV and a Google Sheet with separate proposals without allocating a
+second ID; each proposal still validates its own backend and target digest.
+Push results expose `backend_resolution`. `auto` selects Google Sheets when
+environment credentials or the private
+`JobSearch_2026/00_Profile/tracker_backend.json` are complete; otherwise it
+explicitly warns that it fell back to local CSV.
 
 For Google Sheets, the local workflow ledger is authoritative. Normal additive
 entry inserts the confirmed batch in one bulk operation and keeps older rows;
@@ -106,6 +117,14 @@ record (URL hash only, plus channel/version/headless session facts). See
 `AGENT_REFRESH.md` and
 `docs/JobsDB_Playwright_Cloudflare深取恢复与可靠性技术手册_2026-08-13.md` §15
 for the runbook.
+
+If the user's Chrome does not expose the CDP port, the scorer pauses with
+`requires_user_action`, writes the cookie-free handoff
+`02_Tracker/portal_state/jobsdb_manual_recovery.json`, and prints the resume
+command. Start the reported Chrome port, complete the live challenge in that
+profile, and rerun the same scan. The scanner also deduplicates identical
+portal requests and preserves the requested page number in batch mode; the run
+log reports planned/deduplicated requests, portal errors and filter counts.
 
 ## Rules
 

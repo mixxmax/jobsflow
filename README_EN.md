@@ -20,79 +20,12 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-08-17 · v0.9.5
+## 🆕 Today's update · 2026-08-23 · workflow reliability patch
 
-- **A code-governed workflow instead of model self-discipline:** the unified
-  gateway, policy registry, state machine, task packets, and postconditions now
-  guard `/scan → /push → /materials → /apply`. Scans show lane/score only—no
-  tracker write or persistent job ID; `/push` requires preview/confirmation,
-  archives require preview/confirmation, and `/apply` never submits.
-- **Recall, ranking, and cost are separate:** URL-keyed JD cache is checked
-  first; missing/short teasers and gray-band roles are rescued; deep retrieval
-  follows the economy/balanced/coverage budget. Full JD text drives deep scoring,
-  while unavailable text stays visible as `待审-JD不足` or
-  `provisional_needs_jd` instead of disappearing silently.
-- **Each lane master is the content baseline; audit CV/CL content before files:**
-  CV and Cover Letter are tailored independently from their respective masters
-  against one shared candidate profile and ability ceiling; neither document nor
-  another job package is an evidence source for the other. The main model submits
-  only the current job's bound JD-specific delta—rewrite,
-  reorder, merge, or add. Unchanged content is retained, while full replacement
-  and silent shrinkage are rejected. JobsFlow then dispatches an independent
-  child context that focuses on the delta and makes one compact full-CV/CL sweep
-  for JD coverage, STAR/LLMO placement, role/employer boundaries, consistency,
-  grammar, fragments, and template residue. It never audits email, DOCX/PDF, or
-  layout and cannot edit the materials; the host generates email deterministically
-  after CV/CL content passes.
-- **Bounded repairs and one fixed output path:** the child agent returns
-  block-addressed findings, the main model repairs only affected content, and
-  the independent audit verifies it again. Each job is capped at three audits;
-  a repeated unresolved finding trips a circuit breaker for human review. Only
-  approved content is rendered from the matching lane DOCX master and converted
-  to PDF; deterministic checks own page count, text layer, filenames, and metadata.
-- **Local-first tracker sync:** the local ledger is the source of truth and a
-  local CSV is a complete usable tracker. Google Sheets is an optional
-  projection; failed syncs are replayable, remote changes are reconciled, and
-  user fields enter through an explicit `sync pull`.
-- **Deterministic entry presentation:** after the user confirms `/push`, the
-  newest batch is inserted directly below the header, marked as the current
-  batch and highlighted beige; older rows are demoted to the earlier-entry
-  state. This is a code-level invariant, not a model-selected convention.
-- **Better for models with limited capability:** models handle bounded semantic
-  judgment and wording, while salary, language, qualification, state changes,
-  evidence binding, and high-impact side effects remain deterministic.
-- **One governed SOP across all runtime lines:** `tools/` is the only product
-  implementation. The gateway, state machine, task packets, confirmation
-  boundaries and postconditions prevent a model from switching entry points or
-  writing a side effect at the wrong stage.
-- **The material chain is now baseline-anchored:** each lane's complete CV and
-  Cover Letter master is the content baseline. The main model submits a bounded
-  JD delta; the host compiles canonical CV/CL, automatically runs an independent
-  CV/CL-only audit, renders through the lane DOCX master, converts to PDF, and
-  runs deterministic format gates. Email is host-generated after content passes.
-- **JobsDB is cache-first with controlled human recovery:** in a private runtime,
-  a Cloudflare challenge may open in the user's own daily Chrome; the user clicks
-  once, then the same session is reused sequentially for validated detail pages.
-  There is no headless verification, cookie copying, personal token, or infinite
-  retry. CTgoodjobs remains on its existing structured/cache path; private token
-  integrations are not part of the public release.
-- **Lane and ID boundaries are explicit:** deep review locks a URL to one lane;
-  scan previews have no persistent job ID. Only confirmed `/push` allocates the
-  next three-digit sequence from the single counter for that lane letter (for
-  example `C0-001`, then `C1-002`); the tier digit routes the package but never
-  owns a second counter, and the tracker row is bound to its package.
-- **Material status formatting is fixed:** when a fresh24 worksheet is first
-  created, code installs the V-column `材料状态` dropdown with fixed status
-  values. Choosing `已投递` turns the entire row green through conditional
-  formatting; after CV/CL and mechanical gates pass, the host writes `已制作` to
-  the bound row. Later appends inherit this contract and models cannot choose the
-  column, options, colors, or completion transition.
-
-- **Fewer wrong applications and fewer silent misses:** pass 1 schedules work;
-  the full JD determines the final score, while insufficient-JD rows stay visible.
-- **More relevant materials:** company context and JD priorities drive the CV and cover letter.
-- **Reliable with smaller models:** deterministic preflight, evidence mapping, and quality gates prevent silent skips.
-- **Always user-approved:** JobsFlow never auto-submits an application.
+- **One canonical scan boundary:** `temp_two_pass.sh` is now a compatibility wrapper around the workflow gateway. Each run writes an official `run.json` binding the scan window, scored-artifact hash, semantic status, and cursor commit. When `run_id` is omitted, `/push` resolves only the newest official run—not a legacy `temp`/`daily` sentinel.
+- **Ledger identity is separate from projections:** the local workflow ledger is authoritative for row identity and IDs. A confirmed batch can be projected to CSV and Google Sheets without renumbering when one projection is empty. Push responses expose backend resolution and explicitly warn when `auto → local CSV` because Google configuration is incomplete.
+- **JobsDB recovery is actionable and bounded:** if daily Chrome does not expose CDP, the system does not pretend verification succeeded or retry forever. It writes a cookie-free manual-recovery handoff and a resumable command, deduplicates identical portal requests while preserving page/query aliases, and reports planned/deduplicated/error/filter diagnostics.
+- **Verification:** the full Python regression after this repair is `585 passed, 7 skipped, 41 deselected`; private workspace data, Google credentials, cookies, and runtime artifacts remain outside the public commit.
 
 ### Why JobsFlow?
 
@@ -222,6 +155,35 @@ CV + intent → setup → search → quick score → JD deep read
            → lane/tier preview → your review → confirmed tracker entry
            → persistent job ID → tailored CV/cover letter → your approval
 ```
+
+### Operational reliability and diagnostics
+
+The capabilities described in earlier updates are now workflow contracts, not
+model memory. `temp_two_pass.sh` is only a compatibility wrapper; the workflow
+gateway owns the scan. Every run creates an official
+`scan_runs/<run-id>/run.json` binding the window, scored-artifact hash, semantic
+task status and refresh-cursor commit; the cursor is committed only after the
+scored artifact is verified. If `/push` has no `run_id`, it resolves the newest
+official run instead of treating a legacy `temp`/`daily` sentinel as current.
+The run record reports planned and deduplicated requests, portal errors,
+pass-1 drops, provisional rows and deep-fetch outcomes.
+
+The local ledger is authoritative for row identity and numbering; CSV and Google
+Sheets are replayable projections. A confirmed batch can create separate
+proposals for multiple backends without allocating a second ID when one
+projection is empty. Push returns `backend_resolution` and explicitly warns
+when `auto` falls back to local CSV because Google configuration is incomplete.
+Private deployments may keep the sheet ID and credential path in
+`JobSearch_2026/00_Profile/tracker_backend.json`; the credential itself never
+belongs in the product repository.
+
+JobsDB remains cache-first with bounded human recovery and a portal circuit
+breaker: Cloudflare/WAF never causes infinite retries. If daily Chrome does not
+expose CDP, the system writes a cookie-free manual-recovery handoff and a
+resumable hint; an unverified challenge cannot be recorded as success. Identical
+portal requests are deduplicated while query aliases and page numbers are kept
+for recall attribution. These diagnostics and fallbacks affect only a private
+runtime; tokens, cookies and candidate data stay out of the public product.
 
 ### Our LLMO strategy
 
