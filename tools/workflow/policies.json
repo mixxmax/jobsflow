@@ -203,7 +203,7 @@
     {
       "rule_id": "SYNC-003",
       "domain": "sync",
-      "statement": "Remote user-field changes enter the local ledger only through an explicit pull/import action.",
+      "statement": "Remote user-field changes enter the local ledger only through an explicit pull/import action, except the narrow status-only additive push path defined by SYNC-005.",
       "level": "MUST",
       "autonomy": "A3",
       "enforcement": "user_confirmation",
@@ -221,6 +221,17 @@
       "failure_status": "needs_reconcile",
       "override_policy": "none",
       "tests": ["test_scan_entry_boundary.py", "test_sync_coordinator.py"]
+    },
+    {
+      "rule_id": "SYNC-005",
+      "domain": "sync",
+      "statement": "When a confirmed additive push sees only remote changes to user-maintained status fields, it may reconcile those statuses into the local ledger and append new rows; any other remote drift remains blocking.",
+      "level": "MUST",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "needs_reconcile",
+      "override_policy": "none",
+      "tests": ["test_sync_coordinator.py"]
     }
   ]
 }

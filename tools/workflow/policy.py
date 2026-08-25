@@ -26,6 +26,7 @@ ACTION_RULES: dict[str, dict[str, Any]] = {
             "FRESH-001",
             "SYNC-001",
             "SYNC-004",
+            "SYNC-005",
         ],
         "requires_confirmation": True,
     },

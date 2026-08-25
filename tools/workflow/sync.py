@@ -73,7 +73,6 @@ SYSTEM_FIELDS = frozenset(
         "company_brief",
         "language_gate",
         "salary_review",
-        "材料状态",
         "provisional_needs_jd",
         "待审-JD不足",
     }
@@ -81,6 +80,10 @@ SYSTEM_FIELDS = frozenset(
 
 USER_FIELDS = frozenset(
     {
+        # These are the user-maintained tracker status controls. They may be
+        # changed in Sheets between two additive pushes and are reconciled
+        # back into the local ledger by the narrow status-only fast path.
+        "材料状态",
         "状态",
         "投递状态",
         "是否投递",
@@ -97,6 +100,17 @@ USER_FIELDS = frozenset(
         "follow_up",
         "interview_outcome",
         "user_priority",
+    }
+)
+
+STATUS_FIELDS = frozenset(
+    {
+        "材料状态",
+        "状态",
+        "投递状态",
+        "是否投递",
+        "user_status",
+        "application_status",
     }
 )
 
@@ -162,6 +176,37 @@ def _align_local_rows_to_projection(
         base.update(dict(row))
         aligned.append(base)
     return aligned
+
+
+def _merge_remote_status_fields(
+    local_rows: Iterable[dict[str, Any]],
+    remote_rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Bring only remote user-status edits into the local merge base.
+
+    This is intentionally narrower than ``sync pull``: it is used only after
+    the precondition has proven that the remote drift consists exclusively of
+    status fields, and only to keep an additive push from reverting a user's
+    just-entered ``已定制``/``已投递`` state.
+    """
+    remote_map = _row_map(remote_rows)
+    merged: list[dict[str, Any]] = []
+    for raw in local_rows:
+        row = dict(raw)
+        remote = remote_map.get(_row_key(row) or "") or {}
+        for field in STATUS_FIELDS:
+            if field in remote:
+                row[field] = remote.get(field, "")
+        merged.append(row)
+    return merged
+
+
+def _status_only_remote_changes(changes: Iterable[dict[str, Any]]) -> bool:
+    items = list(changes)
+    return bool(items) and all(
+        item.get("field") in STATUS_FIELDS and item.get("owner") == "user"
+        for item in items
+    )
 
 
 def _snapshot_payload(snapshot: FreshSnapshot) -> dict[str, Any]:
@@ -362,8 +407,18 @@ class SyncLedger:
         atomic_write_json(path, payload)
 
 
-def merge_system_rows(existing: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Merge new system rows without overwriting user-owned fields."""
+def merge_system_rows(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    *,
+    allow_status_updates: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Merge system rows without overwriting user fields.
+
+    The host-owned material lifecycle is the sole caller allowed to update a
+    status field on an existing row; ordinary scan/push merges keep the
+    user's status untouched.
+    """
 
     result = [dict(row) for row in existing]
     index = {_row_key(row): pos for pos, row in enumerate(result) if _row_key(row)}
@@ -381,7 +436,7 @@ def merge_system_rows(existing: list[dict[str, Any]], incoming: list[dict[str, A
         current = result[index[key]]
         changed = False
         for field, value in incoming_row.items():
-            if field in USER_FIELDS:
+            if field in USER_FIELDS and not (allow_status_updates and field in STATUS_FIELDS):
                 continue
             if current.get(field) != value:
                 current[field] = value
@@ -491,6 +546,7 @@ class SyncCoordinator:
         operation_id: str | None = None,
         dry_run: bool = False,
         target_snapshot: FreshSnapshot | None = None,
+        allow_status_updates: bool = False,
     ) -> dict[str, Any]:
         if target_snapshot is None:
             ledger, local_before, target_before, backend = self._prepare_target(title, store)
@@ -510,7 +566,12 @@ class SyncCoordinator:
                 self.operations.write_projection(title, backend, target_before)
         projection = self.operations.read_projection(title, backend) or target_before
         remote_diff = _diff_snapshots(projection, local_before, target_before)
-        if remote_diff["conflicts"] or remote_diff["remote_changes"] or remote_diff["remote_only"]:
+        status_only_remote = _status_only_remote_changes(remote_diff["remote_changes"])
+        unsafe_remote_changes = [
+            item for item in remote_diff["remote_changes"]
+            if not (status_only_remote and item.get("field") in STATUS_FIELDS)
+        ]
+        if remote_diff["conflicts"] or unsafe_remote_changes or remote_diff["remote_only"]:
             report_path = self._write_conflict_report(
                 title,
                 {"kind": "push_precondition", "backend": backend, **remote_diff},
@@ -519,15 +580,20 @@ class SyncCoordinator:
                 "status": "blocked",
                 "blockers": ["remote_changed_requires_reconcile"],
                 "conflicts": remote_diff["conflicts"],
-                "remote_changes": remote_diff["remote_changes"],
+                "remote_changes": unsafe_remote_changes,
                 "remote_only": remote_diff["remote_only"],
                 "backend": backend,
                 "target_digest": target_before.digest,
                 "report_path": report_path,
             }
 
+        merge_local_rows = (
+            _merge_remote_status_fields(local_before.rows, target_before.rows)
+            if status_only_remote
+            else local_before.rows
+        )
         aligned_local_rows = _align_local_rows_to_projection(
-            local_before.rows,
+            merge_local_rows,
             target_before.rows,
         )
         existing_keys = {
@@ -546,7 +612,11 @@ class SyncCoordinator:
         merge_base_rows = [dict(row) for row in aligned_local_rows]
         if append_rows and any((row.get("本轮新增") or "") == "是" for row in append_rows):
             demote_previous_batch(merge_base_rows)
-        merged_rows, stats = merge_system_rows(merge_base_rows, incoming)
+        merged_rows, stats = merge_system_rows(
+            merge_base_rows,
+            incoming,
+            allow_status_updates=allow_status_updates,
+        )
         if append_rows:
             # New explicit-entry rows are always presented first, even when
             # a schema migration forces the guarded full-replacement path.
@@ -664,6 +734,14 @@ class SyncCoordinator:
                 "target_after_digest": after.digest,
                 "postconditions": postconditions,
                 "write_mode": "append_only" if append_only else "replace_full",
+                "status_changes_reconciled": bool(status_only_remote),
+                "status_fields_reconciled": sorted(
+                    {
+                        str(item.get("field"))
+                        for item in remote_diff["remote_changes"]
+                        if item.get("field") in STATUS_FIELDS
+                    }
+                ) if status_only_remote else [],
                 **stats,
             }
         except (SnapshotConflict, SyncConflict) as exc:

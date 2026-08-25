@@ -173,6 +173,7 @@ def mark_materials_created(
         store=store,
         run_id=str(generation_id or "materials"),
         operation_id=operation_id,
+        allow_status_updates=True,
     )
     if result.get("status") not in {"succeeded"}:
         return {

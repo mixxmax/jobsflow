@@ -169,6 +169,12 @@ show the same successful-portal rows again.
   is a list of stable keys from the hash-bound scored artifact; an unknown key
   blocks the preview instead of silently producing a partial batch. Confirmation
   may not broaden or replace the stored selection.
+- A confirmed additive push may proceed when the only remote drift since the
+  last projection is a user-maintained status field such as `材料状态`/`投递状态`.
+  The sync coordinator first imports those status values into the local ledger,
+  appends the new batch, then records the refreshed projection. Changes to
+  system fields, notes, unknown columns, remote-only rows or true conflicts
+  still require reconcile and block the append.
 - Do not claim full-JD analysis when only a teaser is available.
 - Never hard-reject an information-poor card solely because its title-only
   pass-1 score is below 3.3. If deep text cannot be obtained within policy or

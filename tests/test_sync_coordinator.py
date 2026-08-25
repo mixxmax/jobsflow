@@ -338,6 +338,46 @@ def test_remote_change_is_not_silently_overwritten(tmp_path):
     assert store.rows[0]["CareerOps分数"] == "4.2"
 
 
+def test_status_only_remote_change_does_not_block_additive_push(tmp_path):
+    store = AppendOnlyStore("fresh_24h_2026-08-14", [])
+    old = {
+        "岗位编号": "C0-901",
+        "职位": "Old",
+        "公司": "Acme",
+        "链接": "https://example.test/901",
+        "CareerOps分数": "4.2",
+        "材料状态": "未制作",
+    }
+    store.headers = list(old.keys())
+    coordinator = SyncCoordinator(tmp_path)
+    first = coordinator.push_rows(title=store.title, incoming=[old], store=store)
+    assert first["status"] == "succeeded"
+
+    # A user changes only the V-column status in Sheets between scans.
+    store.rows[0]["材料状态"] = "已投递"
+    new = {
+        "岗位编号": "C0-902",
+        "职位": "New",
+        "公司": "Acme",
+        "链接": "https://example.test/902",
+        "CareerOps分数": "4.0",
+        "材料状态": "未制作",
+    }
+    second = coordinator.push_rows(title=store.title, incoming=[new], store=store)
+
+    assert second["status"] == "succeeded"
+    assert second["write_mode"] == "append_only"
+    assert second["status_changes_reconciled"] is True
+    assert second["status_fields_reconciled"] == ["材料状态"]
+    assert store.rows[1]["材料状态"] == "已投递"
+    ledger = json.loads(
+        (tmp_path / "02_Tracker" / "workflow" / "ledger" / f"{store.title}.json")
+        .read_text(encoding="utf-8")
+    )
+    old_ledger = next(row for row in ledger["rows"] if row["岗位编号"] == "C0-901")
+    assert old_ledger["材料状态"] == "已投递"
+
+
 def test_failed_projection_is_replayable(tmp_path):
     store = FlakyStore("fresh_24h_2026-08-14", [])
     coordinator = SyncCoordinator(tmp_path)
