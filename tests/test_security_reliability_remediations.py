@@ -50,7 +50,9 @@ def test_atomic_write_never_leaves_temp_file(tmp_path):
 
 def test_failed_scan_does_not_advance_refresh_cursor():
     assert should_record_refresh([], new_count=0) is True
-    assert should_record_refresh([{"portal": "jobsdb", "error": "timeout"}], new_count=2) is True
+    # Partial results are useful for review but must not consume the refresh
+    # watermark: the failed portal's window must be retried next time.
+    assert should_record_refresh([{"portal": "jobsdb", "error": "timeout"}], new_count=2) is False
     assert should_record_refresh([{"portal": "jobsdb", "error": "timeout"}], new_count=0) is False
 
 

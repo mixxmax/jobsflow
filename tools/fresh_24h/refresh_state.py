@@ -229,6 +229,7 @@ def record_refresh(
     candidates_csv: str | None = None,
     sheet_title: str | None = None,
     completed_through: str | None = None,
+    dedupe_keys: list[str] | None = None,
     path: Path | None = None,
 ) -> dict[str, Any]:
     """Mark a successful refresh (call only after scan wrote outputs)."""
@@ -251,6 +252,10 @@ def record_refresh(
         "candidates_csv": candidates_csv,
         "sheet_title": sheet_title,
         "completed_through": ran if completed_through else None,
+        # A bounded, sanitized identity ledger lets later temp/preview scans
+        # suppress recently shown jobs without rereading the entire tracker.
+        # Values are URL/company-title keys only; no JD or résumé content.
+        "dedupe_keys": [str(item) for item in (dedupe_keys or []) if str(item).strip()][-500:],
     }
     hist = list(state.get("history") or [])
     hist.append(entry)
@@ -262,6 +267,54 @@ def record_refresh(
     state["last_new_count"] = new_count
     state["last_candidates_csv"] = candidates_csv
     state["last_sheet_title"] = sheet_title
+    save_state(state, path)
+    return state
+
+
+def record_scan_observation(
+    state: dict[str, Any],
+    *,
+    mode: str,
+    window_hours: float,
+    since: str | None,
+    observed_count: int,
+    dedupe_keys: list[str] | None = None,
+    completed_through: str | None = None,
+    candidates_csv: str | None = None,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Remember identities from a scored-but-degraded scan without moving the cursor.
+
+    A portal outage must not advance ``last_refresh_at``: doing so could hide
+    jobs that were not fetched.  It also must not make the next temporary
+    scan show the same successful-portal rows again, however.  This separate
+    observation entry is therefore deliberately non-watermark state.  The
+    bounded identity list is the only durable input used by scan de-duplication;
+    no JD, profile or tracker contents are copied here.
+    """
+    ran = to_iso(parse_iso(completed_through) or now_utc())
+    entry = {
+        "at": ran,
+        "mode": mode,
+        "window_hours": window_hours,
+        "since": since,
+        "new_count": int(observed_count),
+        "observed_count": int(observed_count),
+        "observed_only": True,
+        "candidates_csv": candidates_csv,
+        "sheet_title": None,
+        "completed_through": ran,
+        "dedupe_keys": [
+            str(item)
+            for item in (dedupe_keys or [])
+            if str(item).strip()
+        ][-500:],
+    }
+    history = list(state.get("history") or [])
+    history.append(entry)
+    state["history"] = history[-50:]
+    # Intentionally do not change last_refresh_at/last_mode/etc.  Those fields
+    # are the refresh watermark and must only be changed by record_refresh.
     save_state(state, path)
     return state
 

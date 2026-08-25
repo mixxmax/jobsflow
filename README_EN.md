@@ -166,7 +166,13 @@ task status and refresh-cursor commit; the cursor is committed only after the
 scored artifact is verified. If `/push` has no `run_id`, it resolves the newest
 official run instead of treating a legacy `temp`/`daily` sentinel as current.
 The run record reports planned and deduplicated requests, portal errors,
-pass-1 drops, provisional rows and deep-fetch outcomes.
+pass-1 drops, provisional rows and deep-fetch outcomes. Scan-level job
+de-duplication is bounded by policy: temporary scans suppress identities from
+the latest three temporary observations, while daily/preview scans suppress
+identities observed inside the requested window. The scanner does not reread
+the entire tracker for this, and a degraded scan remembers successful-portal
+identities without advancing the refresh watermark, so a retry does not
+immediately show the same rows again.
 
 The local ledger is authoritative for row identity and numbering; CSV and Google
 Sheets are replayable projections. A confirmed batch can create separate

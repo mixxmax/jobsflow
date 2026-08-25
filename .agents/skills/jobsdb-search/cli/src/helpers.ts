@@ -4,6 +4,7 @@
 // ({ data: [...], totalCount, ... }). We reshape it into the portal-skill
 // contract's result fields. See url-reference.md for the full schema.
 
+import { readFileSync } from "node:fs"
 import { requestSignal, retryDelayMs } from "../../../_shared/http-policy.ts"
 
 export const SEARCH_BASE = "https://hk.jobsdb.com/api/jobsearch/v5/search"
@@ -18,22 +19,59 @@ const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
+function envInt(name: string, fallback: number, min = 0, max = 60_000): number {
+  const parsed = Number(process.env[name])
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(max, Math.max(min, Math.trunc(parsed)))
+}
+
+function requestTimeoutMs(): number {
+  return envInt("JOBSFLOW_SCAN_REQUEST_TIMEOUT_MS", 15_000, 1_000, 60_000)
+}
+
+function requestMaxRetries(): number {
+  return envInt("JOBSFLOW_SCAN_MAX_RETRIES", 6, 0, 6)
+}
+
+function retryCapMs(): number {
+  return envInt("JOBSFLOW_SCAN_MAX_RETRY_DELAY_MS", 30_000, 0, 30_000)
+}
+
+function jobsdbCookieHeader(): string {
+  const fromEnv = (process.env.JOBSDB_COOKIE || "").trim()
+  if (fromEnv) return fromEnv
+  const root = (process.env.JOBSEARCH_ROOT || "").trim()
+  const fromFile = (
+    process.env.JOBSDB_COOKIE_FILE ||
+    (root ? `${root}/02_Tracker/portal_state/jobsdb_browser_cookies.txt` : "")
+  ).trim()
+  if (!fromFile) return ""
+  try {
+    return readFileSync(fromFile, "utf8").trim()
+  } catch {
+    return ""
+  }
+}
+
 /**
  * GET the JobsDB search JSON with exponential backoff on 429/5xx.
  * Returns the parsed envelope. Throws on connection failure or non-retryable error.
  */
 export async function searchGet(params: Record<string, string>): Promise<SearchEnvelope> {
   const url = `${SEARCH_BASE}?${new URLSearchParams(params).toString()}`
-  const maxRetries = 6
+  const maxRetries = requestMaxRetries()
   let delay = 500
+  const cookie = jobsdbCookieHeader()
+  const headers: Record<string, string> = { "User-Agent": UA, Accept: "application/json" }
+  if (cookie) headers.Cookie = cookie
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     let response: Response
     try {
       response = await fetch(url, {
-        headers: { "User-Agent": UA, Accept: "application/json" },
+        headers,
         redirect: "follow",
-        signal: requestSignal(),
+        signal: requestSignal(requestTimeoutMs()),
       })
     } catch (e) {
       throw new Error(
@@ -45,7 +83,12 @@ export async function searchGet(params: Record<string, string>): Promise<SearchE
       if (attempt === maxRetries) {
         throw new Error(`JobsDB request failed: ${response.status} ${response.statusText}`)
       }
-      await sleep(retryDelayMs(response, delay + Math.floor(Math.random() * 500)))
+      await sleep(
+        Math.min(
+          retryCapMs(),
+          retryDelayMs(response, delay + Math.floor(Math.random() * 500)),
+        ),
+      )
       delay = Math.min(delay * 2, 8000)
       continue
     }

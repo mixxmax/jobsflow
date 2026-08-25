@@ -215,10 +215,20 @@ _JD_SEMANTIC_MARKERS = (
     "requirements",
     "qualifications",
     "about the role",
+    "about you",
+    "about the company",
     "job description",
     "duties",
     "we are looking for",
     "we offer",
+    "experience and skills",
+    "skills and experience",
+    "what you'll do",
+    "what you will do",
+    "candidate profile",
+    "person specification",
+    "our client",
+    "the successful candidate",
     "職責",
     "要求",
 )
@@ -231,10 +241,17 @@ def is_real_jd(
     html_snip: str,
     has_jd_container: bool,
     cf_mitigated: str | None,
+    trusted_source: bool = False,
 ) -> bool:
     """C5: a page is a real JD only when structure, length and semantics agree.
 
     A long body is a weak signal and can never pass on its own.
+
+    ``trusted_source``: the body came from the portal's own structured
+    output (e.g. schema.org JobPosting JSON-LD) rather than DOM heuristics.
+    The @type=JobPosting declaration already carries the structural and
+    semantic signal this check otherwise approximates, so only the
+    challenge, container and length gates still apply.
     """
     if str(cf_mitigated or "").strip().lower() == "challenge":
         return False
@@ -247,6 +264,8 @@ def is_real_jd(
     clean = (body or "").strip()
     if len(clean) < MIN_BODY_CHARS:
         return False
+    if trusted_source:
+        return True
     lowered = clean.lower()
     signals = sum(1 for m in _JD_SEMANTIC_MARKERS if m in lowered)
     if signals < 2:
@@ -1297,6 +1316,141 @@ class JobsdbHumanVerificationRecovery:
                 except Exception:
                     pass
 
+    def _cdp_verify_search(self, root: Path | None) -> JdFetchResult:
+        """Validate the JobsDB session in the user's Chrome for API search."""
+        from playwright.sync_api import sync_playwright
+
+        probe_url = "https://hk.jobsdb.com/"
+        manual_hint = (
+            'open -na "Google Chrome" --args '
+            f"--remote-debugging-port={self.debug_port} {probe_url}"
+        )
+        self.manual_hint = manual_hint
+        self.manual_command = manual_hint
+        if not self._endpoint_alive():
+            print(
+                "JobsDB 需要人工验证：正在尝试打开你的主 Google Chrome；"
+                "如果端口未出现，请完全退出 Chrome 后执行：\n"
+                f"  {manual_hint}",
+                file=sys.stderr,
+            )
+            self._launch_user_chrome_with_debug_port(probe_url)
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                if self._endpoint_alive():
+                    break
+                time.sleep(2.0)
+            else:
+                self.status = "requires_user_action"
+                return self._failure(
+                    probe_url,
+                    "cdp_endpoint_unavailable",
+                    recommended_action="start_chrome_with_debug_port",
+                    manual_hint="完全退出当前 Chrome（⌘Q），再执行带 remote-debugging-port 的命令并重试扫描。",
+                    manual_command=manual_hint,
+                )
+        with sync_playwright() as p:
+            try:
+                remote = p.chromium.connect_over_cdp(
+                    f"http://127.0.0.1:{self.debug_port}"
+                )
+            except Exception:
+                return self._failure(
+                    probe_url,
+                    "cdp_connect_failed",
+                    recommended_action="retry_cdp_after_manual_start",
+                    manual_hint="确认带 remote-debugging-port 的 Chrome 已启动后重试。",
+                    manual_command=manual_hint,
+                )
+            try:
+                contexts = remote.contexts
+                if not contexts:
+                    return self._failure(probe_url, "cdp_no_context")
+                context = contexts[0]
+                page = context.new_page()
+                try:
+                    self.navigation_count += 1
+                    page.goto(probe_url, wait_until="domcontentloaded", timeout=60000)
+                    title, text, _selector = _observe_cdp(page)
+                    if _looks_challenged_cdp(title, text, page):
+                        print(
+                            "请在你的主 Chrome 窗口中完成 JobsDB/Cloudflare 验证"
+                            f"（等待 {self.verification_timeout_seconds}s）……",
+                            file=sys.stderr,
+                        )
+                        deadline = time.monotonic() + self.verification_timeout_seconds
+                        while time.monotonic() < deadline:
+                            title, text, _selector = _observe_cdp(page)
+                            if not _looks_challenged_cdp(title, text, page):
+                                break
+                            time.sleep(2.0)
+                        else:
+                            return self._failure(probe_url, "challenge_timeout")
+                    if _looks_challenged_cdp(title, text, page):
+                        return self._failure(probe_url, "challenge_still_present")
+                    if _write_jobsdb_cookie_header(context, root) is None:
+                        return self._failure(probe_url, "cdp_cookie_capture_failed")
+                    return JdFetchResult(
+                        ok=True,
+                        url=probe_url,
+                        portal="jobsdb",
+                        detail_reason="manual_recovery_cdp_user_chrome",
+                        content_validated=True,
+                        attempts=1,
+                        browser_channel="user-chrome-cdp",
+                        session_mode="cdp-user-profile",
+                        headless=False,
+                    )
+                finally:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    remote.close()
+                except Exception:
+                    pass
+
+    def recover_search(
+        self,
+        *,
+        circuit: PortalCircuitBreaker | None = None,
+        cache_root: Path | None = None,
+    ) -> JdFetchResult:
+        """Perform one interactive recovery for a failed JobsDB search batch."""
+        probe_url = "https://hk.jobsdb.com/"
+        if self.attempted:
+            return self._failure(probe_url, "manual_recovery_already_attempted")
+        self.attempted = True
+        self.status = "cdp_verification_pending"
+        if self.before_visible is not None:
+            try:
+                self.before_visible()
+            except Exception:
+                self.status = "failed"
+                return self._failure(probe_url, "manual_recovery_profile_release_error")
+        try:
+            result = self._cdp_verify_search(cache_root or _default_cache_root())
+        except Exception:
+            self.status = "failed"
+            return self._failure(probe_url, "cdp_recovery_error")
+        if not (result.ok and result.content_validated):
+            self.status = "requires_user_action" if result.requires_user_action else "failed"
+            if result.requires_user_action:
+                _write_manual_recovery_notice(
+                    result.url,
+                    result,
+                    cache_root or _default_cache_root(),
+                    debug_port=self.debug_port,
+                )
+            return result
+        if circuit is not None:
+            circuit.reconcile_success()
+        _clear_manual_recovery_notice(cache_root or _default_cache_root())
+        self.status = "succeeded"
+        return result
+
     def recover(
         self,
         url: str,
@@ -1553,6 +1707,33 @@ def _manual_recovery_notice_path(root: Path | None) -> Path:
     cache_root = Path(root or _default_cache_root()).expanduser().resolve()
     workspace = cache_root if cache_root.name == "JobSearch_2026" else cache_root / "JobSearch_2026"
     return workspace / "02_Tracker" / "portal_state" / "jobsdb_manual_recovery.json"
+
+
+def _jobsdb_cookie_header_path(root: Path | None) -> Path:
+    """Private portal-scoped cookie handoff for the JobsDB search CLI."""
+    cache_root = Path(root or _default_cache_root()).expanduser().resolve()
+    workspace = cache_root if cache_root.name == "JobSearch_2026" else cache_root / "JobSearch_2026"
+    return workspace / "02_Tracker" / "portal_state" / "jobsdb_browser_cookies.txt"
+
+
+def _write_jobsdb_cookie_header(context: Any, root: Path | None) -> Path | None:
+    """Persist only JobsDB cookies captured from the verified user context."""
+    try:
+        cookies = context.cookies(["https://hk.jobsdb.com/"])
+        pairs = [
+            f"{item.get('name')}={item.get('value')}"
+            for item in cookies
+            if item.get("name") and item.get("value") is not None
+        ]
+        if not pairs:
+            return None
+        path = _jobsdb_cookie_header_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("; ".join(pairs) + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+        return path
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def _write_manual_recovery_notice(

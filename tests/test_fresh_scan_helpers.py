@@ -13,10 +13,13 @@ from tools.fresh_24h.fresh_24h_scan import (
     card_to_hit,
     has_fatal_portal_errors,
     now_utc,
+    recent_scan_dedupe_keys,
+    run_portal_batch,
 )
 from tools.fresh_24h import two_pass_score
 from tools.fresh_24h.jd_cache import jd_cache_key, jd_cache_path, load_jd_cache, save_jd_cache
 from tools.fresh_24h.local_tracker import merge_scored_rows
+from tools.fresh_24h.refresh_state import record_scan_observation
 from tools.fresh_24h.tracker_schema import merge_tracker_headers
 
 
@@ -26,6 +29,159 @@ def test_portal_errors_are_fatal_only_when_no_new_jobs():
     assert has_fatal_portal_errors(errors, 0) is True
     assert has_fatal_portal_errors(errors, 1) is False
     assert has_fatal_portal_errors([], 0) is False
+
+
+def test_recent_scan_dedupe_keys_are_bounded_by_mode():
+    state = {
+        "history": [
+            {"mode": "temp", "dedupe_keys": ["url:old-1"]},
+            {"mode": "temp", "dedupe_keys": ["url:old-2"]},
+            {"mode": "temp", "dedupe_keys": ["url:old-3"]},
+            {"mode": "temp", "dedupe_keys": ["url:old-4"]},
+            {"mode": "daily", "completed_through": "2026-08-25T01:00:00Z", "dedupe_keys": ["url:daily"]},
+        ]
+    }
+
+    assert recent_scan_dedupe_keys(state, mode="temp", since=None) == {
+        "url:old-2",
+        "url:old-3",
+        "url:old-4",
+    }
+    assert recent_scan_dedupe_keys(
+        state, mode="daily", since="2026-08-25T00:00:00Z"
+    ) == {"url:daily"}
+
+
+def test_degraded_scan_observation_does_not_advance_cursor_but_is_reused_for_dedupe(tmp_path):
+    state = {
+        "version": 1,
+        "last_refresh_at": "2026-08-25T00:00:00Z",
+        "last_mode": "temp",
+        "last_window_hours": 1,
+        "history": [],
+    }
+    record_scan_observation(
+        state,
+        mode="temp",
+        window_hours=1,
+        since="2026-08-25T00:00:00Z",
+        observed_count=2,
+        dedupe_keys=["url:partial-1", "ct:acme||legal counsel"],
+        completed_through="2026-08-25T01:00:00Z",
+        path=tmp_path / "fresh_refresh_state.json",
+    )
+
+    saved = json.loads((tmp_path / "fresh_refresh_state.json").read_text())
+    assert saved["last_refresh_at"] == "2026-08-25T00:00:00Z"
+    assert saved["history"][-1]["observed_only"] is True
+    assert recent_scan_dedupe_keys(saved, mode="temp", since=None) == {
+        "url:partial-1",
+        "ct:acme||legal counsel",
+    }
+
+
+def test_live_scan_dedupe_does_not_read_full_tracker(monkeypatch, tmp_path):
+    from tools.fresh_24h import fresh_24h_scan as scan
+
+    repo = tmp_path
+    tracker = repo / "JobSearch_2026" / "02_Tracker"
+    tracker.mkdir(parents=True)
+    tracker_csv = tracker / "hk_apply_list_2026-08-25.csv"
+    tracker_csv.write_text("岗位编号,职位,公司,链接\nA0-001,Old,Old Co,https://old.example/1\n", encoding="utf-8")
+    queries = repo / "queries.json"
+    queries.write_text(
+        json.dumps(
+            {
+                "setup_required": False,
+                "portals": {"linkedin": {"enabled": True, "cli": "fake.ts"}},
+                "queries": [
+                    {"id": "q1", "track_hint": "A", "terms": {"linkedin": "legal"}}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_if_tracker_is_loaded(_path):
+        raise AssertionError("scan must not load the full tracker for de-duplication")
+
+    monkeypatch.setattr(scan, "load_tracker_keys", fail_if_tracker_is_loaded)
+    monkeypatch.setattr(
+        scan,
+        "run_portal_requests",
+        lambda _repo, _cli, requests, *, portal, delay_seconds: [
+            (
+                requests[0],
+                [
+                    {
+                        "id": "12345678",
+                        "title": "Legal Counsel",
+                        "company": "Acme",
+                        "url": "https://www.linkedin.com/jobs/view/12345678",
+                        "date": "2026-08-25T01:00:00Z",
+                        "teaser": "Legal compliance support",
+                    }
+                ],
+                None,
+            )
+        ],
+    )
+
+    code = scan.main(
+        [
+            "--repo",
+            str(repo),
+            "--tracker",
+            str(tracker_csv),
+            "--queries",
+            str(queries),
+            "--mode",
+            "temp",
+            "--no-record",
+        ]
+    )
+    assert code == 0
+
+
+def test_linkedin_batch_is_chunked_and_retries_only_failed_chunk(monkeypatch, tmp_path):
+    cli = tmp_path / "linkedin.ts"
+    cli.write_text("// fixture", encoding="utf-8")
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs["input"], kwargs.get("timeout")))
+        proc = Proc()
+        requests = [json.loads(line) for line in kwargs["input"].splitlines()]
+        proc.stdout = "\n".join(
+            json.dumps({"request_id": item["request_id"], "ok": True, "payload": {"results": []}})
+            for item in requests
+        )
+        return proc
+
+    monkeypatch.setattr("tools.fresh_24h.fresh_24h_scan.subprocess.run", fake_run)
+    requests = [
+        {"request_id": f"li:{i}", "term": f"term-{i}", "page": 1, "limit": 5}
+        for i in range(10)
+    ]
+    rows = run_portal_batch(
+        tmp_path,
+        "linkedin.ts",
+        requests,
+        portal="linkedin",
+        delay_seconds=0,
+        timeout=1,
+    )
+
+    assert len(rows) == 10
+    # Default LinkedIn chunk size is eight; the remaining two are a second
+    # process, so a 300-second whole-portal timeout cannot recur.
+    assert len(calls) == 2
+    assert all(timeout <= 120 for _cmd, _input, timeout in calls)
 
 
 def test_company_brief_extracts_about_section_without_mapping_text():

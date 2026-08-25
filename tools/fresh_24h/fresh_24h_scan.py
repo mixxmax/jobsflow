@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
@@ -51,6 +52,7 @@ from refresh_state import (  # noqa: E402
     DEFAULT_STATE,
     hours_to_jobage,
     load_state,
+    parse_iso,
     record_refresh,
     resolve_window,
     status_text,
@@ -146,8 +148,60 @@ def has_fatal_portal_errors(errors: list[dict[str, Any]], new_count: int) -> boo
 
 
 def should_record_refresh(errors: list[dict[str, Any]], new_count: int) -> bool:
-    """A failed scan must never consume the next temp-mode search window."""
-    return not has_fatal_portal_errors(errors, new_count)
+    """Advance the watermark only after every enabled portal completed.
+
+    A partial result is useful for this run but must not consume the window:
+    otherwise a temporarily unavailable portal would create a silent omission
+    on the next temp scan.
+    """
+    return not bool(errors)
+
+
+def scan_dedupe_keys(hit: "JobHit") -> list[str]:
+    """Return stable, content-free identities for bounded scan history."""
+    keys: list[str] = []
+    url = normalize_url(str(hit.url or ""))
+    if url:
+        keys.append(f"url:{url}")
+        match = re.search(r"/(\d{8,})(?:/|$)", url)
+        if match:
+            keys.append(f"id:{match.group(1)}")
+    company_title = company_title_key(hit.company, hit.title)
+    if company_title and company_title != "—||":
+        keys.append(f"ct:{company_title}")
+    return keys
+
+
+def recent_scan_dedupe_keys(
+    state: dict[str, Any],
+    *,
+    mode: str,
+    since: str | None,
+    temp_runs: int = 3,
+) -> set[str]:
+    """Load only the historical identities relevant to this scan window.
+
+    Temp scans use the last three temp observations.  Daily/preview-style
+    scans use entries whose completion timestamp falls within the requested
+    window.  This is intentionally bounded and never scans the full tracker.
+    """
+    history = [item for item in (state.get("history") or []) if isinstance(item, dict)]
+    selected: list[dict[str, Any]]
+    if str(mode).casefold() == "temp":
+        selected = [item for item in history if str(item.get("mode") or "").casefold() == "temp"][-max(1, int(temp_runs)) :]
+    else:
+        lower = parse_iso(since) if since else None
+        selected = []
+        for item in history:
+            completed = parse_iso(str(item.get("completed_through") or item.get("at") or ""))
+            if lower is None or (completed is not None and completed >= lower):
+                selected.append(item)
+    keys: set[str] = set()
+    for item in selected:
+        for key in item.get("dedupe_keys") or []:
+            if str(key).strip():
+                keys.add(str(key).strip())
+    return keys
 
 
 def today_hk_date() -> str:
@@ -287,30 +341,35 @@ def run_portal_search(
 # one CTgoodjobs session bootstrap for every query.
 BATCH_PORTALS = {"linkedin", "jobsdb", "ctgoodjobs"}
 BATCH_WORKER_MAX_SECONDS = 300
+# A portal worker is deliberately chunked.  A single 300-second process for
+# hundreds of queries turns one slow endpoint into an apparent whole-scan
+# failure and also discards responses that were already produced.  Chunks keep
+# the portal session/rate limit serial while allowing the host to continue
+# after a bounded timeout.
+BATCH_CHUNK_SIZE = {"linkedin": 8, "jobsdb": 8, "ctgoodjobs": 8}
+BATCH_CHUNK_TIMEOUT_SECONDS = {"linkedin": 120, "jobsdb": 120, "ctgoodjobs": 120}
 
 
-def run_portal_batch(
+def _run_portal_batch_once(
     repo: Path,
     cli_rel: str,
     requests: list[dict[str, Any]],
     *,
     portal: str,
     delay_seconds: float,
-    timeout: int = PORTAL_SUBPROCESS_TIMEOUT_SECONDS,
-) -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]:
-    """Run one long-lived portal CLI worker for a batch of serial queries.
+    timeout: int,
+) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]], str | None]], bool]:
+    """Run one bounded batch chunk.
 
-    The CLI speaks a small JSON-lines protocol: one request line in, one result
-    line out.  The process is still batch-fed (rather than kept as a daemon),
-    but it lives for the complete portal batch, which is enough to reuse CT's
-    session headers and eliminate repeated Bun startup overhead.
+    The boolean indicates a worker-level timeout/startup failure.  Per-query
+    failures are returned as normal rows so later queries can continue.
     """
     if not requests:
-        return []
+        return [], False
     cli = repo / cli_rel
     if not cli.exists():
         error = f"CLI missing: {cli_rel}"
-        return [(request, [], error) for request in requests]
+        return [(request, [], error) for request in requests], True
 
     wire_requests: list[dict[str, Any]] = []
     for request in requests:
@@ -319,8 +378,6 @@ def run_portal_batch(
                 "request_id": request["request_id"],
                 "query": request.get("term"),
                 "jobage": request.get("jobage", 9999),
-                # Preserve the page budget. The old batch wire format always
-                # sent page=1, silently paying for duplicate first-page calls.
                 "page": request.get("page", 1),
                 "limit": request.get("limit", 15),
                 "location": request.get("location"),
@@ -332,30 +389,54 @@ def run_portal_batch(
     )
     delay_ms = max(0, round(max(0.0, delay_seconds) * 1000))
     cmd = ["bun", "run", str(cli), "batch", "--delay-ms", str(delay_ms)]
+    chunk_cap = int(BATCH_CHUNK_TIMEOUT_SECONDS.get(portal, BATCH_WORKER_MAX_SECONDS))
+    batch_timeout = max(30, min(chunk_cap, max(timeout, timeout * len(requests))))
 
-    # Keep the old per-query timeout as the lower bound, but cap a whole worker
-    # at five minutes so a broken portal cannot stall the other two forever.
-    batch_timeout = max(timeout, min(timeout * len(requests), BATCH_WORKER_MAX_SECONDS))
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(repo),
-            input=input_text,
-            capture_output=True,
-            text=True,
-            timeout=batch_timeout,
-        )
-    except subprocess.TimeoutExpired:
-        error = f"batch worker timeout after {batch_timeout}s"
-        return [(request, [], error) for request in requests]
-    except FileNotFoundError:
-        error = "bun not found on PATH"
-        return [(request, [], error) for request in requests]
+    # Search helpers keep their normal retry policy outside a scan.  During a
+    # scan the host supplies a tighter, explicit budget: one retry per query,
+    # then the portal is degraded rather than burning the whole 30-minute run.
+    env = os.environ.copy()
+    env.setdefault("JOBSEARCH_ROOT", str(repo / "JobSearch_2026"))
+    env["JOBSFLOW_SCAN_MODE"] = "1"
+    env.setdefault("JOBSFLOW_SCAN_REQUEST_TIMEOUT_MS", "12000")
+    env.setdefault("JOBSFLOW_SCAN_MAX_RETRIES", "1")
+    env.setdefault("JOBSFLOW_SCAN_MAX_RETRY_DELAY_MS", "3000")
+
+    attempts = 2 if portal == "linkedin" else 1
+    proc = None
+    last_timeout_error: str | None = None
+    for attempt in range(attempts):
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(repo),
+                input=input_text,
+                capture_output=True,
+                text=True,
+                timeout=batch_timeout,
+                env=env,
+            )
+            last_timeout_error = None
+            break
+        except subprocess.TimeoutExpired:
+            last_timeout_error = f"batch worker timeout after {batch_timeout}s"
+            if attempt + 1 < attempts:
+                print(
+                    f"{portal}: batch chunk timed out; retrying once "
+                    f"({attempt + 2}/{attempts})",
+                    file=sys.stderr,
+                )
+        except FileNotFoundError:
+            error = "bun not found on PATH"
+            return [(request, [], error) for request in requests], True
+    if last_timeout_error:
+        return [(request, [], last_timeout_error) for request in requests], True
+    assert proc is not None
 
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()[:400]
         error = f"batch worker exit {proc.returncode}: {err}"
-        return [(request, [], error) for request in requests]
+        return [(request, [], error) for request in requests], True
 
     responses: dict[str, tuple[list[dict[str, Any]], str | None]] = {}
     parse_error: str | None = None
@@ -392,6 +473,52 @@ def run_portal_batch(
             ([], parse_error or "batch worker returned no response"),
         )
         output.append((request, results, error))
+    return output, False
+
+
+def run_portal_batch(
+    repo: Path,
+    cli_rel: str,
+    requests: list[dict[str, Any]],
+    *,
+    portal: str,
+    delay_seconds: float,
+    timeout: int = PORTAL_SUBPROCESS_TIMEOUT_SECONDS,
+) -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]:
+    """Run one long-lived portal CLI worker for a batch of serial queries.
+
+    The CLI speaks a small JSON-lines protocol: one request line in, one result
+    line out.  The process is still batch-fed (rather than kept as a daemon),
+    but it lives for the complete portal batch, which is enough to reuse CT's
+    session headers and eliminate repeated Bun startup overhead.
+    """
+    if not requests:
+        return []
+    chunk_size = max(1, int(BATCH_CHUNK_SIZE.get(portal, len(requests))))
+    output: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] = []
+    for start in range(0, len(requests), chunk_size):
+        chunk = requests[start : start + chunk_size]
+        chunk_rows, worker_failed = _run_portal_batch_once(
+            repo,
+            cli_rel,
+            chunk,
+            portal=portal,
+            delay_seconds=delay_seconds,
+            timeout=timeout,
+        )
+        output.extend(chunk_rows)
+        if worker_failed:
+            # A worker-level failure is portal-local.  Do not spend another
+            # 300-second attempt on the remaining chunks; the caller will
+            # either perform JobsDB human recovery or mark this portal
+            # degraded while other portals continue.
+            remaining = requests[start + len(chunk) :]
+            if remaining:
+                output.extend(
+                    (request, [], f"portal worker stopped after bounded {portal} failure")
+                    for request in remaining
+                )
+            break
     return output
 
 
@@ -430,6 +557,57 @@ def run_portal_requests(
         if index < len(requests) - 1 and delay_seconds > 0:
             time.sleep(delay_seconds)
     return output
+
+
+def recover_jobsdb_search_session(repo: Path) -> dict[str, Any]:
+    """Open the user's Chrome once when the JobsDB search worker is blocked.
+
+    The search API itself is not a browser, so deep-JD recovery alone cannot
+    help when the listing worker returns no rows.  This seam deliberately
+    keeps the browser handoff portal-local and bounded; callers may retry only
+    the failed JobsDB requests after a successful validation.
+    """
+    try:
+        from portal_jd_browser import (  # type: ignore
+            JobsdbHumanVerificationRecovery,
+            PortalCircuitBreaker,
+            default_circuit_state_path,
+        )
+    except ImportError:
+        from tools.fresh_24h.portal_jd_browser import (  # type: ignore
+            JobsdbHumanVerificationRecovery,
+            PortalCircuitBreaker,
+            default_circuit_state_path,
+        )
+    threshold = 2
+    try:
+        from tools.workflow.portal_policy import jobsdb_runtime_config, resolve_workspace_profile
+
+        workspace_hint = os.environ.get("JOBSEARCH_ROOT") or repo
+        threshold = int(
+            jobsdb_runtime_config(resolve_workspace_profile(workspace_hint)).get(
+                "challenge_threshold", 2
+            )
+        )
+    except (ImportError, OSError, TypeError, ValueError):
+        pass
+    circuit = PortalCircuitBreaker(
+        portal="jobsdb",
+        challenge_threshold=max(1, threshold),
+        state_path=default_circuit_state_path(repo),
+    )
+    recovery = JobsdbHumanVerificationRecovery()
+    result = recovery.recover_search(circuit=circuit, cache_root=repo)
+    return {
+        "status": recovery.status,
+        "ok": bool(getattr(result, "ok", False)),
+        "requires_user_action": bool(getattr(result, "requires_user_action", False)),
+        "detail_reason": getattr(result, "detail_reason", None),
+        "manual_hint": getattr(result, "manual_hint", None),
+        "manual_command": getattr(result, "manual_command", None),
+        "navigation_count": int(getattr(recovery, "navigation_count", 0) or 0),
+        "cookie_bridge": bool(getattr(result, "ok", False)),
+    }
 
 
 def card_to_hit(
@@ -949,36 +1127,20 @@ def main(argv: list[str] | None = None) -> int:
     portals_cfg = cfg.get("portals") or {}
     location = cfg.get("location_linkedin") or "Hong Kong"
 
-    url_keys, ct_keys, existing_ids, _ = load_tracker_keys(tracker_path)
-    # 去重集合扩展：仅并入主表归档（已入表职位防重复报新）。不并入历史
-    # fresh 候选——temp 窗口内的新职位即使上一轮扫到过但未入表，对用户
-    # 仍是新职位（重新从窗口起点做临时检索时它们应继续出现）。
-    archived_tabs = tracker_path.parent / "archived_main_tabs.json"
-    if archived_tabs.exists():
-        try:
-            _arch = json.loads(archived_tabs.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            _arch = None
-        if isinstance(_arch, dict):
-            _urls: set[str] = set()
-
-            def _collect_arch_urls(node):
-                if isinstance(node, str):
-                    u = normalize_url(node)
-                    if u:
-                        _urls.add(u)
-                        m = re.search(r"/(\d{8,})(?:/|$)", u)
-                        if m:
-                            _urls.add(m.group(1))
-                elif isinstance(node, list):
-                    for item in node:
-                        _collect_arch_urls(item)
-                elif isinstance(node, dict):
-                    for item in node.values():
-                        _collect_arch_urls(item)
-
-            _collect_arch_urls(_arch)
-            url_keys |= _urls
+    # Do not read the full tracker for scan de-duplication.  The unified
+    # workflow owns tracker writes, and the direct ``--append-tracker`` path is
+    # refused above, so there is no legitimate scan-time consumer for a full
+    # table snapshot.  Recent scan identities are the bounded source of truth
+    # for this stage; the tracker is reconciled later by ``/push``.
+    existing_ids: list[str] = []
+    history_keys = recent_scan_dedupe_keys(
+        state,
+        mode=str(window.get("mode") or args.mode),
+        since=str(window.get("since") or ""),
+    )
+    url_keys = {key[4:] for key in history_keys if key.startswith("url:")}
+    url_keys |= {key[3:] for key in history_keys if key.startswith("id:")}
+    ct_keys = {key[3:] for key in history_keys if key.startswith("ct:")}
 
     all_hits: list[JobHit] = []
     errors: list[dict[str, str]] = []
@@ -1044,6 +1206,7 @@ def main(argv: list[str] | None = None) -> int:
             portal_cfg_by_name[portal] = pcfg
 
     worker_results: dict[str, list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]] = {}
+    recovery_meta: dict[str, Any] | None = None
     if work_by_portal:
         with ThreadPoolExecutor(
             max_workers=len(work_by_portal),
@@ -1068,6 +1231,53 @@ def main(argv: list[str] | None = None) -> int:
                     worker_results[portal] = [
                         (request, [], error) for request in work_by_portal[portal]
                     ]
+
+    # A JobsDB listing failure must not terminate the other portals.  If the
+    # worker returned an error, make one explicit handoff to the user's main
+    # Chrome, capture the portal-scoped session bridge, and retry only the
+    # failed JobsDB requests.  A failed handoff remains a degraded portal and
+    # never raises an exception or advances the refresh cursor by itself.
+    jobsdb_rows = worker_results.get("jobsdb") or []
+    jobsdb_failed_requests = [
+        request
+        for request, _results, error in jobsdb_rows
+        if error
+    ]
+    if jobsdb_failed_requests:
+        try:
+            recovery_meta = recover_jobsdb_search_session(repo)
+        except Exception as exc:
+            recovery_meta = {
+                "status": "unavailable",
+                "ok": False,
+                "requires_user_action": False,
+                "detail_reason": "recovery_error",
+                "error": str(exc)[:200],
+            }
+        if recovery_meta.get("ok"):
+            retry_rows = run_portal_requests(
+                repo,
+                portal_cfg_by_name["jobsdb"]["cli"],
+                jobsdb_failed_requests,
+                portal="jobsdb",
+                delay_seconds=args.sleep,
+            )
+            first_by_id = {
+                str(request["request_id"]): (request, results, error)
+                for request, results, error in jobsdb_rows
+            }
+            for request, results, error in retry_rows:
+                key = str(request["request_id"])
+                # Prefer a successful post-verification response.  Preserve
+                # the original error if the retry is also unsuccessful so the
+                # report remains truthful and actionable.
+                if not error or not first_by_id.get(key, (None, [], None))[1]:
+                    first_by_id[key] = (request, results, error)
+            worker_results["jobsdb"] = [
+                first_by_id[str(request["request_id"])]
+                for request in work_by_portal.get("jobsdb", [])
+                if str(request["request_id"]) in first_by_id
+            ]
 
     responses: dict[str, tuple[list[dict[str, Any]], str | None]] = {}
     for rows in worker_results.values():
@@ -1116,16 +1326,20 @@ def main(argv: list[str] | None = None) -> int:
                 seen_urls.add(uk)
                 seen_ct.add(ck)
 
-            # tracker dedupe
+            # bounded recent-scan dedupe (not a full-table scan)
             bare = ""
             m = re.search(r"/(\d{8,})(?:/|$)", hit.url)
             if m:
                 bare = m.group(1)
-            if hit.url in url_keys or bare in url_keys or ck in ct_keys:
+            # URL/portal ID is the authoritative identity.  Company-title is
+            # only a fallback for cards that genuinely have no URL; using it
+            # as an unconditional key would hide two distinct requisitions
+            # from the same employer with the same title.
+            if hit.url in url_keys or bare in url_keys or (not hit.url and ck in ct_keys):
                 hit.in_tracker = True
                 if hit.decision == "new":
                     hit.decision = "duplicate"
-                    hit.reject_reason = "already_in_tracker"
+                    hit.reject_reason = "already_in_recent_scan"
 
             counters[hit.decision] = counters.get(hit.decision, 0) + 1
             all_hits.append(hit)
@@ -1205,6 +1419,12 @@ def main(argv: list[str] | None = None) -> int:
         atomic_write_json(seen_path, blob)
 
     n_new = len(to_write)
+    dedupe_keys: list[str] = []
+    for hit in all_hits:
+        dedupe_keys.extend(scan_dedupe_keys(hit))
+    # Keep the run artifact small and deterministic while retaining enough
+    # identities for the next three temp windows.
+    dedupe_keys = list(dict.fromkeys(dedupe_keys))[-500:]
     summary = {
         "ran_at": iso_now(),
         "day": day,
@@ -1215,6 +1435,19 @@ def main(argv: list[str] | None = None) -> int:
         "candidates_csv": str(cand_path),
         "state_file": str(state_path),
         "fatal_portal_errors": has_fatal_portal_errors(errors, n_new),
+        # Portal errors are recoverable scan degradation, not a reason to
+        # discard results from other portals.  The separate cursor flag keeps
+        # refresh-window safety explicit.
+        "scan_degraded": bool(errors),
+        "cursor_safe": should_record_refresh(errors, n_new),
+        "jobsdb_search_recovery": recovery_meta,
+        "dedupe_keys": dedupe_keys,
+        "dedupe_policy": (
+            "last_3_temp_observations"
+            if str(window.get("mode") or args.mode).casefold() == "temp"
+            else "requested_time_window"
+        ),
+        "recent_dedupe_key_count": len(history_keys),
         "counts": {
             "fetched": len(all_hits),
             "new": sum(1 for h in all_hits if h.decision == "new"),
@@ -1232,9 +1465,7 @@ def main(argv: list[str] | None = None) -> int:
         "model_contract": {
             "mode": "deterministic",
             "next_action": (
-                "abort_and_report_errors"
-                if has_fatal_portal_errors(errors, n_new)
-                else ("score_new_jobs" if n_new else "report_no_new_jobs")
+                "score_new_jobs" if n_new or errors else "report_no_new_jobs"
             ),
             "must_report": [
                 "window",
@@ -1265,6 +1496,8 @@ def main(argv: list[str] | None = None) -> int:
             "new_count": n_new,
             "portal_error_count": len(errors),
             "fatal": bool(summary["fatal_portal_errors"]),
+            "degraded": bool(summary["scan_degraded"]),
+            "cursor_safe": bool(summary["cursor_safe"]),
         },
     )
 
@@ -1278,6 +1511,7 @@ def main(argv: list[str] | None = None) -> int:
             candidates_csv=str(cand_path),
             sheet_title=f"fresh_24h_{day}",
             path=state_path,
+            dedupe_keys=dedupe_keys,
         )
         print(f"  state:       recorded last_refresh_at → {state.get('last_refresh_at')}")
     elif args.no_record:
@@ -1302,6 +1536,13 @@ def main(argv: list[str] | None = None) -> int:
         print("  (candidates only — review first, then use workflow push preview/confirm to enter selected rows)")
     if errors:
         print(f"  portal errors: {len(errors)} (see run log)")
+    if recovery_meta:
+        print(
+            "  jobsdb recovery: "
+            f"{recovery_meta.get('status')}"
+            + (" (session bridge ready)" if recovery_meta.get("ok") else ""),
+            file=sys.stderr if not recovery_meta.get("ok") else sys.stdout,
+        )
 
     if to_write:
         print("\n## New (not in tracker)")
@@ -1313,11 +1554,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if has_fatal_portal_errors(errors, n_new):
         print(
-            "FATAL: portal errors left no trustworthy new-job result — "
-            "refresh cursor preserved",
+            "DEGRADED: portal errors left no trustworthy new-job result — "
+            "other portal work may continue; refresh cursor preserved",
             file=sys.stderr,
         )
-        return 2
+        # A portal outage is not a process-level scan failure.  The workflow
+        # adapter scores the (possibly empty) candidate artifact and records a
+        # degraded run without advancing the watermark.
+        return 0
     return 0
 
 

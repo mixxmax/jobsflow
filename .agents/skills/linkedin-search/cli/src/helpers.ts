@@ -18,6 +18,29 @@ const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+function envInt(name: string, fallback: number, min = 0, max = 60_000): number {
+  const parsed = Number(process.env[name])
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(max, Math.max(min, Math.trunc(parsed)))
+}
+
+function requestTimeoutMs(): number {
+  return envInt(
+    "JOBSFLOW_SCAN_REQUEST_TIMEOUT_MS",
+    15_000,
+    1_000,
+    60_000,
+  )
+}
+
+function requestMaxRetries(): number {
+  return envInt("JOBSFLOW_SCAN_MAX_RETRIES", 6, 0, 6)
+}
+
+function retryCapMs(): number {
+  return envInt("JOBSFLOW_SCAN_MAX_RETRY_DELAY_MS", 30_000, 0, 30_000)
+}
+
 /**
  * Some VPN/DNS paths (esp. utun + polluted resolvers) map www.linkedin.com to
  * unreachable Azure-CN style A records (e.g. 52.131.*). TLS then dies with
@@ -48,7 +71,7 @@ async function resolveHostViaDoh(host: string): Promise<string | null> {
     try {
       const r = await fetch(ep, {
         headers: { Accept: "application/dns-json" },
-        signal: requestSignal(),
+        signal: requestSignal(requestTimeoutMs()),
         // DoH endpoints are not LinkedIn — use normal system DNS
       })
       if (!r.ok) continue
@@ -101,13 +124,13 @@ async function fetchInitFor(url: string): Promise<{ target: string; init: FetchI
 
 /** Fetch HTML with exponential backoff on 429/5xx. Returns "" on a 404. */
 export async function htmlFetch(url: string): Promise<string> {
-  const maxRetries = 6
+  const maxRetries = requestMaxRetries()
   let delay = 500
   let lastErr: unknown
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const { target, init } = await fetchInitFor(url)
-      init.signal = requestSignal()
+      init.signal = requestSignal(requestTimeoutMs())
       const response = await fetch(target, init)
       if (response.status === 429 || response.status >= 500) {
         if (attempt === maxRetries) {
@@ -115,7 +138,7 @@ export async function htmlFetch(url: string): Promise<string> {
         }
         const jitter = Math.floor(Math.random() * 500)
         await new Promise((r) =>
-          setTimeout(r, retryDelayMs(response, delay + jitter)),
+          setTimeout(r, Math.min(retryCapMs(), retryDelayMs(response, delay + jitter))),
         )
         delay = Math.min(delay * 2, 8000)
         continue
@@ -140,7 +163,7 @@ export async function htmlFetch(url: string): Promise<string> {
           /* ignore */
         }
         const jitter = Math.floor(Math.random() * 500)
-        await new Promise((r) => setTimeout(r, delay + jitter))
+        await new Promise((r) => setTimeout(r, Math.min(retryCapMs(), delay + jitter)))
         delay = Math.min(delay * 2, 8000)
         continue
       }

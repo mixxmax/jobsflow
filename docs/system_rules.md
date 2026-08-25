@@ -145,7 +145,12 @@ scored CSV hash, semantic status and refresh-cursor commit. An omitted push run
 ID resolves only to the newest official run record, never to the legacy
 `temp`/`daily` state sentinel. Run diagnostics expose planned/deduplicated
 requests, portal errors, pass-1 drops, provisional rows and deep-fetch
-outcomes.
+outcomes. Scan identity de-duplication is deliberately bounded: a `temp` run
+suppresses identities from the most recent three temp observations, while a
+daily/preview window suppresses identities observed within the requested
+window. It does not reread the full tracker. A degraded scan may remember
+identities without advancing `last_refresh_at`, so a retry does not immediately
+show the same successful-portal rows again.
 
 - Promote copies matching rows into the main trackers and **keeps** the
   fresh tab. Archiving or clearing fresh is an A3 action:

@@ -125,5 +125,10 @@ def commit_refresh_after_score(
         candidates_csv=str(summary.get("candidates_csv") or scored),
         sheet_title=f"fresh_24h_{summary.get('day') or ''}".rstrip("_"),
         completed_through=str(completed_through),
+        dedupe_keys=[
+            str(item)
+            for item in (summary.get("dedupe_keys") or [])
+            if str(item).strip()
+        ],
         path=state_path,
     )

@@ -269,6 +269,8 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
     score_meta = _read_json(Path(scored).with_suffix(".json")) or {}
     scan_counts = scan_summary.get("counts") or {}
     scan_errors = list(scan_summary.get("errors") or [])
+    scan_degraded = bool(scan_summary.get("scan_degraded") or scan_errors)
+    cursor_safe = bool(scan_summary.get("cursor_safe")) and not scan_errors
     diagnostics = {
         "scan": {
             "counts": scan_counts,
@@ -313,11 +315,52 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
             "scan_counts": scan_summary.get("counts") or {},
             "candidates_csv": scan_summary.get("candidates_csv"),
             "scan_errors": scan_errors,
+            "scan_degraded": scan_degraded,
+            "cursor_safe": cursor_safe,
+            "dedupe_keys": list(scan_summary.get("dedupe_keys") or [])[-500:],
+            "dedupe_policy": scan_summary.get("dedupe_policy"),
+            "recent_dedupe_key_count": int(scan_summary.get("recent_dedupe_key_count") or 0),
+            "jobsdb_search_recovery": scan_summary.get("jobsdb_search_recovery"),
             "diagnostics": diagnostics,
         },
     )
-    committed = commit_refresh_after_score(workspace=workspace, mode=mode, run_id=run_id)
-    if committed is None:
+    committed = None
+    if cursor_safe:
+        committed = commit_refresh_after_score(workspace=workspace, mode=mode, run_id=run_id)
+    else:
+        # Keep successful-portal identities for bounded de-duplication even
+        # when a partial scan cannot safely advance the refresh watermark.
+        # This is observation state only; it never changes last_refresh_at.
+        dedupe_keys = [
+            str(item)
+            for item in (scan_summary.get("dedupe_keys") or [])
+            if str(item).strip()
+        ]
+        if dedupe_keys:
+            try:
+                from tools.fresh_24h import refresh_state
+
+                window = scan_summary.get("window") or {}
+                state_path = tracker / "fresh_refresh_state.json"
+                state = refresh_state.load_state(state_path)
+                refresh_state.record_scan_observation(
+                    state,
+                    mode=str(scan_summary.get("mode") or mode),
+                    window_hours=float(
+                        scan_summary.get("hours") or window.get("hours") or 24
+                    ),
+                    since=window.get("since"),
+                    observed_count=int((scan_summary.get("counts") or {}).get("fetched") or 0),
+                    dedupe_keys=dedupe_keys,
+                    completed_through=window.get("until"),
+                    candidates_csv=str(scan_summary.get("candidates_csv") or ""),
+                    path=state_path,
+                )
+            except (OSError, TypeError, ValueError):
+                # Observation memory is a performance aid, not a reason to
+                # turn an otherwise usable degraded scan into a hard failure.
+                pass
+    if cursor_safe and committed is None:
         return result(
             status="failed",
             after_state="scan_failed",
@@ -329,11 +372,18 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
         )
     return result(
         status="succeeded",
-        after_state="scan_completed",
-        side_effects=["write_scan_artifacts", "commit_refresh_cursor"],
+        after_state="scan_degraded" if scan_degraded else "scan_completed",
+        side_effects=(
+            ["write_scan_artifacts", "commit_refresh_cursor"]
+            if committed is not None
+            else ["write_scan_artifacts", "preserve_refresh_cursor"]
+        ),
         rule_ids=["SCAN-001", "FRESH-001"],
-        advance_refresh_cursor=True,
+        advance_refresh_cursor=committed is not None,
         generate_materials=False,
+        degraded=scan_degraded,
+        scan_errors=scan_errors,
+        jobsdb_search_recovery=scan_summary.get("jobsdb_search_recovery"),
         run_id=run_id,
         run=meta,
         scored_path=meta["scored_path"],
