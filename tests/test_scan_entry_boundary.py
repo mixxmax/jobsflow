@@ -6,6 +6,9 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
+
+from tools.workflow.confirmation import require_preview
 from tools.workflow.engine import dispatch
 from tools.workflow.id_allocation import (
     IdCounterConflict,
@@ -14,6 +17,22 @@ from tools.workflow.id_allocation import (
     prepare_rows_for_entry,
 )
 from tools.workflow.testing_packages import build_workspace
+
+
+def test_require_preview_blocks_write_without_proposal():
+    """JF-PREVIEW-001 consumer: no preview proposal → no write gate pass."""
+    with pytest.raises(ValueError, match="preview_required"):
+        require_preview(None)
+    with pytest.raises(ValueError, match="preview_not_confirmable"):
+        require_preview({"proposal_id": "x", "status": "stale"})
+
+
+def test_require_preview_accepts_pending_confirmation():
+    gated = require_preview({
+        "proposal_id": "arch-test",
+        "status": "pending_confirmation",
+    })
+    assert gated["proposal_id"] == "arch-test"
 
 
 def test_scan_fixture_is_review_only_and_has_no_persistent_ids(tmp_path):
@@ -76,6 +95,11 @@ def test_push_preview_is_write_free_and_confirmation_allocates_id(tmp_path):
     assert preview["requires_confirmation"] is True
     assert store.row_count() == 0
     assert all(is_assigned_job_id(value) for value in preview["proposed_ids"])
+    # Named consumer must see the durable preview before confirmation writes.
+    from tools.workflow.confirmation import ConfirmationStore
+
+    proposal = ConfirmationStore(ws).load(preview["proposal_id"])
+    assert require_preview(proposal)["proposal_id"] == preview["proposal_id"]
 
     confirmed = dispatch(
         "push",
@@ -90,6 +114,116 @@ def test_push_preview_is_write_free_and_confirmation_allocates_id(tmp_path):
     assert confirmed["status"] == "succeeded"
     assert store.row_count() == 1
     assert is_assigned_job_id(store.read_active().rows[0]["岗位编号"])
+
+
+def test_private_push_preview_does_not_deep_fetch_until_selection(tmp_path):
+    from tools.workflow.fresh_store import MemoryFreshStore
+
+    ws = build_workspace(tmp_path)
+    (ws / "00_Profile" / "queries.json").write_text(
+        json.dumps(
+            {
+                "workflow_preferences": {
+                    "preview_floor": 2.8,
+                    "defer_deep_until_selection": True,
+                    "default_entry_policy": "standard",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    scan = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "scan-private-review",
+                "jobs": [
+                    {
+                        "title": "Compliance Officer",
+                        "company": "Acme",
+                        "url": "https://example.test/job/94199570",
+                        "score": "3.15",
+                    }
+                ],
+            },
+        },
+    )
+    store = MemoryFreshStore("fresh_private_review", [])
+    preview = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={"run_id": scan["run_id"], "fresh_title": store.title},
+    )
+
+    assert preview["status"] == "planned"
+    assert preview["selection_required"] is True
+    assert preview["next_action"] == "push_select"
+    assert preview["review_rows"][0]["初评分数"] == "3.15"
+    assert store.row_count() == 0
+
+
+def test_private_selected_push_applies_final_gate_after_deep_review(tmp_path, monkeypatch):
+    from tools.fresh_24h import two_pass_score
+    from tools.workflow.fresh_store import MemoryFreshStore
+
+    ws = build_workspace(tmp_path)
+    (ws / "00_Profile" / "queries.json").write_text(
+        json.dumps(
+            {
+                "workflow_preferences": {
+                    "preview_floor": 2.8,
+                    "defer_deep_until_selection": True,
+                    "default_entry_policy": "standard",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    scan = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "scan-private-deep",
+                "jobs": [
+                    {
+                        "title": "Compliance Officer",
+                        "company": "Acme",
+                        "url": "https://example.test/job/94199570",
+                        "score": "3.15",
+                    }
+                ],
+            },
+        },
+    )
+
+    def fake_deep(rows, *, repo, min_final):
+        deep = dict(rows[0])
+        deep.update({"深评分数": "3.50", "JD深度": "full", "评估状态": "ready"})
+        return [deep], {"input": 1, "deep_attempted": 1, "deep_ok": 1}
+
+    monkeypatch.setattr(two_pass_score, "deepen_scored_rows", fake_deep)
+    store = MemoryFreshStore("fresh_private_deep", [])
+    preview = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={
+            "run_id": scan["run_id"],
+            "fresh_title": store.title,
+            "selected_keys": ["https://example.test/job/94199570"],
+        },
+    )
+
+    assert preview["status"] == "planned"
+    assert preview["requires_confirmation"] is True
+    assert preview["entry_policy"] == "standard"
+    assert preview["row_count"] == 1
+    assert preview["deep_review"]["deep_ok"] == 1
 
 
 def test_push_without_run_id_uses_latest_official_run_not_mode_state(tmp_path):
@@ -535,3 +669,71 @@ def test_stale_entry_preview_cannot_reuse_a_consumed_sequence(tmp_path):
         assert str(exc) == "id_counter_conflict:C0-001"
     else:
         raise AssertionError("stale proposal reused a consumed ID")
+
+
+def test_failed_confirmation_invalidates_the_proposal(tmp_path):
+    """A confirmation that dies after ID reservation must not look retryable.
+
+    The counters are persisted before the projection write on purpose, so the
+    numbers the proposal holds are already consumed.  Retrying the same
+    proposal_id used to surface id_counter_conflict; it has to ask for a fresh
+    preview instead.
+    """
+    from tools.workflow.fresh_store import MemoryFreshStore
+
+    class ProjectionFailsStore(MemoryFreshStore):
+        def replace_active_if_digest(self, snapshot, expected_digest):
+            raise OSError("simulated_projection_failure")
+
+    ws = build_workspace(tmp_path)
+    scan = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "scan-stale",
+                "jobs": [{"title": "Analyst", "company": "Acme", "score": "4.0"}],
+            },
+        },
+    )
+    store = ProjectionFailsStore("fresh_24h_stale", [])
+    preview = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={"run_id": scan["run_id"], "fresh_title": store.title},
+    )
+    assert preview["status"] == "planned"
+    proposal_id = preview["proposal_id"]
+
+    failed = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={
+            "run_id": scan["run_id"],
+            "fresh_title": store.title,
+            "confirmation_id": proposal_id,
+        },
+    )
+    assert failed["status"] != "succeeded"
+
+    saved = json.loads(
+        (ws / "02_Tracker" / "workflow" / "confirmations" / f"{proposal_id}.json")
+        .read_text(encoding="utf-8")
+    )
+    assert saved["status"] != "pending_confirmation"
+
+    retried = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={
+            "run_id": scan["run_id"],
+            "fresh_title": store.title,
+            "confirmation_id": proposal_id,
+        },
+    )
+    assert retried["status"] == "blocked"
+    assert retried["blockers"] == ["confirmation_not_pending"]

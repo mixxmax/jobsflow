@@ -85,6 +85,22 @@ def build_proposal(
     return payload
 
 
+def require_preview(proposal: dict[str, Any] | None) -> dict[str, Any]:
+    """JF-PREVIEW-001 production consumer: write only after an explicit preview.
+
+    Push / tracker entry must call this at the confirmation→write boundary.
+    A missing or non-confirmable proposal must not reach permanent storage.
+    """
+    if not isinstance(proposal, dict) or not proposal:
+        raise ValueError("preview_required")
+    status = str(proposal.get("status") or "")
+    if status not in {"pending_confirmation", "applied"}:
+        raise ValueError(f"preview_not_confirmable:{status or 'missing'}")
+    if not str(proposal.get("proposal_id") or "").strip():
+        raise ValueError("preview_required")
+    return proposal
+
+
 def validate_proposal(
     proposal: dict[str, Any] | None,
     *,

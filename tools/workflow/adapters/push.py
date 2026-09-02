@@ -14,6 +14,7 @@ from tools.workflow.contracts import result
 from tools.workflow.confirmation import (
     ConfirmationStore,
     build_proposal,
+    require_preview,
     validate_proposal,
 )
 from tools.fresh_24h.batch_mark import hkt_now_str, make_batch_id, mark_new_rows, sort_fresh_rows
@@ -26,8 +27,107 @@ from tools.workflow.id_allocation import (
 from tools.workflow.sync import SyncCoordinator, TrackerLedger
 from tools.job_urls import normalize_job_url
 from tools.job_materials.packages import create_package_from_entry_row, validate_entry_row_binding
+from tools.fresh_24h.policy import (
+    load_workflow_preferences,
+    normalize_entry_policy,
+)
 
-ENTRY_RULE_IDS = ["PUSH-001", "FRESH-001", "SYNC-001", "SYNC-004"]
+ENTRY_RULE_IDS = ["PUSH-001", "FRESH-001", "SYNC-001", "SYNC-004", "SYNC-005"]
+
+
+def _retire_proposal(
+    confirmations: ConfirmationStore,
+    proposal: dict[str, Any],
+    reason: str,
+) -> None:
+    """Retire a proposal whose reserved IDs can no longer be confirmed.
+
+    The per-lane counters advance at the confirmation boundary, so a failure
+    after that point leaves the proposal holding numbers that are already
+    consumed.  Retiring it makes the next attempt report
+    ``confirmation_not_pending`` — an explicit instruction to re-preview —
+    instead of colliding on the dead numbers.
+    """
+
+    proposal["status"] = "stale"
+    proposal["stale_reason"] = reason
+    confirmations.save(proposal)
+
+
+def _repo_for_workspace(workspace: Path) -> Path:
+    root = Path(workspace).expanduser().resolve()
+    return root.parent if root.name == "JobSearch_2026" else root
+
+
+def _review_row_summary(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "岗位编号": row.get("岗位编号") or "",
+        "职位": row.get("职位") or row.get("title") or "",
+        "公司": row.get("公司") or row.get("company") or "",
+        "链接": row.get("链接") or row.get("url") or "",
+        "lane": row.get("简历版本") or row.get("lane") or "",
+        "初评分数": row.get("初评分数") or "",
+        "深评分数": row.get("深评分数") or "",
+        "JD深度": row.get("JD深度") or "",
+        "评估状态": row.get("评估状态") or "",
+        "硬门提示": row.get("_hard_gate") or "",
+        "层级": row.get("层级") or "",
+    }
+
+
+def _review_entry_result(
+    rows: list[dict[str, Any]],
+    *,
+    entry_policy: str,
+    final_gate: float,
+    source_row_count: int,
+    selection_required: bool = True,
+    deep_meta: dict[str, Any] | None = None,
+    rejected: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return a user-facing review without creating a push proposal."""
+    return result(
+        status="planned",
+        rule_ids=ENTRY_RULE_IDS,
+        requires_confirmation=False,
+        next_action="push_select" if selection_required else "push_confirm",
+        entry_policy=entry_policy,
+        final_gate=float(final_gate),
+        source_row_count=int(source_row_count),
+        review_only=True,
+        selection_required=bool(selection_required),
+        estimated_deep_count=len(rows),
+        estimated_network_cost={
+            "selected_rows": len(rows),
+            "note": "仅对明确选择的岗位深评；缓存命中不消耗门户请求预算",
+        },
+        review_rows=[_review_row_summary(row) for row in rows],
+        rejected_rows=[_review_row_summary(row) for row in (rejected or [])],
+        deep_review=deep_meta or {},
+    )
+
+
+def _standard_entry_rows(
+    rows: list[dict[str, Any]],
+    *,
+    final_gate: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep only full-JD rows at the final line for the default policy."""
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for row in rows:
+        depth = str(row.get("JD深度") or "").casefold()
+        try:
+            score = float(row.get("深评分数") or row.get("CareerOps分数") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        status = str(row.get("评估状态") or "")
+        if depth in {"full", "deep", "cache"} and score >= float(final_gate) and status != "language_gate_failed":
+            row["评估状态"] = "ready"
+            accepted.append(row)
+        else:
+            rejected.append(row)
+    return accepted, rejected
 
 
 def _ensure_entry_packages(workspace: Path, title: str, rows: list[dict[str, Any]]) -> list[str]:
@@ -157,6 +257,8 @@ def _entry_preview(
     selection_keys: list[str] | None = None,
     source_row_count: int | None = None,
     authoritative_rows: list[dict[str, Any]] | None = None,
+    entry_policy: str = "standard",
+    deep_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a digest-bound, write-free proposal for a tracker entry."""
 
@@ -207,6 +309,8 @@ def _entry_preview(
             "batch_id": batch_id,
             "selection_keys": list(selection_keys or []),
             "source_row_count": int(source_row_count if source_row_count is not None else len(rows)),
+            "entry_policy": entry_policy,
+            "deep_review": deep_review or {},
         },
     )
     ConfirmationStore(workspace).save(proposal)
@@ -242,6 +346,9 @@ def _preview_result(
             }
             for row in rows
         ],
+        entry_policy=str((proposal.get("entry_policy") or "standard")),
+        deep_review=proposal.get("deep_review") or {},
+        source_row_count=int(proposal.get("source_row_count") or len(rows)),
     )
     if backend_resolution:
         out["backend_resolution"] = backend_resolution
@@ -294,7 +401,25 @@ def handle(
         return result(status="blocked", blockers=[error or "scored_artifact_missing"], rule_ids=["PUSH-001", "FRESH-001"])
     source_row_count = len(rows)
     selection_keys = _selection_keys(payload)
+    preferences = load_workflow_preferences(_repo_for_workspace(workspace))
+    entry_policy = normalize_entry_policy(
+        payload.get("entry_policy") or preferences.get("default_entry_policy", "standard")
+    )
+    defer_deep = bool(preferences.get("defer_deep_until_selection"))
+    deep_review_meta: dict[str, Any] = {}
+    rejected_rows: list[dict[str, Any]] = []
     if not proposal_id:
+        # Private review-only mode is intentionally selection-first: a plain
+        # push preview never spends network budget on the entire window.  The
+        # explicit ``all`` policy is the only way to select the complete
+        # displayed review pool, and it remains visible in the proposal.
+        if defer_deep and not selection_keys and entry_policy != "all":
+            return _review_entry_result(
+                rows,
+                entry_policy=entry_policy,
+                final_gate=float(preferences["final_gate"]),
+                source_row_count=source_row_count,
+            )
         rows, selection_error = _select_scored_rows(rows, selection_keys)
         if selection_error:
             return result(
@@ -304,6 +429,48 @@ def handle(
                 blockers=[selection_error],
                 selection_keys=selection_keys,
             )
+        if defer_deep:
+            try:
+                from tools.fresh_24h.two_pass_score import deepen_scored_rows
+
+                deep_rows, deep_review_meta = deepen_scored_rows(
+                    rows,
+                    repo=_repo_for_workspace(workspace),
+                    min_final=float(preferences["final_gate"]),
+                )
+            except Exception as exc:
+                return result(
+                    status="failed",
+                    after_state="scan_completed",
+                    rule_ids=ENTRY_RULE_IDS,
+                    blockers=["selected_deep_review_failed"],
+                    error=str(exc),
+                    entry_policy=entry_policy,
+                    selection_keys=selection_keys,
+                )
+            deep_review_meta = {
+                "input": int(deep_review_meta.get("input") or len(rows)),
+                "deep_attempted": int(deep_review_meta.get("deep_attempted") or 0),
+                "deep_ok": int(deep_review_meta.get("deep_ok") or 0),
+                "provisional_needs_jd": int(deep_review_meta.get("provisional_needs_jd") or 0),
+                "deep_score_distribution": deep_review_meta.get("deep_score_distribution") or {},
+                "jobsdb_detail_status": deep_review_meta.get("jobsdb_detail_status"),
+            }
+            rows = deep_rows
+            if entry_policy == "standard":
+                rows, rejected_rows = _standard_entry_rows(
+                    rows, final_gate=float(preferences["final_gate"])
+                )
+                if not rows:
+                    return _review_entry_result(
+                        rejected_rows,
+                        entry_policy=entry_policy,
+                        final_gate=float(preferences["final_gate"]),
+                        source_row_count=source_row_count,
+                        selection_required=True,
+                        deep_meta=deep_review_meta,
+                        rejected=rejected_rows,
+                    )
     title = str(
         payload.get("fresh_title")
         or run.get("fresh_title")
@@ -340,6 +507,8 @@ def handle(
                 selection_keys=selection_keys,
                 source_row_count=source_row_count,
                 authoritative_rows=authoritative_rows,
+                entry_policy=entry_policy,
+                deep_review=deep_review_meta,
             )
         except ValueError as exc:
             return result(
@@ -385,6 +554,18 @@ def handle(
             proposal_id=proposal_id,
         )
     assert proposal is not None
+    # JF-PREVIEW-001: named consumer on the write boundary (preview→confirm→write).
+    try:
+        proposal = require_preview(proposal)
+    except ValueError as exc:
+        return result(
+            status="blocked",
+            after_state="scan_completed",
+            rule_ids=["PUSH-001", "FRESH-001", "SYNC-001"],
+            blockers=[str(exc)],
+            requires_confirmation=True,
+            proposal_id=proposal_id,
+        )
     if proposal.get("status") == "applied":
         try:
             package_paths = _ensure_entry_packages(workspace, title, prepared)
@@ -449,6 +630,9 @@ def handle(
             existing_rows=[*authoritative_rows, *target_before.rows],
         )
     except IdCounterConflict as exc:
+        # The reserved numbers are already taken, so this proposal can never be
+        # confirmed: counters only move forward.
+        _retire_proposal(confirmations, proposal, str(exc))
         return result(
             status="blocked",
             after_state="scan_completed",
@@ -465,6 +649,7 @@ def handle(
     try:
         package_paths = _ensure_entry_packages(workspace, title, prepared)
     except (OSError, ValueError, LookupError) as exc:
+        _retire_proposal(confirmations, proposal, f"entry_package_creation_failed:{exc}")
         return result(
             status="blocked",
             after_state="scan_completed",
@@ -484,6 +669,11 @@ def handle(
         target_snapshot=target_before,
     )
     if sync.get("status") != "succeeded":
+        _retire_proposal(
+            confirmations,
+            proposal,
+            ",".join(str(item) for item in (sync.get("blockers") or ["sync_projection_failed"])),
+        )
         return result(
             status=str(sync.get("status") or "failed"),
             blockers=list(sync.get("blockers") or ["sync_projection_failed"]),
