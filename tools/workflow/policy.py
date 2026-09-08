@@ -90,6 +90,16 @@ ACTION_RULES: dict[str, dict[str, Any]] = {
         "rule_ids": ["SYNC-001", "SYNC-002"],
         "requires_confirmation": False,
     },
+    "base": {
+        "autonomy": "A3",
+        "rule_ids": [],
+        "requires_confirmation": False,
+    },
+    "intent": {
+        "autonomy": "A3",
+        "rule_ids": ["INTENT-001"],
+        "requires_confirmation": False,
+    },
 }
 
 

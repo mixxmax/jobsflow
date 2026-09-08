@@ -545,13 +545,37 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("text", nargs="?", help="new or replacement intent text")
-    parser.add_argument("--repo", default=".", help="repository root")
+    parser.add_argument("--repo", default=".", help="repository root / private workspace")
     parser.add_argument("--bucket", help="existing query bucket for an added query")
     parser.add_argument("--track", help="personalized A-F direction for an added query")
     args = parser.parse_args(argv)
     repo = Path(args.repo).expanduser().resolve()
     profile_dir = private_profile_dir(repo)
+    # Canonical path: WorkflowEngine → SOP Control adapter → update_intent helpers.
+    # Keep this CLI as a human-facing facade; do not open a side door around the gateway.
     try:
+        from tools.workflow.engine import dispatch
+
+        out = dispatch(
+            "intent",
+            workspace=repo,
+            payload={
+                "intent_cmd": args.action,
+                "text": args.text or "",
+                "bucket": args.bucket,
+                "track": args.track,
+            },
+        )
+        status = str(out.get("status") or "")
+        blockers = list(out.get("blockers") or [])
+        if status == "blocked":
+            if "private_search_config_missing" in blockers:
+                raise RuntimeError("没有私有搜索配置，请先运行 /setup")
+            if "intent_text_required" in blockers:
+                raise ValueError("该操作需要提供内容")
+            if "explicit_user_confirmation_missing" in blockers or "intent_proposal_missing" in blockers:
+                raise RuntimeError("没有待确认的意向变更预览")
+            raise RuntimeError(",".join(str(item) for item in blockers) or "intent_blocked")
         if args.action == "show":
             config = _load(profile_dir / "queries.json")
             if not config:
@@ -559,12 +583,10 @@ def main(argv: list[str] | None = None) -> int:
             _display(config, profile_dir)
             return 0
         if args.action == "cancel":
-            cancel_proposal(repo)
             print("已取消待确认的意向变更；私有搜索配置未改变。")
             return 0
         if args.action == "confirm":
-            proposal = apply_proposal(repo)
-            if str(proposal.get("operation") or "").startswith("set_"):
+            if str(out.get("operation") or "").startswith("set_"):
                 config = _load(profile_dir / "queries.json")
                 workflow = resolve_workflow_preferences(config)
                 print("工作流偏好已确认并写入私有配置。下次 /scan 自动生效。")
@@ -574,22 +596,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             else:
                 print("意向变更已确认并写入私有配置。下次 /scan 将使用新检索词。")
-                print(f"识别关键词：{', '.join(proposal.get('recognized_terms') or [])}")
+                print(f"识别关键词：{', '.join(out.get('recognized_terms') or [])}")
             return 0
-        if not args.text:
-            raise ValueError("该操作需要提供内容")
         if args.action in {"scan-depth", "retention"}:
-            preference = (
-                "scan_depth"
-                if args.action == "scan-depth"
-                else "retention_preference"
-            )
-            proposal = create_preference_proposal(
-                repo, preference=preference, value=args.text
-            )
-            save_proposal(repo, proposal)
-            change = proposal["diff"]["workflow_preferences"]
-            resolved = change["resolved_after"]
+            change = ((out.get("diff") or {}).get("workflow_preferences") or {})
+            resolved = change.get("resolved_after") or resolve_workflow_preferences({})
             print("已生成工作流偏好预览，尚未修改配置。")
             print(
                 f"扫描深度：{resolved['scan_depth_label']}（最多 {resolved['max_network_deep']} 个网络深取）"
@@ -599,19 +610,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             print("请检查后运行：python3 tools/update_intent.py confirm")
             return 0
-        operation = "replace" if args.action in {"replace", "set"} else "add"
-        proposal = create_proposal(
-            repo,
-            operation=operation,
-            text=args.text,
-            bucket=args.bucket,
-            track=args.track,
-        )
-        save_proposal(repo, proposal)
         print("已生成意向变更预览，尚未修改配置。")
-        print(f"当前意向：{proposal['current_intent'] or '（未记录）'}")
-        print(f"识别关键词：{', '.join(proposal['recognized_terms'])}")
-        constraints = (proposal.get("diff") or {}).get("constraints") or {}
+        print(f"当前意向：{out.get('current_intent') or '（未记录）'}")
+        print(f"识别关键词：{', '.join(out.get('recognized_terms') or [])}")
+        constraints = (out.get("diff") or {}).get("constraints") or {}
         if constraints.get("minimum_salary_parse_status") in {AMBIGUOUS, INVALID}:
             print(
                 "薪资约束需要确认："

@@ -11,6 +11,8 @@ from uuid import uuid4
 from tools.workflow.adapters import apply as apply_adapter
 from tools.workflow.adapters import archive as archive_adapter
 from tools.workflow.adapters import audit as audit_adapter
+from tools.workflow.adapters import base as base_adapter
+from tools.workflow.adapters import intent as intent_adapter
 from tools.workflow.adapters import materials as materials_adapter
 from tools.workflow.adapters import promote as promote_adapter
 from tools.workflow.adapters import push as push_adapter
@@ -219,6 +221,44 @@ class WorkflowEngine:
             _audit(workspace, request, out, entity, event_id, duration_ms=_elapsed_ms(started))
             return out
 
+        # SOP Control adapter: admit before side effects; receipts are written
+        # in ``_audit``.  JobsFlow ``policy.decide`` and the entity state
+        # machine remain authoritative for domain transitions.
+        sop_admit_report = None
+        try:
+            from tools.workflow.sopcontrol_adapter import admit as sop_admit
+
+            sop_admit_report = sop_admit(request, entity=entity, workspace=Path(workspace))
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            try:
+                from tools.workflow.sopcontrol_adapter import current_mode as sop_mode
+
+                mode_name = sop_mode()
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+                mode_name = "off"
+            if mode_name == "enforce":
+                sop_admit_report = {
+                    "mode": mode_name,
+                    "phase": "admit",
+                    "verdict": "fail",
+                    "blocking": True,
+                    "blockers": ["sopcontrol_admit_error", type(exc).__name__],
+                }
+        if sop_admit_report and sop_admit_report.get("blocking"):
+            out = result(
+                status="blocked",
+                before_state=entity.phase,
+                after_state=entity.phase,
+                blockers=["sop_control_blocked", *list(sop_admit_report.get("blockers") or [])],
+                rule_ids=list(sop_admit_report.get("rule_ids") or decision.rule_ids),
+                event_id=event_id,
+                before_revision=entity.revision,
+                after_revision=entity.revision,
+                sop_control=sop_admit_report,
+            )
+            _audit(workspace, request, out, entity, event_id, duration_ms=_elapsed_ms(started))
+            return out
+
         try:
             out = _run_adapter(request.action, payload, workspace, store, dry_run, now)
         except Exception as exc:
@@ -237,6 +277,8 @@ class WorkflowEngine:
             # ``observe``/``warn`` preserve the business result but expose a
             # scope warning to the caller and to the trace.
             out["quality_control_preflight"] = qc_preflight_report
+        if sop_admit_report and not sop_admit_report.get("blocking"):
+            out["sop_control_admit"] = sop_admit_report
 
         dest = out.get("after_state")
         if out.get("status") == "succeeded" and dest and dest != entity.phase and not dry_run:
@@ -372,6 +414,10 @@ def _run_adapter(action, payload, workspace, store, dry_run, now):
             confirmation_id=payload.get("proposal_id") or payload.get("confirmation_id"),
             now=now,
         )
+    if action == "base":
+        return base_adapter.handle(payload, workspace=workspace, dry_run=dry_run)
+    if action == "intent":
+        return intent_adapter.handle(payload, workspace=workspace, dry_run=dry_run)
     return result(status="blocked", blockers=["unknown_action"])
 
 
@@ -387,6 +433,10 @@ def _entity_for(action: str, payload: dict[str, Any], store) -> tuple[str, str]:
         return "materials", str(payload.get("job_id") or "unknown")
     if action in {"sync_status", "sync_reconcile", "sync_pull", "sync_retry"}:
         return "sync", str(payload.get("fresh_title") or payload.get("target") or "fresh_24h")
+    if action == "base":
+        return "base", str(payload.get("lane") or payload.get("base_cmd") or "base")
+    if action == "intent":
+        return "intent", str(payload.get("intent_cmd") or "intent")
     return "scan", "latest"
 
 
@@ -484,4 +534,17 @@ def _audit(
                 }
         except (ImportError, OSError, RuntimeError, TypeError, ValueError):
             pass
+    try:
+        from tools.workflow.sopcontrol_adapter import record_receipt
+
+        record_receipt(
+            request,
+            out,
+            entity=entity,
+            workspace=Path(workspace),
+            event_id=recorded,
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        # Receipts are observability.  Admit already fail-closed in enforce.
+        pass
     return recorded

@@ -1,4 +1,4 @@
-"""python3 -m tools.workflow <doctor|base|scan|push|materials|apply|promote|archive>"""
+"""python3 -m tools.workflow <doctor|base|intent|scan|push|materials|apply|promote|archive>"""
 
 from __future__ import annotations
 
@@ -106,6 +106,17 @@ def main(argv: list[str] | None = None) -> int:
     base.add_argument("--lane", default="", help="Lane letter; omit for all lanes on init/status")
     base.add_argument("--content", type=Path, help="The fixed private base response path")
     base.add_argument("--confirm", action="store_true", help="Confirm the prior base preview")
+
+    intent = sub.add_parser("intent", parents=[common], help="Preview and confirm job-search intent updates")
+    intent.add_argument(
+        "intent_cmd",
+        nargs="?",
+        choices=["show", "add", "replace", "set", "scan-depth", "retention", "confirm", "cancel"],
+        default="show",
+    )
+    intent.add_argument("text", nargs="?", default="", help="New or replacement intent text")
+    intent.add_argument("--bucket", default="", help="Existing query bucket for an added query")
+    intent.add_argument("--track", default="", help="Personalized A-F direction for an added query")
 
     doctor = sub.add_parser("doctor", parents=[common], help="Read-only environment and base readiness check")
     doctor.add_argument("--strict-materials", action="store_true", help="Return non-zero until every configured lane has an active base pair")
@@ -243,19 +254,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if out.get("ready") and (not getattr(args, "strict_materials", False) or out.get("materials_ready")) else 2
 
     if action == "base":
-        from tools.workflow.base_onboarding import handle as handle_base
-
-        out = handle_base(
-            workspace,
-            args.base_cmd,
-            args.lane,
-            args.content,
-            bool(args.confirm),
+        payload.update(
+            {
+                "base_cmd": args.base_cmd,
+                "lane": args.lane,
+                "content": str(args.content) if args.content else "",
+                "confirmed": bool(args.confirm),
+                "confirm": bool(args.confirm),
+            }
         )
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 0 if out.get("status") in {"initialized", "drafted", "preview", "activated"} or out.get("ready") else 2
-
-    if action == "scan":
+    elif action == "intent":
+        payload.update(
+            {
+                "intent_cmd": args.intent_cmd,
+                "text": args.text or "",
+                "bucket": args.bucket or None,
+                "track": args.track or None,
+            }
+        )
+    elif action == "scan":
         payload["mode"] = args.mode
         if args.hours:
             payload["hours"] = args.hours
@@ -537,7 +554,17 @@ def main(argv: list[str] | None = None) -> int:
     if action in {"materials", "audit", "format", "apply"} and isinstance(payload.get("materials_engine_info"), dict):
         out.update(payload["materials_engine_info"])
     print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 0 if out.get("status") in {"succeeded", "planned"} else 2
+    ok_statuses = {
+        "succeeded",
+        "planned",
+        "initialized",
+        "drafted",
+        "preview",
+        "activated",
+    }
+    if out.get("status") in ok_statuses or out.get("ready"):
+        return 0
+    return 2
 
 
 if __name__ == "__main__":

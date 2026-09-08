@@ -1,0 +1,236 @@
+"""SOP Control adapter wiring through the unified WorkflowEngine gateway."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from tools.workflow.engine import dispatch
+from tools.workflow.fresh_store import MemoryFreshStore
+from tools.workflow.sopcontrol_adapter import (
+    admit,
+    current_mode,
+    product_root,
+    sanitize_payload,
+)
+from tools.workflow.testing_packages import build_workspace
+
+
+def _install_registry(root: Path, *, rule_id: str = "JF-PREVIEW-001") -> None:
+    rules = root / ".sopcontrol" / "rules"
+    rules.mkdir(parents=True, exist_ok=True)
+    (root / ".sopcontrol" / "manifest.yaml").write_text("controller_paths: []\n", encoding="utf-8")
+    (rules / "registry.yaml").write_text(
+        "\n".join(
+            [
+                "rules:",
+                f"- rule_id: {rule_id}",
+                "  statement: 新岗位入表必须先预览后确认，确认后才能写表",
+                "  modality: MUST",
+                "  status: accepted",
+                "  scope: project",
+                "  owner: user",
+                "  risk: medium",
+                "  source:",
+                "    type: document",
+                "    ref: docs/system_rules.md",
+                "    observed_at: null",
+                "  consumer_markers:",
+                "  - require_preview",
+                "  legacy_markers: []",
+                "  state_markers: []",
+                "  supersedes: []",
+                "  tags: []",
+                "  created_at: '2026-08-25T16:59:37.963723Z'",
+                "  accepted_at: '2026-08-25T16:59:38.255983Z'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def sop_root(tmp_path, monkeypatch):
+    root = tmp_path / "product"
+    root.mkdir()
+    _install_registry(root)
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_ROOT", str(root))
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "observe")
+    return root
+
+
+def test_mode_off_skips_adapter(tmp_path, monkeypatch):
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "off")
+    ws = build_workspace(tmp_path)
+    out = dispatch(
+        "scan",
+        workspace=ws,
+        payload={"mode": "temp", "fixture": {"run_id": "sop-off", "jobs": []}},
+    )
+    assert out["status"] == "succeeded"
+    assert "sop_control" not in out
+    assert "sop_control_admit" not in out
+
+
+def test_product_root_ignores_private_workspace(tmp_path, monkeypatch):
+    product = tmp_path / "ai-job-search"
+    private = product / "JobSearch_2026"
+    private.mkdir(parents=True)
+    _install_registry(product)
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_ROOT", str(product))
+    monkeypatch.delenv("JOBSFLOW_SOPCONTROL_MODE", raising=False)
+    assert product_root() == product.resolve()
+    assert "JobSearch_2026" not in str(product_root())
+
+
+def test_sanitize_redacts_material_text():
+    safe = sanitize_payload(
+        {
+            "run_id": "scan-1",
+            "jd_text": "SECRET JD BODY",
+            "resume_text": "PRIVATE CV",
+            "cookie": "abc",
+        }
+    )
+    assert safe["run_id"] == "scan-1"
+    assert safe["jd_text"]["redacted"] is True
+    assert "SECRET" not in json.dumps(safe)
+    assert "PRIVATE" not in json.dumps(safe)
+
+
+def test_observe_scan_emits_receipt(sop_root, tmp_path):
+    pytest.importorskip("sopcontrol.events")
+    ws = build_workspace(tmp_path)
+    out = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "sop-observe",
+                "jobs": [{"title": "Analyst", "company": "Acme", "score": "4.0"}],
+            },
+        },
+    )
+    assert out["status"] == "succeeded"
+    assert out["sop_control"]["emitted"] is True
+    events = list((sop_root / ".sopcontrol-local").rglob("events.jsonl")
+                  )
+    assert events, "expected ControlEvent receipts under product .sopcontrol-local"
+    raw = events[0].read_text(encoding="utf-8")
+    assert "Analyst" not in raw
+    assert "Acme" not in raw
+    assert "action_started" in raw or "action_completed" in raw
+
+
+def test_enforce_blocks_push_confirm_without_preview(sop_root, tmp_path, monkeypatch):
+    pytest.importorskip("sopcontrol.events")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "enforce")
+    ws = build_workspace(tmp_path)
+    scan = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "sop-push-block",
+                "jobs": [{"title": "Analyst", "company": "Acme", "score": "4.0"}],
+            },
+        },
+    )
+    store = MemoryFreshStore("sop-fresh", [])
+    out = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={
+            "run_id": scan["run_id"],
+            "fresh_title": store.title,
+            "confirmation_id": "missing-proposal",
+        },
+    )
+    assert out["status"] == "blocked"
+    assert "sop_control_blocked" in out["blockers"]
+    assert "preview_required" in out["blockers"]
+    assert "JF-PREVIEW-001" in (out.get("rule_ids") or out.get("sop_control", {}).get("rule_ids") or [])
+
+
+def test_enforce_allows_push_preview_then_confirm(sop_root, tmp_path, monkeypatch):
+    pytest.importorskip("sopcontrol.events")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "enforce")
+    ws = build_workspace(tmp_path)
+    scan = dispatch(
+        "scan",
+        workspace=ws,
+        payload={
+            "mode": "temp",
+            "fixture": {
+                "run_id": "sop-push-ok",
+                "jobs": [{"title": "Analyst", "company": "Acme", "score": "4.0"}],
+            },
+        },
+    )
+    store = MemoryFreshStore("sop-fresh-ok", [])
+    preview = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={"run_id": scan["run_id"], "fresh_title": store.title},
+    )
+    assert preview["status"] == "planned"
+    pushed = dispatch(
+        "push",
+        workspace=ws,
+        store=store,
+        payload={
+            "run_id": scan["run_id"],
+            "fresh_title": store.title,
+            "confirmation_id": preview["proposal_id"],
+        },
+    )
+    assert pushed["status"] == "succeeded"
+    assert pushed.get("sop_control", {}).get("emitted") is True
+
+
+def test_base_goes_through_dispatch(sop_root, tmp_path):
+    ws = build_workspace(tmp_path)
+    out = dispatch("base", workspace=ws, payload={"base_cmd": "status"})
+    # ``base status`` reports readiness via ``ready`` / lane rows; the gateway
+    # still attaches SOP Control admit/receipt metadata.
+    assert "ready" in out or out.get("engine_version") == "base-onboarding-v1"
+    assert (
+        out.get("sop_control_admit", {}).get("action") == "base"
+        or out.get("sop_control", {}).get("action") == "base"
+    )
+
+
+def test_intent_confirm_without_proposal_is_blocked(sop_root, tmp_path, monkeypatch):
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "enforce")
+    ws = build_workspace(tmp_path)
+    # Minimal private profile layout expected by update_intent helpers.
+    profile = ws / "JobSearch_2026" / "00_Profile"
+    profile.mkdir(parents=True)
+    (profile / "queries.json").write_text(json.dumps({"intent": "data roles", "queries": []}), encoding="utf-8")
+    out = dispatch(
+        "intent",
+        workspace=ws,
+        payload={"intent_cmd": "confirm"},
+    )
+    assert out["status"] == "blocked"
+    assert "sop_control_blocked" in out["blockers"] or "intent_proposal_missing" in out["blockers"]
+
+
+def test_admit_off_returns_none(monkeypatch):
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "off")
+    assert current_mode() == "off"
+
+    class Req:
+        action = "scan"
+        payload = {}
+        actor = "test"
+        confirmation_id = None
+
+    assert admit(Req(), entity=type("E", (), {"phase": "idle", "entity_id": "x"})(), workspace=Path(".")) is None
