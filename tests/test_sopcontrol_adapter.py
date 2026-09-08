@@ -234,3 +234,107 @@ def test_admit_off_returns_none(monkeypatch):
         confirmation_id = None
 
     assert admit(Req(), entity=type("E", (), {"phase": "idle", "entity_id": "x"})(), workspace=Path(".")) is None
+
+
+def test_applicable_rules_include_preview_intent_base(sop_root):
+    from tools.workflow.sopcontrol_adapter import applicable_sop_rule_ids, load_effective_sop_rules
+
+    rules_path = sop_root / ".sopcontrol" / "rules" / "registry.yaml"
+    chunks = [rules_path.read_text(encoding="utf-8").rstrip(), ""]
+    for rule_id, statement, marker in (
+        ("JF-INTENT-001", "intent preview then confirm", "require_intent_proposal"),
+        ("JF-BASE-001", "base preview then confirm", "require_base_activation"),
+    ):
+        chunks.append(
+            "\n".join(
+                [
+                    f"- rule_id: {rule_id}",
+                    f"  statement: {statement}",
+                    "  modality: MUST",
+                    "  status: accepted",
+                    "  scope: project",
+                    "  owner: user",
+                    "  risk: medium",
+                    "  source:",
+                    "    type: document",
+                    "    ref: test",
+                    "    observed_at: null",
+                    "  consumer_markers:",
+                    f"  - {marker}",
+                    "  legacy_markers: []",
+                    "  state_markers: []",
+                    "  supersedes: []",
+                    "  tags: []",
+                    "  created_at: '2026-08-25T16:59:37.963723Z'",
+                    "  accepted_at: '2026-08-25T16:59:38.255983Z'",
+                ]
+            )
+        )
+    rules_path.write_text("\n".join(chunks) + "\n", encoding="utf-8")
+    rules, err = load_effective_sop_rules(sop_root)
+    assert err is None
+    assert "JF-PREVIEW-001" in applicable_sop_rule_ids("push", rules)
+    assert "JF-INTENT-001" in applicable_sop_rule_ids("intent", rules)
+    assert "JF-BASE-001" in applicable_sop_rule_ids("base", rules)
+
+
+def test_intent_and_base_consumers_are_regressable(tmp_path):
+    from tools.workflow.confirmation import require_base_activation, require_intent_proposal
+
+    missing = tmp_path / "missing.json"
+    try:
+        require_intent_proposal(missing)
+        assert False, "expected intent_proposal_missing"
+    except ValueError as exc:
+        assert "intent_proposal_missing" in str(exc)
+    present = tmp_path / "intent_update_proposal.json"
+    present.write_text("{}", encoding="utf-8")
+    assert require_intent_proposal(present) == present
+
+    try:
+        require_base_activation(confirmed=False)
+        assert False, "expected base_activation_requires_confirm"
+    except ValueError as exc:
+        assert "base_activation_requires_confirm" in str(exc)
+    assert require_base_activation(confirmed=True) is True
+
+
+def test_capability_ticket_issue_and_redeem(sop_root, tmp_path, monkeypatch):
+
+    pytest.importorskip("sopcontrol.tickets")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "observe")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_TICKETS", "on")
+    from tools.workflow.sopcontrol_adapter import issue_capability_ticket, _redeem_capability_ticket
+
+    payload = {"run_id": "scan-tkt", "proposal_id": "prop-tkt-1", "confirmation_id": "prop-tkt-1"}
+    issued = issue_capability_ticket(action="push", payload=payload, run_id="scan-tkt")
+    assert issued is not None
+    assert issued["ticket_id"]
+    assert issued["secret"]
+    assert "secret" not in json.dumps({"public": {"ticket_id": issued["ticket_id"]}})
+
+    class Req:
+        action = "push"
+        confirmation_id = "prop-tkt-1"
+        payload = {
+            "run_id": "scan-tkt",
+            "confirmation_id": "prop-tkt-1",
+            "capability_ticket_id": issued["ticket_id"],
+            "capability_ticket_secret": issued["secret"],
+        }
+        actor = "test"
+
+    assert _redeem_capability_ticket(Req()) == []
+
+    class BadReq:
+        action = "push"
+        confirmation_id = "prop-tkt-1"
+        payload = {
+            "run_id": "scan-tkt",
+            "confirmation_id": "prop-tkt-1",
+            "capability_ticket_id": issued["ticket_id"],
+            "capability_ticket_secret": "wrong",
+        }
+        actor = "test"
+
+    assert "capability_ticket_invalid" in _redeem_capability_ticket(BadReq())

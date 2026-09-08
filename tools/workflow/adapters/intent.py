@@ -68,6 +68,10 @@ def handle(payload: dict[str, Any], *, workspace: Path, dry_run: bool = False) -
     if command == "confirm":
         if dry_run:
             return {"status": "planned", "intent_cmd": "confirm", "dry_run": True, "side_effects": []}
+        from tools.update_intent import PROPOSAL_NAME
+        from tools.workflow.confirmation import require_intent_proposal
+
+        require_intent_proposal(profile_dir / PROPOSAL_NAME)
         proposal = apply_proposal(repo)
         return {
             "status": "succeeded",

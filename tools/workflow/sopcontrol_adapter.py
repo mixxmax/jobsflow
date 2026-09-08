@@ -59,8 +59,8 @@ SOP_RULES_BY_ACTION: dict[str, tuple[str, ...]] = {
     "audit": (),
     "format": (),
     "apply": (),
-    "base": (),
-    "intent": (),
+    "base": ("JF-BASE-001",),
+    "intent": ("JF-INTENT-001",),
 }
 
 
@@ -265,12 +265,135 @@ def _check_intent_confirm(payload: dict[str, Any], workspace: Path) -> list[str]
         return []
     try:
         from tools.update_intent import PROPOSAL_NAME, private_profile_dir
+        from tools.workflow.confirmation import require_intent_proposal
 
         proposal_path = private_profile_dir(Path(workspace)) / PROPOSAL_NAME
-        if not proposal_path.is_file():
-            return ["explicit_user_confirmation_missing", "intent_proposal_missing"]
-    except (ImportError, OSError, TypeError, ValueError):
+        require_intent_proposal(proposal_path)
+    except ValueError:
+        return ["explicit_user_confirmation_missing", "intent_proposal_missing"]
+    except (ImportError, OSError, TypeError):
         return ["explicit_user_confirmation_missing"]
+    return []
+
+
+def tickets_enabled() -> bool:
+    raw = str(os.environ.get("JOBSFLOW_SOPCONTROL_TICKETS", "off") or "off").strip().casefold()
+    return raw in {"1", "true", "yes", "on", "enforce"}
+
+
+def _side_effect_for_write(action: str) -> str:
+    return {
+        "push": "tracker_write",
+        "intent": "profile_write",
+        "base": "base_activation",
+        "apply": "apply_prepare",
+    }.get(action, "side_effect")
+
+
+def _write_path_requested(request: Any) -> bool:
+    action = str(getattr(request, "action", "") or "")
+    payload = dict(getattr(request, "payload", {}) or {})
+    if action == "push":
+        return _push_write_requested(request)
+    if action == "intent":
+        return _intent_is_confirm(payload)
+    if action == "base":
+        return _base_is_activate(payload)
+    return False
+
+
+def _ticket_fingerprint(action: str, payload: dict[str, Any]) -> str:
+    """Stable fingerprint shared by preview issue and confirm redeem.
+
+    Command names (add vs confirm) must not diverge the digest; bind on the
+    durable selection key instead (proposal id, lane, or action domain).
+    """
+
+    api, _err = _import_sopcontrol()
+    binding = (
+        payload.get("confirmation_id")
+        or payload.get("proposal_id")
+        or payload.get("capability_binding")
+        or payload.get("lane")
+        or action
+    )
+    safe = sanitize_payload(
+        {
+            "action": action,
+            "binding": binding,
+            "run_id": payload.get("run_id") or "",
+            "job_id": payload.get("job_id") or "",
+        }
+    )
+    if api is None:
+        return _digest(safe)
+    return str(api["fingerprint_payload"](safe))
+
+
+def issue_capability_ticket(
+    *,
+    action: str,
+    payload: dict[str, Any],
+    run_id: str = "",
+) -> dict[str, Any] | None:
+    """Issue a one-shot ticket for a later write. Secret returned once to caller."""
+
+    if not tickets_enabled():
+        return None
+    try:
+        from sopcontrol.tickets import issue_ticket, ticket_public_view
+    except ImportError:
+        return None
+    root = product_root()
+    fingerprint = _ticket_fingerprint(action, payload)
+    side = _side_effect_for_write(action)
+    ticket = issue_ticket(
+        root,
+        action=action,
+        input_fingerprint=fingerprint,
+        allowed_side_effects=[side],
+        run_id=run_id,
+        issued_by="jobsflow.workflow",
+    )
+    view = ticket_public_view(ticket)
+    # Secret is returned once to the caller result; never emit it in ControlEvents.
+    return {
+        "ticket_id": ticket.ticket_id,
+        "secret": ticket.secret,
+        "action": action,
+        "input_fingerprint": fingerprint,
+        "allowed_side_effects": list(ticket.allowed_side_effects),
+        "expires_at": view.get("expires_at"),
+    }
+
+
+def _redeem_capability_ticket(request: Any) -> list[str]:
+    if not tickets_enabled() or not _write_path_requested(request):
+        return []
+    payload = dict(getattr(request, "payload", {}) or {})
+    ticket_id = str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
+    secret = str(payload.get("capability_ticket_secret") or payload.get("ticket_secret") or "").strip()
+    if not ticket_id or not secret:
+        return ["capability_ticket_required"]
+    try:
+        from sopcontrol.tickets import TicketError, redeem_ticket
+    except ImportError:
+        return ["sopcontrol_unavailable"]
+    action = str(getattr(request, "action", "") or "")
+    fingerprint = _ticket_fingerprint(action, payload)
+    try:
+        redeem_ticket(
+            product_root(),
+            ticket_id=ticket_id,
+            secret=secret,
+            action=action,
+            input_fingerprint=fingerprint,
+            side_effect=_side_effect_for_write(action),
+        )
+    except TicketError as exc:
+        return ["capability_ticket_invalid", type(exc).__name__]
+    except (OSError, TypeError, ValueError, RuntimeError):
+        return ["capability_ticket_invalid"]
     return []
 
 
@@ -306,6 +429,7 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         blockers.extend(_check_push_preview(request, Path(workspace)))
     elif action == "intent":
         blockers.extend(_check_intent_confirm(payload, Path(workspace)))
+    blockers.extend(_redeem_capability_ticket(request))
 
     blockers = sorted(set(blockers))
     report = {
@@ -318,6 +442,7 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         "blocking": bool(blockers) and mode == "enforce",
         "blockers": blockers,
         "load_error": load_err,
+        "tickets_enabled": tickets_enabled(),
     }
 
     emitted, emit_err = _emit(
@@ -452,6 +577,28 @@ def record_receipt(
         "emitted": emitted,
         "emit_error": emit_err,
         "product_root": str(root),
+        "tickets_enabled": tickets_enabled(),
     }
+    # Preview/planned outcomes may mint a one-shot capability ticket for the
+    # matching write.  The secret is attached only to the caller result.
+    if event_type == "preview_created" and action in {"push", "intent", "base"}:
+        bind_payload = dict(payload)
+        if out.get("proposal_id"):
+            bind_payload["proposal_id"] = out["proposal_id"]
+            bind_payload["confirmation_id"] = out["proposal_id"]
+        if out.get("lane") and not bind_payload.get("lane"):
+            bind_payload["lane"] = out["lane"]
+        if action == "intent":
+            bind_payload["capability_binding"] = "intent"
+        issued = issue_capability_ticket(action=action, payload=bind_payload, run_id=run_id)
+        if issued is not None:
+            report["capability_ticket"] = {
+                "ticket_id": issued["ticket_id"],
+                "expires_at": issued.get("expires_at"),
+                "input_fingerprint": issued.get("input_fingerprint"),
+            }
+            # One-shot secret for the confirming caller; not written to events.
+            out["capability_ticket_secret"] = issued["secret"]
+            out["capability_ticket_id"] = issued["ticket_id"]
     out["sop_control"] = report
     return report

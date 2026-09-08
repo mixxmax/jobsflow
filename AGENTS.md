@@ -57,6 +57,12 @@ profile; neither is evidence for the other. The ability ceiling is available for
 matching/transferable framing only, never as completed experience. Email is a
 deterministic host artifact created after the CV/CL content audit.
 
+Role-title punctuation and acronym order are host-owned. `ECM/IPO` and
+`IPO/ECM` (including spaced forms) are equivalent compound titles; the host
+preserves the JD/source order and does not ask the model to normalize, verify,
+or compare them with another package. Only materially distinct slash-separated
+roles require a user confirmation.
+
 If a package contains a pre-vNext material generation, the gateway reports
 `legacy_material_state_requires_vnext_reset` with a preview and confirmation
 command. Agents must not delete legacy files or infer permission to reset;
@@ -65,6 +71,26 @@ including `--scope all`, is preview-first; only the matching
 `--confirm-reset` command archives the old generation before retrying vNext.
 
 ## /scan 模式
+
+JobsDB 详情抓取必须走统一 scan gateway。遇到 Cloudflare 时，系统只允许一
+次有界的用户可见 Chrome CDP 恢复：用户完成验证后，已验证的 CDP context
+会在本轮内串行复用给后续 JobsDB 详情，不得切回新的无头实例，也不得把
+cookie 当作详情抓取凭证。若 9222 未监听，系统只会在用户的主 Chrome 中打开
+`chrome://inspect/#remote-debugging`，由用户启用 Allow remote debugging；
+不得启动第二个 Chrome、不得传入新的 `--user-data-dir`，也不得把“已启动进程”
+当成“恢复成功”。只有通过本地 endpoint 检查、CDP 连接和真实 JD 内容校验后，
+会话才会被标记为可用。
+
+Chrome 136+ 的开关模式可能故意让 `/json/version` 等 HTTP 发现路径返回 404，
+但仍提供 `/devtools/browser` WebSocket。此时不要切换浏览器、复制 cookie 或反复
+运行探测；网关会在一次真实扫描连接中使用 WebSocket，并用 `Browser.getVersion`
+确认主 Chrome。`doctor` 只做端口级提示，不建立 WebSocket，避免重复触发
+“Allow remote debugging”授权框。
+
+`tools/fresh_24h/portal_jd_browser.py` 和 `portal_jd_cdp.py` 是网关内部兼容
+实现，不是第二套入口；直接运行 JobsDB 详情 CLI 会 fail-closed 并返回
+`jobsdb_gateway_only`。内部运行标记由 `tools.workflow` 注入，模型或用户不得
+自行设置。JobsDB 的 Bun `detail --teaser-only` 只读结构化摘要，不能升级为全文。
 
 ```
 /scan              # 临时模式：只扫上次刷新之后的新岗（系统自动记忆时间）
@@ -140,3 +166,56 @@ See `docs/tracker_defaults.md` for:
 | `tools/fresh_24h/jd_cache.py` | JD full-text cache (URL-keyed) |
 | `tools/job_materials/` | Application materials pipeline |
 | `setup.py` | First-time setup wizard |
+
+<!-- sopcontrol:v1 -->
+# SOP Control 规则投影（自动生成，勿手改）
+
+权威源: `.sopcontrol/rules/registry.yaml`；规则变更后运行 `sopctl project all` 刷新本节。
+本节只是有损切片——真正的拦截在 git pre-push 钩子、CI gate、运行时 hook 与 `sopctl gate`。
+
+## 新会话恢复（先读这里）
+1. 权威在项目 `.sopcontrol/`；模型上下文不是记忆本体。
+2. 只推进「当前链头」里的合法动作；不要重做已交付副作用。
+3. 全量历史与接手包：`sopctl task list` / `task show <id>` / `task takeover <id>`。
+4. 本切片摘要: `5d5587750d2a1f6c`（漂移时 `sopctl project check` 会报 stale）。
+5. 项目何以至此：见下节；全量编年 `sopctl chronicle`。
+
+## 何以至此（换模型/换会话）
+- 编年 6 条（完整性 OK）；下列为最近 4 条治理动作：
+- [2026-09-08T13:32] JF-INTENT-001 登记为 proposed
+- [2026-09-08T13:32] JF-INTENT-001 proposed→accepted
+- [2026-09-08T13:32] JF-BASE-001 登记为 proposed
+- [2026-09-08T13:32] JF-BASE-001 proposed→accepted
+- 全量：`sopctl chronicle`；核对：`sopctl chronicle check`。
+
+## 空间生长（无感观察；定型需人）
+- 空间生长（无感）：观察 3；待人定型候选 0（删入口 0 / 改善入口 0 / 登记规则 0）
+- 发现已自动；写入权威或删代码仍需人确认——不是要你「推进发现」。
+- 最近空间快照：ambiguity_index=0 （旁路开 0 / 平行状态 0）
+- 相对上一帧：歧义指数未变：ambiguity_index=0（`sopctl growth diff`）
+- 明细：`sopctl growth status|measure|diff`；全量候选：`sopctl candidate list`；中途接入看 `sopctl doctor`（默认轻量，全量加 `--full`）。
+
+## 控制成熟度：L2 Validate：schema/test 不通过则不宣称完成
+- 未达下一级 L3：补齐 ORDER-2：装了运行时拦截或 git 钩子，且至少一条生效规则声明了 guard_ids
+- 明细与依据: `sopctl bootstrap`。低于 L3 时门以建议为主，沉默不等于许可。
+
+## 必须遵守的规则
+- [JF-PREVIEW-001][MUST] 新岗位入表必须先预览后确认，确认后才能写表 （生产消费者标记: require_preview）
+- [JF-INTENT-001][MUST] 意向变更必须先预览再确认；闲聊不得直接写入搜索配置 （生产消费者标记: require_intent_proposal）
+- [JF-BASE-001][MUST] 车道基础版永久激活必须先预览再显式确认 （生产消费者标记: require_base_activation）
+
+## 当前链头（可执行切片）
+- 上限 5 条明细；verified 折叠；摘要 `5d5587750d2a1f6c`
+- （当前无可执行任务；勿凭记忆重做已交付副作用）
+
+## 硬约束
+- 不得直接读写或修改 `.sopcontrol/` 内任何文件；一切经 `sopctl` 子命令。
+- 完成任务前运行 `sopctl gate`（若不在 PATH：`python -m sopcontrol.cli gate`）；fail 判定或账本篡改会阻断推送。
+- 用户若说「只讨论不修改」，不得改任何文件（会话意图 discuss_only）。
+
+## 与控制器配合（SKILL 要点）
+- 先读「新会话恢复」与「当前链头」；规则/账本/任务变更只经 `sopctl`。
+- `task submit` 若契约有 MUST 字段，必须带齐 `--field key=value`（漏字段会被拒）。
+- 不要用自报「已完成」代替 `task verify` / `gate`；已 `delivered` 的任务勿重做副作用。
+- 不要卸 hook/插件（提权，需人工）。日用全序见仓库 `PLAYBOOK.md` / `SKILL.md`。
+<!-- /sopcontrol:v1 -->

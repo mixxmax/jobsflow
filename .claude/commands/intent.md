@@ -34,13 +34,21 @@
 
 ### 2. 只生成预览
 
+唯一入口是统一网关（SOP Control admit/receipt 在此生效）：
+
 ```bash
-python3 tools/update_intent.py add "用户确认后的新增意向"
+python3 -m tools.workflow intent add "用户确认后的新增意向"
 # 或
-python3 tools/update_intent.py replace "用户确认后的完整新意向"
+python3 -m tools.workflow intent replace "用户确认后的完整新意向"
 # 或工作流偏好
-python3 tools/update_intent.py scan-depth 节能
-python3 tools/update_intent.py retention 宽松
+python3 -m tools.workflow intent scan-depth 节能
+python3 -m tools.workflow intent retention 宽松
+```
+
+兼容 facade（内部同样 `dispatch("intent")`，不得当作旁路）：
+
+```bash
+python3 tools/update_intent.py add "..."
 ```
 
 向用户展示识别出的岗位/行业关键词、当前意向、拟新增查询数量和影响范围。此时不得运行 `confirm`，也不得直接编辑 `JobSearch_2026/00_Profile/queries.json`。
@@ -50,15 +58,15 @@ python3 tools/update_intent.py retention 宽松
 用户明确回复确认后执行：
 
 ```bash
-python3 tools/update_intent.py confirm
+python3 -m tools.workflow intent confirm
 ```
 
-脚本会校验预览生成后私有配置是否发生变化；发生变化就拒绝写入并要求重新预览。确认后，更新私有查询词、相关性关键词、当前意向和派生行业评分词。下一次 `/scan` 自动使用新配置。
+网关会校验预览生成后私有配置是否发生变化；发生变化就拒绝写入并要求重新预览。确认后，更新私有查询词、相关性关键词、当前意向和派生行业评分词。下一次 `/scan` 自动使用新配置。
 
 用户拒绝或改变主意时执行：
 
 ```bash
-python3 tools/update_intent.py cancel
+python3 -m tools.workflow intent cancel
 ```
 
 ## 边界

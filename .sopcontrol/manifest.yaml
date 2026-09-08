@@ -1,0 +1,8 @@
+# controller_paths：本仓库中构成控制器/验证器自身的路径前缀。
+# 列出的路径在本项目任务里被改动时，必须先提交基线才能通过完成门（手册 9.3）。
+controller_paths: []
+test_command: ".venv/bin/python -m pytest -q"
+
+# Private runtime trees are never product authority; exclude from sensors.
+scan_excludes:
+- JobSearch_2026

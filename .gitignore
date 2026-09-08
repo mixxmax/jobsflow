@@ -131,3 +131,10 @@ upskill/*.md
 .agents/skills/jobindex-search/
 .agents/skills/jobnet-search/
 docs/superpowers/
+
+# === SOP Control: local runtime only (never commit) ===
+.sopcontrol-local/
+.sopcontrol/evidence/
+.sopcontrol/tasks/
+.sopcontrol/worktrees/
+.sopcontrol/rules/candidates.yaml

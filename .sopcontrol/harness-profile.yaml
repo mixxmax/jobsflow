@@ -1,0 +1,17 @@
+claude:
+  interception: 'runtime: PreToolUse hook (JSON 决策)'
+  terminal: git pre-push 钩子 + CI gate
+  live_verified: false
+  note: 本环境 claude API key 无效（401），协议契约由测试覆盖
+opencode:
+  interception: 'runtime: .opencode/plugins tool.execute.before（抛错阻断）'
+  terminal: git pre-push 钩子 + CI gate
+  live_verified: true
+  live_evidence: 2026-08-24 沙箱演习：真实模型 Edit .sopcontrol 被拒，文件未改，模型转述理由后停止
+codex:
+  interception: none（0.147 无工具调用前钩子）
+  terminal: git pre-push 钩子 + CI gate + sopctl wrap codex（事后门）
+  advisory: AGENTS.md 规则投影（sopctl project codex）
+  live_verified: true
+  live_evidence: 2026-08-24 沙箱演习：codex 创建文件后 wrap 事后门阻断（fail 规则），退出码 1；模型曾主动尝试按投影运行
+    sopctl gate

@@ -101,6 +101,28 @@ def require_preview(proposal: dict[str, Any] | None) -> dict[str, Any]:
     return proposal
 
 
+def require_intent_proposal(proposal_path: Path | None) -> Path:
+    """JF-INTENT-001 production consumer: confirm only with a stored preview.
+
+    Casual chat must not authorize profile writes.  The confirm path must see
+    an on-disk proposal produced by a prior preview command.
+    """
+    if proposal_path is None or not Path(proposal_path).is_file():
+        raise ValueError("intent_proposal_missing")
+    return Path(proposal_path)
+
+
+def require_base_activation(*, confirmed: bool) -> bool:
+    """JF-BASE-001 production consumer: activate masters only after --confirm.
+
+    A preview may validate drafts; permanent master activation requires an
+    explicit confirmation flag on the gateway call.
+    """
+    if not confirmed:
+        raise ValueError("base_activation_requires_confirm")
+    return True
+
+
 def validate_proposal(
     proposal: dict[str, Any] | None,
     *,
