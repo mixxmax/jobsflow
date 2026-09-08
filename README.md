@@ -661,7 +661,7 @@ pytest -q
 
 ## 📦 版本
 
-當前主線：**0.9.5** - 統一 SOP gateway 與狀態機、lane 鎖定和確認入表、基礎版增量材料鏈、獨立 CV/CL 內容審計、固定 lane-master DOCX/PDF 渲染、JD 緩存與受控 JobsDB 恢復。
+當前主線：**1.0.0** - 統一 SOP gateway 與狀態機、lane 鎖定和確認入表、基礎版增量材料鏈、獨立 CV/CL 內容審計、固定 lane-master DOCX/PDF 渲染、JD 緩存與受控 JobsDB 恢復。
 
 ---
 
