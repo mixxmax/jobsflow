@@ -53,22 +53,67 @@ GOVERNED_ACTIONS = frozenset({
 # Accepted SOP Control rule ids that apply to a JobsFlow action when present
 # in the project's registry. Unknown / unregistered ids are simply omitted.
 SOP_RULES_BY_ACTION: dict[str, tuple[str, ...]] = {
-    "push": ("JF-PREVIEW-001",),
-    "scan": (),
-    "materials": (),
-    "audit": (),
-    "format": (),
-    "apply": (),
+    "push": ("JF-PREVIEW-001", "JF-PUSH-002"),
+    "scan": ("JF-SCAN-001", "JF-SCAN-002"),
+    "materials": ("JF-MAT-001", "JF-MAT-002", "JF-MAT-003"),
+    "audit": ("JF-AUD-001",),
+    "format": ("JF-AUD-001",),
+    "apply": ("JF-APPLY-001",),
     "base": ("JF-BASE-001",),
     "intent": ("JF-INTENT-001",),
+    "promote": ("JF-SYNC-001",),
+    "archive_preview": ("JF-ARCH-001",),
+    "archive_fresh": ("JF-ARCH-001",),
+    "archive_confirm": ("JF-ARCH-001",),
+    "sync_status": ("JF-SYNC-001",),
+    "sync_reconcile": ("JF-SYNC-001",),
+    "sync_pull": ("JF-SYNC-001",),
+    "sync_retry": ("JF-SYNC-001",),
 }
+
+SIDE_EFFECT_ACTIONS = frozenset({
+    "push",
+    "materials",
+    "audit",
+    "format",
+    "apply",
+    "base",
+    "intent",
+    "promote",
+    "archive_preview",
+    "archive_fresh",
+    "archive_confirm",
+    "sync_pull",
+    "sync_retry",
+    "scan",
+})
+
+
+def relax_allowed() -> bool:
+    """Tests may relax mode/tickets; production models cannot."""
+
+    if str(os.environ.get("JOBSFLOW_SOPCONTROL_ALLOW_RELAX", "") or "").strip() != "1":
+        return False
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    return str(os.environ.get("JOBSFLOW_SOPCONTROL_TEST", "") or "").strip() == "1"
 
 
 def current_mode() -> str:
+    """Return control mode.
+
+    Production workspaces with a portable registry are always ``enforce``.
+    Models cannot disable protection via ``JOBSFLOW_SOPCONTROL_MODE=off``.
+    Relaxed modes exist only when ``relax_allowed()`` is true (pytest/fixtures).
+    """
+
+    has_registry = (product_root() / ".sopcontrol" / "rules" / "registry.yaml").is_file()
     raw = str(os.environ.get("JOBSFLOW_SOPCONTROL_MODE", "") or "").strip().casefold()
-    if raw in MODES:
-        return raw
-    if (product_root() / ".sopcontrol" / "rules" / "registry.yaml").is_file():
+    if relax_allowed():
+        if raw in MODES:
+            return raw
+        return "enforce" if has_registry else "off"
+    if has_registry:
         return "enforce"
     return "off"
 
@@ -277,6 +322,13 @@ def _check_intent_confirm(payload: dict[str, Any], workspace: Path) -> list[str]
 
 
 def tickets_enabled() -> bool:
+    """Tickets authorize side effects whenever the control plane is enforcing."""
+
+    if current_mode() == "enforce":
+        if relax_allowed():
+            raw = str(os.environ.get("JOBSFLOW_SOPCONTROL_TICKETS", "off") or "off").strip().casefold()
+            return raw in {"1", "true", "yes", "on", "enforce"}
+        return True
     raw = str(os.environ.get("JOBSFLOW_SOPCONTROL_TICKETS", "off") or "off").strip().casefold()
     return raw in {"1", "true", "yes", "on", "enforce"}
 
@@ -287,19 +339,41 @@ def _side_effect_for_write(action: str) -> str:
         "intent": "profile_write",
         "base": "base_activation",
         "apply": "apply_prepare",
+        "materials": "materials_write",
+        "audit": "audit_write",
+        "format": "format_write",
+        "promote": "promote_write",
+        "archive_fresh": "archive_write",
+        "archive_confirm": "archive_write",
+        "sync_pull": "sync_write",
+        "sync_retry": "sync_write",
+        "scan": "scan_write",
     }.get(action, "side_effect")
 
 
 def _write_path_requested(request: Any) -> bool:
     action = str(getattr(request, "action", "") or "")
     payload = dict(getattr(request, "payload", {}) or {})
+    if bool(payload.get("dry_run")):
+        return False
     if action == "push":
         return _push_write_requested(request)
     if action == "intent":
         return _intent_is_confirm(payload)
     if action == "base":
         return _base_is_activate(payload)
-    return False
+    if action == "scan":
+        # Fixture/dry-run scans are review-only for ticket purposes; live scans write.
+        return not bool(payload.get("fixture"))
+    if action in {"materials", "audit", "format", "apply", "promote", "sync_retry"}:
+        return True
+    if action in {"archive_fresh", "archive_confirm"}:
+        return bool(payload.get("confirmation_id") or payload.get("proposal_id") or True)
+    if action == "sync_pull":
+        return True
+    if action == "archive_preview" or action == "sync_status" or action == "sync_reconcile":
+        return False
+    return action in SIDE_EFFECT_ACTIONS
 
 
 def _ticket_fingerprint(action: str, payload: dict[str, Any]) -> str:
@@ -397,6 +471,37 @@ def _redeem_capability_ticket(request: Any) -> list[str]:
     return []
 
 
+def _run_domain_consumers(action: str, payload: dict[str, Any], *, run_id: str = "") -> list[str]:
+    """Invoke named SOP consumers; return blocker codes on ValueError."""
+
+    try:
+        from tools.workflow import sop_consumers as consumers
+    except ImportError:
+        return ["sop_consumers_unavailable"]
+    try:
+        if action == "scan":
+            consumers.require_scan_review_only(payload)
+            consumers.require_scored_hash_binding(payload, run_id=run_id)
+        elif action == "push":
+            consumers.require_system_id_allocation(payload)
+        elif action == "materials":
+            consumers.require_vnext_engine(payload)
+            consumers.require_current_job_bundle(payload)
+            consumers.require_audit_before_render(payload)
+        elif action in {"audit", "format"}:
+            consumers.require_audit_generation_binding(payload)
+        elif action == "apply":
+            consumers.require_apply_validation_only(payload)
+        elif action.startswith("archive"):
+            consumers.require_archive_confirmation(payload, action=action)
+        elif action.startswith("sync") or action == "promote":
+            consumers.require_sync_gateway(payload)
+    except ValueError as exc:
+        code = str(exc).split(":", 1)[0]
+        return [code]
+    return []
+
+
 def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | None:
     """Admit or block a governed action before the business adapter runs."""
 
@@ -414,36 +519,66 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
     actor = str(getattr(request, "actor", "") or "agent")
     phase = str(getattr(entity, "phase", "") or "")
     run_id = str(payload.get("run_id") or getattr(entity, "entity_id", "") or "")
+    writing = _write_path_requested(request)
 
     blockers: list[str] = []
-    if load_err and mode == "enforce" and action in {"push", "base", "intent", "apply"}:
-        # Side-effectful governed actions fail closed when the controller
-        # cannot be consulted. Read-only scan preview still proceeds with a
-        # warning so clean clones without sopcontrol remain diagnosable.
+    # Missing controller: fail-closed on side effects. Fixture/dry-run scan may
+    # continue with a diagnostic only when relax_allowed (tests).
+    if load_err and mode == "enforce" and writing:
         if load_err.startswith("import_error"):
             blockers.append("sopcontrol_unavailable")
         else:
             blockers.append("sopcontrol_registry_unavailable")
+    if not (root / ".sopcontrol" / "rules" / "registry.yaml").is_file() and writing and mode == "enforce":
+        blockers.append("sopcontrol_registry_unavailable")
 
     if action == "push":
         blockers.extend(_check_push_preview(request, Path(workspace)))
     elif action == "intent":
         blockers.extend(_check_intent_confirm(payload, Path(workspace)))
-    blockers.extend(_redeem_capability_ticket(request))
+    blockers.extend(_run_domain_consumers(action, payload, run_id=run_id))
+
+    ticket_challenge = False
+    issued_ticket: dict[str, Any] | None = None
+    if not blockers and writing and tickets_enabled():
+        ticket_id = str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
+        secret = str(payload.get("capability_ticket_secret") or payload.get("ticket_secret") or "").strip()
+        if not ticket_id or not secret:
+            # Two-phase: mint a ticket and stop before the business adapter so
+            # the caller must present it on the real write. Zero side effects.
+            issued_ticket = issue_capability_ticket(action=action, payload=payload, run_id=run_id)
+            if issued_ticket is None:
+                blockers.append("capability_ticket_required")
+                blockers.append("sopcontrol_unavailable")
+            else:
+                ticket_challenge = True
+                blockers.append("capability_ticket_required")
+        else:
+            blockers.extend(_redeem_capability_ticket(request))
 
     blockers = sorted(set(blockers))
-    report = {
+    report: dict[str, Any] = {
         "mode": mode,
         "phase": "admit",
         "action": action,
         "rule_ids": sop_rule_ids,
         "product_root": str(root),
-        "verdict": "fail" if blockers else "pass",
-        "blocking": bool(blockers) and mode == "enforce",
+        "verdict": "ticket_required" if ticket_challenge else ("fail" if blockers else "pass"),
+        "blocking": bool(blockers) and mode in {"enforce", "warn"},
         "blockers": blockers,
         "load_error": load_err,
         "tickets_enabled": tickets_enabled(),
+        "ticket_challenge": ticket_challenge,
+        "zero_side_effects": ticket_challenge,
     }
+    if issued_ticket is not None:
+        report["capability_ticket_id"] = issued_ticket["ticket_id"]
+        report["capability_ticket_secret"] = issued_ticket["secret"]
+        report["next_action"] = "retry_with_capability_ticket"
+
+    if mode == "warn" and blockers and not ticket_challenge:
+        report["blocking"] = False
+        report["verdict"] = "warn"
 
     emitted, emit_err = _emit(
         root,
@@ -453,14 +588,14 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         rule_ids=sop_rule_ids,
         payload=payload,
         state_before=phase,
-        outcome="blocked" if blockers else "admitted",
+        outcome="ticket_required" if ticket_challenge else ("blocked" if blockers else "admitted"),
         blocker=",".join(blockers),
-        next_action=report.get("verdict"),
+        next_action=str(report.get("next_action") or report.get("verdict") or ""),
         side_effect_class="none",
         run_id=run_id,
-        detail={"admit": {"blockers": blockers, "mode": mode}},
+        detail={"admit": {"blockers": blockers, "mode": mode, "ticket_challenge": ticket_challenge}},
     )
-    if not emitted and mode == "enforce" and action in {"push", "apply", "base", "intent"}:
+    if not emitted and mode == "enforce" and writing and not ticket_challenge:
         blockers = sorted(set(blockers + ["sopcontrol_receipt_failed"]))
         report["blockers"] = blockers
         report["verdict"] = "fail"
@@ -469,9 +604,6 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
     elif emit_err:
         report["emit_error"] = emit_err
 
-    if mode == "warn" and blockers:
-        report["blocking"] = False
-        report["verdict"] = "warn"
     return report
 
 

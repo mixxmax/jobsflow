@@ -18,6 +18,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -107,6 +109,48 @@ def find_soffice() -> str | None:
     return None
 
 
+@contextmanager
+def soffice_lock(timeout: float = 300.0):
+    """Serialize soffice conversions across threads and processes.
+
+    Parallel LibreOffice launches pre-empt each other's profile and fail with
+    exit 2 even though every conversion uses its own UserInstallation.  The
+    lock is global (one soffice at a time per machine) because concurrent
+    conversions gain nothing: soffice startup dominates the runtime.
+    """
+
+    lock_path = Path(tempfile.gettempdir()) / "jobsflow-soffice.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    acquired = False
+    try:
+        try:
+            import fcntl
+
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.2)
+        except ImportError:
+            acquired = True
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+        handle.close()
+
+
 def convert_libreoffice(docx: Path, pdf: Path) -> bool:
     soffice = find_soffice()
     if not soffice:
@@ -117,23 +161,30 @@ def convert_libreoffice(docx: Path, pdf: Path) -> bool:
     # and can silently attach to the wrong process.
     with tempfile.TemporaryDirectory(prefix="jobsflow-lo-") as profile_dir:
         env_profile = Path(profile_dir).resolve().as_uri()
-        subprocess.check_call(
-            [
-                soffice,
-                "--headless",
-                "--nologo",
-                "--nofirststartwizard",
-                "--norestore",
-                f"-env:UserInstallation={env_profile}",
-                "--convert-to",
-                "pdf:writer_pdf_Export",
-                "--outdir",
-                str(outdir),
-                str(docx),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        command = [
+            soffice,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            "--norestore",
+            f"-env:UserInstallation={env_profile}",
+            "--convert-to",
+            "pdf:writer_pdf_Export",
+            "--outdir",
+            str(outdir),
+            str(docx),
+        ]
+        # The machine-wide run lock prevents concurrent soffice pre-emption.
+        with soffice_lock() as locked:
+            if not locked:
+                raise RuntimeError(
+                    "libreoffice_render_lock_timeout: another soffice conversion is still running"
+                )
+            subprocess.check_call(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
     produced = outdir / (docx.stem + ".pdf")
     if produced.exists() and produced != pdf:
         produced.replace(pdf)
@@ -325,6 +376,12 @@ def convert_package_dir(
 
 
 def main(argv=None) -> int:
+    from tools.workflow.gateway_guard import print_deny_legacy
+
+    return print_deny_legacy(
+        "python3 -m tools.workflow materials --job-id <ID>",
+        detail="docx_to_pdf_cli_retired_use_workflow_materials",
+    )
     ap = argparse.ArgumentParser(
         description="Headless DOCX→PDF (LibreOffice first; explicit Spire fallback). Never launches WPS."
     )

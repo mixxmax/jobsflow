@@ -274,6 +274,12 @@ def should_clear_fresh(args=None, **_kwargs) -> bool:
 
 
 def main(argv=None) -> int:
+    from tools.workflow.gateway_guard import print_deny_legacy
+
+    return print_deny_legacy(
+        "python3 -m tools.workflow promote",
+        detail="promote_fresh_to_main_cli_retired",
+    )
     args = parse_args(argv)
     if decide_promote_fresh_retention(
         clear_fresh=bool(args.clear_fresh),

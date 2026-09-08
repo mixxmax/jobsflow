@@ -459,6 +459,8 @@ def test_build_jobs_json_creates_private_batch_manifest(tmp_path):
     assert (root / "01_Masters" / "A_track" / "核心").exists()
 
     cli_output = root / "02_Tracker" / "jobs.cli.json"
+    # The build-jobs CLI is gateway-only; library build_jobs_json above remains
+    # the programmatic helper, while models must use tools.workflow.
     assert materials_main(
         [
             "build-jobs",
@@ -469,5 +471,5 @@ def test_build_jobs_json_creates_private_batch_manifest(tmp_path):
             "--output",
             str(cli_output),
         ]
-    ) == 0
-    assert cli_output.exists()
+    ) == 2
+    assert not cli_output.exists()

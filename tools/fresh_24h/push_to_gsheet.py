@@ -1006,12 +1006,12 @@ def main(argv: list[str] | None = None) -> int:
         help=f"Seconds between detail/deep calls (default {SHALLOW_SLEEP_S})",
     )
     args = ap.parse_args(argv)
-    print(
-        "ERROR: direct tracker writes are disabled; use "
-        "python3 -m tools.workflow push (preview, then --confirm <proposal-id>).",
-        file=sys.stderr,
+    from tools.workflow.gateway_guard import print_deny_legacy
+
+    return print_deny_legacy(
+        "python3 -m tools.workflow push",
+        detail="push_to_gsheet_cli_retired",
     )
-    return 2
     use_two_pass = bool(args.two_pass) and not bool(args.legacy_single_pass)
     workflow = load_workflow_preferences(REPO)
     if args.scan_depth or args.retention:

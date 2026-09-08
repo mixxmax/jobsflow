@@ -66,22 +66,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Checkout SOP Control
+      - name: Read fixed SOP Control pin
+        id: pin
+        run: |
+          pin=$(grep -E '^[0-9a-f]{40}$' tools/sopcontrol_pin.txt | head -1)
+          test -n "$pin"
+          echo "ref=$pin" >> "$GITHUB_OUTPUT"
+      - name: Checkout SOP Control (fixed Prompt A commit)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: mixxmax/sopcontrol
+          ref: ${{ steps.pin.outputs.ref }}
           path: .ci/sopcontrol
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      - name: Install sopcontrol
-        run: pip install -e .ci/sopcontrol
+      - name: Install pinned sopcontrol
+        run: |
+          test "$(git -C .ci/sopcontrol rev-parse HEAD)" = "${{ steps.pin.outputs.ref }}"
+          pip install -e .ci/sopcontrol
       - name: Require portable control-plane files
         run: |
           test -f .sopcontrol/rules/registry.yaml
           test -f .sopcontrol/manifest.yaml
           test -f .sopcontrol/identity.yaml
-      - name: Run sopctl gate
+          test -f .sopcontrol/harness-profile.yaml
+      - name: sopctl doctor
+        run: python -m sopcontrol.cli doctor .
+      - name: sopctl gate
         run: python -m sopcontrol.cli gate .
 
   dependency-review:

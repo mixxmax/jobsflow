@@ -1071,7 +1071,8 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "JobSearch_2026 materials (on-demand only). "
             "Separate from scan two-pass. "
-            "JD body: LinkedIn CLI + Playwright browser (JobsDB/CT); paste fallback. "
+            "JD body: LinkedIn CLI + JobsDB visible primary-Chrome CDP; "
+            "CT teaser/paste fallback. "
             "tailor/pipeline are blocked compatibility names; materials use tools.workflow."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1220,6 +1221,25 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_pipeline)
 
     args = ap.parse_args(argv)
+    # Authoring / package-mutation CLIs are retired. Read-only helpers
+    # (assessment show, validate, role show, resume parse) remain for
+    # interview/setup tooling until they move behind tools.workflow.
+    _gateway_blocked = {
+        "tailor",
+        "pipeline",
+        "enrich",
+        "build-jobs",
+        "jd",
+        "company",
+        "preflight",
+    }
+    if str(getattr(args, "cmd", "") or "") in _gateway_blocked:
+        from tools.workflow.gateway_guard import print_deny_legacy
+
+        return print_deny_legacy(
+            "python3 -m tools.workflow materials --job-id <JOB-ID>",
+            detail=f"job_materials_cli_retired:{getattr(args, 'cmd', '')}",
+        )
     return int(args.func(args) or 0)
 
 

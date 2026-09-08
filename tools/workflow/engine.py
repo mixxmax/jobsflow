@@ -245,16 +245,26 @@ class WorkflowEngine:
                     "blockers": ["sopcontrol_admit_error", type(exc).__name__],
                 }
         if sop_admit_report and sop_admit_report.get("blocking"):
+            ticket_challenge = bool(sop_admit_report.get("ticket_challenge"))
             out = result(
-                status="blocked",
+                status="planned" if ticket_challenge else "blocked",
                 before_state=entity.phase,
                 after_state=entity.phase,
-                blockers=["sop_control_blocked", *list(sop_admit_report.get("blockers") or [])],
+                blockers=(
+                    list(sop_admit_report.get("blockers") or [])
+                    if ticket_challenge
+                    else ["sop_control_blocked", *list(sop_admit_report.get("blockers") or [])]
+                ),
                 rule_ids=list(sop_admit_report.get("rule_ids") or decision.rule_ids),
                 event_id=event_id,
                 before_revision=entity.revision,
                 after_revision=entity.revision,
                 sop_control=sop_admit_report,
+                next_action=sop_admit_report.get("next_action"),
+                requires_capability_ticket=ticket_challenge,
+                capability_ticket_id=sop_admit_report.get("capability_ticket_id"),
+                capability_ticket_secret=sop_admit_report.get("capability_ticket_secret"),
+                side_effects=[],
             )
             _audit(workspace, request, out, entity, event_id, duration_ms=_elapsed_ms(started))
             return out

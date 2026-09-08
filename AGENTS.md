@@ -181,15 +181,16 @@ See `docs/tracker_defaults.md` for:
 5. 项目何以至此：见下节；全量编年 `sopctl chronicle`。
 
 ## 何以至此（换模型/换会话）
-- 编年 6 条（完整性 OK）；下列为最近 4 条治理动作：
-- [2026-09-08T13:32] JF-INTENT-001 登记为 proposed
-- [2026-09-08T13:32] JF-INTENT-001 proposed→accepted
-- [2026-09-08T13:32] JF-BASE-001 登记为 proposed
-- [2026-09-08T13:32] JF-BASE-001 proposed→accepted
+- 编年 28 条（完整性 OK）；下列为最近 5 条治理动作：
+- [2026-09-08T14:21] JF-APPLY-001 proposed→accepted
+- [2026-09-08T14:21] JF-ARCH-001 登记为 proposed
+- [2026-09-08T14:21] JF-ARCH-001 proposed→accepted
+- [2026-09-08T14:21] JF-SYNC-001 登记为 proposed
+- [2026-09-08T14:21] JF-SYNC-001 proposed→accepted
 - 全量：`sopctl chronicle`；核对：`sopctl chronicle check`。
 
 ## 空间生长（无感观察；定型需人）
-- 空间生长（无感）：观察 3；待人定型候选 0（删入口 0 / 改善入口 0 / 登记规则 0）
+- 空间生长（无感）：观察 8；待人定型候选 0（删入口 0 / 改善入口 0 / 登记规则 0）
 - 发现已自动；写入权威或删代码仍需人确认——不是要你「推进发现」。
 - 最近空间快照：ambiguity_index=0 （旁路开 0 / 平行状态 0）
 - 相对上一帧：歧义指数未变：ambiguity_index=0（`sopctl growth diff`）
@@ -203,6 +204,16 @@ See `docs/tracker_defaults.md` for:
 - [JF-PREVIEW-001][MUST] 新岗位入表必须先预览后确认，确认后才能写表 （生产消费者标记: require_preview）
 - [JF-INTENT-001][MUST] 意向变更必须先预览再确认；闲聊不得直接写入搜索配置 （生产消费者标记: require_intent_proposal）
 - [JF-BASE-001][MUST] 车道基础版永久激活必须先预览再显式确认 （生产消费者标记: require_base_activation）
+- [JF-SCAN-001][MUST] 扫描只检索与评分；不得自动入表或制作材料 （生产消费者标记: require_scan_review_only）
+- [JF-SCAN-002][MUST] 扫描结果必须绑定 run_id 与评分产物 （生产消费者标记: require_scored_hash_binding）
+- [JF-PUSH-002][MUST] 持久岗位编号只能由系统编号器分配，模型不得注入 （生产消费者标记: require_system_id_allocation）
+- [JF-MAT-001][MUST] 材料制作必须使用产品 vNext 引擎 （生产消费者标记: require_vnext_engine）
+- [JF-MAT-002][MUST] 材料制作必须冻结并绑定当前岗位包 （生产消费者标记: require_current_job_bundle）
+- [JF-MAT-003][MUST] 内容审计未通过不得 render 或导出 PDF （生产消费者标记: require_audit_before_render）
+- [JF-AUD-001][MUST] 审计与格式门结果必须绑定当前 generation，禁止复用过期审计 （生产消费者标记: require_audit_generation_binding）
+- [JF-APPLY-001][MUST] apply 只验证准备，禁止自动提交 （生产消费者标记: require_apply_validation_only）
+- [JF-ARCH-001][MUST] 归档写入必须先有确认提案 （生产消费者标记: require_archive_confirmation）
+- [JF-SYNC-001][MUST] 同步与晋升必须走统一 gateway，禁止旁路写表 （生产消费者标记: require_sync_gateway）
 
 ## 当前链头（可执行切片）
 - 上限 5 条明细；verified 折叠；摘要 `5d5587750d2a1f6c`

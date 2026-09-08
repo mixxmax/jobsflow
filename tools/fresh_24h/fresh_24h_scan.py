@@ -396,7 +396,12 @@ def _run_portal_batch_once(
     # scan the host supplies a tighter, explicit budget: one retry per query,
     # then the portal is degraded rather than burning the whole 30-minute run.
     env = os.environ.copy()
-    env.setdefault("JOBSEARCH_ROOT", str(repo / "JobSearch_2026"))
+    # Do not infer a private runtime from the product checkout.  The unified
+    # gateway explicitly injects JOBSEARCH_ROOT for a private run; a direct
+    # product-line invocation must keep the product policy (no personal
+    # browser handoff) instead of silently taking control of the user's
+    # Chrome.  This was the remaining path by which a new harness could
+    # re-enable the private JobsDB recovery merely by calling the batch helper.
     env["JOBSFLOW_SCAN_MODE"] = "1"
     env.setdefault("JOBSFLOW_SCAN_REQUEST_TIMEOUT_MS", "12000")
     env.setdefault("JOBSFLOW_SCAN_MAX_RETRIES", "1")
@@ -597,17 +602,66 @@ def recover_jobsdb_search_session(repo: Path) -> dict[str, Any]:
         state_path=default_circuit_state_path(repo),
     )
     recovery = JobsdbHumanVerificationRecovery()
-    result = recovery.recover_search(circuit=circuit, cache_root=repo)
-    return {
-        "status": recovery.status,
-        "ok": bool(getattr(result, "ok", False)),
-        "requires_user_action": bool(getattr(result, "requires_user_action", False)),
-        "detail_reason": getattr(result, "detail_reason", None),
-        "manual_hint": getattr(result, "manual_hint", None),
-        "manual_command": getattr(result, "manual_command", None),
-        "navigation_count": int(getattr(recovery, "navigation_count", 0) or 0),
-        "cookie_bridge": bool(getattr(result, "ok", False)),
-    }
+    try:
+        result = recovery.recover_search(circuit=circuit, cache_root=repo)
+        return {
+            "status": recovery.status,
+            "ok": bool(getattr(result, "ok", False)),
+            "entrypoint": "workflow_gateway",
+            "detail_transport": "primary_chrome_cdp_only",
+            "cookie_scope": "search_api_only",
+            "requires_user_action": bool(getattr(result, "requires_user_action", False)),
+            "detail_reason": getattr(result, "detail_reason", None),
+            "manual_hint": getattr(result, "manual_hint", None),
+            "manual_command": getattr(result, "manual_command", None),
+            "navigation_count": int(getattr(recovery, "navigation_count", 0) or 0),
+            # This is deliberately named with its narrow scope.  It is only
+            # an HTTP listing-API compatibility bridge; JobsDB detail pages
+            # never receive this cookie and continue in the live CDP context.
+            "search_api_cookie_bridge": bool(getattr(result, "ok", False)),
+            "session_mode": getattr(result, "session_mode", None),
+            "headless": getattr(result, "headless", None),
+            "browser_channel": getattr(result, "browser_channel", None),
+        }
+    finally:
+        # ``recover_search`` is a short-lived listing handoff.  Detach the
+        # local Playwright transport before the scan retries the API; this
+        # never closes the user's visible Chrome process or its session.
+        try:
+            recovery.close()
+        except Exception:
+            pass
+
+
+def jobsdb_human_handoff_enabled(repo: Path) -> bool:
+    """Return the workspace policy for visible-Chrome JobsDB recovery.
+
+    The public product defaults to a non-interactive, fail-soft scan because
+    it cannot assume access to a user's personal browser.  The private
+    ``JobSearch_2026`` runtime explicitly enables the one-user handoff.  Keep
+    this decision in the policy module rather than letting a model or a
+    portal error decide to open a browser implicitly.
+    """
+    # A private workspace enables the handoff only when this process was
+    # started by the canonical workflow gateway. Running this adapter directly
+    # (a common failure mode when a new model searches the tree) must remain a
+    # scan-only operation and may not open Chrome or request a verification
+    # click.
+    if os.environ.get("JOBSFLOW_GATEWAY_ACTIVE", "").strip() != "1":
+        return False
+    try:
+        from tools.workflow.portal_policy import (
+            jobsdb_runtime_config,
+            resolve_workspace_profile,
+        )
+
+        workspace_hint = os.environ.get("JOBSEARCH_ROOT") or repo
+        profile = resolve_workspace_profile(Path(workspace_hint))
+        return bool(
+            jobsdb_runtime_config(profile).get("human_verification_handoff", False)
+        )
+    except (ImportError, OSError, TypeError, ValueError):
+        return False
 
 
 def card_to_hit(
@@ -978,6 +1032,15 @@ def parse_page_budget(raw: str) -> dict[str, int]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import os
+
+    if os.environ.get("JOBSFLOW_GATEWAY_ACTIVE", "").strip() != "1":
+        from tools.workflow.gateway_guard import print_deny_legacy
+
+        return print_deny_legacy(
+            "python3 -m tools.workflow scan --mode temp",
+            detail="fresh_24h_scan_cli_retired",
+        )
     ap = argparse.ArgumentParser(
         description="Scan HK portals for fresh jobs (daily 24h or temp since last refresh)"
     )
@@ -1243,13 +1306,16 @@ def main(argv: list[str] | None = None) -> int:
         for request, _results, error in jobsdb_rows
         if error
     ]
-    if jobsdb_failed_requests:
+    if jobsdb_failed_requests and jobsdb_human_handoff_enabled(repo):
         try:
             recovery_meta = recover_jobsdb_search_session(repo)
         except Exception as exc:
             recovery_meta = {
                 "status": "unavailable",
                 "ok": False,
+                "entrypoint": "workflow_gateway",
+                "detail_transport": "primary_chrome_cdp_only",
+                "cookie_scope": "search_api_only",
                 "requires_user_action": False,
                 "detail_reason": "recovery_error",
                 "error": str(exc)[:200],
@@ -1278,6 +1344,21 @@ def main(argv: list[str] | None = None) -> int:
                 for request in work_by_portal.get("jobsdb", [])
                 if str(request["request_id"]) in first_by_id
             ]
+    elif jobsdb_failed_requests:
+        # A public/product workspace must not unexpectedly take control of a
+        # user's personal browser.  Keep the failed portal visible in the run
+        # record and let the caller opt into the private handoff by running in
+        # the JobSearch_2026 workspace.
+        recovery_meta = {
+            "status": "disabled_by_policy",
+            "ok": False,
+            "entrypoint": "workflow_gateway",
+            "detail_transport": "primary_chrome_cdp_only",
+            "cookie_scope": "search_api_only",
+            "requires_user_action": False,
+            "detail_reason": "human_verification_handoff_disabled",
+            "search_api_cookie_bridge": False,
+        }
 
     responses: dict[str, tuple[list[dict[str, Any]], str | None]] = {}
     for rows in worker_results.values():
