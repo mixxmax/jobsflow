@@ -11,7 +11,9 @@
 #   ./tools/fresh_24h/temp_two_pass.sh 24            # last 24 hours
 #   PASS1_GATE=3.3 ./tools/fresh_24h/temp_two_pass.sh temporary  # advanced only
 #
-# Pass-2 deep: LinkedIn CLI + JobsDB Playwright. CT = teaser only (no browser).
+# Pass-2 deep: LinkedIn CLI + JobsDB user-Chrome CDP handoff when required.
+# CT stays teaser/solver-policy controlled; this script never opens a manual
+# Playwright verification window or copies cookies into a detail browser.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"

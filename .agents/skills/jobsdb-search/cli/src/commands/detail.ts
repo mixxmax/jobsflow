@@ -10,6 +10,8 @@ import {
 export interface DetailOpts {
   id: string // a numeric job id or a /job/<id> URL
   format: "json" | "plain"
+  /** Explicit acknowledgement that this is teaser/structured lookup only. */
+  teaserOnly: boolean
 }
 
 /**
@@ -26,11 +28,29 @@ export async function runDetail(opts: DetailOpts): Promise<number> {
     writeError(`could not parse a JobsDB job id from "${opts.id}"`, "BAD_ID")
     return 1
   }
+  // This command can only query the public listing API.  Calling it "detail"
+  // is a historical compatibility surface and repeatedly caused models to
+  // treat a teaser as a full JD.  Require an explicit acknowledgement and
+  // point full-JD callers at the one product gateway route.
+  if (!opts.teaserOnly) {
+    writeError(
+      "JobsDB full-JD retrieval is gateway-only; rerun with --teaser-only for structured listing fields, or use python3 -m tools.workflow scan",
+      "DETAIL_REQUIRES_GATEWAY",
+    )
+    return 2
+  }
   try {
     // The search API supports a `jobid` filter that returns exactly the one
     // matching job (totalCount: 1). The plain `/job/<id>` page is a client-
     // rendered SPA, so we use this instead of scraping.
-    const env = await searchGet({ siteKey: SITE_KEY, jobid: id, page: "1", pageSize: "5" })
+    // Structured detail is still only an API lookup.  Never carry the
+    // optional listing cookie bridge into this command: full-JD acquisition is
+    // owned by the JobsFlow gateway and must use the live primary-Chrome CDP
+    // context, not a copied cookie or a second browser.
+    const env = await searchGet(
+      { siteKey: SITE_KEY, jobid: id, page: "1", pageSize: "5" },
+      { includeSearchCookie: false },
+    )
     const match = (env.data || []).map(toResult).find((j: JobResult) => j.id === id)
     if (!match) {
       writeError("job not found", "NOT_FOUND")

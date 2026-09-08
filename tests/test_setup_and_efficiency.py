@@ -247,6 +247,30 @@ def test_material_lanes_follow_private_setup_mapping(tmp_path):
     assert "legal" not in json.dumps(lanes).lower()
 
 
+
+
+def test_formal_query_pool_keeps_legaltech_capability_queries_on_g_lane():
+    from pathlib import Path
+
+    path = Path(__file__).parents[1] / "JobSearch_2026" / "00_Profile" / "queries.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    by_id = {item["id"]: item for item in data["queries"]}
+    expected = {
+        "g_legal_workflow_tools": "legal workflow tools",
+        "g_document_automation": "document automation legal",
+        "g_practitioner_workflow_efficiency": "practitioner workflow efficiency legal",
+        "g_legaltech_process_design_qa": "legal technology requirements process design quality assurance",
+        "g_legal_ops_implementation_support": "legal operations technology implementation support",
+        "g_legal_product_design": "legal product design",
+    }
+    for query_id, term in expected.items():
+        assert by_id[query_id]["track_hint"] == "G"
+        assert by_id[query_id]["cadence"] == "every_scan"
+        assert by_id[query_id]["terms"]["linkedin"] == term
+        assert by_id[query_id]["terms"]["jobsdb"] == term
+        assert by_id[query_id]["terms"]["ctgoodjobs"] == term
+
+
 def test_pdf_conversion_cache_is_content_and_engine_aware(tmp_path):
     docx = tmp_path / "cover.docx"
     pdf = tmp_path / "cover.pdf"

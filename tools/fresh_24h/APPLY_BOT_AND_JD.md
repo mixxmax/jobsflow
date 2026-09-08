@@ -27,40 +27,57 @@ It does **not** ship JobsDB/CT/LinkedIn-specific scrapers. The LLM/agent uses ge
 
 ## How *we* solve the JD body卡点 (recommended)
 
-Portal CLIs have no description body. Two-pass now calls:
+Portal CLIs have no description body. The supported product path is the unified
+gateway, which calls the deterministic two-pass scorer:
 
 ```bash
-python3 tools/fresh_24h/portal_jd_browser.py --url 'https://hk.jobsdb.com/job/…'
+python3 -m tools.workflow scan --mode temp
 ```
 
 Wired into `two_pass_score.deep_enrich_hit` for JobsDB / CT / LinkedIn fallback when CLI detail fails.
 
 - Env `PORTAL_JD_BROWSER=0` disables browser deep.
-- Env `PORTAL_JD_STORAGE_STATE=~/.config/jobsearch/storage_state_<portal>.json` for cookies;
-  the browser also checks the portal-specific default path automatically.
+- JobsDB detail is not a storage-state workflow. It is a user-visible primary
+  Chrome CDP workflow: the gateway opens
+  `chrome://inspect/#remote-debugging` when needed, the user enables **Allow
+  remote debugging** and clears the challenge in that same Chrome, and the
+  validated context is reused serially for the run. No second profile,
+  `--user-data-dir`, copied cookie or headless verification window is allowed.
+  `PORTAL_JD_STORAGE_STATE`/`--storage-state` remain available only to portals
+  whose policy explicitly permits snapshot sessions.
 - **Challenge / 429 / WAF never auto-retry and never overwrite saved session
   state.** Only `timeout` retries (default 2, `--retry 0` disables).
 - Two consecutive JobsDB challenges open a persisted portal circuit breaker
   (`JobSearch_2026/02_Tracker/portal_state/jobsdb_circuit.json`); later
   uncached detail requests fail soft as `paste_needed` until the cooldown or a
   manual recovery. A 429 is honoured via its `Retry-After` value.
-- Manual recovery (human verification) uses the explicit interactive mode:
-  `--headed --interactive-verification [--user-data-dir <dir>]`. The
-  interactive path bypasses the breaker, waits independent of TTY, and only
-  saves state after a real JD validates. Recovery state stays under the user
-  home directory.
+- Manual recovery is owned by the gateway. If it returns
+  `requires_user_action`, start the printed **visible** Chrome command and
+  complete the challenge there. The validated CDP context is retained and
+  reused serially for later JobsDB detail pages in that scan. Do not run
+  `portal_jd_browser.py --headed --interactive-verification` as a scan
+  substitute, launch a headless browser for the click, or copy cookies into a
+  second detail browser. `portal_jd_cdp.py` is only an explicit compatibility
+  debugger and requires an already-running primary Chrome CDP endpoint; it is
+  not a scan entry point.
 - `--diagnostics-dir <dir>` writes a sanitized JSON (URL hash only — never
   cookies or headers).
-- Env `PORTAL_JD_CHANNEL=chrome` to use system Chrome channel;
-  `PORTAL_JD_JOBSDB_PROFILE_DIR` enables a dedicated persistent profile for
-  scan sessions (optional, must be under home).
+- Env `PORTAL_JD_CHANNEL=chrome` applies only to portals that use the
+  Playwright fallback. JobsDB detail has no selectable browser profile; its
+  only accepted session is the local primary-Chrome CDP context.
+
+The Python JobsDB helpers are not a user-facing route. Direct
+`portal_jd_browser.py`/`portal_jd_cdp.py` detail calls are rejected with
+`jobsdb_gateway_only`; use the gateway command above. The gateway injects its
+internal permission only into the scan child process, so switching models or
+harnesses cannot silently revive the retired headless/profile path.
 
 ## Extends to JobsDB + CTgoodjobs?
 
 | Portal | API body | Browser body |
 |--------|----------|--------------|
 | LinkedIn | CLI detail often works | fallback browser |
-| JobsDB | no | **Playwright** (`portal_jd_browser`) |
+| JobsDB | no | **primary user Chrome CDP session** after one manual handoff |
 | CTgoodjobs | no + WAF | **Playwright**; may still need paste if WAF |
 
 Same automation model as apply-bot-mcp; we use a **deterministic Python fetch** for scoring instead of agent chat loops.
@@ -107,4 +124,5 @@ Grok：`~/.grok/config.toml` 已配 `npx apply-bot-mcp run-mcp-server --extensio
 3. 第一次连时允许扩展连接你的 Chrome  
 
 效果：Agent 可操作**你已打开/已登录的 Chrome**（LinkedIn 登录态可用）。  
-日常 two-pass 入表**不依赖** extension；JobsDB 仍用脚本 Playwright，CT 仍用短摘要。
+日常 two-pass 入表**不依赖** extension；JobsDB 详情由统一 gateway 连接主 Chrome
+CDP，CT 仍用短摘要。

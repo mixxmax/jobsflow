@@ -5,7 +5,8 @@ User product rule (JobSearch line):
   1) Scan latest jobs (temp/daily) — title + teaser only
   2) **Pass-1 triage** — direct gate 3.3 plus a lower uncertainty rescue floor
   3) **Deep JD** — all cache hits, then a bounded prioritized network budget
-     (LinkedIn CLI; JobsDB Playwright; **skip CT browser**)
+     (LinkedIn CLI; JobsDB through the retained user-Chrome CDP context;
+     **skip CT browser**)
   4) **Pass-2 score** on full(er) JD text; persist raw deep scores
   5) **Retention view** — loose 3.0 / standard 3.3 / selective 3.5, user chosen
   6) Keep unfetched/thin cards visible as ``provisional_needs_jd`` instead of
@@ -566,6 +567,36 @@ def _load_cache(url: str, repo: Path) -> tuple[str | None, dict]:
         return None, {}
 
 
+def _try_ct_solver(url: str, repo: Path) -> tuple[str, str] | None:
+    """Try the private CTgoodjobs AWS WAF solver; return (text, source) or None.
+
+    Disabled when the private 2captcha key is absent or the per-scan budget
+    is exhausted.  A token accepted for one CT URL is reused across the rest
+    of the scan (domain-scoped), so one solve can unlock many URLs.  Never
+    raises; the caller keeps the teaser-only degradation.
+    """
+    try:
+        from tools.fresh_24h.aws_waf_solver import (
+            ct_session_token,
+            load_ct_captcha_key,
+            set_ct_session_token,
+            solve_ctgoodjobs_jd,
+        )
+    except ImportError:
+        return None
+    if not load_ct_captcha_key(repo):
+        return None
+    try:
+        result = solve_ctgoodjobs_jd(url, repo, session_token=ct_session_token())
+    except Exception:
+        return None
+    if not (result.ok and result.text):
+        return None
+    if result.token:
+        set_ct_session_token(result.token)
+    return result.text, "ct_waf_2captcha"
+
+
 def deep_enrich_hit(
     h: dict,
     *,
@@ -580,7 +611,8 @@ def deep_enrich_hit(
     Order:
       1) URL-keyed JD cache (zero network requests)
       2) LinkedIn CLI detail when possible
-      3) Playwright for **JobsDB only** (and LinkedIn if CLI failed)
+      3) the retained visible user-Chrome CDP context for **JobsDB**; a
+         controlled Playwright fallback may still serve LinkedIn if its CLI fails
       4) **CTgoodjobs: never open browser** — teaser only (saves compute; WAF often fails)
       5) teaser / paste_needed fallback
 
@@ -616,8 +648,30 @@ def deep_enrich_hit(
         h["_deep_jd_full"] = cached_text
         return cached_text[:DEEP_DESC_CHARS], "deep"
 
-    # CT: never waste browser cycles — short teaser is enough for scoring.
+    # CT: private 2captcha solver first (key + budget), teaser-only fallback.
     if "ctgoodjobs.hk" in portal_host:
+        solved = _try_ct_solver(url, repo)
+        if solved:
+            ct_text, ct_source = solved
+            try:
+                from jd_cache import jd_cache_key as _jd_key
+            except ImportError:
+                _jd_key = lambda _u: ""
+            h["_enrich"] = {
+                "mode": "ct_solver",
+                "ok": True,
+                "desc_len": len(ct_text),
+                "source": ct_source,
+            }
+            h["_jd_cache_meta"] = {
+                "url": url,
+                "source": ct_source,
+                "chars": len(ct_text),
+                "cache_key": _jd_key(url),
+                "mode": "fetched",
+            }
+            h["_deep_jd_full"] = ct_text
+            return ct_text[:DEEP_DESC_CHARS], "deep"
         h["_enrich"] = {
             "mode": "ctgoodjobs_skip_browser",
             "ok": False,
@@ -652,17 +706,25 @@ def deep_enrich_hit(
         if not use_browser:
             return h.get("teaser") or "", "teaser_fallback"
 
-    # Browser only for JobsDB (and LinkedIn CLI miss)
+    # Browser/CDP deep fetch only for JobsDB (and LinkedIn CLI miss).  JobsDB
+    # itself is CDP-only; the helper below will fail closed before any
+    # Playwright launch if the validated user-Chrome context is absent.
     needs_browser = use_browser and (
         "jobsdb.com" in portal_host
         or (is_linkedin_url(url) and not (h.get("_enrich") or {}).get("ok"))
     )
     if needs_browser:
         try:
-            from portal_jd_browser import fetch_jd_body  # type: ignore
+            from portal_jd_browser import (  # type: ignore
+                _is_user_chrome_cdp_session,
+                fetch_jd_body,
+            )
         except ImportError:
             try:
-                from tools.fresh_24h.portal_jd_browser import fetch_jd_body  # type: ignore
+                from tools.fresh_24h.portal_jd_browser import (  # type: ignore
+                    _is_user_chrome_cdp_session,
+                    fetch_jd_body,
+                )
             except ImportError as e:
                 h["_enrich"] = {
                     "mode": "browser",
@@ -672,28 +734,68 @@ def deep_enrich_hit(
                 return h.get("teaser") or "", "teaser"
 
         fetch_kwargs: dict[str, Any] = {"cache_root": repo}
+        recovery = h.get("_jobsdb_human_recovery")
+        is_jobsdb = "jobsdb.com" in portal_host
         browser_session = h.get("_browser_session")
+        # A JobsDB detail session is valid only when it is the retained,
+        # user-visible CDP context.  Drop any stale/headless object supplied
+        # by an old harness before it can reach fetch_jd_body.
+        if is_jobsdb:
+            validated_session = getattr(recovery, "session", None) if recovery is not None else None
+            if validated_session is not None:
+                browser_session = validated_session
+            if not _is_user_chrome_cdp_session(browser_session):
+                browser_session = None
         if browser_session is not None:
             fetch_kwargs["session"] = browser_session
         circuit = h.get("_browser_fetch_circuit")
         if circuit is not None:
             fetch_kwargs["circuit"] = circuit
-        if "jobsdb.com" in portal_host:
+        if is_jobsdb:
             # Scan policy: one attempt per URL with a tighter per-attempt
             # timeout.  Repetition is the portal breaker's and failure cache's
             # job, not per-URL auto-retries.
             fetch_kwargs["retry"] = max(0, int(jobsdb_retry))
             fetch_kwargs["timeout_ms"] = 25000
-        fres = fetch_jd_body(url, **fetch_kwargs)
-        recovery = h.get("_jobsdb_human_recovery")
+        fres = None
         recovery_status = None
         recovery_navigations = 0
+        # Never probe JobsDB with a fresh/headless browser.  In the private
+        # runtime the first uncached detail is handed directly to the visible
+        # Chrome recovery seam; its retained session then serves the rest of
+        # the batch.  A failed handoff is returned as a provisional row and
+        # does not trigger another browser path.
+        if (
+            is_jobsdb
+            and recovery is not None
+            and browser_session is None
+            and not bool(getattr(recovery, "attempted", False))
+        ):
+            recovered = recovery.recover(
+                url,
+                circuit=circuit,
+                cache_root=repo,
+            )
+            recovery_status = str(getattr(recovery, "status", "failed"))
+            recovery_navigations = int(
+                getattr(recovery, "navigation_count", 0) or 0
+            )
+            fres = recovered
+
+        if fres is None:
+            # For JobsDB this call is a deliberate policy check: without a
+            # validated CDP session it returns ``jobsdb_cdp_session_required``
+            # without opening Playwright.  LinkedIn keeps its normal browser
+            # fallback behavior.
+            fres = fetch_jd_body(url, **fetch_kwargs)
         initial_attempts = int(getattr(fres, "attempts", 0) or 0)
         if (
-            "jobsdb.com" in portal_host
+            is_jobsdb
             and recovery is not None
+            and browser_session is not None
             and (
-                getattr(fres, "fail_reason", None) in {"challenge", "blocked"}
+                getattr(fres, "fail_reason", None)
+                in {"challenge", "blocked", "rate_limited"}
                 or getattr(fres, "detail_reason", None) == "circuit_open"
             )
         ):
@@ -774,7 +876,19 @@ def deep_enrich_hit(
             "manual_recovery_navigations": recovery_navigations,
             "url": url,
         }
-        if getattr(fres, "detail_reason", None) in {"circuit_open", "budget_exhausted"}:
+        if getattr(fres, "detail_reason", None) in {
+            "circuit_open",
+            "budget_exhausted",
+            "jobsdb_cdp_session_required",
+            "jobsdb_cdp_rejects_storage_state",
+            "cdp_endpoint_unavailable",
+            "cdp_endpoint_retired_profile",
+            "cdp_connect_failed",
+            "cdp_non_primary_browser",
+            "cdp_session_busy",
+            "cdp_session_lease_unavailable",
+            "manual_recovery_already_attempted",
+        } or getattr(fres, "requires_user_action", False):
             # Portal-wide stop or budget stop: the row is teaser-level and the
             # materials path must ask the user to paste the full JD.
             return h.get("teaser") or "", "paste_needed"
@@ -810,6 +924,52 @@ def _run_deep_enrich(
         return deep_enrich_hit(hit, repo=repo)
 
 
+def _tracker_row_from_scores(
+    hit: dict[str, Any],
+    pass1_score: Any,
+    final_score: Any,
+    *,
+    depth: str,
+    status: str,
+) -> dict[str, Any]:
+    """Build the review row without allocating an ID or inventing a deep score.
+
+    Review-only scans deliberately use the pass-1 value as the visible
+    provisional value, while keeping the dedicated deep-score field empty.
+    This makes it impossible for a teaser score to masquerade as a final
+    assessment at the push boundary.
+    """
+    cells = build_tracker_row("", 0, hit, final_score)
+    row = dict(zip(SHEET_HEADERS, cells))
+    row["岗位编号"] = ""
+    row["_preview_key"] = hit.get("_preview_key") or preview_key(hit)
+    row["简历版本"] = getattr(pass1_score, "resume_ver", "") or getattr(final_score, "resume_ver", "")
+    row["CareerOps分数"] = f"{getattr(pass1_score, 'score', 0.0):.2f}"
+    row["CareerOps等级"] = getattr(pass1_score, "grade", "")
+    row["CareerOps理由"] = (getattr(pass1_score, "reason", "") or "")[:200]
+    row["初评分数"] = f"{getattr(pass1_score, 'score', 0.0):.2f}"
+    row["初评等级"] = getattr(pass1_score, "grade", "")
+    row["初评理由"] = (getattr(pass1_score, "reason", "") or "")[:200]
+    row["深评分数"] = ""
+    row["深评等级"] = ""
+    row["深评理由"] = "等待用户选择后深评"
+    row["JD深度"] = _INTERNAL_TO_EXTERNAL_DEPTH.get(depth, depth)
+    row["评估状态"] = status
+    pending_tasks = list(getattr(final_score, "semantic_pending_tasks", ()) or ())
+    row["_semantic_pending_count"] = len(pending_tasks)
+    row["_semantic_pending_tasks"] = ";".join(str(item) for item in pending_tasks)
+    row["_semantic_lane_pending"] = any(
+        str(item).split(":", 1)[0] in {"position_profile", "lane_classify"}
+        for item in pending_tasks
+    )
+    row["_semantic_resume_pending"] = any(
+        str(item).split(":", 1)[0] == "semantic_resume_match"
+        for item in pending_tasks
+    )
+    row["_provisional_needs_jd"] = True
+    return row
+
+
 def run_two_pass(
     hits: list[dict],
     *,
@@ -820,6 +980,8 @@ def run_two_pass(
     sleep_s: float = DEEP_SLEEP_S,
     max_deep: int = DEFAULT_MAX_DEEP_FETCHES,
     drop_below_final: bool = True,
+    defer_deep: bool = False,
+    preview_floor: float | None = None,
 ) -> tuple[list[dict], dict]:
     """
     Returns (sheet_rows with two-pass fields, meta).
@@ -831,13 +993,26 @@ def run_two_pass(
     """
     if min_final is None:
         min_final = gate_pass1
-    retrieval_floor = default_retrieval_floor(gate_pass1)
+    # In review-only mode the display line is an explicit uncertainty floor,
+    # not the final quality line.  The public default remains the historical
+    # pass-1 gate unless a private runtime opts in through its config.
+    try:
+        effective_preview_floor = float(preview_floor) if preview_floor is not None else float(gate_pass1)
+    except (TypeError, ValueError):
+        effective_preview_floor = float(gate_pass1)
+    effective_preview_floor = round(min(5.0, max(1.0, effective_preview_floor)), 2)
+    routing_gate = effective_preview_floor if defer_deep else float(gate_pass1)
+    retrieval_floor = default_retrieval_floor(routing_gate)
 
     # URL normalize before scoring/dedup (not only inside deep enrich)
     normalize_hits_urls(hits)
 
     meta: dict[str, Any] = {
         "gate_pass1": gate_pass1,
+        "review_only": bool(defer_deep),
+        "preview_floor": effective_preview_floor,
+        "deep_deferred": bool(defer_deep),
+        "deep_deferred_count": 0,
         "retrieval_floor": retrieval_floor,
         "min_final": min_final,
         "drop_below_final": drop_below_final,
@@ -864,6 +1039,7 @@ def run_two_pass(
         "assessment_records": 0,
         "assessment_errors": [],
         "language_gate_failed": 0,
+        "language_gate_visible": 0,
         "language_gate_dropped": [],
         "jd_fingerprints": {},
         "linkedin_batch_attempted": 0,
@@ -882,6 +1058,11 @@ def run_two_pass(
         "jobsdb_manual_recovery_requires_action": False,
         "jobsdb_manual_recovery_hint": None,
         "jobsdb_manual_recovery_command": None,
+        "jobsdb_detail_entrypoint": "workflow_gateway_only",
+        "jobsdb_detail_transport": "primary_chrome_cdp",
+        "jobsdb_gateway_active": False,
+        "jobsdb_cdp_session_attached": False,
+        "jobsdb_cdp_detail_requests": 0,
         "enrich_errors": [],
         "jobsdb_detail_status": None,
     }
@@ -891,6 +1072,8 @@ def run_two_pass(
     scoring_profile = profile if profile is not None else load_scoring_profile(repo)
     assessment_profile = scoring_profile
     assessment_events: list[dict[str, Any]] = []
+    # Allocated before the optional review-only early return below.
+    draft_rows: list[dict] = []
 
     def record_assessment(
         h: dict,
@@ -957,6 +1140,21 @@ def run_two_pass(
                         "note": sc1.language_note,
                     }
                 )
+            if defer_deep:
+                # Keep a visible hard-safety marker in the human review
+                # surface. It is never silently converted into a normal
+                # candidate and remains ineligible for the standard push.
+                row = _tracker_row_from_scores(
+                    h,
+                    sc1,
+                    sc1,
+                    depth="teaser",
+                    status="language_gate_failed",
+                )
+                row["层级"] = "待审-语言门"
+                row["_hard_gate"] = "language"
+                meta["language_gate_visible"] += 1
+                draft_rows.append(row)
             continue
         cached_text, _cached_meta = _load_cache(str(h.get("url") or ""), repo)
         if cached_text:
@@ -964,14 +1162,14 @@ def run_two_pass(
         teaser_chars = len(re.sub(r"\s+", "", teaser1))
         thin_teaser = teaser_chars < MIN_INFORMATIVE_TEASER_CHARS
         rescue_reason = ""
-        if sc1.score < gate_pass1:
+        if sc1.score < routing_gate:
             if cached_text:
                 rescue_reason = "jd_cache"
             elif thin_teaser:
                 rescue_reason = "thin_teaser"
             elif sc1.score >= retrieval_floor:
                 rescue_reason = "gray_band"
-        if sc1.score < gate_pass1 and not rescue_reason:
+        if sc1.score < routing_gate and not rescue_reason:
             record_assessment(
                 h,
                 score=sc1,
@@ -990,7 +1188,7 @@ def run_two_pass(
                     }
                 )
             continue
-        if sc1.score < gate_pass1:
+        if sc1.score < routing_gate:
             meta["pass1_rescued"] += 1
             h["_pass1_rescue_reason"] = rescue_reason
             if len(meta["pass1_rescue_samples"]) < 15:
@@ -1007,10 +1205,51 @@ def run_two_pass(
             meta["pass1_kept"] += 1
         gated.append((h, sc1))
 
+    if defer_deep:
+        # The scan is a human review surface only.  It does not fetch, write
+        # deep scores, allocate IDs, create packages or silently apply the
+        # final 3.3 retention line.  A later explicit /push selection invokes
+        # the bounded deep-review helper in the push adapter.
+        for h, sc1 in gated:
+            row = _tracker_row_from_scores(
+                h,
+                sc1,
+                sc1,
+                depth="teaser",
+                status="provisional_needs_jd",
+            )
+            record_assessment(
+                h,
+                score=sc1,
+                pass1=sc1,
+                pass2=None,
+                depth="teaser",
+                status="provisional_needs_jd",
+            )
+            meta["provisional_needs_jd"] += 1
+            meta["deep_deferred_count"] += 1
+            draft_rows.append(row)
+        draft_rows.sort(key=lambda r: -float(r.get("初评分数") or 0))
+        pending_rows = pending_semantic_rows(draft_rows)
+        meta["semantic_pending_rows"] = len(pending_rows)
+        meta["semantic_pending_tasks"] = pending_semantic_tasks(draft_rows)
+        for assessment in assessment_events:
+            try:
+                persist_job_assessment(repo, assessment)
+                meta["assessment_records"] += 1
+            except OSError as exc:
+                meta["assessment_errors"].append(str(exc))
+        if assessment_events:
+            meta["assessment_dir"] = str(
+                _workspace_root(repo) / "02_Tracker" / "job_assessments"
+            )
+        return draft_rows, meta
+
     # Cache hits are zero-cost and never consume the network budget.  Among
     # cache misses, prioritize candidates by pass-1 score plus an uncertainty
-    # bonus for missing/short teaser text.  CT without cache is deliberately
-    # excluded because the product policy does not burn a browser on its WAF.
+    # bonus for missing/short teaser text.  CT participates through the
+    # private AWS WAF solver; its spend is bounded by the solver's own
+    # per-scan budget (and zero while a persisted token is valid).
     def network_priority(item: tuple[dict, Any]) -> float:
         candidate, score = item
         teaser_chars = len(re.sub(r"\s+", "", str(candidate.get("teaser") or "")))
@@ -1027,7 +1266,6 @@ def run_two_pass(
         item
         for item in gated
         if not item[0].get("_pass1_cache_hit")
-        and "ctgoodjobs.hk" not in str(item[0].get("url") or "").casefold()
     ]
     network_candidates.sort(key=network_priority, reverse=True)
     selected_network = network_candidates[: max(0, int(max_deep))]
@@ -1128,6 +1366,12 @@ def run_two_pass(
             # reset would silently discard min-interval/max-request values and
             # recreate an environment-default budget on the first fetch.
             reset_portal_budget("jobsdb")
+            try:
+                from tools.fresh_24h.aws_waf_solver import reset_ct_solver_budget
+
+                reset_ct_solver_budget()
+            except ImportError:
+                pass
             apply_jobsdb_config_to_runtime(jobsdb_config)
             jobsdb_retry = int(jobsdb_config.get("max_challenge_retries") or 0)
             jobsdb_cache_first = bool(jobsdb_config.get("cache_first", True))
@@ -1146,7 +1390,14 @@ def run_two_pass(
                     "human_verification_handoff"
                 ],
             }
-            if bool(jobsdb_config.get("human_verification_handoff")):
+            # Only the official workflow gateway may hand a JobsDB detail URL
+            # to the visible Chrome recovery coordinator.  Direct execution
+            # of this historical scorer must not open any browser (especially
+            # a headless verification window) merely because JOBSEARCH_ROOT
+            # points at a private runtime.
+            gateway_active = os.environ.get("JOBSFLOW_GATEWAY_ACTIVE", "").strip() == "1"
+            meta["jobsdb_gateway_active"] = gateway_active
+            if bool(jobsdb_config.get("human_verification_handoff")) and gateway_active:
                 try:
                     jobsdb_recovery = JobsdbHumanVerificationRecovery(
                         verification_timeout_seconds=int(
@@ -1157,20 +1408,21 @@ def run_two_pass(
                             "jobsdb", session
                         ),
                     )
-                    browser_pool.configure_jobsdb_profile(jobsdb_recovery.profile_dir)
                     meta["jobsdb_manual_recovery_status"] = "not_attempted"
                 except (OSError, ValueError, TypeError):
                     # Recovery is an optional private handoff.  Its setup must
                     # never disable the portal breaker or abort scoring.
                     jobsdb_recovery = None
                     meta["jobsdb_manual_recovery_status"] = "unavailable"
+            elif bool(jobsdb_config.get("human_verification_handoff")):
+                meta["jobsdb_manual_recovery_status"] = "gateway_only"
         except (OSError, ValueError, TypeError):
             jobsdb_circuit = None
     except ImportError:
         browser_pool = None
         jobsdb_circuit = None
 
-    draft_rows: list[dict] = []
+    draft_rows = []
     network_processed = 0
     try:
         for h, sc1 in gated:
@@ -1179,11 +1431,7 @@ def run_two_pass(
             cache_available = bool(h.pop("_pass1_cache_hit", False))
             network_selected = id(h) in selected_network_ids
             portal_host = str(h.get("url") or "").casefold()
-            ct_without_cache = "ctgoodjobs.hk" in portal_host and not cache_available
-            if ct_without_cache:
-                depth = "teaser_unavailable"
-                meta["deep_unavailable"] += 1
-            elif cache_available or network_selected:
+            if cache_available or network_selected:
                 meta["deep_attempted"] += 1
                 if network_selected:
                     meta["deep_network_attempted"] += 1
@@ -1193,7 +1441,11 @@ def run_two_pass(
                     h["_linkedin_batch_result"] = linkedin_batch[li_job_id]
                     h["_linkedin_batch_used"] = True
                 if browser_pool is not None:
-                    session = browser_pool.session_for(str(h.get("url") or ""))
+                    session = None
+                    if "jobsdb.com" in portal_host and jobsdb_recovery is not None:
+                        session = getattr(jobsdb_recovery, "session", None)
+                    if session is None:
+                        session = browser_pool.session_for(str(h.get("url") or ""))
                     if session is not None:
                         h["_browser_session"] = session
                 if jobsdb_circuit is not None and "jobsdb.com" in portal_host:
@@ -1237,6 +1489,9 @@ def run_two_pass(
                         meta["jd_fingerprints"][deep_url] = jd_fingerprint(deep_text)
                 enrich = h.get("_enrich") or {}
                 enrich_mode = str(enrich.get("mode") or "")
+                if enrich.get("session_mode") == "cdp-user-profile":
+                    meta["jobsdb_cdp_session_attached"] = True
+                    meta["jobsdb_cdp_detail_requests"] += 1
                 if enrich_mode == "cache":
                     meta["deep_cache_hits"] += 1
                 if "jobsdb.com" in portal_host:
@@ -1428,6 +1683,11 @@ def run_two_pass(
             "manual_recovery_status": meta["jobsdb_manual_recovery_status"],
             "manual_recovery_attempted": meta["jobsdb_manual_recovery_attempted"],
             "manual_recovery_success": meta["jobsdb_manual_recovery_success"],
+            "manual_recovery_requires_action": meta["jobsdb_manual_recovery_requires_action"],
+            "manual_recovery_hint": meta["jobsdb_manual_recovery_hint"],
+            "manual_recovery_command": meta["jobsdb_manual_recovery_command"],
+            "cdp_session_attached": meta["jobsdb_cdp_session_attached"],
+            "cdp_detail_requests": meta["jobsdb_cdp_detail_requests"],
             "circuit_state": snapshot.get("state"),
             "retry_not_before": (
                 datetime.fromtimestamp(
@@ -1463,6 +1723,48 @@ def run_two_pass(
             / "job_assessments"
         )
     return draft_rows, meta
+
+
+def deepen_scored_rows(
+    rows: list[dict[str, Any]],
+    *,
+    repo: Path = REPO,
+    min_final: float = SCORE_GATE,
+) -> tuple[list[dict], dict]:
+    """Deep-review only the rows explicitly selected by a user push.
+
+    The scan artifact is a review surface and may contain teaser-only rows.
+    This adapter converts the immutable scored-row snapshot back to the
+    scorer's raw-hit shape, then reuses the same bounded enrichment and
+    scoring path.  It never allocates IDs or writes a tracker projection.
+    """
+    hits: list[dict[str, Any]] = []
+    for row in rows:
+        hit = {
+            "title": row.get("职位") or row.get("title") or "",
+            "company": row.get("公司") or row.get("company") or "",
+            "source": row.get("来源") or row.get("source") or "",
+            "location": row.get("地点") or row.get("location") or "",
+            "salary": row.get("薪资") or row.get("salary") or "—",
+            "url": row.get("链接") or row.get("url") or "",
+            "teaser": row.get("简述") or row.get("teaser") or "",
+            "posted_at": row.get("发布日期") or row.get("posted_at") or "",
+            "track_hint": row.get("简历版本") or row.get("lane") or "F",
+            "soft_flags": row.get("soft_flags") or "",
+            "scan_id": row.get("scan_id") or "",
+        }
+        hit["_preview_key"] = row.get("_preview_key") or preview_key(hit)
+        hits.append(hit)
+    return run_two_pass(
+        hits,
+        gate_pass1=0.0,
+        min_final=float(min_final),
+        repo=repo,
+        sleep_s=0,
+        max_deep=max(1, len(hits)),
+        drop_below_final=False,
+        defer_deep=False,
+    )
 
 
 def write_csv(path: Path, rows: list[dict], *, repo: Path = REPO) -> None:
@@ -1556,6 +1858,17 @@ def main(argv: list[str] | None = None) -> int:
             "Maximum cache-miss network deep fetches; valid JD cache hits "
             "do not consume this budget"
         ),
+    )
+    ap.add_argument(
+        "--defer-deep",
+        action="store_true",
+        help="Review-only scan: show pass-1 candidates and defer JD deep fetch until explicit push selection",
+    )
+    ap.add_argument(
+        "--preview-floor",
+        type=float,
+        default=None,
+        help="Review display floor (private workflow preference; does not change final entry line)",
     )
     ap.add_argument("--sleep", type=float, default=DEEP_SLEEP_S)
     ap.add_argument(
@@ -1667,6 +1980,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.max_deep is not None
         else preferences["max_network_deep"]
     )
+    defer_deep = bool(args.defer_deep or preferences.get("defer_deep_until_selection"))
+    preview_floor = (
+        args.preview_floor
+        if args.preview_floor is not None
+        else preferences.get("preview_floor", gate_pass1)
+    )
     print(f"two-pass: input={len(hits)} from {csv_path.name}")
     print(
         f"  scan_depth={preferences['scan_depth_label']} "
@@ -1677,6 +1996,11 @@ def main(argv: list[str] | None = None) -> int:
         f"min_final={effective_min}"
     )
     print(f"  gate_pass1={gate_pass1} (internal direct routing)")
+    if defer_deep:
+        print(
+            f"  review_only=true preview_floor={preview_floor}; "
+            "deep review waits for explicit push selection"
+        )
     print(
         f"  retrieval_floor={default_retrieval_floor(gate_pass1)} "
         f"or teaser<{MIN_INFORMATIVE_TEASER_CHARS} chars (uncertainty rescue)"
@@ -1686,8 +2010,8 @@ def main(argv: list[str] | None = None) -> int:
         "(allows instant retention changes without another fetch)"
     )
     print(
-        "  deep JD: LinkedIn CLI + JobsDB Playwright; "
-        "CT=teaser only (no browser)"
+        "  deep JD: LinkedIn CLI + JobsDB user-Chrome CDP + "
+        "CT AWS WAF solver (budget-capped)"
     )
     print("  materials/tailor: NOT run here — only when you make a package")
 
@@ -1700,6 +2024,8 @@ def main(argv: list[str] | None = None) -> int:
         sleep_s=args.sleep,
         max_deep=max_deep,
         drop_below_final=args.hide_below_final,
+        defer_deep=defer_deep,
+        preview_floor=preview_floor,
     )
     # 未入表阶段不分配任何岗位编号。lane（简历版本/赛道）和层级仍然
     # 用于预览；完整 A0-001 之类的编号只在确认 push 时分配。
@@ -1744,7 +2070,9 @@ def main(argv: list[str] | None = None) -> int:
         repo=repo,
         # A --only-keys sidecar never carries the full window's deep scores;
         # marking it partial keeps it out of artifact-reuse consumers.
-        contains_all_deep_scores=not args.hide_below_final and not only_keys,
+        contains_all_deep_scores=(
+            not args.hide_below_final and not only_keys and not defer_deep
+        ),
     )
     atomic_write_json(meta_path, meta)
 
@@ -1795,7 +2123,7 @@ def main(argv: list[str] | None = None) -> int:
         if jobsdb_status.get("manual_recovery_requires_action"):
             print(
                 "jobsdb: 需要用户完成一次 CDP 人工恢复；"
-                f"{jobsdb_status.get('manual_recovery_hint') or '按提示启动带调试端口的 Chrome'}",
+                f"{jobsdb_status.get('manual_recovery_hint') or '按提示在主 Chrome 启用远程调试'}",
                 file=sys.stderr,
             )
             if jobsdb_status.get("manual_recovery_command"):

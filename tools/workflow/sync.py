@@ -114,6 +114,25 @@ STATUS_FIELDS = frozenset(
     }
 )
 
+# The tracker status sequence only ever moves forward: a row that reached
+# 已投递 records an irreversible fact.  Equal ranks are alternate spellings of
+# the same state.
+STATUS_RANK = {
+    "": 0,
+    "未做": 0,
+    "未制作": 0,
+    "已定制": 1,
+    "已制作": 1,
+    "已投递": 2,
+    "面试中": 3,
+    "已结束": 4,
+    "已录用": 5,
+}
+
+
+def status_rank(value: Any) -> int:
+    return STATUS_RANK.get(str(value or "").strip(), 0)
+
 
 class SyncError(RuntimeError):
     """Base class for synchronization failures."""
@@ -487,6 +506,14 @@ def _diff_snapshots(base: FreshSnapshot | None, local: FreshSnapshot, remote: Fr
                 "owner": "system" if field in SYSTEM_FIELDS else ("user" if field in USER_FIELDS else "unknown"),
             }
             if local_changed and remote_changed and local_value != remote_value:
+                # A three-way split on a status field is not a real
+                # disagreement when the remote value is further along the
+                # sequence: the user advanced the row in Sheets while the host
+                # was still recording an earlier step.  Adopt the later remote
+                # value instead of blocking every later entry.
+                if field in STATUS_FIELDS and status_rank(remote_value) > status_rank(local_value):
+                    remote_changes.append(item)
+                    continue
                 conflicts.append({**item, "reason": "both_changed"})
             elif local_changed:
                 local_changes.append(item)

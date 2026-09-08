@@ -313,3 +313,42 @@ def test_pending_role_confirmation_blocks_planning(tmp_path):
 
     ctx = PackageContextLoader(workspace).load("F0-091")
     assert "role_confirmation_required" in ctx.blockers
+
+
+def test_legacy_stale_confirmation_for_acronym_compound_is_repaired_by_host(tmp_path):
+    """A parser-era pending flag must not make ECM/IPO a model decision."""
+    import json
+
+    from tools.workflow.package_context import PackageContextLoader
+
+    workspace = tmp_path / "JobSearch_2026"
+    package = workspace / "01_Masters" / "G_general" / "核心" / "G0-092_未投_TestCo"
+    package.mkdir(parents=True)
+    manifest = {
+        "schema_version": 1,
+        "job_id": "G0-092",
+        "job": {
+            "role_display": "ECM/IPO Specialist",
+            # This is the legacy parser output that incorrectly split the
+            # acronym compound and left a confirmation blocker behind.
+            "role_material": "ECM",
+            "role_primary": "ECM",
+            "role_selection": {
+                "selection_mode": "deterministic_first_variant",
+                "ambiguity_status": "pending_confirmation",
+                "confirmation_needed": True,
+            },
+            "publisher_type": "employer",
+            "publisher_name": "TestCo",
+            "employer_name": "TestCo",
+            "url": "https://example.com/job/2",
+        },
+    }
+    (package / "job_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    (package / "jd_full.md").write_text("ECM/IPO Specialist role with operational responsibilities.", encoding="utf-8")
+
+    ctx = PackageContextLoader(workspace).load("G0-092")
+    assert "role_confirmation_required" not in ctx.blockers
+    refreshed = json.loads((package / "job_manifest.json").read_text(encoding="utf-8"))
+    assert refreshed["job"]["role_primary"] == "ECM/IPO Specialist"
+    assert refreshed["job"]["role_selection"]["confirmation_needed"] is False

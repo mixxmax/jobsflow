@@ -225,6 +225,7 @@ def test_plan_response_never_advertises_the_legacy_full_document_schema(tmp_path
         "id": "JD-001",
         "text": "Draft vendor contracts",
         "priority": 1,
+        "source": "duties",
     }
     assert "complete CV" not in json.dumps(outcome["draft_schema"], ensure_ascii=False)
 
@@ -534,6 +535,7 @@ def test_small_transform_preserves_every_unmentioned_baseline_block(tmp_path):
                         "action": "rewrite",
                         "text": "Reviewed vendor contracts and converted findings into an accurate operations checklist.",
                         "jd_anchor_ids": ["JD-001"],
+                        "change_reason": "condensed the original bullet; all measurable evidence retained verbatim",
                     },
                     {
                         "material": "cover_letter",
@@ -565,7 +567,7 @@ def test_small_transform_preserves_every_unmentioned_baseline_block(tmp_path):
     )
 
     audit_task = outcome["audit_task_packet"]
-    assert audit_task["audit_mode"] == "bounded_tailoring_delta"
+    assert audit_task["audit_mode"] == "full_generation"
     # Delta-first review still receives the compact final CV/CL so it can
     # catch role/employer drift, grammar damage and fragments globally.
     assert "materials.cv.text" in audit_task["read_allowlist"]

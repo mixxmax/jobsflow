@@ -168,6 +168,17 @@
       "tests": ["test_portal_jd_recovery.py", "test_workflow_portal_policy.py"]
     },
     {
+      "rule_id": "PORTAL-JDB-004",
+      "domain": "portal",
+      "statement": "JobsDB full-JD detail is gateway-only and may use only a validated visible primary-Chrome CDP context; headless/Playwright profiles, storage-state imports and copied-cookie detail routes are forbidden.",
+      "level": "MUST_NOT",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_portal_jd_browser.py", "test_portal_jd_recovery.py", "test_workflow_portal_policy.py"]
+    },
+    {
       "rule_id": "APPLY-001",
       "domain": "apply",
       "statement": "/apply never submits an application.",

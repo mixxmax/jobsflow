@@ -4,7 +4,7 @@
 // ({ data: [...], totalCount, ... }). We reshape it into the portal-skill
 // contract's result fields. See url-reference.md for the full schema.
 
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import { requestSignal, retryDelayMs } from "../../../_shared/http-policy.ts"
 
 export const SEARCH_BASE = "https://hk.jobsdb.com/api/jobsearch/v5/search"
@@ -37,13 +37,33 @@ function retryCapMs(): number {
   return envInt("JOBSFLOW_SCAN_MAX_RETRY_DELAY_MS", 30_000, 0, 30_000)
 }
 
+/**
+ * Read the optional listing-API cookie bridge.
+ *
+ * This function is intentionally kept separate from the detail command.  A
+ * cookie copied out of a browser is never a substitute for the browser-bound
+ * Cloudflare session used by JobsFlow's full-JD path.  The only consumer is
+ * `searchGet` when its caller explicitly permits the listing compatibility
+ * bridge.
+ */
 function jobsdbCookieHeader(): string {
   const fromEnv = (process.env.JOBSDB_COOKIE || "").trim()
   if (fromEnv) return fromEnv
   const root = (process.env.JOBSEARCH_ROOT || "").trim()
+  const defaultPrivateFile = process.env.HOME
+    ? `${process.env.HOME}/.config/jobsearch/jobsdb_browser_cookies.txt`
+    : ""
+  const legacyPrivateFile = root
+    ? `${root}/02_Tracker/portal_state/jobsdb_browser_cookies.txt`
+    : ""
   const fromFile = (
     process.env.JOBSDB_COOKIE_FILE ||
-    (root ? `${root}/02_Tracker/portal_state/jobsdb_browser_cookies.txt` : "")
+    (defaultPrivateFile && existsSync(defaultPrivateFile)
+      ? defaultPrivateFile
+      : // Compatibility read for a pre-2026.08 runtime. New writes always use
+        // the home-directory secret path above; this fallback can be removed
+        // after existing private instances complete one successful recovery.
+        legacyPrivateFile)
   ).trim()
   if (!fromFile) return ""
   try {
@@ -57,11 +77,26 @@ function jobsdbCookieHeader(): string {
  * GET the JobsDB search JSON with exponential backoff on 429/5xx.
  * Returns the parsed envelope. Throws on connection failure or non-retryable error.
  */
-export async function searchGet(params: Record<string, string>): Promise<SearchEnvelope> {
+export interface SearchGetOptions {
+  /**
+   * Whether the legacy cookie header may be sent to the search API.  This is
+   * deliberately opt-in: a new caller (or a new model) must not accidentally
+   * turn a browser cookie bridge into an authentication mechanism.  Detail
+   * always passes `false`; only the listing command passes `true` explicitly.
+   */
+  includeSearchCookie?: boolean
+}
+
+export async function searchGet(
+  params: Record<string, string>,
+  options: SearchGetOptions = {},
+): Promise<SearchEnvelope> {
   const url = `${SEARCH_BASE}?${new URLSearchParams(params).toString()}`
   const maxRetries = requestMaxRetries()
   let delay = 500
-  const cookie = jobsdbCookieHeader()
+  // Fail closed.  Cookie forwarding is a narrowly-scoped compatibility
+  // bridge for the listing API, never the default and never a detail path.
+  const cookie = options.includeSearchCookie === true ? jobsdbCookieHeader() : ""
   const headers: Record<string, string> = { "User-Agent": UA, Accept: "application/json" }
   if (cookie) headers.Cookie = cookie
 

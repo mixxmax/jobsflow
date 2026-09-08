@@ -26,6 +26,12 @@ describe("jobsdb-search CLI", () => {
     expect(r.stderr).toContain("NO_ID");
   });
 
+  it("rejects implicit detail lookups so full-JD work cannot bypass the gateway", async () => {
+    const r = await runCLI(["detail", "93369834"]);
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("DETAIL_REQUIRES_GATEWAY");
+  });
+
   liveIt("live search returns real results for a profession-neutral query", async () => {
     const r = await runCLI(["search", "-q", "operations", "--jobage", "30", "--limit", "5", "--format", "json"]);
     expect(r.exitCode).toBe(0);
@@ -41,7 +47,7 @@ describe("jobsdb-search CLI", () => {
     const s = await runCLI(["search", "-q", "operations", "--limit", "1", "--format", "json"]);
     const out = parseJSON<SearchOut>(s);
     const id = out.results[0].id;
-    const d = await runCLI(["detail", id, "--format", "json"]);
+    const d = await runCLI(["detail", id, "--teaser-only", "--format", "json"]);
     expect(d.exitCode).toBe(0);
     const job = parseJSON<{ id: string; title: string }>(d);
     expect(job.id).toBe(id);

@@ -1,10 +1,27 @@
 # JobsDB Playwright + Cloudflare 深取恢复与可靠性技术手册
 
+> **文档状态：历史背景/迁移记录（不可直接执行）。** 当前实现只接受统一
+> gateway 的用户主 Chrome 可见 CDP 路径；本文旧章节中的独立浏览器、
+> `--user-data-dir`、storage-state 和复制 cookie 示例均已废止。
+
 **版本：** 1.0  
 **日期：** 2026-08-13  
 **适用系统：** `ai-job-search` 的 JobsDB 职位详情页深取流程  
 **主要代码：** `tools/fresh_24h/portal_jd_browser.py`、`tools/fresh_24h/two_pass_score.py`  
 **目标读者：** 产品线开发者、维护者及负责实施修复的 LLM
+
+> **当前实现覆盖（2026-08-29）：** 本手册早期关于 `--headed`、独立
+> Playwright 可见窗口和 storage-state 复用的示例不再是运行入口。当前唯一受
+> 支持的 JobsDB 详情路径是 `python3 -m tools.workflow scan`：Cloudflare 只触发
+> 一次有界的用户可见 Chrome CDP 交接，人工验证后复用同一 live context 串行抓取。
+> 兼容 CLI 也已硬路由到该 CDP 路径；不得让模型打开 Playwright 验证窗口、复制
+> cookie 作为详情凭证或逐岗新建浏览器。搜索 API 的 cookie header bridge 仅用于
+> 搜索请求，不得用于详情页。
+
+> **运行权限说明：** 下文的旧章节、旧命令和旧目录结构仅保留作故障背景与迁移
+> 记录，不是当前可执行 runbook。任何历史示例中的独立 Playwright 窗口、
+> `--user-data-dir`、`--storage-state` 或复制 cookie 方案都不得执行；与本段
+> 当前实现覆盖说明冲突时，以当前说明和 `AGENTS.md` 的 gateway 规则为准。
 
 ---
 
@@ -882,4 +899,3 @@ python3 -m pytest -q \
 - [Playwright Authentication and storage state](https://playwright.dev/python/docs/auth)
 - [Playwright BrowserType and persistent context](https://playwright.dev/python/docs/api/class-browsertype)
 - [Playwright BrowserContext](https://playwright.dev/python/docs/api/class-browsercontext)
-

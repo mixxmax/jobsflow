@@ -63,30 +63,40 @@ runs must not advance the cursor. Use `--no-record` for previews and debugging.
 Use a full JD for materials. If a portal remains shallow, mark `paste_needed` and
 ask for pasted text instead of fabricating requirements.
 
-## 首次使用：门户会话复用
+## 首次使用：JobsDB 详情的唯一会话入口
 
-JobsDB、CTgoodjobs 和 LinkedIn 详情页默认使用无头 Chrome，并会尝试读取：
+JobsDB 详情页是浏览器绑定的 Cloudflare 资源，**只能**由统一 gateway 接入用户
+正在使用的主 Chrome 的可见 CDP context。产品代码会在第一次需要详情时做一次有界
+交接；验证成功后，在本轮内串行复用同一个 live context。这个规则是代码门禁，不是
+模型可以选择的偏好：
 
-```text
-~/.config/jobsearch/storage_state_<portal>.json
-```
+- 不得让模型启动无头/有头 Playwright 来点验证；
+- 不得传入新的 `--user-data-dir`、使用 JobsDB 专用隔离 profile，或把 cookie/
+  `storage_state` 复制给另一个详情浏览器；
+- 不得把 JobsDB URL 伪装成 generic/LinkedIn，也不得把 `portal_jd_cdp.py` 当成
+  扫描替代入口；
+- 搜索 API 的 cookie header bridge 仅用于列表请求，详情页永远使用 live CDP。
 
-如果首次抓取遇到人机验证，请在用户明确允许的情况下运行：
+扫描/网关路径只能使用：
 
 ```bash
-python3 tools/fresh_24h/portal_jd_browser.py \
-  --url '<job-detail-url>' \
-  --headed \
-  --interactive-verification \
-  [--user-data-dir ~/.config/jobsearch/browser_profiles/jobsdb]
+python3 -m tools.workflow scan --mode temp
 ```
 
-`--interactive-verification` 必须与 `--headed` 同用；它在浏览器窗口中等待
-人工完成验证，与是否 TTY 无关，且只有页面出现真实职位详情后才会保存会话
-（`content_validated=true` / `state_saved=true`）。可用 `--storage-state` 或
-`PORTAL_JD_STORAGE_STATE` 覆盖读取路径，`--channel` 或 `PORTAL_JD_CHANNEL`
-覆盖浏览器通道。Cookie/session 文件属于敏感数据，必须放在用户主目录下，
-禁止写入仓库、CSV、日志或报告。
+若网关返回 `requires_user_action`，系统只会在主 Chrome 中打开
+`chrome://inspect/#remote-debugging`。用户在自己的主 Chrome 启用 **Allow remote
+debugging**，在主 Chrome 的 JobsDB 标签页完成一次验证，然后重跑同一条扫描命令。
+系统会检查端点确实可连接、不是旧隔离 profile，并且真实 JD 已通过结构校验；在此
+之前不得报告“已恢复”。`portal_jd_cdp.py` 仅为兼容调试入口，仍必须连接同一主
+Chrome，不能作为扫描替代品。JobsDB 详情不接受 `--storage-state`/
+`PORTAL_JD_STORAGE_STATE`；这些参数只适用于其他允许快照的门户。Cookie/session
+文件属于敏感数据，必须放在用户主目录下，禁止写入仓库、CSV、日志或报告。
+
+Chrome 136+ 的开关模式可能让 `/json/version`、`/json` 返回 404，这是 WS-only
+CDP 的正常表现，不代表端点失效。系统会先做无副作用的本地端口检查，然后在
+网关扫描中唯一一次连接 `ws://127.0.0.1:<port>/devtools/browser`，通过
+`Browser.getVersion` 验证主 Chrome。`doctor` 不建立探测 WebSocket，避免重复弹出
+Allow remote debugging；模型不得因 HTTP 404 自行换浏览器或重启多个连接。
 
 **失败与熔断纪律**：`challenge`/`waf`/429 绝不自动重试，也绝不覆盖已保存的
 有效会话；只有 `timeout` 按 `--retry`（默认 2，`--retry 0` 关闭）自动重试，
@@ -104,8 +114,10 @@ headless 会话事实，不含 cookie/请求头）。两段评分行的 `JD深�
 熔断/Challenge/429/预算/失败缓存停止后直接写 paste-needed stub 并终止，
 不会再追加 structured 详情请求；只有普通本地错误才保留该 fallback。
 `jobsdb_detail_status.detail_requests` 只计真实导航次数（含真实 timeout
-重试），拦截一律计 0 次。人工 headed/persistent 恢复取得
-`content_validated=true` 的真实 JD 后会自动关闭持久熔断。
+重试），拦截一律计 0 次。人工 CDP 恢复取得 `content_validated=true` 的真实 JD 后
+会自动关闭持久熔断，并把同一 CDP 会话交回本轮 JobsDB 详情队列。搜索 API 如需
+Cookie header bridge，只用于搜索请求，文件在用户主目录且权限为 0600；详情页
+绝不读取该 bridge。
 
 ## Batch and identifiers
 

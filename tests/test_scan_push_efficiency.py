@@ -236,14 +236,11 @@ def test_two_pass_rescues_a_low_initial_score_from_zero_cost_jd_cache(tmp_path):
     assert meta["deep_score_distribution"]["3.3_to_3.5"] == 1
 
 
-def test_two_pass_keeps_thin_ct_card_as_provisional_without_spending_network_budget(
+def test_two_pass_keeps_thin_ct_card_as_provisional_when_solver_unavailable(
     monkeypatch, tmp_path
 ):
-    def unexpected_deep_fetch(*args, **kwargs):
-        raise AssertionError("CT without cache must not enter the network deep-fetch path")
-
-    monkeypatch.setattr(two_pass_score, "deep_enrich_hit", unexpected_deep_fetch)
-
+    # A thin CT card now enters the network deep path; without the private
+    # 2captcha key the solver soft-fails and the row stays provisional.
     rows, meta = two_pass_score.run_two_pass(
         [
             {
@@ -264,12 +261,13 @@ def test_two_pass_keeps_thin_ct_card_as_provisional_without_spending_network_bud
     )
 
     assert len(rows) == 1
-    assert rows[0]["JD深度"] == "teaser_unavailable"
+    assert rows[0]["JD深度"] == "teaser"
     assert rows[0]["评估状态"] == "provisional_needs_jd"
     assert rows[0]["_provisional_needs_jd"] is True
     assert meta["pass1_rescued"] == 1
     assert meta["provisional_needs_jd"] == 1
-    assert meta["deep_network_attempted"] == 0
+    assert meta["deep_network_selected"] == 1
+    assert meta["deep_network_attempted"] == 1
 
 
 def test_two_pass_rescues_gray_band_score_even_when_teaser_is_not_short(
@@ -326,7 +324,7 @@ def test_two_pass_rescues_gray_band_score_even_when_teaser_is_not_short(
     assert meta["deep_network_attempted"] == 1
 
 
-def test_two_pass_network_budget_excludes_cache_ct_and_keeps_capped_rows_visible(
+def test_two_pass_network_budget_includes_ct_and_keeps_capped_rows_visible(
     monkeypatch, tmp_path
 ):
     cached_url = "https://example.com/jobs/cached"
@@ -380,14 +378,17 @@ def test_two_pass_network_budget_excludes_cache_ct_and_keeps_capped_rows_visible
         sleep_s=0.0,
     )
 
-    assert network_calls == [network_url]
+    # Equal priority: stable sort keeps input order, so the CT row — now a
+    # first-class network candidate — wins the single deep slot.
+    assert network_calls == [ct_url]
     assert len(rows) == 4
     assert meta["deep_cache_hits"] == 1
     assert meta["deep_network_selected"] == 1
     assert meta["deep_network_attempted"] == 1
-    assert meta["deep_budget_exhausted"] == 1
+    assert meta["deep_budget_exhausted"] == 2
     assert meta["provisional_needs_jd"] == 2
     by_url = {row["链接"]: row for row in rows}
-    assert by_url[ct_url]["JD深度"] == "teaser_unavailable"
+    assert by_url[ct_url]["JD深度"] == "full"
+    assert by_url[network_url]["JD深度"] == "teaser_capped"
     assert by_url[capped_url]["JD深度"] == "teaser_capped"
     assert by_url[capped_url]["评估状态"] == "provisional_needs_jd"

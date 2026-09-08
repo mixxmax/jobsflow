@@ -31,10 +31,13 @@ def portal_patch(monkeypatch):
 
 def _session(user_data_dir=None):
     return browser.JdBrowserSession(
-        portal="jobsdb",
+        # The local fixture is not a real JobsDB transport.  Keep it outside
+        # the production JobsDB browser gate; real JobsDB details use CDP only.
+        portal="generic",
         headless=True,
         channel=os.environ.get("PORTAL_JD_CHANNEL") or "chrome",
         user_data_dir=user_data_dir,
+        allow_legacy_jobsdb=True,
     )
 
 

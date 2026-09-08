@@ -103,28 +103,51 @@ challenges open a persisted portal circuit breaker under
 degrade to `paste_needed` until the cooldown (429 uses the response
 `Retry-After`) or a manual recovery. The scan budget defaults to one JobsDB
 detail navigation at a time, at least 15 s apart, at most 10 per scan. Manual
-recovery is explicit: `--headed --interactive-verification
-[--user-data-dir <dir>]` waits for human verification independent of TTY and
-saves state only after a real JD validates. A validated manual JD also closes
-the persisted breaker (`last_reason=manual_recovery_success`); challenge, 429,
+recovery is owned by the unified gateway: run `python3 -m tools.workflow scan`
+and, when it returns `requires_user_action`, start the printed **visible** Chrome
+command and complete the challenge there. Do not ask a model to call
+`portal_jd_browser.py --headed --interactive-verification` for a scan and do not
+start one browser per URL. In the unified scan gateway, the
+validated user-visible CDP context is retained and reused serially for every
+later JobsDB detail in the same run; the scanner never falls back to a fresh
+headless profile after that handoff. A validated manual JD also closes the
+persisted breaker (`last_reason=manual_recovery_success`); challenge, 429,
 timeout and empty pages never close it. Rows record JD depth as
 `full`/`cache`/`teaser`/`paste_needed`. `jobsdb_detail_status.detail_requests`
 counts only real browser navigations (including real timeout retries);
 breaker, budget and failure-cache stops navigate zero times and never inflate
 it. Cookie files stay under the user home
 directory and out of the repository; `--diagnostics-dir` writes a sanitized
-record (URL hash only, plus channel/version/headless session facts). See
+record (URL hash only, plus channel/version/headless session facts). The
+optional JobsDB cookie header bridge is for the search API only, lives at
+`~/.config/jobsearch/jobsdb_browser_cookies.txt` (0600), and is never used by
+detail fetching. See
 `AGENT_REFRESH.md` and
 `docs/JobsDB_Playwright_Cloudflare深取恢复与可靠性技术手册_2026-08-13.md` §15
 for the runbook.
 
-If the user's Chrome does not expose the CDP port, the scorer pauses with
+If the user's primary Chrome does not expose the CDP port, the scorer pauses with
 `requires_user_action`, writes the cookie-free handoff
 `02_Tracker/portal_state/jobsdb_manual_recovery.json`, and prints the resume
-command. Start the reported Chrome port, complete the live challenge in that
-profile, and rerun the same scan. The scanner also deduplicates identical
-portal requests and preserves the requested page number in batch mode; the run
-log reports planned/deduplicated requests, portal errors and filter counts.
+command. The command opens `chrome://inspect/#remote-debugging` in the already
+running primary Chrome; enable **Allow remote debugging** there, complete the
+live challenge in that same Chrome, and rerun the same gateway scan. Do not start
+a second Chrome, pass a new `--user-data-dir`, copy cookies, or use a headless
+verification window. The scanner also deduplicates identical portal requests and
+preserves the requested page number in batch mode; the run log reports
+planned/deduplicated requests, portal errors and filter counts.
+
+The Python browser helpers are not user-facing alternatives. Direct JobsDB
+invocation returns `jobsdb_gateway_only`; only the gateway-owned scan child
+process receives permission to run the visible-CDP handoff. This prevents a new
+model or harness from silently selecting the historical browser path.
+
+With Chrome 136+ toggle mode, `/json/version` may return 404 because the HTTP
+discovery face is disabled. This is not a reason to open another browser: the
+gateway checks the local listener, attaches once to `/devtools/browser` over
+WebSocket, and validates `Browser.getVersion`. `doctor` does not open a probe
+WebSocket, so repeated status checks will not repeatedly trigger the permission
+dialog.
 
 ## Rules
 

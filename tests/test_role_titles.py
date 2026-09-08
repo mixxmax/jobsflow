@@ -38,12 +38,24 @@ def test_compliance_and_design_compounds_are_one_role():
     for title in (
         "KYC/CDD Officer (HNW Client)",
         "AML/KYC Analyst",
+        "ECM/IPO Specialist",
+        "IPO / ECM Specialist",
         "UI/UX Designer",
     ):
         contract = build_role_title_contract(title)
         assert contract["primary"] == title
         assert contract["alternates"] == []
         assert contract["ambiguity_status"] == "not_ambiguous"
+
+
+def test_acronym_slash_order_is_non_substantive_and_never_needs_confirmation():
+    ecm_first = build_role_title_contract("ECM/IPO Specialist")
+    ipo_first = build_role_title_contract("IPO/ECM Specialist")
+
+    assert ecm_first["confirmation_needed"] is False
+    assert ipo_first["confirmation_needed"] is False
+    assert ecm_first["slash_order_policy"]["compound_order_is_non_substantive"] is True
+    assert ipo_first["slash_order_policy"]["mode"] == "source_order_preserved"
 
 
 def test_salary_parenthetical_is_metadata_and_not_part_of_outbound_role():

@@ -27,8 +27,10 @@ PROFILES = {
         "allow_model_override": False,
         "max_requests_per_scan": 10,
         "min_interval_seconds": 15,
-        # Private interactive scans may ask the user once, in visible Chrome,
-        # then must prove that the same persistent profile works headlessly.
+        # Private interactive scans may ask the user once in a visible Chrome
+        # session.  The validated CDP context is then reused for all JobsDB
+        # detail navigations in that scan; no headless/cookie-copy fallback is
+        # permitted for detail retrieval.
         "human_verification_handoff": True,
         "verification_timeout_seconds": 600,
     },
@@ -42,9 +44,20 @@ class PolicyOverrideError(ValueError):
 def resolve_workspace_profile(workspace: Path | str | None = None) -> str:
     if workspace is None:
         return "product"
-    path = Path(workspace)
+    try:
+        path = Path(workspace).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return "product"
     if path.name == "JobSearch_2026":
         return "private"
+    # Callers may pass the runtime root or one of its tracker/profile
+    # subdirectories.  Resolve upward to the actual private instance instead
+    # of silently applying product defaults when a new harness starts from a
+    # child directory or a symlink.  The repository root itself is never
+    # classified as private merely because it contains this child directory.
+    for candidate in (path, *path.parents):
+        if candidate.name == "JobSearch_2026" and (candidate / "00_Profile").is_dir():
+            return "private"
     return "product"
 
 
@@ -80,7 +93,12 @@ def apply_portal_overrides(
 ) -> dict[str, Any]:
     overrides = dict(overrides or {})
     if not overrides:
-        return {"config": dict(base), "diagnostic": False, "rule_ids": ["PORTAL-JDB-002"], "audit": {}}
+        return {
+            "config": dict(base),
+            "diagnostic": False,
+            "rule_ids": ["PORTAL-JDB-002", "PORTAL-JDB-004"],
+            "audit": {},
+        }
     if not diagnostic:
         raise PolicyOverrideError("PORTAL-JDB-002: model cannot override JobsDB runtime policy")
     unknown = sorted(key for key in overrides if key not in ALLOWED_DIAGNOSTIC_KEYS)
@@ -95,7 +113,7 @@ def apply_portal_overrides(
     return {
         "config": config,
         "diagnostic": True,
-        "rule_ids": ["PORTAL-JDB-002", "PORTAL-JDB-003"],
+        "rule_ids": ["PORTAL-JDB-002", "PORTAL-JDB-003", "PORTAL-JDB-004"],
         "audit": {
             "actor": actor,
             "override_keys": sorted(applied),

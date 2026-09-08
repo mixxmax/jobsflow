@@ -53,7 +53,10 @@ function renderTable(cards: JobResult[]): string {
 /** Fetch and normalize one search without writing to stdout. */
 export async function searchData(opts: SearchOpts): Promise<SearchPayload> {
   const params = buildParams(opts)
-  const env: SearchEnvelope = await searchGet(params)
+  // The optional cookie bridge is permitted only for the listing API.  Keep
+  // this explicit so future callers cannot inherit browser credentials by
+  // accident; detail.ts deliberately passes `false`.
+  const env: SearchEnvelope = await searchGet(params, { includeSearchCookie: true })
   let cards = (env.data || []).map(toResult)
   if (opts.limit !== undefined && opts.limit >= 0) cards = cards.slice(0, opts.limit)
 

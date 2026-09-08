@@ -25,6 +25,16 @@ def test_product_and_private_thresholds_are_declared():
     assert private["verification_timeout_seconds"] == 600
 
 
+def test_jobsdb_detail_route_is_a_code_enforced_gateway_policy():
+    from tools.workflow.policy import rules_for
+
+    scan_rules = {item["rule_id"] for item in rules_for("scan")}
+    assert "PORTAL-JDB-004" in scan_rules
+    rule = next(item for item in rules_for("scan") if item["rule_id"] == "PORTAL-JDB-004")
+    assert rule["enforcement"] == "code"
+    assert rule["override_policy"] == "none"
+
+
 def test_model_cannot_override_circuit_without_diagnostic_flag():
     with pytest.raises(PolicyOverrideError, match="PORTAL-JDB-002"):
         apply_portal_overrides(

@@ -51,7 +51,7 @@ const HELP = `jobsdb-cli — search JobsDB Hong Kong job listings (https://hk.jo
 USAGE
   bun run src/cli.ts search [-q "<keywords>"] [--jobage <days>] [--page <n>] [--limit <n>] [--format json|table|plain]
   bun run src/cli.ts batch --delay-ms <milliseconds> < requests.jsonl
-  bun run src/cli.ts detail <id|url> [--format json|plain]
+  bun run src/cli.ts detail <id|url> --teaser-only [--format json|plain]
 
 SEARCH FLAGS
   --query, -q <text>    Keywords (title, skill, role, company). Optional.
@@ -63,11 +63,14 @@ SEARCH FLAGS
 DETAIL
   <id|url>              A numeric JobsDB job id (e.g. 93369834) or a
                         https://hk.jobsdb.com/job/<id> URL.
+  --teaser-only         Explicitly acknowledge that this is structured/listing
+                        data only; it is never a full JD. Full JD uses the
+                        JobsFlow gateway and the user's primary Chrome CDP.
 
 EXAMPLES
   bun run src/cli.ts search -q "paralegal" --jobage 14 --format table
   bun run src/cli.ts search -q "legal counsel" --limit 10 --format json
-  bun run src/cli.ts detail 93369834 --format plain
+  bun run src/cli.ts detail 93369834 --teaser-only --format plain
 
 No authentication required. Personal use only — keep volume low; the endpoint is
 public but Seek/Cloudflare may rate-limit bulk access.
@@ -155,7 +158,11 @@ async function main(): Promise<number> {
       return 1
     }
     const fmt = (flags.format as string) || "json"
-    const opts: DetailOpts = { id, format: fmt === "plain" ? "plain" : "json" }
+    const opts: DetailOpts = {
+      id,
+      format: fmt === "plain" ? "plain" : "json",
+      teaserOnly: flags["teaser-only"] === true,
+    }
     return runDetail(opts)
   }
 

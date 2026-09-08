@@ -14,6 +14,9 @@ def test_legacy_config_gets_balanced_scan_and_standard_retention_defaults():
         "retention_preference": "standard",
         "retention_label": "标准",
         "final_gate": 3.3,
+        "preview_floor": 3.3,
+        "defer_deep_until_selection": False,
+        "default_entry_policy": "standard",
     }
 
 
@@ -87,3 +90,40 @@ def test_final_retention_reuses_scores_and_keeps_provisional_rows_separate():
     assert [row["职位"] for row in standard] == ["Core", "Needs JD"]
     assert loose_meta == {"final_selected": 2, "final_filtered": 0, "provisional": 1}
     assert standard_meta == {"final_selected": 1, "final_filtered": 1, "provisional": 1}
+
+
+def test_private_review_floor_keeps_uncertain_teaser_without_deep_fetch(tmp_path, monkeypatch):
+    from tools.fresh_24h import two_pass_score
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("review-only scan must not deep-fetch")
+
+    monkeypatch.setattr(two_pass_score, "deep_enrich_hit", fail_if_called)
+    rows, meta = two_pass_score.run_two_pass(
+        [
+            {
+                "title": "Compliance Officer",
+                "company": "Acme",
+                "url": "https://example.com/job/94199570",
+                "teaser": "Compliance monitoring and risk review.",
+            }
+        ],
+        repo=tmp_path,
+        profile={
+            "core_keywords": ["compliance"],
+            "evidence_keywords": ["process"],
+            "preferred_industry_keywords": ["banking"],
+            "track_mapping": {"C": "Compliance"},
+        },
+        gate_pass1=3.3,
+        preview_floor=2.8,
+        defer_deep=True,
+        sleep_s=0,
+    )
+
+    assert len(rows) == 1
+    assert float(rows[0]["初评分数"]) >= 2.8
+    assert rows[0]["深评分数"] == ""
+    assert rows[0]["评估状态"] == "provisional_needs_jd"
+    assert meta["review_only"] is True
+    assert meta["deep_deferred_count"] == 1

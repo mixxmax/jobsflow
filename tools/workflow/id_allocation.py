@@ -194,12 +194,21 @@ class LocalIdCounterStore:
         }
         with self._locked():
             counters = self._baseline()
+            # Validate every proposed number against the counter state that
+            # existed before this batch.  ``prepared_rows`` are normally
+            # sorted for presentation (highest score first), while IDs are
+            # allocated in sequence order.  Comparing a later row with the
+            # counter already advanced by an earlier row would therefore
+            # reject a valid same-batch pair such as A2-081 followed by
+            # A2-080.  The final persisted counter still advances to the
+            # maximum number in the batch below.
+            initial_counters = dict(counters)
             for row in pending:
                 parsed = parse_id(str(row.get("岗位编号") or row.get("job_id") or ""))
                 if not parsed:
                     continue
                 letter, _digit, number = parsed
-                current = counters.get(letter, 0)
+                current = initial_counters.get(letter, 0)
                 candidate = str(row.get("岗位编号") or row.get("job_id") or "").strip().upper()
                 if number <= current and row_identity(row) not in existing_identities:
                     raise IdCounterConflict(f"id_counter_conflict:{candidate}")

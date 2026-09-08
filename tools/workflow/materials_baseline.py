@@ -234,7 +234,12 @@ def baseline_task_view(baseline: dict[str, Any]) -> dict[str, Any]:
 
 
 def plan_jd_anchor_catalog(plan: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Normalize plan duties/requirements into stable transform anchor IDs."""
+    """Normalize plan duties/requirements into stable transform anchor IDs.
+
+    Each anchor records its plan ``source`` so deterministic gates can tell a
+    concrete duty/requirement (which must receive a visible response) from a
+    positioning theme (guidance for emphasis, not an outbound claim).
+    """
 
     plan = dict(plan or {})
     output: list[dict[str, Any]] = []
@@ -244,16 +249,19 @@ def plan_jd_anchor_catalog(plan: dict[str, Any] | None) -> list[dict[str, Any]]:
             text = " ".join(str(raw.get("text") or raw.get("label") or "").split()).strip()
             anchor_id = str(raw.get("id") or "").strip()
             priority = raw.get("priority")
+            source = str(raw.get("source") or "jd_anchors")
         else:
             text = " ".join(str(raw or "").split()).strip()
             anchor_id = ""
             priority = None
+            source = "jd_anchors"
         if text:
             output.append(
                 {
                     "id": anchor_id or f"JD-{len(output) + 1:03d}",
                     "text": text,
                     "priority": priority if priority is not None else len(output) + 1,
+                    "source": source,
                 }
             )
     if not output:
@@ -273,6 +281,7 @@ def plan_jd_anchor_catalog(plan: dict[str, Any] | None) -> list[dict[str, Any]]:
                         "id": f"JD-{len(output) + 1:03d}",
                         "text": text,
                         "priority": len(output) + 1,
+                        "source": field,
                     }
                 )
     return output or [
@@ -280,6 +289,7 @@ def plan_jd_anchor_catalog(plan: dict[str, Any] | None) -> list[dict[str, Any]]:
             "id": "JD-001",
             "text": "the selected JD duties and requirements",
             "priority": 1,
+            "source": "duties",
         }
     ]
 

@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import json
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
+from tools.workflow.materials_vnext import semantic_lint
 from tools.workflow.materials_vnext.contracts import BLOCK_TYPES, MATERIALS, digest, text
 
 
@@ -18,6 +20,16 @@ ALLOWED_ACTIONS = {"replace", "append_after", "reorder"}
 MAX_CHANGED_RATIO = 0.60
 MAX_ADDED_BLOCKS = 6
 MAX_ADDED_CHARS_RATIO = 0.55
+
+# Every operation carries (or gets derived) a change class.  The class decides
+# audit routing: pure wording changes stay on the cheap host lint, while
+# fact-sensitive and structural edits always reach the independent auditor.
+CHANGE_CLASSES = ("wording_only", "jd_alignment", "fact_sensitive", "structure_change")
+_CLASS_RANK = {name: rank for rank, name in enumerate(CHANGE_CLASSES)}
+# A heavy restructure of a key experience bullet/heading must say why before
+# it can pass the bounded-transform gate.
+CHANGE_REASON_MIN_CHARS = 12
+
 _NUMBER_WORDS = {
     "zero", "one", "two", "three", "four", "five", "six", "seven",
     "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
@@ -208,6 +220,16 @@ def baseline_preservation_errors(baseline: dict[str, Any], current: dict[str, An
             current_text = " ".join(text(block.get("text")) for block in matching)
             missing = sorted(token for token in baseline_tokens if token not in current_text.casefold())
             for token in missing:
+                # A legacy lane baseline may contain a different acronym slash
+                # order (for example ``IPO/ECM``) while the tailored material
+                # uses ``ECM/IPO``.  Slash order is non-substantive, so the
+                # host treats the pair as preserved evidence and does not
+                # create a needless repair round.  Preserve all other explicit
+                # baseline evidence.
+                if "/" in token:
+                    left, right = token.split("/", 1)
+                    if f"{right}/{left}" in current_text.casefold():
+                        continue
                 errors.append(f"baseline_protected_evidence_removed:{material}:{base_id}:{token}")
     return sorted(set(errors))
 
@@ -217,6 +239,83 @@ def refs_for_block(block: dict[str, Any], fallback: list[str] | None = None) -> 
     if isinstance(refs, list):
         return {text(item) for item in refs if text(item)}
     return {text(block.get("id"))} if text(block.get("id")) else set(fallback or [])
+
+
+def derive_change_class(before: Any, after: Any, *, action: str = "replace") -> str:
+    """Derive the deterministic change class of one bounded operation.
+
+    The classes describe what kind of edit was made, not whether it is
+    allowed: synonym, voice, tone and sentence merge/split edits are ordinary
+    wording (light diff), JD-driven rewrites keep all evidence but move
+    emphasis (medium diff), and anything that touches a number, an evidence
+    verb or a protected scope term is fact-sensitive regardless of similarity.
+    Block-level reorganisation is structural.
+    """
+
+    action = str(action or "replace").casefold()
+    if action == "reorder":
+        return "structure_change"
+    if action == "append_after":
+        return "structure_change"
+    before_text = text(before)
+    after_text = text(after)
+    if not after_text:
+        return "structure_change"
+    new_numbers = semantic_lint.number_tokens(after_text) - semantic_lint.number_tokens(before_text)
+    new_verbs = semantic_lint.high_risk_verbs(after_text) - semantic_lint.high_risk_verbs(before_text)
+    lost_scope = semantic_lint.sentence_scope_terms(before_text) - semantic_lint.sentence_scope_terms(after_text)
+    if new_numbers or new_verbs or lost_scope:
+        return "fact_sensitive"
+    ratio = SequenceMatcher(None, before_text, after_text).ratio()
+    if ratio < 0.5:
+        return "structure_change"
+    if ratio < 0.75:
+        return "jd_alignment"
+    return "wording_only"
+
+
+def _apply_change_class(
+    operation: dict[str, Any],
+    *,
+    before: str,
+    after: str,
+    errors: list[str],
+    index: int,
+) -> str:
+    declared = text(operation.get("change_class")).casefold()
+    derived = derive_change_class(before, after, action=text(operation.get("action")))
+    if declared and declared not in CHANGE_CLASSES:
+        errors.append(f"operation_change_class_invalid:{index}:{declared}")
+        derived_class = derived
+    else:
+        derived_class = declared or derived
+        if declared and _CLASS_RANK[declared] < _CLASS_RANK[derived]:
+            errors.append(
+                f"operation_change_class_conflict:{index}:{declared}:{derived}"
+            )
+    operation["change_class_derived"] = derived
+    operation["change_class"] = derived_class
+    return derived
+
+
+def _change_reason_error(
+    operation: dict[str, Any],
+    derived: str,
+    *,
+    target: dict[str, Any] | None,
+    action: str,
+    repair: bool,
+    index: int,
+) -> str | None:
+    """Deleting or heavily changing a key experience must say why."""
+
+    if repair or derived != "structure_change" or action != "replace":
+        return None
+    if not isinstance(target, dict) or text(target.get("section")) != "experience":
+        return None
+    if len(text(operation.get("change_reason"))) < CHANGE_REASON_MIN_CHARS:
+        return f"operation_change_reason_required:{index}:{text(target.get('id'))}"
+    return None
 
 
 def validate_transform(
@@ -267,6 +366,12 @@ def validate_transform(
             elif after == before:
                 errors.append(f"operation_noop:{index}:{target_id}")
             else:
+                derived = _apply_change_class(operation, before=before, after=after, errors=errors, index=index)
+                reason_error = _change_reason_error(
+                    operation, derived, target=target, action=action, repair=repair, index=index
+                )
+                if reason_error:
+                    errors.append(reason_error)
                 changed[material] += 1
         elif action == "append_after":
             after_id = text(operation.get("after_id") or operation.get("target_id"))
@@ -282,6 +387,13 @@ def validate_transform(
             else:
                 if text(block.get("type") or "bullet") not in BLOCK_TYPES:
                     errors.append(f"operation_append_type_invalid:{index}")
+                _apply_change_class(
+                    operation,
+                    before="",
+                    after=new_text,
+                    errors=errors,
+                    index=index,
+                )
                 additions += 1
                 added_chars += len(new_text)
                 changed[material] += 1
@@ -289,6 +401,7 @@ def validate_transform(
             after_id = text(operation.get("after_id") or operation.get("before_id"))
             if after_id and after_id not in lookup:
                 errors.append(f"operation_reorder_target_missing:{index}:{after_id}")
+            _apply_change_class(operation, before="", after="", errors=errors, index=index)
             changed[material] += 1
         anchors = operation.get("jd_anchor_ids")
         if anchors is not None and not isinstance(anchors, list):
@@ -309,6 +422,44 @@ def validate_transform(
         if additions:
             errors.append("repair_cannot_add_unbounded_block")
     return sorted(set(errors))
+
+
+def stamp_derived_change_classes(transform: dict[str, Any]) -> None:
+    """Write the derived change classes onto the caller's operation dicts.
+
+    ``_ops`` normalizes into copies, so classes computed inside
+    ``validate_transform`` never reach the caller's list.  This helper
+    re-derives deterministically from each operation's own before/after text
+    and stamps both the derived class and the effective class (the declared
+    class when it is at least as severe as the derived one).  Operations that
+    cannot be derived in isolation (for example a compat ``rewrite`` without
+    ``before_text``) are left unstamped and stay conservative downstream.
+    """
+
+    raw = transform.get("operations")
+    if raw is None:
+        raw = transform.get("changes")
+    if not isinstance(raw, list):
+        return
+    for original in raw:
+        if not isinstance(original, dict):
+            continue
+        action = text(original.get("action")).casefold()
+        if action == "rewrite":
+            action = "replace"
+        elif action == "add":
+            action = "append_after"
+        before = text(original.get("before_text"))
+        after = text(original.get("after_text") or original.get("text"))
+        if action == "replace" and (not before or not after):
+            continue
+        derived = derive_change_class(before, after, action=action)
+        declared = text(original.get("change_class")).casefold()
+        original["change_class_derived"] = derived
+        if declared in CHANGE_CLASSES and _CLASS_RANK[declared] >= _CLASS_RANK[derived]:
+            original["change_class"] = declared
+        else:
+            original["change_class"] = derived
 
 
 def _apply_operations(base: dict[str, Any], transform: dict[str, Any], *, repair: bool = False) -> dict[str, Any]:
@@ -337,6 +488,12 @@ def _apply_operations(base: dict[str, Any], transform: dict[str, Any], *, repair
                 target["jd_anchor_ids"] = list(operation["jd_anchor_ids"])
             target["customized"] = True
             target["change_action"] = "replace"
+            if text(operation.get("change_class")):
+                target["change_class"] = text(operation.get("change_class"))
+            if text(operation.get("change_class_derived")):
+                target["change_class_derived"] = text(operation.get("change_class_derived"))
+            if text(operation.get("change_reason")):
+                target["change_reason"] = text(operation.get("change_reason"))
         elif action == "append_after":
             block = operation.get("block") if isinstance(operation.get("block"), dict) else operation
             section = text(block.get("section")) or ("summary" if material == "cv" else "body")
@@ -393,6 +550,9 @@ def compile_canonical(
     errors = validate_transform(original_transform, baseline)
     if errors:
         raise ValueError("invalid_original_transform: " + ", ".join(errors))
+    # Keep the derived change classes on the operation dicts so the compiled
+    # canonical blocks carry the edit category into the audit packet.
+    stamp_derived_change_classes(original_transform)
     state = _apply_operations(baseline, original_transform)
     patch_rows: list[dict[str, Any]] = []
     for patch in patches or []:

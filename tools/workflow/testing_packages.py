@@ -198,6 +198,8 @@ def prepare_package_for_apply(ws: Path, job_id: str = "C0-001") -> None:
         "job_id": job_id,
         "audit_scope": "jd_mapping_and_presentation",
         "audit_input_fingerprint": task["audit_input_fingerprint"],
+        "audit_task_sha256": task["audit_task_sha256"],
+        "delegation_id": task["delegation_id"],
         "auditor_context_id": task["auditor_context_id"],
         "counts": {"P0": 0, "P1": 0, "P2": 0},
         "findings": [],

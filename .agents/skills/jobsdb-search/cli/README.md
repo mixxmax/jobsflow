@@ -31,10 +31,20 @@ bun run .agents/skills/jobsdb-search/cli/src/cli.ts search --query "paralegal" [
 ### Detail
 
 ```bash
-bun run .agents/skills/jobsdb-search/cli/src/cli.ts detail <id|url> [--format json|plain]
+bun run .agents/skills/jobsdb-search/cli/src/cli.ts detail <id|url> --teaser-only [--format json|plain]
 ```
 
 `<id>` is a numeric JobsDB job id (e.g. `93369834`) or a `/job/<id>` URL.
+The required `--teaser-only` flag is an explicit acknowledgement that this
+command only returns structured listing fields. It never fetches the full
+client-rendered description. Full-JD retrieval is owned by the fixed
+`python3 -m tools.workflow scan` gateway, which uses the user's visible primary
+Chrome over CDP after one manual verification; do not start a browser, pass a
+profile/storage-state, or copy cookies from this CLI.
+On Chrome 136+ the user's remote-debugging toggle may intentionally return 404
+for `/json/version` and expose only `/devtools/browser` over WebSocket. This is
+handled by the gateway's single attach and `Browser.getVersion` identity check;
+do not treat the HTTP 404 as permission to start another browser.
 
 ## Notes
 

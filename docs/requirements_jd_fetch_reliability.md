@@ -1,5 +1,26 @@
 # 技术需求：JD 详情页抓取可靠性提升（WAF 对抗与会话复用）
 
+> **文档状态：历史需求（不可执行）。** 本页只记录旧方案的背景；实现以
+> `AGENTS.md`、`docs/system_rules.md` 和 `python3 -m tools.workflow scan` 为准。
+
+# 当前实现覆盖说明（2026-08-29）
+
+本文件中的早期 Playwright `--headed`/storage-state 方案仅保留作历史需求背景，
+不再是运行入口。当前产品与私人求职实例的 JobsDB 详情链统一由
+`python3 -m tools.workflow scan` 驱动：遇到 Cloudflare 时只通过一次有界的、
+可见用户 Chrome CDP 交接，人工验证后在同一个 CDP context 中串行复用；不得让
+模型打开 Playwright 验证窗口、逐岗启动浏览器或复制 cookie 作为详情凭证。若
+9222 未监听，系统只在主 Chrome 中打开 `chrome://inspect/#remote-debugging`，
+用户启用 Allow remote debugging 后再重跑同一入口；不得启动第二个 Chrome 或
+传入新的 `--user-data-dir`。搜索 API 的 cookie header bridge 仅是兼容性的搜索
+通道，不能被详情抓取使用。
+
+> **历史需求隔离：** 本文件后续章节保留的是早期需求和实验方案，不能作为新
+> 模型的操作指令。旧的 `--headed`、独立 profile、`--user-data-dir`、
+> storage-state 或 cookie 详情路径全部被当前实现覆盖；执行时只允许
+> `python3 -m tools.workflow scan` → 用户主 Chrome 可见 CDP → 同一 context
+> 串行复用。
+
 - 文档版本：v1.0
 - 提出日期：2026-08-03
 - 状态：待排期

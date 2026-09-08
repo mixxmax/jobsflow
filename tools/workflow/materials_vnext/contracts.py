@@ -60,6 +60,10 @@ class JobEntity:
     role_source: str
     role_primary: str
     role_alternates: tuple[str, ...] = ()
+    # Host-owned title policy.  In particular, acronym compounds such as
+    # ECM/IPO and IPO/ECM are equivalent; the source/JD order is retained for
+    # display and never delegated to a drafting or audit model.
+    role_title_contract: dict[str, Any] = field(default_factory=dict)
     publisher_type: str = "unknown"
     publisher_name: str = ""
     employer_name: str = ""
@@ -73,6 +77,7 @@ class JobEntity:
             "role_source": self.role_source,
             "role_primary": self.role_primary,
             "role_alternates": list(self.role_alternates),
+            "role_title_contract": dict(self.role_title_contract or {}),
             "publisher_type": self.publisher_type,
             "publisher_name": self.publisher_name,
             "employer_name": self.employer_name,

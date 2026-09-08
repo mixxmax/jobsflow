@@ -14,7 +14,15 @@ POLICIES_PATH = Path(__file__).with_name("policies.json")
 ACTION_RULES: dict[str, dict[str, Any]] = {
     "scan": {
         "autonomy": "A0",
-        "rule_ids": ["SCAN-001", "SCAN-002", "FRESH-001"],
+        "rule_ids": [
+            "SCAN-001",
+            "SCAN-002",
+            "FRESH-001",
+            "PORTAL-JDB-001",
+            "PORTAL-JDB-002",
+            "PORTAL-JDB-003",
+            "PORTAL-JDB-004",
+        ],
         "requires_confirmation": False,
     },
     "push": {

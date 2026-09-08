@@ -16,6 +16,8 @@ from tools.workflow.materials_vnext.store import (
     AUDIT_RESULT_NAME,
     load_audit_result,
     load_audit_task,
+    load_canonical,
+    load_dispositions,
     load_run,
     save_audit_result,
     save_audit_task,
@@ -31,9 +33,19 @@ from tools.workflow.materials_vnext.store import (
 MAX_AUDIT_ATTEMPTS = 3
 MAX_REPEAT_FINDING = 2
 BLOCKING = {"P0", "P1"}
+# Findings carrying one of these user rulings no longer count as blockers.
+# Producer claims of ``fixed`` never suppress a finding by themselves — that
+# would let the producer certify its own repair.
+SUPPRESSING_DISPOSITIONS = {"user_accepted", "user_rejected", "not_actionable"}
+AUDIT_MODE_FULL = "full_generation"
+AUDIT_MODE_INCREMENTAL = "incremental_repair"
+AUDIT_MODE_WORDING_LINT = "wording_only_lint"
 
 
 def _finding_fingerprint(item: dict[str, Any]) -> str:
+    # Fingerprints group by problem category + target block, deliberately not
+    # by the full sentence: the same defect re-introduced in a reworded
+    # sentence must still be recognised as a repeat.
     raw = json.dumps(
         {
             "rule_id": text(item.get("rule_id")),
@@ -106,10 +118,27 @@ def _tailoring_delta(bundle: dict[str, Any], canonical: dict[str, Any]) -> dict[
                 "material": material,
                 "baseline_ids": [ident],
                 "action": text(current_item.get("change_action")) or ("rewrite" if before != after else "retain"),
+                # Change class comes from the validated operation (host
+                # derived) so the child sees the edit category without
+                # re-reading the baseline contract.
+                "change_class": text(current_item.get("change_class")) or "fact_sensitive",
+                "change_reason": text(current_item.get("change_reason")),
                 "before": [before],
                 "after": after,
                 "content_floor": bool(base.get("content_floor", not base.get("host_managed"))),
                 "protected_evidence": sorted(_protected_markers(before)),
+                # Semantic anchors of the affected master block: the child
+                # checks the delta against these instead of re-reading a full
+                # fact base or lane master.
+                "baseline_anchor": {
+                    "section": text(base.get("section")),
+                    "experience_id": text(base.get("experience_id")),
+                    "priority": base.get("priority", 0),
+                    "presentation_role": text(base.get("presentation_role")),
+                    "protected_numbers": sorted(
+                        _protected_numbers(before) - _protected_numbers(after)
+                    ),
+                },
                 "jd_anchor_ids": list(current_item.get("jd_anchor_ids") or []),
                 "source_style": text(base.get("source_style")),
                 "presentation_role": text(base.get("presentation_role")),
@@ -145,7 +174,22 @@ def _protected_markers(value: str) -> set[str]:
     return markers
 
 
-def build_task(*, bundle: dict[str, Any], canonical: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
+def _protected_numbers(value: str) -> set[str]:
+    from tools.workflow.materials_vnext.semantic_lint import number_tokens
+
+    return number_tokens(value)
+
+
+def build_task(
+    *,
+    bundle: dict[str, Any],
+    canonical: dict[str, Any],
+    run: dict[str, Any],
+    mode: str = AUDIT_MODE_FULL,
+    repair_scope: dict[str, Any] | None = None,
+    suppressed_findings: list[dict[str, Any]] | None = None,
+    preflight_findings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     pack = build_rule_pack()
     tailoring_delta = _tailoring_delta(bundle, canonical)
     entity = bundle.get("entity") if isinstance(bundle.get("entity"), dict) else {}
@@ -158,16 +202,43 @@ def build_task(*, bundle: dict[str, Any], canonical: dict[str, Any], run: dict[s
             "grammar_fragments_and_template_residue",
         ],
     }
+    if mode == AUDIT_MODE_INCREMENTAL:
+        # A repair round re-checks only the repaired blocks, the cross-material
+        # invariants that touch them, and a global sweep of the same problem
+        # categories.  It never re-litigates settled or unchanged content.
+        audit_focus = {
+            "primary": "incremental_repair",
+            "repaired_targets": list((repair_scope or {}).get("target_ids") or []),
+            "focus_rule_ids": list((repair_scope or {}).get("focus_rule_ids") or []),
+            "whole_document_sweep": [
+                "same_category_rescan",
+                "cross_material_invariants_of_repaired_targets",
+            ],
+        }
+    role_title_contract = entity.get("role_title_contract") if isinstance(entity.get("role_title_contract"), dict) else {}
     entity_contract = {
-        "role_display": text(entity.get("role_primary")),
+        "role_display": text(entity.get("role_source") or entity.get("role_primary")),
         "role_primary": text(entity.get("role_primary")),
+        "role_title_contract": {
+            "primary": text(role_title_contract.get("primary") or entity.get("role_primary")),
+            "alternates": [text(value) for value in (role_title_contract.get("alternates") or entity.get("role_alternates") or []) if text(value)],
+            "ambiguity_status": text(role_title_contract.get("ambiguity_status")),
+            "slash_order_policy": dict(role_title_contract.get("slash_order_policy") or {
+                "mode": "source_order_preserved",
+                "compound_order_is_non_substantive": True,
+                "confirmation_trigger": "materially_distinct_top_level_roles_only",
+                "model_action": "use the host-supplied title; do not reorder or inspect another package",
+            }),
+        },
         "publisher_type": text(entity.get("publisher_type")) or "unknown",
         "publisher_name": text(entity.get("publisher_name")),
         "employer_name": text(entity.get("employer_name")),
         "role_policy": {
-            "slash_alternatives": "use the selected primary role, not every alternative",
+            "slash_alternatives": "only materially distinct top-level roles require confirmation; acronym compounds are one role",
+            "slash_order": "ECM/IPO and IPO/ECM are equivalent; preserve host/source order and never flag or rewrite order",
             "parentheticals": "preserve substantive parenthetical wording unless a user override selected a shorter title",
             "title_punctuation": "when retained, preserve parentheses and their wording; do not substitute commas or hyphens",
+            "cross_package_lookup": "forbidden; current-job contract is authoritative",
         },
     }
     filename_contract = {
@@ -214,21 +285,31 @@ def build_task(*, bundle: dict[str, Any], canonical: dict[str, Any], run: dict[s
         "job_id": bundle.get("job_id"),
         "generation_id": run.get("generation_id"),
         "audit_attempt": int(run.get("audit_attempts") or 0) + 1,
+        "audit_mode": mode,
         "producer_context_id": str(run.get("producer_context_id") or f"producer-{uuid4().hex[:10]}"),
         "auditor_context_id": f"auditor-{uuid4().hex[:10]}",
+        "delegation_id": f"deleg-{uuid4().hex[:12]}",
         "audit_input_fingerprint": digest({
             "bundle": bundle.get("bundle_sha256"),
             "canonical": run.get("canonical_sha256"),
             "rules": pack.get("rules_digest"),
             "tailoring_delta": tailoring_delta,
-            "audit_mode": "bounded_tailoring_delta",
+            "audit_mode": mode,
             "audit_focus": audit_focus,
             "entity_contract": entity_contract,
+            "deterministic_lint": preflight_findings or [],
+            "suppressed_findings": suppressed_findings or [],
         }),
         "jd": {"text": ((bundle.get("jd") or {}).get("text") or ""), "sha256": ((bundle.get("jd") or {}).get("sha256") or "")},
         "materials": materials,
-        "audit_mode": "bounded_tailoring_delta",
+        "audit_mode": mode,
         "audit_focus": audit_focus,
+        # Deterministic host lint results: the child verifies semantics with
+        # these already computed instead of re-deriving mechanical checks.
+        "deterministic_lint": list(preflight_findings or []),
+        # User-ruled findings are settled. The child must not re-report them.
+        "suppressed_findings": list(suppressed_findings or []),
+        "repair_scope": dict(repair_scope or {}),
         "entity_contract": entity_contract,
         "filename_contract": filename_contract,
         "tailoring_delta": tailoring_delta,
@@ -267,12 +348,20 @@ def build_task(*, bundle: dict[str, Any], canonical: dict[str, Any], run: dict[s
         "output_schema": {
             "job_id": "host-bound; optional in child output; the gateway binds the current task job_id",
             "audit_scope": "jd_mapping_and_presentation",
-            "findings": "array of {finding_id,severity,rule_id,material,target_id,quote,reason,required_action}",
+            "findings": "array of {finding_id,severity,rule_id,material,target_id,quote,reason,required_action}; never include a suppressed finding",
             "counts": "object {P0,P1,P2}",
             "audit_input_fingerprint": "echo exactly",
+            "audit_task_sha256": "echo exactly",
+            "delegation_id": "echo exactly",
             "auditor_context_id": "must differ from producer_context_id",
+            "severities": {
+                "P0": "fabricated facts, wrong employer attribution, severely wrong numbers, active weakness disclosure, or a plainly un-submittable role/material",
+                "P1": "important JD requirement missed, responsibility mis-attributed, scope narrowed, severely insufficient STAR structure, cross-material factual contradiction, severe grammar or template residue",
+                "P2": "wording preference, evidence ordering suggestion, minor style issues, non-blocking expression improvements",
+            },
         },
     }
+    task["audit_task_sha256"] = digest({key: value for key, value in task.items() if key != "audit_task_sha256"})
     task["model_routing"] = {
         "preferred_tier": "strong" if task["requires_strong_auditor"] else "fast",
         "reason": "broad_baseline_delta" if task["requires_strong_auditor"] else "focused_baseline_delta",
@@ -293,6 +382,20 @@ def validate_result(report: Any, *, task: dict[str, Any]) -> list[str]:
         errors.append("generation_id_mismatch")
     if report.get("audit_input_fingerprint") != task.get("audit_input_fingerprint"):
         errors.append("audit_input_fingerprint_mismatch")
+    # Anti-fabrication bindings: a result may only be recorded against the
+    # exact task packet that was handed to an independent auditor.  The host
+    # (and therefore the producing model) cannot mint these values without
+    # dispatching the task, and a producer context can never pass as auditor.
+    report_task_digest = text(report.get("audit_task_sha256"))
+    if not report_task_digest:
+        errors.append("audit_task_digest_missing")
+    elif report_task_digest != text(task.get("audit_task_sha256")):
+        errors.append("audit_task_digest_mismatch")
+    report_delegation = text(report.get("delegation_id"))
+    if not report_delegation:
+        errors.append("audit_delegation_id_missing")
+    elif report_delegation != text(task.get("delegation_id")):
+        errors.append("audit_delegation_id_mismatch")
     auditor = text(report.get("auditor_context_id"))
     if not auditor:
         errors.append("auditor_context_missing")
@@ -345,6 +448,7 @@ def record_result(package, report: dict[str, Any], *, task: dict[str, Any], run:
     errors = validate_result(bound_report, task=task)
     if errors:
         raise ValueError("invalid_vnext_audit_result: " + ", ".join(errors))
+    dispositions = load_dispositions(package)
     findings: list[dict[str, Any]] = []
     history = dict(run.get("finding_history") or {})
     for raw in bound_report.get("findings") or []:
@@ -354,37 +458,71 @@ def record_result(package, report: dict[str, Any], *, task: dict[str, Any], run:
         item["fingerprint"] = fp
         item.setdefault("finding_id", f"finding-{fp.split('-', 1)[-1]}")
         history[fp] = int(history.get(fp) or 0) + 1
+        ruling = str((dispositions.get(fp) or {}).get("status") or "")
+        if ruling in SUPPRESSING_DISPOSITIONS:
+            # The user has explicitly ruled on this category+target problem.
+            # It stays visible in the record but never blocks or re-triggers.
+            item["disposition"] = ruling
         findings.append(item)
     counts = _counts(findings)
-    blockers = counts["P0"] + counts["P1"]
+    open_blockers = sum(
+        1
+        for item in findings
+        if item.get("severity") in BLOCKING and item.get("disposition") not in SUPPRESSING_DISPOSITIONS
+    )
+    suppressed_blockers = sum(
+        1
+        for item in findings
+        if item.get("severity") in BLOCKING and item.get("disposition") in SUPPRESSING_DISPOSITIONS
+    )
     attempt = int(run.get("audit_attempts") or 0) + 1
-    repeated = any(history.get(item.get("fingerprint"), 0) >= MAX_REPEAT_FINDING for item in findings if item.get("severity") in BLOCKING)
-    if repeated and blockers:
+    # The repeat detector runs on open blocking findings only; user-ruled
+    # findings can no longer manufacture an audit loop.
+    repeated = any(
+        history.get(item.get("fingerprint"), 0) >= MAX_REPEAT_FINDING
+        for item in findings
+        if item.get("severity") in BLOCKING and item.get("disposition") not in SUPPRESSING_DISPOSITIONS
+    )
+    if repeated and open_blockers:
         status = "audit_loop_detected"
         phase = "audit_review_required"
-    elif blockers and attempt >= MAX_AUDIT_ATTEMPTS:
+    elif open_blockers and attempt >= MAX_AUDIT_ATTEMPTS:
         status = "audit_review_required"
         phase = "audit_review_required"
-    elif blockers:
+    elif open_blockers:
         status = "repair_required"
         phase = "repair_required"
     else:
         status = "passed"
         phase = "content_passed"
+    gate_basis = "user_dispositions" if suppressed_blockers and not open_blockers else "independent_zero_open_findings"
     normalized = {
         "schema_version": 1,
         "audit_scope": "jd_mapping_and_presentation",
         "job_id": task.get("job_id"),
         "generation_id": run.get("generation_id"),
         "audit_attempt": attempt,
+        "audit_mode": text(task.get("audit_mode")) or AUDIT_MODE_FULL,
+        "produced_by": "independent_child_audit",
         "auditor_context_id": task.get("auditor_context_id"),
         "producer_context_id": task.get("producer_context_id"),
+        "delegation_id": text(bound_report.get("delegation_id")) or text(task.get("delegation_id")),
         "audit_input_fingerprint": task.get("audit_input_fingerprint"),
+        "audit_task_sha256": task.get("audit_task_sha256"),
         "findings": findings,
         "counts": counts,
-        "open_counts": counts,
+        "open_counts": {
+            "P0": sum(1 for item in findings if item.get("severity") == "P0" and item.get("disposition") not in SUPPRESSING_DISPOSITIONS),
+            "P1": sum(1 for item in findings if item.get("severity") == "P1" and item.get("disposition") not in SUPPRESSING_DISPOSITIONS),
+            "P2": sum(1 for item in findings if item.get("severity") == "P2" and item.get("disposition") not in SUPPRESSING_DISPOSITIONS),
+        },
+        "suppressed_by_disposition": suppressed_blockers,
+        "gate_basis": gate_basis,
+        # Two distinct, non-interchangeable facts: whether a real independent
+        # audit closed the content gate, and whether the package is ready.
+        "independent_audit_passed": status == "passed" and gate_basis == "independent_zero_open_findings",
         "status": status,
-        "content_gate": "passed" if blockers == 0 else "blocked",
+        "content_gate": "passed" if open_blockers == 0 else "blocked",
         "format_gate": "not_run",
     }
     # Compatibility fields are derived here solely for the stable renderer;
@@ -396,20 +534,129 @@ def record_result(package, report: dict[str, Any], *, task: dict[str, Any], run:
         for material in MATERIALS
     }
     save_audit_result(package, normalized)
-    atomic_write_text(Path(package) / "materials_audit.md", f"# CV/CL content audit\n\n- status: `{status}`\n- attempt: `{attempt}/{MAX_AUDIT_ATTEMPTS}`\n- P0/P1/P2: `{counts['P0']}/{counts['P1']}/{counts['P2']}`\n- scope: CV and Cover Letter text only\n")
+    atomic_write_text(Path(package) / "materials_audit.md", f"# CV/CL content audit\n\n- status: `{status}`\n- attempt: `{attempt}/{MAX_AUDIT_ATTEMPTS}`\n- mode: `{normalized['audit_mode']}`\n- independent audit passed: `{normalized['independent_audit_passed']}`\n- gate basis: `{gate_basis}`\n- P0/P1/P2: `{counts['P0']}/{counts['P1']}/{counts['P2']}`\n- scope: CV and Cover Letter text only\n")
     updated = dict(run)
     updated.update({"phase": phase, "audit_attempts": attempt, "audit_result_sha256": digest(normalized), "finding_history": history, "last_error": "" if status == "passed" else status})
     save_run(package, updated)
-    write_event(package, "audit_recorded", generation_id=run.get("generation_id"), attempt=attempt, status=status, counts=counts)
+    write_event(package, "audit_recorded", generation_id=run.get("generation_id"), attempt=attempt, status=status, counts=counts, audit_mode=normalized["audit_mode"], gate_basis=gate_basis)
     return normalized
+
+
+def record_wording_only_lint(
+    package,
+    run: dict[str, Any],
+    *,
+    preflight: dict[str, Any],
+    base_canonical_sha256: str = "",
+) -> dict[str, Any]:
+    """Close a wording-only repair round with the deterministic host lint.
+
+    Pure wording changes never reach the independent auditor.  The gate opens
+    only through the host semantic lint, and the record says exactly that:
+    ``produced_by`` is the host lint and ``independent_audit_passed`` stays
+    false.  This is not an independent audit and must never be presented as
+    one.
+    """
+
+    blocking = [item for item in preflight.get("blocking") or []]
+    lint_findings = list(preflight.get("findings") or [])
+    normalized = {
+        "schema_version": 1,
+        "audit_scope": "jd_mapping_and_presentation",
+        "job_id": run.get("job_id"),
+        "generation_id": run.get("generation_id"),
+        "audit_attempt": int(run.get("audit_attempts") or 0),
+        "audit_mode": AUDIT_MODE_WORDING_LINT,
+        "produced_by": "host_deterministic_lint",
+        "producer_context_id": run.get("producer_context_id"),
+        "auditor_context_id": "host-semantic-lint",
+        "delegation_id": "",
+        "audit_input_fingerprint": "",
+        "audit_task_sha256": "",
+        "base_canonical_sha256": base_canonical_sha256,
+        "findings": [],
+        "lint_findings": lint_findings,
+        "counts": {
+            "P0": sum(1 for item in lint_findings if item.get("severity") == "P0"),
+            "P1": sum(1 for item in lint_findings if item.get("severity") == "P1"),
+            "P2": sum(1 for item in lint_findings if item.get("severity") == "P2"),
+        },
+        "open_counts": {"P0": 0, "P1": 0, "P2": 0},
+        "gate_basis": "wording_only_lint",
+        "independent_audit_passed": False,
+        "status": "passed" if not blocking else "repair_required",
+        "content_gate": "passed" if not blocking else "blocked",
+        "format_gate": "not_run",
+    }
+    from tools.workflow.materials_hashes import normalize_text, sha256_text
+
+    canonical = load_canonical(package)
+    normalized["semantic_material_hashes"] = {
+        material: sha256_text(normalize_text("\n".join(
+            text(block.get("text"))
+            for block in ((canonical.get(material) or {}).get("blocks") or [])
+            if isinstance(block, dict)
+        )))
+        for material in MATERIALS
+    }
+    save_audit_result(package, normalized)
+    atomic_write_text(Path(package) / "materials_audit.md", f"# CV/CL content audit\n\n- status: `{normalized['status']}`\n- mode: `{AUDIT_MODE_WORDING_LINT}` (host lint only; no independent child audit ran)\n- independent audit passed: `false`\n- lint findings: `{len(lint_findings)}`\n- scope: CV and Cover Letter text only\n")
+    phase = "content_passed" if not blocking else "repair_required"
+    updated = dict(run)
+    updated.update({
+        "phase": phase,
+        "audit_result_sha256": digest(normalized),
+        "last_error": "" if not blocking else "wording_only_lint_failed",
+    })
+    save_run(package, updated)
+    write_event(package, "audit_recorded", generation_id=run.get("generation_id"), status=normalized["status"], audit_mode=AUDIT_MODE_WORDING_LINT, gate_basis="wording_only_lint")
+    return normalized
+
+
+def open_blocking_findings(package) -> list[dict[str, Any]]:
+    """Return the still-open P0/P1 findings of the current audit result."""
+
+    result = load_audit_result(package)
+    return [
+        dict(item)
+        for item in result.get("findings") or []
+        if isinstance(item, dict)
+        and item.get("severity") in BLOCKING
+        and str(item.get("disposition") or "") not in SUPPRESSING_DISPOSITIONS
+    ]
+
+
+def suppressed_findings_for(package) -> list[dict[str, Any]]:
+    """Project user-ruled findings into the auditor-facing suppression list."""
+
+    dispositions = load_dispositions(package)
+    return [
+        {
+            "fingerprint": fingerprint,
+            "rule_id": str(entry.get("rule_id") or ""),
+            "material": str(entry.get("material") or ""),
+            "disposition": str(entry.get("status") or ""),
+        }
+        for fingerprint, entry in sorted(dispositions.items())
+        if str(entry.get("status") or "") in SUPPRESSING_DISPOSITIONS
+    ]
 
 
 def audit_current(package, run: dict[str, Any]) -> bool:
     result = load_audit_result(package)
-    return bool(
+    if (
         result.get("status") == "passed"
         and result.get("generation_id") == run.get("generation_id")
         and digest(result) == run.get("audit_result_sha256")
+    ):
+        return True
+    # An explicit user acceptance is a legitimate gate outcome, but it is
+    # recorded as user acceptance — never as an independent audit pass.
+    acceptance = run.get("audit_acceptance") if isinstance(run.get("audit_acceptance"), dict) else {}
+    return bool(
+        acceptance.get("user_accepted")
+        and acceptance.get("accepted_material_hash") == run.get("canonical_sha256")
+        and acceptance.get("generation_id") == run.get("generation_id")
     )
 
 

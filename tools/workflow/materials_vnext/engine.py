@@ -11,7 +11,18 @@ from typing import Any
 from uuid import uuid4
 
 from tools.io_utils import atomic_write_json
-from tools.workflow.materials_vnext.audit import audit_current, build_task, dispatch, record_result
+from tools.workflow.materials_vnext.audit import (
+    AUDIT_MODE_FULL,
+    AUDIT_MODE_INCREMENTAL,
+    audit_current,
+    build_task,
+    dispatch,
+    load_audit_result,
+    open_blocking_findings,
+    record_result,
+    record_wording_only_lint,
+    suppressed_findings_for,
+)
 from tools.workflow.materials_vnext.bundle import build_bundle, bundle_current, load_json, state_dir
 from tools.workflow.materials_vnext.contracts import MATERIALS, digest, text
 from tools.workflow.materials_vnext.preflight import run_preflight
@@ -20,15 +31,19 @@ from tools.workflow.materials_vnext.store import (
     EFFECTIVE_NAME,
     TRANSFORM_NAME,
     append_patch,
+    load_acceptance,
     load_audit_task,
     load_canonical,
+    load_dispositions,
     load_plan,
     load_run,
     new_run,
     patches,
     read_transform,
     reset,
+    save_acceptance,
     save_canonical,
+    save_dispositions,
     save_effective,
     save_plan,
     save_run,
@@ -37,6 +52,21 @@ from tools.workflow.materials_vnext.store import (
     write_event,
 )
 from tools.workflow.materials_vnext.transform import compile_canonical, validate_transform
+
+# Audit finding rulings a user may record.  ``fixed`` is a producer-side
+# claim and never opens the gate by itself; only the three explicit user
+# rulings suppress a finding, and every ruling stays auditable in the ledger.
+RESOLUTION_STATUSES = {"open", "fixed", "user_accepted", "user_rejected", "not_actionable", "reopened"}
+USER_RULING_STATUSES = {"user_accepted", "user_rejected", "not_actionable"}
+_DISPATCH_FAILURES = {
+    "auditor_timeout",
+    "auditor_launch_failed",
+    "auditor_nonzero",
+    "auditor_result_missing",
+    "auditor_provider_not_configured",
+    "invalid_auditor_command",
+    "empty_auditor_command",
+}
 
 
 def _write_email(package: Path, bundle: dict[str, Any]) -> Path:
@@ -153,6 +183,203 @@ def _run_or_new(package: Path, bundle: dict[str, Any], job_id: str, *, producer_
     return save_run(package, run)
 
 
+def _record_resolve(
+    package: Path,
+    run: dict[str, Any],
+    decisions: Any,
+    *,
+    workspace: Path,
+) -> dict[str, Any]:
+    """Record user rulings on audit findings into the disposition ledger.
+
+    A ruling is a first-class record — it keeps the material hash, the rule
+    category and the reason, and it suppresses only the three explicit user
+    ruling statuses.  It is never rewritten into an independent audit pass.
+    """
+
+    result = load_audit_result(package)
+    if not result.get("findings"):
+        return {"status": "blocked", "blockers": ["audit_result_missing"], "next_action": "run_content_audit_first", "engine": "materials-vnext"}
+    if not isinstance(decisions, list) or not decisions:
+        return {"status": "blocked", "blockers": ["resolve_decisions_required"], "next_action": "submit_decisions_list", "engine": "materials-vnext"}
+    findings = [dict(item) for item in result.get("findings") or [] if isinstance(item, dict)]
+    ledger = load_dispositions(package)
+    applied: list[dict[str, Any]] = []
+    errors: list[str] = []
+    canonical_sha = text(run.get("canonical_sha256"))
+    for index, raw in enumerate(decisions):
+        if not isinstance(raw, dict):
+            errors.append(f"decision_not_object:{index}")
+            continue
+        status = text(raw.get("status")).casefold()
+        if status not in RESOLUTION_STATUSES:
+            errors.append(f"decision_status_invalid:{index}:{status}")
+            continue
+        if status in USER_RULING_STATUSES and len(text(raw.get("reason"))) < 4:
+            errors.append(f"decision_reason_required:{index}:{status}")
+            continue
+        ident = text(raw.get("fingerprint")) or text(raw.get("finding_id"))
+        finding = next(
+            (
+                item for item in findings
+                if (text(item.get("fingerprint")) and text(item.get("fingerprint")) == ident)
+                or (text(item.get("finding_id")) and text(item.get("finding_id")) == ident)
+            ),
+            None,
+        )
+        if finding is None:
+            errors.append(f"decision_finding_not_found:{index}:{ident}")
+            continue
+        fingerprint = text(finding.get("fingerprint"))
+        finding["disposition"] = status
+        finding["disposition_reason"] = text(raw.get("reason"))
+        finding["disposition_decided_at"] = run.get("updated_at") or ""
+        applied.append({"fingerprint": fingerprint, "status": status})
+        ledger[fingerprint] = {
+            "status": status,
+            "rule_id": text(finding.get("rule_id")),
+            "material": text(finding.get("material") or finding.get("artifact")),
+            "target_id": text(finding.get("target_id")),
+            "reason": text(raw.get("reason")),
+            "decided_at": finding["disposition_decided_at"],
+            "generation_id": run.get("generation_id"),
+            "accepted_material_hash": canonical_sha,
+        }
+    if errors:
+        return {"status": "blocked", "blockers": ["resolve_decisions_invalid"], "errors": sorted(set(errors)), "engine": "materials-vnext"}
+    result["findings"] = findings
+    open_blockers = [
+        item for item in findings
+        if item.get("severity") in {"P0", "P1"} and item.get("disposition") not in USER_RULING_STATUSES
+    ]
+    suppressed = [
+        item for item in findings
+        if item.get("severity") in {"P0", "P1"} and item.get("disposition") in USER_RULING_STATUSES
+    ]
+    gate_open = not open_blockers
+    result["status"] = "passed" if gate_open else "repair_required"
+    result["content_gate"] = "passed" if gate_open else "blocked"
+    result["open_counts"] = {
+        "P0": sum(1 for item in findings if item.get("severity") == "P0" and item.get("disposition") not in USER_RULING_STATUSES),
+        "P1": sum(1 for item in findings if item.get("severity") == "P1" and item.get("disposition") not in USER_RULING_STATUSES),
+        "P2": sum(1 for item in findings if item.get("severity") == "P2" and item.get("disposition") not in USER_RULING_STATUSES),
+    }
+    result["gate_basis"] = "user_dispositions" if gate_open and suppressed else result.get("gate_basis")
+    # A user ruling never upgrades the audit into an independent pass.
+    if gate_open and result.get("produced_by") == "independent_child_audit" and suppressed:
+        result["independent_audit_passed"] = False
+    save_dispositions(package, ledger)
+    atomic_write_json(state_dir(package) / "audit_result.json", result)
+    atomic_write_json(Path(package) / "materials_audit.json", result)
+    phase = str(run.get("phase") or "")
+    if gate_open:
+        new_phase = "content_passed" if phase in {"repair_required", "content_audit_pending", "audit_review_required"} else phase
+    else:
+        new_phase = "repair_required" if phase in {"content_passed", "audit_review_required"} else phase
+    updated = dict(run)
+    updated.update({
+        "phase": new_phase,
+        "audit_result_sha256": digest(result),
+        "last_error": "" if gate_open else "open_findings_after_resolution",
+    })
+    save_run(package, updated)
+    write_event(
+        package,
+        "audit_dispositions_recorded",
+        generation_id=run.get("generation_id"),
+        decisions=len(applied),
+        gate_open=gate_open,
+    )
+    return {
+        "status": "succeeded",
+        "after_state": new_phase,
+        "decisions_applied": applied,
+        "open_blocking_findings": len(open_blockers),
+        "suppressed_by_user_ruling": len(suppressed),
+        "gate_open": gate_open,
+        "independent_audit_passed": bool(result.get("independent_audit_passed")),
+        "engine": "materials-vnext",
+    }
+
+
+def _record_acceptance(package: Path, run: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """Record the user accepting materials without an independent audit.
+
+    This is the only sanctioned path that opens the content gate without a
+    real child audit.  It stores an explicit, hash-bound acceptance record;
+    ``independent_audit_passed`` stays false and audit dispatch is suspended
+    so no background audit can be launched against the user's decision.
+    """
+
+    phase = str(run.get("phase") or "")
+    if phase not in {"content_audit_pending", "repair_required", "audit_review_required"}:
+        return {
+            "status": "blocked",
+            "after_state": phase,
+            "blockers": ["acceptance_not_expected_in_phase"],
+            "next_action": "use_resolve_for_rulings_or_continue_pipeline",
+            "engine": "materials-vnext",
+        }
+    reason = text(payload.get("acceptance_reason"))
+    if len(reason) < 8:
+        return {
+            "status": "blocked",
+            "blockers": ["acceptance_reason_required"],
+            "next_action": "provide_acceptance_reason_of_at_least_8_chars",
+            "engine": "materials-vnext",
+        }
+    from tools.workflow.materials_hashes import semantic_material_hashes
+
+    accepted_hash = text(run.get("canonical_sha256"))
+    record = {
+        "schema_version": 1,
+        "job_id": run.get("job_id"),
+        "generation_id": run.get("generation_id"),
+        "accepted_material_hash": accepted_hash,
+        "semantic_material_hashes": semantic_material_hashes(Path(package)),
+        "independent_audit_passed": False,
+        "user_accepted": True,
+        "acceptance_reason": reason,
+        "decided_at": run.get("updated_at") or "",
+    }
+    save_acceptance(package, record)
+    updated = dict(run)
+    updated.update({
+        "phase": "content_passed",
+        "audit_acceptance": {
+            "user_accepted": True,
+            "accepted_material_hash": accepted_hash,
+            "generation_id": run.get("generation_id"),
+            "acceptance_reason": reason,
+        },
+        "audit_dispatch_suspended": True,
+        "last_error": "",
+    })
+    save_run(package, updated)
+    write_event(package, "audit_user_acceptance_recorded", generation_id=run.get("generation_id"), accepted_material_hash=accepted_hash)
+    return {
+        "status": "succeeded",
+        "after_state": "content_passed",
+        "user_accepted": True,
+        "independent_audit_passed": False,
+        "audit_dispatch_suspended": True,
+        "engine": "materials-vnext",
+    }
+
+
+def _dispatch_audit_task(task: dict[str, Any], *, package: Path, payload: dict[str, Any], run: dict[str, Any]) -> dict[str, Any] | None:
+    """Dispatch one audit task unless the user suspended audit dispatch.
+
+    A suspended dispatch returns ``None``: the packet stays available for a
+    real independent child, but the host must not launch (or re-launch) an
+    audit the user explicitly stopped.
+    """
+
+    if run.get("audit_dispatch_suspended"):
+        return None
+    return dispatch(task, package=package, timeout=int(payload.get("audit_timeout") or 600))
+
+
 def _plan_packet(
     bundle: dict[str, Any],
     run: dict[str, Any],
@@ -181,6 +408,19 @@ def _plan_packet(
         jd_anchors=plan_jd_anchor_catalog(plan or {}),
         contract="vnext",
     )
+    entity = bundle.get("entity") if isinstance(bundle.get("entity"), dict) else {}
+    role_contract = entity.get("role_title_contract") if isinstance(entity.get("role_title_contract"), dict) else {}
+    if not role_contract:
+        role_contract = {
+            "primary": entity.get("role_primary") or "",
+            "alternates": list(entity.get("role_alternates") or []),
+            "slash_order_policy": {
+                "mode": "source_order_preserved",
+                "compound_order_is_non_substantive": True,
+                "confirmation_trigger": "materially_distinct_top_level_roles_only",
+                "model_action": "use the host-supplied title; do not reorder or inspect another package",
+            },
+        }
     return {
         "schema_version": 1,
         "task_type": "materials_plan_and_bounded_tailoring",
@@ -207,9 +447,10 @@ def _plan_packet(
             or []
         ),
         "entity": {
-            "role": ((bundle.get("entity") or {}).get("role_primary") or ""),
-            "application_target": ((bundle.get("entity") or {}).get("application_target") or ""),
-            "publisher_type": ((bundle.get("entity") or {}).get("publisher_type") or "unknown"),
+            "role": entity.get("role_primary") or "",
+            "role_title_contract": role_contract,
+            "application_target": entity.get("application_target") or "",
+            "publisher_type": entity.get("publisher_type") or "unknown",
         },
         "cover_letter_header_contract": {
             "source": "host_current_job_entity_contract",
@@ -258,7 +499,7 @@ def _plan_packet(
             "Return only a bounded transform JSON; do not write DOCX/PDF/email or assemble a full replacement CV/CL.",
             "CV and Cover Letter are parallel materials; each starts from its own lane baseline.",
             "Do not delete baseline blocks. Replace or reorder only a small number, and add concise blocks only when truthful and JD-relevant.",
-            "Use one primary role supplied by the host. Never expose a missing qualification or recruiter as employer.",
+            "Use the one primary role supplied by the host. Slash order inside an acronym compound (ECM/IPO or IPO/ECM) is non-substantive; preserve the supplied source order and do not investigate another package. Never expose a missing qualification or recruiter as employer.",
         ],
         "transform_schema": {
             "schema_version": 1,
@@ -612,6 +853,26 @@ class MaterialsEngine:
                 response["format_passed"] = False
             return response
 
+        # User-ruling and acceptance stages operate on the recorded audit
+        # state.  They run before any drafting/transform handling because they
+        # never involve new content.
+        if stage == "resolve" or payload.get("decisions") is not None:
+            return _record_resolve(package, run, payload.get("decisions"), workspace=Path(workspace))
+        if stage == "accept":
+            return _record_acceptance(package, run, payload)
+        if stage == "audit" and text(payload.get("audit_dispatch")).casefold() in {"suspend", "resume"}:
+            updated = dict(run)
+            suspend = text(payload.get("audit_dispatch")).casefold() == "suspend"
+            updated["audit_dispatch_suspended"] = suspend
+            save_run(package, updated)
+            write_event(package, "audit_dispatch_" + ("suspended" if suspend else "resumed"), generation_id=run.get("generation_id"))
+            return {
+                "status": "succeeded",
+                "after_state": updated.get("phase"),
+                "audit_dispatch_suspended": suspend,
+                "engine": "materials-vnext",
+            }
+
         # Normalize the model submission once. A complete canonical
         # replacement that silently drops baseline blocks must be reported as
         # a structured, fail-closed blocker rather than escaping as a Python
@@ -763,7 +1024,7 @@ class MaterialsEngine:
 
         if stage in {"render", "docx", "docx_generated"}:
             if not audit_current(package, run):
-                return {"status": "blocked", "blockers": ["content_audit_not_current"], "engine": "materials-vnext", "after_state": run.get("phase")}
+                return {"status": "blocked", "blockers": ["content_audit_not_current"], "next_action": "record_independent_audit_result_or_reset_audit_scope", "engine": "materials-vnext", "after_state": run.get("phase")}
             current_phase = str(run.get("phase") or "")
             if current_phase in {"pdf_generated", "format_passed", "apply_ready"}:
                 # A late retry must never regenerate DOCX and then report a
@@ -805,7 +1066,7 @@ class MaterialsEngine:
 
         if stage in {"pdf", "convert", "pdf_generated"}:
             if not audit_current(package, run):
-                return {"status": "blocked", "blockers": ["content_audit_not_current"], "engine": "materials-vnext", "after_state": run.get("phase")}
+                return {"status": "blocked", "blockers": ["content_audit_not_current"], "next_action": "record_independent_audit_result_or_reset_audit_scope", "engine": "materials-vnext", "after_state": run.get("phase")}
             current_phase = str(run.get("phase") or "")
             if current_phase in {"pdf_generated", "format_passed", "apply_ready"} and not bool(payload.get("force")):
                 # A duplicate PDF request is safe to acknowledge only when
@@ -946,6 +1207,14 @@ class MaterialsEngine:
                 findings = [{"code": "required_outbound_missing", "artifact": name} for name in missing]
                 if not audit_current(package, run):
                     findings.append({"code": "content_audit_not_current", "artifact": "materials_audit.json"})
+                audit_result = load_audit_result(package)
+                acceptance = load_acceptance(package)
+                independent_audit_passed = bool(audit_result.get("independent_audit_passed"))
+                if payload.get("strict_audit") and not independent_audit_passed:
+                    # --strict-audit makes apply refuse anything whose content
+                    # gate was opened by host lint or user acceptance instead
+                    # of a real independent audit result.
+                    findings.append({"code": "independent_audit_not_passed", "artifact": "materials_audit.json"})
                 if str(canonical.get("generation_id") or "") != str(run.get("generation_id") or ""):
                     findings.append({"code": "stale_generation", "artifact": "canonical.json"})
                 if not format_report.get("format_passed"):
@@ -961,6 +1230,15 @@ class MaterialsEngine:
                     "findings": findings,
                     "files_ok": not missing,
                     "content_audited": audit_current(package, run),
+                    # Deliberately distinct from apply_ready: an apply-ready
+                    # package may have reached the gate via user acceptance or
+                    # host lint, and this field says so honestly.
+                    "independent_audit_passed": independent_audit_passed,
+                    "audit_mode": text(audit_result.get("audit_mode")),
+                    "user_accepted_without_audit": bool(
+                        acceptance.get("user_accepted")
+                        and acceptance.get("accepted_material_hash") == text(run.get("canonical_sha256"))
+                    ),
                     "format_passed": bool(format_report.get("format_passed")),
                     "generation_id": run.get("generation_id"),
                     "outbound_files": required,
@@ -1055,15 +1333,32 @@ class MaterialsEngine:
                     canonical = load_canonical(package)
                     if not canonical:
                         return {"status": "blocked", "blockers": ["canonical_missing"], "engine": "materials-vnext"}
-                    task = build_task(bundle=bundle, canonical=canonical, run=run)
-                dispatched = dispatch(task, package=package, timeout=int(payload.get("audit_timeout") or 600))
+                    task = build_task(
+                        bundle=bundle,
+                        canonical=canonical,
+                        run=run,
+                        suppressed_findings=suppressed_findings_for(package),
+                    )
+                dispatched = _dispatch_audit_task(task, package=package, payload=payload, run=run)
+                if dispatched is None:
+                    return {"status": "succeeded", "after_state": "content_audit_pending", "pending": True, "audit_dispatch_suspended": True, "next_action": "record_independent_audit_result_or_resume_dispatch", "audit_task_packet": task, "engine": "materials-vnext"}
                 if dispatched.get("status") == "completed" and isinstance(dispatched.get("report"), dict):
                     try:
                         normalized = record_result(package, dispatched["report"], task=task, run=run)
                     except ValueError as exc:
                         return {"status": "blocked", "blockers": ["invalid_audit_result"], "error": str(exc), "audit_dispatch": dispatched, "engine": "materials-vnext"}
                     return {"status": "succeeded" if normalized.get("status") == "passed" else "blocked", "after_state": load_run(package).get("phase"), "audit": normalized, "audit_dispatch": dispatched, "engine": "materials-vnext"}
-                return {"status": "succeeded", "after_state": "content_audit_pending", "pending": True, "next_action": "launch_independent_auditor_from_task_packet", "audit_task_packet": task, "audit_dispatch": dispatched, "engine": "materials-vnext"}
+                if dispatched.get("status") == "delegation_required":
+                    return {"status": "succeeded", "after_state": "content_audit_pending", "pending": True, "next_action": "launch_independent_auditor_from_task_packet", "audit_task_packet": task, "audit_dispatch": dispatched, "engine": "materials-vnext"}
+                return {
+                    "status": "blocked",
+                    "after_state": "content_audit_pending",
+                    "blockers": ["audit_unavailable"],
+                    "error": text(dispatched.get("reason")) or text(dispatched.get("error")) or "audit_dispatch_failed",
+                    "next_action": "retry_audit_dispatch_or_record_user_acceptance",
+                    "audit_dispatch": dispatched,
+                    "engine": "materials-vnext",
+                }
             if not task or not isinstance(report, dict):
                 return {"status": "blocked", "blockers": ["audit_task_or_result_missing"], "engine": "materials-vnext"}
             try:
@@ -1092,6 +1387,11 @@ class MaterialsEngine:
             patch_errors = validate_transform(patch, current_canonical, current=current_canonical, repair=True)
             if patch_errors:
                 return {"status": "blocked", "blockers": ["repair_patch_invalid"], "errors": patch_errors, "engine": "materials-vnext"}
+            from tools.workflow.materials_vnext.transform import stamp_derived_change_classes
+
+            # Persist the derived classes with the patch so the wording-only
+            # routing decision and the audit ledger see the same categories.
+            stamp_derived_change_classes(patch)
             append_patch(package, patch)
             run["generation"] = int(run.get("generation") or 1) + 1
             save_run(package, run)
@@ -1132,12 +1432,16 @@ class MaterialsEngine:
                 and not submitted_value.get("artifact_type")
             )
             if binding_errors and not legacy_in_process_transform:
+                from tools.workflow.materials_drafting_context import expected_submission_path
+
+                response_file = expected_submission_path(package, phase="tailoring")
                 return {
                     "status": "blocked",
                     "after_state": run.get("phase"),
                     "blockers": ["drafting_submission_unbound"],
                     "error": ", ".join(binding_errors),
-                    "next_action": "edit_current_drafting_workspace_response",
+                    "response_file": str(response_file) if response_file else "",
+                    "next_action": "edit_the_response_file_and_resubmit",
                     "engine": "materials-vnext",
                 }
 
@@ -1237,22 +1541,92 @@ class MaterialsEngine:
         save_effective(package, effective)
         run.update({"phase": "transformed", "effective_transform_sha256": effective.get("effective_transform_sha256"), "canonical_sha256": canonical.get("canonical_sha256")})
         save_run(package, run)
-        preflight = run_preflight(bundle=bundle, canonical=canonical, effective_transform=effective)
+        preflight = run_preflight(bundle=bundle, canonical=canonical, effective_transform=effective, plan=load_plan(package) or {})
         if preflight.get("status") != "passed":
             run.update({"phase": "blocked", "last_error": "content_preflight_failed"})
             save_run(package, run)
             return {"status": "blocked", "after_state": "blocked", "blockers": [item.get("code") for item in preflight.get("blocking") or []], "preflight": preflight, "engine": "materials-vnext"}
         run.update({"phase": "content_audit_pending", "producer_context_id": text(payload.get("producer_context_id") or run.get("producer_context_id"))})
         save_run(package, run)
-        task = build_task(bundle=bundle, canonical=canonical, run=run)
+
+        # A repair whose every operation is pure wording never reaches the
+        # independent auditor: the deterministic host semantic lint closes the
+        # round.  The record is explicit that no child audit ran.
+        patch_operations = [item for item in (patch or {}).get("operations") or [] if isinstance(item, dict)]
+        wording_only_repair = bool(patch) and bool(patch_operations) and all(
+            text(item.get("change_class")) == "wording_only" for item in patch_operations
+        )
+        if wording_only_repair:
+            lint_result = record_wording_only_lint(
+                package,
+                run,
+                preflight=preflight,
+                base_canonical_sha256=text((patch or {}).get("base_canonical_sha256")),
+            )
+            return {
+                "status": "succeeded" if lint_result.get("status") == "passed" else "blocked",
+                "after_state": load_run(package).get("phase"),
+                "audit": lint_result,
+                "audit_skipped_reason": "wording_only_change_class",
+                "preflight": preflight,
+                "engine": "materials-vnext",
+            }
+
+        repair_scope: dict[str, Any] = {}
+        audit_mode = AUDIT_MODE_FULL
+        if patch is not None:
+            # Incremental repair audit: the repaired blocks plus a global
+            # rescan of the same problem categories.  User-ruled findings are
+            # handed to the child as settled so it cannot re-report them.
+            audit_mode = AUDIT_MODE_INCREMENTAL
+            repair_scope = {
+                "target_ids": sorted({
+                    text(item.get("target_id"))
+                    for item in patch_operations
+                    if text(item.get("target_id"))
+                }),
+                "focus_rule_ids": sorted({
+                    text(item.get("rule_id"))
+                    for item in open_blocking_findings(package)
+                    if text(item.get("rule_id"))
+                }),
+            }
+        task = build_task(
+            bundle=bundle,
+            canonical=canonical,
+            run=run,
+            mode=audit_mode,
+            repair_scope=repair_scope or None,
+            suppressed_findings=suppressed_findings_for(package),
+            preflight_findings=preflight.get("findings") or [],
+        )
         # Keep the producer identity stable and distinct from the child.
         run["producer_context_id"] = task.get("producer_context_id")
         save_run(package, run)
-        dispatched = dispatch(task, package=package, timeout=int(payload.get("audit_timeout") or 600))
+        dispatched = _dispatch_audit_task(task, package=package, payload=payload, run=run)
+        if dispatched is None:
+            # Dispatch is suspended (usually by an explicit user decision).
+            # The task packet stays available; no background audit may start.
+            return {"status": "succeeded", "after_state": "content_audit_pending", "pending": True, "audit_dispatch_suspended": True, "next_action": "record_independent_audit_result_or_resume_dispatch", "audit_task_packet": task, "preflight": preflight, "engine": "materials-vnext"}
         if dispatched.get("status") == "completed" and isinstance(dispatched.get("report"), dict):
             try:
                 normalized = record_result(package, dispatched["report"], task=task, run=run)
             except ValueError as exc:
                 return {"status": "blocked", "after_state": "content_audit_pending", "blockers": ["invalid_audit_result"], "error": str(exc), "audit_dispatch": dispatched, "engine": "materials-vnext"}
             return {"status": "succeeded" if normalized.get("status") == "passed" else "blocked", "after_state": load_run(package).get("phase"), "audit": normalized, "audit_dispatch": dispatched, "preflight": preflight, "engine": "materials-vnext"}
-        return {"status": "succeeded", "after_state": "content_audit_pending", "pending": True, "next_action": "launch_independent_auditor_from_task_packet", "audit_task_packet": task, "audit_dispatch": dispatched, "preflight": preflight, "engine": "materials-vnext"}
+        if dispatched.get("status") == "delegation_required":
+            # No provider is configured; the desktop runtime launches a real
+            # independent child from the packet.  Nothing is recorded yet.
+            return {"status": "succeeded", "after_state": "content_audit_pending", "pending": True, "next_action": "launch_independent_auditor_from_task_packet", "audit_task_packet": task, "audit_dispatch": dispatched, "preflight": preflight, "engine": "materials-vnext"}
+        # A timeout, crash, EOF or unusable provider is an *unavailable*
+        # audit: never passed, never zero findings, never self-recorded.
+        return {
+            "status": "blocked",
+            "after_state": "content_audit_pending",
+            "blockers": ["audit_unavailable"],
+            "error": text(dispatched.get("reason")) or text(dispatched.get("error")) or "audit_dispatch_failed",
+            "next_action": "retry_audit_dispatch_or_record_user_acceptance",
+            "audit_dispatch": dispatched,
+            "preflight": preflight,
+            "engine": "materials-vnext",
+        }

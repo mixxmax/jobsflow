@@ -382,10 +382,17 @@ def handle(
     if not run:
         return result(status="blocked", blockers=["scan_run_missing"], rule_ids=["PUSH-001", "FRESH-001"])
     status = str(run.get("status") or "")
-    if status not in {"scan_completed", "scan_degraded", "scored", "semantic_ready"}:
+    allow = bool(payload.get("allow_pending_semantic"))
+    # A user may explicitly select a row whose two semantic layers are already
+    # complete while another row in the same scan remains pending.  The
+    # documented diagnostic override is intentionally limited to that explicit
+    # path; the normal (unselected) push still fails closed on a pending run.
+    pending_selected_push = status == "semantic_pending" and allow and bool(
+        _selection_keys(payload)
+    )
+    if status not in {"scan_completed", "scan_degraded", "scored", "semantic_ready"} and not pending_selected_push:
         return result(status="blocked", blockers=["scan_not_completed"], rule_ids=["PUSH-001"])
     pending = int(run.get("semantic_pending_rows") or 0)
-    allow = bool(payload.get("allow_pending_semantic"))
     if pending and not allow:
         return result(
             status="blocked",

@@ -189,8 +189,44 @@ def reconcile_package_metadata(root: Path, package: Path) -> dict[str, Any]:
         changed = True
     manifest["paths"] = paths
 
-    research = _package_company_research(package)
+    # Role-title parsing is a host-owned contract, not a model preference.
+    # Refresh it on every context load so a legacy manifest cannot resurrect a
+    # stale ``confirmation_needed`` flag for an acronym compound such as
+    # ``ECM/IPO``.  A true top-level alternative (for example
+    # ``Paralegal / Legal Assistant``) remains confirmation-worthy.  Preserve
+    # an explicit user selection, but never preserve a parser-era decision
+    # that conflicts with the current deterministic parser.
     researched_job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
+    role_display = _clean(researched_job.get("role_display") or researched_job.get("role_material"))
+    overrides = manifest.get("overrides") if isinstance(manifest.get("overrides"), dict) else {}
+    role_selection = researched_job.get("role_selection") if isinstance(researched_job.get("role_selection"), dict) else {}
+    selected_role = _clean(overrides.get("role_primary"))
+    if not selected_role and _clean(role_selection.get("mode") or role_selection.get("selection_mode")).casefold() == "user_override":
+        selected_role = _clean(researched_job.get("role_material") or researched_job.get("role_primary"))
+    if role_display:
+        role_contract = build_role_title_contract(role_display, selected_primary=selected_role)
+        refreshed_role = {
+            "role_display": role_display,
+            "role_material": _clean(role_contract.get("primary") or role_display),
+            "role_title_contract": role_contract,
+            "role_primary": _clean(role_contract.get("primary") or role_display),
+            "role_alternates": list(role_contract.get("alternates") or []),
+            "role_specialisms": list(role_contract.get("specialisms") or []),
+            "role_parentheticals": list(role_contract.get("primary_parentheticals") or []),
+            "role_selection": {
+                "mode": role_contract.get("selection_mode"),
+                "confirmation_needed": bool(role_contract.get("confirmation_needed")),
+                "ambiguity_status": role_contract.get("ambiguity_status"),
+                "policy": role_contract.get("policy"),
+            },
+        }
+        for key, value in refreshed_role.items():
+            if researched_job.get(key) != value:
+                researched_job[key] = value
+                changed = True
+        manifest["job"] = researched_job
+
+    research = _package_company_research(package)
     if research:
         research_type = _clean(research.get("publisher_type") or research.get("type"))
         explicit_recruiter = research_type.casefold() in RECRUITER_TYPES

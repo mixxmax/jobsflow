@@ -74,7 +74,10 @@ infer IDs or schema. `task_packet.json` and `response_schema.json` are the only
 authority for this job's facts, baseline block IDs, JD anchors and contract.
 
 Edit only `{response_file}`. Preserve its `drafting_context_id` and
-`drafting_input_fingerprint` exactly. Then submit that same file through
+`drafting_input_fingerprint` exactly. A slash-separated acronym pair is
+order-insensitive (for example, ECM/IPO and IPO/ECM mean the same compound);
+keep the host-supplied/source order, do not spend a turn normalizing it, and
+do not open another package to decide how to write it. Then submit that same file through
 `python3 -m tools.workflow materials ...`; do not directly create DOCX/PDF.
 """
 

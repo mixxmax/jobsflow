@@ -87,20 +87,20 @@ def test_failure_cache_short_circuits_repeated_waf(monkeypatch, tmp_path):
         calls.append(1)
         return portal_jd_browser.JdFetchResult(
             ok=False,
-            url="https://hk.jobsdb.com/job/123",
-            portal="jobsdb",
+            url="https://www.linkedin.com/jobs/view/123",
+            portal="linkedin",
             fail_reason="waf",
         )
 
     monkeypatch.setattr(portal_jd_browser, "_fetch_jd_body_once", fail_once)
     first = portal_jd_browser.fetch_jd_body(
-        "https://hk.jobsdb.com/job/123",
+        "https://www.linkedin.com/jobs/view/123",
         retry=1,
         retry_delay=0,
         cache_root=tmp_path,
     )
     second = portal_jd_browser.fetch_jd_body(
-        "https://hk.jobsdb.com/job/123",
+        "https://www.linkedin.com/jobs/view/123",
         retry=2,
         retry_delay=0,
         cache_root=tmp_path,
@@ -131,9 +131,12 @@ def test_browser_session_pool_reuses_one_session_per_portal(monkeypatch):
     second = pool.session_for("https://hk.jobsdb.com/job/2")
     linkedin = pool.session_for("https://www.linkedin.com/jobs/view/3")
 
-    assert first is second
-    assert linkedin is not first
-    assert len(created) == 2
+    # JobsDB never constructs a Playwright session; only the LinkedIn
+    # fallback is pooled.  This protects the visible-Chrome CDP boundary.
+    assert first is None
+    assert second is None
+    assert linkedin is not None
+    assert len(created) == 1
     pool.close()
     assert all(getattr(session, "closed", False) for session in created)
 

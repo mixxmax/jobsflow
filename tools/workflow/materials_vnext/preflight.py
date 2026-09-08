@@ -6,7 +6,9 @@ import re
 from typing import Any
 
 from tools.workflow.materials_schema import NEGATIVE_SELF_DISCLOSURE_PATTERNS, PLACEHOLDER_PATTERNS
+from tools.workflow.materials_vnext import semantic_lint
 from tools.workflow.materials_vnext.contracts import MATERIALS, text
+from tools.workflow.terminology_lint import role_text_contains
 
 
 _NEGATIVE = re.compile("|".join(NEGATIVE_SELF_DISCLOSURE_PATTERNS + (
@@ -20,6 +22,12 @@ _PLACEHOLDER = re.compile("|".join(PLACEHOLDER_PATTERNS), re.I)
 # treating it as a dangling connector creates a known false positive. Keep
 # only words that cannot normally close a complete sentence.
 _TRAILING_FRAGMENT = re.compile(r"(?:\s|^)(?:and|or|with|for|to|of|the|a|an|in|on)\s*[.,;:]?$", re.I)
+
+# Wrapped-line growth against the lane master that makes a second page
+# likely.  Advisory only: the LibreOffice PDF stays the one-page authority,
+# but this estimate removes the render-loop blind spot at zero cost.
+_CAPACITY_OVER_LINES = 4
+_CAPACITY_OVER_RATIO = 1.08
 
 
 def _texts(canonical: dict[str, Any]) -> dict[str, str]:
@@ -37,7 +45,13 @@ def _finding(code: str, material: str, evidence: str, *, severity: str = "P0") -
     return {"code": code, "severity": severity, "material": material, "evidence": evidence[:300]}
 
 
-def run_preflight(*, bundle: dict[str, Any], canonical: dict[str, Any], effective_transform: dict[str, Any]) -> dict[str, Any]:
+def run_preflight(
+    *,
+    bundle: dict[str, Any],
+    canonical: dict[str, Any],
+    effective_transform: dict[str, Any],
+    plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     for error in effective_transform.get("baseline_preservation_errors") or []:
         value = text(error)
@@ -50,6 +64,10 @@ def run_preflight(*, bundle: dict[str, Any], canonical: dict[str, Any], effectiv
     recruiter = text(entity.get("publisher_type")).casefold() in RECRUITER_TYPES
     baseline = bundle.get("baseline") if isinstance(bundle.get("baseline"), dict) else {}
     texts = _texts(canonical)
+    # Slash-separated acronym order is a host-owned presentation detail, not
+    # a semantic defect.  ``role_text_contains`` accepts both ECM/IPO and
+    # IPO/ECM (including spaces around the slash) without asking the model to
+    # choose a preferred form or inspect another package.
     operations = []
     original = effective_transform.get("original") if isinstance(effective_transform.get("original"), dict) else {}
     operations.extend(original.get("operations") or original.get("changes") or [])
@@ -72,11 +90,11 @@ def run_preflight(*, bundle: dict[str, Any], canonical: dict[str, Any], effectiv
         missing = sorted(base_ids - current_ids)
         if missing:
             findings.append(_finding("baseline_block_lost", material, ",".join(missing)))
-        base_chars = sum(len(text(item.get("text"))) for item in base_blocks)
-        current_chars = sum(len(text(item.get("text"))) for item in material_blocks)
-        if base_chars and current_chars < int(base_chars * 0.85):
-            findings.append(_finding("baseline_content_floor", material, f"baseline={base_chars}; current={current_chars}"))
-        if role and role.casefold() not in texts.get(material, "").casefold():
+        # The baseline is a semantic master, not a verbatim script: there is
+        # deliberately no character-ratio floor here.  Evidence retention is
+        # enforced per semantic anchor (block presence above, protected
+        # numbers/attributions in the semantic lint), never by document size.
+        if role and not role_text_contains(texts.get(material, ""), role):
             findings.append(_finding("role_not_positioned", material, role))
         for block in material_blocks:
             value = text(block.get("text"))
@@ -92,6 +110,36 @@ def run_preflight(*, bundle: dict[str, Any], canonical: dict[str, Any], effectiv
             baseline_text = "\n".join(text(item.get("text")) for item in base_blocks).casefold()
             if publisher.casefold() not in baseline_text:
                 findings.append(_finding("recruiter_leakage", material, publisher))
+
+    # Deterministic semantic lint: numbers, attribution, scope, evidence
+    # verbs, cross-material invariants and internal-marker leakage.  These
+    # checks compare semantic anchors, never wording similarity.
+    findings.extend(semantic_lint.run_semantic_lint(bundle=bundle, canonical=canonical, plan=plan))
+
+    # Pre-render capacity estimate (advisory): how far the tailored canonical
+    # has grown past the lane master's estimated one-page budget.
+    try:
+        from tools.workflow.materials_renderer import estimate_canonical_capacity
+
+        capacity = estimate_canonical_capacity(canonical, baseline)
+        for material in MATERIALS:
+            item = capacity.get(material) or {}
+            if (
+                item.get("over_master_lines", 0) >= _CAPACITY_OVER_LINES
+                or item.get("ratio", 0) > _CAPACITY_OVER_RATIO
+            ):
+                findings.append(_finding(
+                    "capacity_estimate_over_master",
+                    material,
+                    (
+                        f"estimated {item.get('estimated_lines')} wrapped lines vs master "
+                        f"{item.get('master_lines')} (+{item.get('over_master_lines')}); "
+                        "trim before rendering instead of looping PDF conversions"
+                    ),
+                    severity="P2",
+                ))
+    except (ImportError, OSError, ValueError, TypeError, KeyError):
+        capacity = {}
 
     # A tailored run must carry at least one explicit JD anchor.  This keeps a
     # weak model from silently returning the unmodified master while still
@@ -116,4 +164,5 @@ def run_preflight(*, bundle: dict[str, Any], canonical: dict[str, Any], effectiv
         "findings": findings,
         "counts": counts,
         "blocking": blocking,
+        "capacity_estimate": capacity,
     }

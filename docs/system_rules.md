@@ -138,6 +138,20 @@ Their actual queries and relevance rules are candidate- and profession-specific.
 | Assess | Persist structured strengths/gaps with JD/profile hashes under the private tracker |
 | Materials | Never auto-generate during scan |
 
+An optional runtime may enable a review-first mode with
+`workflow_preferences.preview_floor` (for example `2.8`) and
+`defer_deep_until_selection=true`. In that mode the scan is a human review
+surface: it shows pass-1 candidates at or above the configured display floor
+and labels teaser-only rows `provisional_needs_jd`; it does not spend deep-fetch
+budget for the whole window. A plain `/push` returns the review list and an
+estimated cost. Only explicitly selected keys trigger deep review. The default
+`standard` entry policy then admits only full-JD rows at or above the configured
+final line (3.3 by default). An explicit `entry_policy=all` is a user override
+for the displayed selection, recorded in the proposal together with provisional
+status and deep-review cost; it is never inferred from ordinary model prose.
+Hard safety markers such as a language-gate failure remain visible and are not
+silently converted into a normal match.
+
 The supported scan boundary is the workflow gateway; the compatibility shell
 `tools/fresh_24h/temp_two_pass.sh` delegates to it. Every live run creates one
 official `02_Tracker/workflow/scan_runs/<run-id>/run.json` binding the window,
@@ -207,12 +221,21 @@ show the same successful-portal rows again.
   budget is one JobsDB detail navigation at a time, at least 15 s apart, at
   most 10 per scan. In the private runtime, the first Cloudflare challenge
   pauses JobsDB and may trigger one bounded recovery over CDP: the user's own
-  running daily Chrome (started with `--remote-debugging-port=9222`) receives
-  the URL in its real profile, the user clears any live challenge in that
-  window, and only a structurally validated real JD closes the circuit and
-  resumes the queue. Cloudflare binds its clearance to the real browsing
-  profile, so a clean dedicated-profile Chrome or a Playwright-launched
-  Chromium is never used for verification and never counts as a recovery.
+  running primary Chrome receives the URL in its real profile, the user clears
+  any live challenge in that window, and only a structurally validated real JD
+  closes the circuit and resumes the queue. Cloudflare binds its clearance to
+  the real browsing profile. The validated user-visible CDP context is retained
+  and reused serially for the rest of that scan; a Playwright-launched
+  Chromium is never used for the verification handoff and never counts as a
+  recovery. If the CDP endpoint is unavailable, the system opens
+  `chrome://inspect/#remote-debugging` in the primary Chrome and asks the user
+  to enable *Allow remote debugging*. It must not launch a second Chrome or
+  supply a new `--user-data-dir`; a process that merely started is not treated
+  as a connected or verified endpoint.
+  Chrome 136+ toggle mode may return 404 for `/json/version` while exposing only
+  the local `/devtools/browser` WebSocket. The gateway treats this as a supported
+  transport: it performs one attach and validates `Browser.getVersion`; doctor
+  performs only a local port check and must not open repeated probe sockets.
   Interactive verification can never run in a headless context, and recovery
   never copies cookies into a second browser-state file.
   If the real Chrome CDP endpoint is unavailable, the result is an explicit
@@ -220,7 +243,9 @@ show the same successful-portal rows again.
   `02_Tracker/portal_state/jobsdb_manual_recovery.json`; the same scan may be
   rerun after the user starts the reported port and completes verification.
   Browser profiles and cookie files never belong in the repository or tracker
-  output; rows record JD depth as
+  output. The optional cookie header bridge is limited to the JobsDB search API
+  and is stored under the user's home directory with mode 0600; detail pages
+  use the retained CDP context and never read that bridge. Rows record JD depth as
   `full`/`cache`/`teaser`/`paste_needed`, and a teaser is never treated as a
   full JD.
 - Deep position profiling creates a separate `position_profile` task containing
@@ -410,8 +435,12 @@ python3 -m tools.workflow materials --job-id <JOB-ID>
   publisher only inside the private package for traceability.
 - Treat the job title as a separate deterministic contract. Preserve the source
   `role_display`; split a top-level slash into one recommended `role_primary`
-  and internal `role_alternates`, and use only one primary title in outbound
-  material unless the user confirms the roles are one vacancy. Preserve
+  and internal `role_alternates` only when the slash joins materially distinct
+  role names. Known/acronym compounds (including `ECM/IPO` and `IPO/ECM`, with
+  either spacing) are one role: their order is non-substantive, the host keeps
+  the source/JD order, and no confirmation or model lookup is allowed. Use
+  only one primary title in outbound material unless the user confirms
+  genuinely distinct roles are one vacancy. Preserve
   substantive parenthetical specialisms exactly (for example, `Paralegal
   (Corporate Funds)`). Remove only obvious location, work-arrangement,
   contract or identifier metadata parentheses from the material-facing title;
@@ -421,6 +450,13 @@ python3 -m tools.workflow materials --job-id <JOB-ID>
 - Deterministic preflight, evidence-map and quality-gate outputs are mandatory so
   lower-capability models cannot silently skip requirements such as salary,
   authorization, language, location or schedule.
+- Materials preflight treats slash-separated acronym order as a host-owned,
+  non-substantive presentation detail. `ECM/IPO`, `IPO/ECM`, and the same forms
+  with spaces around the slash are equivalent; they never trigger a block,
+  confirmation request or a repair turn. The host preserves the JD/source
+  order, and the child `TERM-001` rule may flag only a genuine change in
+  terminology meaning, scope or hierarchy. Neither the producer nor the child
+  may inspect another package to decide the order.
 - Each selected package must carry a private `job_manifest.json` hand-off
   contract. Generated fields may be rebuilt; confirmed wording belongs in its
   `overrides` object and must survive reruns. JD, profile, company-research or
@@ -526,6 +562,59 @@ metadata gate. A change to normalized CV/CL text, the frozen content baseline,
 JD, memory lessons or audit rules invalidates the semantic result. Findings are copied to a
 privacy-preserving lessons ledger for later runs; the ledger stores patterns
 and repairs, never candidate facts or document text.
+
+### 5.1.1 Semantic master, change classes and audit routing
+
+The lane baseline is a **semantic master**, not a verbatim script. It freezes
+semantic anchors — real experience and employer attribution, numbers/dates/
+ranges, responsibility scope, evidence-verb boundaries, key experiences and
+JD themes, and the no-self-disclosure rule. Wording, voice, sentence
+merging/splitting, reordering and JD keyword adaptation are ordinary
+tailoring and never require text to match the baseline; there is no
+character-ratio content floor.
+
+Every validated operation carries a deterministic `change_class`:
+
+- `wording_only` — light wording edit; the host semantic lint closes the
+  round and no independent re-audit runs;
+- `jd_alignment` — JD-driven rewrite keeping all evidence; audited with the
+  delta;
+- `fact_sensitive` — touches a number, evidence verb or scope term;
+  incremental audit required;
+- `structure_change` — block-level reorganisation or heavy rewrite;
+  incremental audit required and key-experience edits need a `change_reason`.
+
+A declared class safer than the derived one is rejected
+(`operation_change_class_conflict`). Before any independent audit, the host
+runs deterministic semantic checks: invented numbers, number-object drift,
+scope narrowing near a retained number, verb escalation, cross-employer
+attribution, employer-heading attribution loss, cross-material language-level
+conflicts, internal marker/prompt leakage, and JD duty coverage (themes are
+exempt; coverage dispositions are honoured). An advisory wrapped-line
+capacity estimate (`estimate_canonical_capacity`) reports page-budget
+overruns before any DOCX/PDF cycle; the LibreOffice PDF page count stays the
+only authoritative one-page fact, and a machine-wide soffice run lock
+serializes conversions.
+
+The content gate opens only through (1) a real independent audit bound to the
+task-packet digest, delegation id, canonical semantic hashes and a distinct
+auditor context, (2) an explicit hash-bound user acceptance (`materials
+accept --accept-reason`) that records `independent_audit_passed=false` and
+suspends audit dispatch, or (3) the host wording lint for all-wording
+repairs, recorded as `produced_by=host_deterministic_lint`. Dispatch
+failures are `audit_unavailable` — never a passed status and never
+self-recorded zero findings. `apply_ready` and `independent_audit_passed`
+are separate fields; `--strict-audit` refuses any gate opened without a real
+independent audit.
+
+Audit findings carry dispositions (`open`, `fixed`, `user_accepted`,
+`user_rejected`, `not_actionable`, `reopened`) recorded via `materials
+resolve` with a reason, rule category and accepted material hash. Only the
+explicit user rulings suppress a finding — a producer claiming `fixed` never
+certifies its own repair. Rulings are handed to later audit packets as
+settled items, survive an audit-scope reset, and are never silently rewritten
+into an independent audit pass. `audit --suspend-audit` / `--resume-audit`
+stop or restart automatic dispatch.
 
 ## 6. Final checks
 

@@ -134,7 +134,19 @@ def build_task_packet(
         "publisher_type": ctx.get("publisher_type") or "unknown",
         "publisher_name": ctx.get("publisher_name") or "",
         "employer_name": ctx.get("employer_name") or "",
-        "role_title_contract": {"role_primary": ctx.get("role_primary") or ""},
+        "role_title_contract": (
+            dict(ctx.get("role_title_contract"))
+            if isinstance(ctx.get("role_title_contract"), dict)
+            else {
+                "role_primary": ctx.get("role_primary") or "",
+                "slash_order_policy": {
+                    "mode": "source_order_preserved",
+                    "compound_order_is_non_substantive": True,
+                    "confirmation_trigger": "materially_distinct_top_level_roles_only",
+                    "model_action": "use the host-supplied title; do not reorder or inspect another package",
+                },
+            }
+        ),
         "cover_letter_header_contract": {
             "source": "host_current_job_entity_contract",
             "role_line": "host_substituted_from_role_primary",

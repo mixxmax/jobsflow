@@ -24,6 +24,8 @@ AUDIT_TASK_NAME = "audit_task.json"
 AUDIT_RESULT_NAME = "audit_result.json"
 FORMAT_NAME = "format_report.json"
 PLAN_NAME = "plan.json"
+DISPOSITIONS_NAME = "dispositions.json"
+ACCEPTANCE_NAME = "audit_acceptance.json"
 
 
 def now() -> str:
@@ -174,6 +176,31 @@ def load_audit_result(package: Path) -> dict[str, Any]:
     return value or load(Path(package) / "materials_audit.json")
 
 
+def load_dispositions(package: Path) -> dict[str, Any]:
+    """Return the user-ruling ledger keyed by finding fingerprint.
+
+    Dispositions survive an audit-scope reset on purpose: a user ruling about
+    a wording class must keep suppressing the same category+target finding,
+    and the fingerprints are deterministic (rule_id + material + target), so
+    they re-derive identically after a re-audit.  A draft/all reset archives
+    the ledger together with the generation it ruled on.
+    """
+
+    return load(state_dir(package) / DISPOSITIONS_NAME)
+
+
+def save_dispositions(package: Path, value: dict[str, Any]) -> None:
+    atomic_write_json(state_dir(package) / DISPOSITIONS_NAME, value)
+
+
+def load_acceptance(package: Path) -> dict[str, Any]:
+    return load(state_dir(package) / ACCEPTANCE_NAME)
+
+
+def save_acceptance(package: Path, value: dict[str, Any]) -> None:
+    atomic_write_json(state_dir(package) / ACCEPTANCE_NAME, value)
+
+
 def _recorded_artifact_names(package: Path) -> set[str]:
     """Return only artifacts registered by the current render generation.
 
@@ -236,8 +263,8 @@ def archive_known_outputs(
     candidates = [path for path in package.iterdir() if path.is_file() and path.name in names]
     state = package / STATE_DIR_NAME
     state_names = {
-        "audit": {AUDIT_TASK_NAME, AUDIT_RESULT_NAME, PATCHES_NAME},
-        "draft": {TRANSFORM_NAME, EFFECTIVE_NAME, CANONICAL_NAME, AUDIT_TASK_NAME, AUDIT_RESULT_NAME, PATCHES_NAME, FORMAT_NAME, "artifact_hashes.json"},
+        "audit": {AUDIT_TASK_NAME, AUDIT_RESULT_NAME, PATCHES_NAME, ACCEPTANCE_NAME},
+        "draft": {TRANSFORM_NAME, EFFECTIVE_NAME, CANONICAL_NAME, AUDIT_TASK_NAME, AUDIT_RESULT_NAME, PATCHES_NAME, FORMAT_NAME, "artifact_hashes.json", DISPOSITIONS_NAME, ACCEPTANCE_NAME},
         "render": {FORMAT_NAME, "artifact_hashes.json"},
         "all": set(),
     }[scope]
@@ -283,8 +310,17 @@ def reset(
             run["phase"] = target_phase
             if scope == "audit":
                 run["audit_result_sha256"] = ""
+                # A user acceptance belongs to the audited content; rewinding
+                # the audit scope revokes it together with the audit result.
+                run["audit_acceptance"] = {}
+                run["audit_dispatch_suspended"] = False
             if scope in {"audit", "draft"}:
+                # The repeat-finding detector counts fingerprints within one
+                # audit cycle.  Its counter has to die with the attempt counter,
+                # or a fresh generation inherits stale fingerprints and trips
+                # audit_loop_detected on its first attempt.
                 run["audit_attempts"] = 0
+                run["finding_history"] = {}
             save_run(package, run)
     return {
         "status": "reset",
@@ -292,6 +328,14 @@ def reset(
         "archived_path": archived,
         "phase": target_phase,
         "side_effects": ["archive_material_generation_outputs"],
+        # Explicit scope semantics so a preview (and the confirm that follows
+        # it) states exactly which stages survive and which are archived.
+        "scope_effects": {
+            "audit": "archives audit task/result/patches and any user acceptance; keeps canonical, plan and wording dispositions",
+            "draft": "archives transform, canonical, audit and disposition ledgers; keeps frozen bundle and plan",
+            "render": "archives DOCX/PDF/email receipts only; content and audit stay current",
+            "all": "archives the whole generation and rewinds to idle",
+        }[scope],
     }
 
 

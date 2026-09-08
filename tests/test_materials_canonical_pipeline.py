@@ -35,7 +35,7 @@ def test_canonical_draft_launches_compact_cv_cl_only_audit(tmp_path):
     assert set(task["materials"]) == {"cv", "cover_letter"}
     assert "email" not in task["materials"]
     assert all("email" not in item.casefold() for item in task["read_allowlist"])
-    assert task["audit_mode"] == "bounded_tailoring_delta"
+    assert task["audit_mode"] == "full_generation"
     assert task["tailoring_delta"]["changed_block_count"] == 2
     assert len(task["materials"]["cv"]["blocks"]) > len(
         [item for item in task["tailoring_delta"]["changes"] if item["material"] == "cv"]
@@ -52,18 +52,15 @@ def test_canonical_draft_launches_compact_cv_cl_only_audit(tmp_path):
     ]
     assert task["filename_contract"]["model_may_edit"] is False
     assert task["filename_contract"]["max_stem_chars"] == 80
-    assert task["entity_contract"] == {
-        "role_display": "Paralegal",
-        "role_primary": "Paralegal",
-        "publisher_type": "recruiter",
-        "publisher_name": "Michael Page",
-        "employer_name": "Acme",
-        "role_policy": {
-            "slash_alternatives": "use the selected primary role, not every alternative",
-            "parentheticals": "preserve substantive parenthetical wording unless a user override selected a shorter title",
-            "title_punctuation": "when retained, preserve parentheses and their wording; do not substitute commas or hyphens",
-        },
-    }
+    entity_contract = task["entity_contract"]
+    assert entity_contract["role_display"] == "Paralegal"
+    assert entity_contract["role_primary"] == "Paralegal"
+    assert entity_contract["publisher_type"] == "recruiter"
+    assert entity_contract["publisher_name"] == "Michael Page"
+    assert entity_contract["employer_name"] == "Acme"
+    assert "compound_order_is_non_substantive" in entity_contract["role_title_contract"]["slash_order_policy"]
+    assert entity_contract["role_policy"]["slash_order"].startswith("ECM/IPO and IPO/ECM")
+    assert entity_contract["role_policy"]["cross_package_lookup"].startswith("forbidden")
     assert not list(package.glob("*.docx"))
 
 
@@ -109,6 +106,8 @@ def test_render_creates_a_deterministic_application_email_after_cv_cl_audit(tmp_
         "job_id": "C0-001",
         "audit_scope": "jd_mapping_and_presentation",
         "audit_input_fingerprint": task["audit_input_fingerprint"],
+        "audit_task_sha256": task["audit_task_sha256"],
+        "delegation_id": task["delegation_id"],
         "auditor_context_id": task["auditor_context_id"],
         "counts": {"P0": 0, "P1": 0, "P2": 0},
         "findings": [],
@@ -146,7 +145,7 @@ def test_repair_is_finding_scoped_and_preserves_retry_budget(tmp_path):
         "quote": cl_block["text"], "reason": "value response is too implicit",
         "required_action": "make the evidence-to-value link explicit",
     }
-    report = {"job_id": "C0-001", "audit_scope": "jd_mapping_and_presentation", "audit_input_fingerprint": task["audit_input_fingerprint"], "auditor_context_id": task["auditor_context_id"], "counts": {"P0": 0, "P1": 1, "P2": 0}, "findings": [finding]}
+    report = {"job_id": "C0-001", "audit_scope": "jd_mapping_and_presentation", "audit_input_fingerprint": task["audit_input_fingerprint"], "audit_task_sha256": task["audit_task_sha256"], "delegation_id": task["delegation_id"], "auditor_context_id": task["auditor_context_id"], "counts": {"P0": 0, "P1": 1, "P2": 0}, "findings": [finding]}
     assert dispatch("audit", workspace=ws, payload={"job_id": "C0-001", "audit_result": report})["status"] == "blocked"
     draft = json.loads((package / "materials_draft.canonical.json").read_text(encoding="utf-8"))
     opening = next(item for item in draft["cover_letter"]["blocks"] if item["id"] == cl_block["id"])
@@ -268,6 +267,8 @@ def test_audit_host_binds_job_id_when_child_omits_routing_field(tmp_path):
     report = {
         "audit_scope": "jd_mapping_and_presentation",
         "audit_input_fingerprint": task["audit_input_fingerprint"],
+        "audit_task_sha256": task["audit_task_sha256"],
+        "delegation_id": task["delegation_id"],
         "auditor_context_id": task["auditor_context_id"],
         "counts": {"P0": 0, "P1": 0, "P2": 0},
         "findings": [],
@@ -276,6 +277,7 @@ def test_audit_host_binds_job_id_when_child_omits_routing_field(tmp_path):
     assert out["status"] == "succeeded"
     stored = json.loads((package / "materials_vnext" / "audit_result.json").read_text(encoding="utf-8"))
     assert stored["job_id"] == "C0-001"
+    assert stored["independent_audit_passed"] is True
 
 
 def test_batch_clamps_parallelism_and_isolates_job_failures(tmp_path, monkeypatch):

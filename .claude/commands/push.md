@@ -7,6 +7,8 @@
 python3 -m tools.workflow push --run-id <id>
 # 只把用户选中的岗位放入本次 proposal（可用 URL、scan_id 或已有岗位编号）
 python3 -m tools.workflow push --run-id <id> --select <key1>,<key2>
+# 明确覆盖默认 3.3 入表线：只可由用户明确指定，且仍记录 provisional/硬门状态
+python3 -m tools.workflow push --run-id <id> --entry-policy all
 
 # 用户查看职位、lane、拟分配编号后，第二步才允许写入
 python3 -m tools.workflow push --run-id <id> --confirm <proposal-id>
@@ -43,6 +45,16 @@ python3 -m tools.workflow sync retry --operation-id <sync-id> --fresh-title <tit
 绝不会把 C 岗位放进 F 文件夹。后续 `/materials` 不会再创建或搬运包。
 
 网关读取已完成 scan run：semantic pending 默认阻断。成功后验证写入行数再提交 `pushed_to_fresh`。
+
+如果上次入表后用户只在远端把旧行的 `材料状态`/`投递状态` 改成了“已定制”或
+“已投递”，追加新岗位时系统会先把这些状态同步回本地 ledger，再走 append-only
+追加，不要求先做整表 reconcile。任何分数、JD、职位、链接、备注、结构或远端新增行
+的变化仍会阻断并要求 reconcile；模型不得把普通差异当成状态旁路。
+
+在 review-first 运行配置下，不带 `--select` 的第一次 push 只返回候选列表和深评
+预计成本，不创建 proposal。选定岗位后，第二次预览才会调用深评；默认
+`standard` 只把完整 JD 且深评分达到 3.3 的岗位放入 proposal。`--entry-policy all`
+是显式用户覆盖，不能由模型根据普通对话自行推断。
 
 `auto` 在已配置 `GSHEET_ID` 与凭据时使用真实 Google Sheets，否则使用私人工作区的持久化 CSV；`file` 只用于合成夹具。向用户报告网关 JSON：目标 tab、backend、写入行数、pending 标记、postconditions、blockers。
 

@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any
 
 SCORE_GATE = 3.3
+# The scan-display floor is deliberately separate from the final entry line.
+# Public/legacy workspaces keep the historical 3.3 default; a private runtime
+# may lower this to expose uncertain candidates for human selection.
+DEFAULT_PREVIEW_FLOOR = SCORE_GATE
 PASS1_RESCUE_MARGIN = 0.35
 MIN_INFORMATIVE_TEASER_CHARS = 60
 PORTAL_SUBPROCESS_TIMEOUT_SECONDS = 90
@@ -45,6 +49,16 @@ _RETENTION_ALIASES = {
     "精选": "selective",
 }
 
+_ENTRY_POLICY_ALIASES = {
+    "standard": "standard",
+    "default": "standard",
+    "标准": "standard",
+    "all": "all",
+    "explicit_all": "all",
+    "全部": "all",
+    "全部入表": "all",
+}
+
 
 def normalize_scan_depth(value: Any) -> str:
     """Normalize a user-facing scan-depth label to a stable config key."""
@@ -74,6 +88,31 @@ def parse_retention_preference(value: Any) -> str:
     return _RETENTION_ALIASES[raw]
 
 
+def normalize_entry_policy(value: Any) -> str:
+    """Normalize the explicit push policy; never infer ``all`` from prose."""
+    return _ENTRY_POLICY_ALIASES.get(str(value or "").strip().casefold(), "standard")
+
+
+def _bounded_floor(value: Any, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return round(min(5.0, max(1.0, number)), 2)
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        raw = value.strip().casefold()
+        if raw in {"1", "true", "yes", "on", "是", "开启"}:
+            return True
+        if raw in {"0", "false", "no", "off", "否", "关闭"}:
+            return False
+    return default
+
+
 def resolve_workflow_preferences(config: dict[str, Any] | None) -> dict[str, Any]:
     """Resolve old or new private config into executable workflow controls."""
     raw = config if isinstance(config, dict) else {}
@@ -86,6 +125,10 @@ def resolve_workflow_preferences(config: dict[str, Any] | None) -> dict[str, Any
     )
     scan_preset = SCAN_DEPTH_PRESETS[scan_depth]
     retention_preset = RETENTION_PRESETS[retention]
+    preview_floor = _bounded_floor(
+        preferences.get("preview_floor", DEFAULT_PREVIEW_FLOOR),
+        DEFAULT_PREVIEW_FLOOR,
+    )
     return {
         "scan_depth": scan_depth,
         "scan_depth_label": scan_preset["label_zh"],
@@ -93,6 +136,15 @@ def resolve_workflow_preferences(config: dict[str, Any] | None) -> dict[str, Any
         "retention_preference": retention,
         "retention_label": retention_preset["label_zh"],
         "final_gate": retention_preset["final_gate"],
+        # These controls are opt-in in a runtime config.  They are not
+        # model-decided values and do not alter public defaults.
+        "preview_floor": preview_floor,
+        "defer_deep_until_selection": _as_bool(
+            preferences.get("defer_deep_until_selection", False)
+        ),
+        "default_entry_policy": normalize_entry_policy(
+            preferences.get("default_entry_policy", "standard")
+        ),
     }
 
 

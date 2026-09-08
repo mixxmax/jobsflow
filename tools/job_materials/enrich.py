@@ -98,7 +98,13 @@ def try_jobsdb_structured(url: str, repo: Path = REPO) -> tuple[str, dict[str, A
     if not cli.exists():
         return "", {"ok": False, "error": "jobsdb CLI missing"}
     jid = extract_job_id(url) or url
-    cmd = ["bun", "run", str(cli), "detail", str(jid), "--format", "json"]
+    # The compatibility CLI requires an explicit acknowledgement because its
+    # result is structured teaser data, never a full JD.  Full JobsDB detail
+    # retrieval belongs exclusively to the workflow gateway/CDP route.
+    cmd = [
+        "bun", "run", str(cli), "detail", str(jid),
+        "--teaser-only", "--format", "json",
+    ]
     try:
         proc = subprocess.run(
             cmd,
@@ -196,6 +202,15 @@ MATERIALS_TERMINAL_STOPS = {
     "rate_limited",
     "blocked",
     "budget_exhausted",
+    # JobsDB detail is now CDP-only.  These reasons mean the approved
+    # user-Chrome session is absent/unavailable; falling through to the
+    # structured CLI would reintroduce the old teaser/credential ambiguity.
+    "jobsdb_cdp_session_required",
+    "jobsdb_cdp_rejects_storage_state",
+    "cdp_endpoint_unavailable",
+    "cdp_endpoint_retired_profile",
+    "cdp_connect_failed",
+    "manual_recovery_already_attempted",
 }
 
 
@@ -205,7 +220,11 @@ def _materials_terminal_stop(fres: object) -> bool:
         return True
     reason = str(getattr(fres, "fail_reason", "") or "").strip().lower()
     detail = str(getattr(fres, "detail_reason", "") or "").strip().lower()
-    return reason in MATERIALS_TERMINAL_STOPS or detail in MATERIALS_TERMINAL_STOPS
+    return (
+        reason in MATERIALS_TERMINAL_STOPS
+        or detail in MATERIALS_TERMINAL_STOPS
+        or bool(getattr(fres, "requires_user_action", False))
+    )
 
 
 def enrich_package(package: Path, root: Path, repo: Path = REPO) -> list[str]:

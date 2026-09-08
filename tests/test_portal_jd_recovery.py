@@ -17,7 +17,15 @@ from types import SimpleNamespace
 import pytest
 
 from tools.fresh_24h import portal_jd_browser as browser
+from tools.fresh_24h import portal_jd_cdp
 from tools.fresh_24h import two_pass_score
+
+
+def _approve_cdp_fixture(session):
+    """Mint the same process-local capability used by ``connect()``."""
+    session._jobsflow_approved_cdp_session = True
+    session._jobsflow_cdp_attestation = browser._CDP_SESSION_ATTESTATION
+    return session
 
 
 def _long_jd_body(chars: int = 1400) -> str:
@@ -153,9 +161,32 @@ class _FakeContext:
         pass
 
 
-def _session_with_page(page, *, user_data_dir=None, interactive=False, timeout=600):
+def _session_with_page(
+    page,
+    *,
+    user_data_dir=None,
+    interactive=False,
+    timeout=600,
+    portal="linkedin",
+):
+    # These five tests exercise the generic Playwright challenge/retry
+    # reducer.  JobsDB details intentionally have a separate CDP-only gate;
+    # using LinkedIn here keeps the tests focused on the generic behavior
+    # instead of treating a hand-built context as an approved JobsDB session.
+    if portal == "linkedin":
+        if hasattr(page, "_selectors"):
+            body = page._selectors.get('[data-automation="jobAdDetails"]')
+            if body is not None:
+                page._selectors[".show-more-less-html__markup"] = body
+        if hasattr(page, "states"):
+            for state in page.states:
+                selectors = state.get("selectors") or {}
+                body = selectors.get('[data-automation="jobAdDetails"]')
+                if body is not None:
+                    selectors[".show-more-less-html__markup"] = body
+                state["selectors"] = selectors
     session = browser.JdBrowserSession(
-        portal="jobsdb",
+        portal=portal,
         headless=not interactive,
         interactive_verification=interactive,
         verification_timeout_seconds=timeout,
@@ -208,7 +239,7 @@ def test_challenge_header_produces_challenge_and_never_saves_state(tmp_path, mon
     original = lkg.read_bytes()
 
     result = session.fetch_once(
-        "https://hk.jobsdb.com/job/111",
+        "https://www.linkedin.com/jobs/view/111",
         save_storage_state=lkg,
         timeout_ms=5000,
     )
@@ -234,14 +265,19 @@ def test_rate_limit_retry_after_opens_breaker_until_deadline(monkeypatch):
         headers={"retry-after": "120"},
     )
     session = _session_with_page(page)
-    breaker = browser.PortalCircuitBreaker(portal="jobsdb", challenge_threshold=2)
+    # This test exercises the generic retry/circuit reducer with a synthetic
+    # session; the production JobsDB gate is covered separately and must not
+    # be bypassable by the legacy argument.
+    monkeypatch.setattr(browser, "_is_user_chrome_cdp_session", lambda _s: True)
+    breaker = browser.PortalCircuitBreaker(portal="linkedin", challenge_threshold=2)
     result = browser.fetch_jd_body(
-        "https://hk.jobsdb.com/job/999",
+        "https://www.linkedin.com/jobs/view/999",
         session=session,
         retry=0,
         retry_delay=0,
         circuit=breaker,
         failure_cache=False,
+        allow_legacy_jobsdb=True,
     )
 
     assert result.ok is False
@@ -250,7 +286,7 @@ def test_rate_limit_retry_after_opens_breaker_until_deadline(monkeypatch):
     assert result.attempts == 1  # no automatic retry on 429
     assert result.circuit_state == "open"
     assert breaker.retry_not_before() >= time.time() + 100
-    assert breaker.allow_fetch("https://hk.jobsdb.com/job/888") is False
+    assert breaker.allow_fetch("https://www.linkedin.com/jobs/view/888") is False
     assert result.recommended_action == "wait_or_manual_verify"
 
 
@@ -270,7 +306,7 @@ def test_interactive_challenge_then_valid_polls_and_saves_once(tmp_path, monkeyp
     valid_state = {
         "title": "Paralegal - Example Firm",
         "html": "",
-        "selectors": {'[data-automation="jobAdDetails"]': _long_jd_body()},
+        "selectors": {".show-more-less-html__markup": _long_jd_body()},
     }
     page = _SequencedPage([challenge_state, challenge_state, valid_state])
     ctx = _FakeContext(
@@ -278,7 +314,7 @@ def test_interactive_challenge_then_valid_polls_and_saves_once(tmp_path, monkeyp
         state_payload={"cookies": [{"name": "cf_clearance", "value": "x"}], "origins": []},
     )
     session = browser.JdBrowserSession(
-        portal="jobsdb", headless=False, interactive_verification=True,
+        portal="linkedin", headless=False, interactive_verification=True,
         verification_timeout_seconds=600
     )
     session.context = ctx
@@ -288,7 +324,7 @@ def test_interactive_challenge_then_valid_polls_and_saves_once(tmp_path, monkeyp
 
     lkg = tmp_path / "storage_state_lkg.json"
     result = session.fetch_once(
-        "https://hk.jobsdb.com/job/222",
+        "https://www.linkedin.com/jobs/view/222",
         save_storage_state=lkg,
         timeout_ms=5000,
     )
@@ -310,14 +346,14 @@ def test_interactive_never_validates_reports_verification_timeout(tmp_path, monk
     }
     page = _SequencedPage([challenge_state])
     session = browser.JdBrowserSession(
-        portal="jobsdb", headless=False, interactive_verification=True,
+        portal="linkedin", headless=False, interactive_verification=True,
         verification_timeout_seconds=3
     )
     session.context = _FakeContext(page=page)
     clock = iter([0, 1, 2, 3, 4, 5])
     monkeypatch.setattr(browser.time, "monotonic", lambda: next(clock))
 
-    result = session.fetch_once("https://hk.jobsdb.com/job/222", timeout_ms=5000)
+    result = session.fetch_once("https://www.linkedin.com/jobs/view/222", timeout_ms=5000)
 
     assert result.ok is False
     assert result.fail_reason == "verification_timeout"
@@ -332,7 +368,7 @@ def test_signal_file_triggers_recheck_but_never_success(tmp_path, monkeypatch):
     }
     page = _SequencedPage([challenge_state])
     session = browser.JdBrowserSession(
-        portal="jobsdb", headless=False, interactive_verification=True,
+        portal="linkedin", headless=False, interactive_verification=True,
         verification_timeout_seconds=3
     )
     session.context = _FakeContext(page=page)
@@ -342,7 +378,7 @@ def test_signal_file_triggers_recheck_but_never_success(tmp_path, monkeypatch):
     signal = tmp_path / "recheck.signal"
     signal.write_text("", encoding="utf-8")
     result = session.fetch_once(
-        "https://hk.jobsdb.com/job/222", timeout_ms=5000, signal_file=signal
+        "https://www.linkedin.com/jobs/view/222", timeout_ms=5000, signal_file=signal
     )
 
     assert result.ok is False
@@ -423,18 +459,113 @@ def test_recovery_hands_off_to_user_main_chrome_over_cdp(tmp_path, monkeypatch):
     assert circuit_calls["reconciled"] == 1
 
 
-def test_private_pool_uses_configured_persistent_profile(tmp_path):
+def test_recovered_cdp_session_is_reused_for_following_jobsdb_details(
+    tmp_path, monkeypatch
+):
+    """A successful human handoff must become the batch detail session.
+
+    The first URL may require the user's click, but the following URLs in the
+    same scan must stay in that validated CDP context.  Falling back to the
+    stale headless session recreates the Cloudflare failure for every URL.
+    """
+    monkeypatch.setitem(sys.modules, "portal_jd_browser", browser)
+    monkeypatch.setattr(two_pass_score, "_load_cache", lambda *_args, **_kw: (None, {}))
+    monkeypatch.setattr(two_pass_score, "_save_cache", lambda *_args, **_kw: {})
+
+    body = _long_jd_body()
+    headless = SimpleNamespace(
+        headless=True,
+        channel="chrome",
+        user_data_dir=tmp_path / "headless",
+        _session_mode_label=lambda: "persistent",
+    )
+    cdp = _approve_cdp_fixture(SimpleNamespace(
+        portal="jobsdb",
+        headless=False,
+        channel="user-chrome-cdp",
+        user_data_dir=None,
+        _session_mode_label=lambda: "cdp-user-profile",
+        fetch_once=lambda *_args, **_kwargs: None,
+    ))
+    calls = []
+
+    def fake_fetch(url, **kwargs):
+        calls.append((url, kwargs.get("session")))
+        if kwargs.get("session") is headless:
+            return browser.JdFetchResult(
+                ok=False,
+                url=url,
+                portal="jobsdb",
+                fail_reason="challenge",
+                detail_reason="challenge",
+            )
+        return browser.JdFetchResult(
+            ok=True,
+            url=url,
+            portal="jobsdb",
+            text=body,
+            chars=len(body),
+            content_validated=True,
+            attempts=1,
+            browser_channel="user-chrome-cdp",
+            session_mode="cdp-user-profile",
+            headless=False,
+        )
+
+    monkeypatch.setattr(browser, "fetch_jd_body", fake_fetch)
+
+    class Recovery:
+        attempted = False
+        status = "not_attempted"
+        navigation_count = 1
+        session = None
+
+        def recover(self, url, **_kwargs):
+            assert self.attempted is False
+            self.attempted = True
+            self.status = "succeeded"
+            self.session = cdp
+            return browser.JdFetchResult(
+                ok=True,
+                url=url,
+                portal="jobsdb",
+                text=body,
+                chars=len(body),
+                content_validated=True,
+                attempts=1,
+                browser_channel="user-chrome-cdp",
+                session_mode="cdp-user-profile",
+                headless=False,
+            )
+
+    recovery = Recovery()
+    common = {
+        "_browser_session": headless,
+        "_jobsdb_human_recovery": recovery,
+        "_browser_fetch_circuit": None,
+    }
+    first = {"url": "https://hk.jobsdb.com/job/101", "teaser": "", **common}
+    second = {"url": "https://hk.jobsdb.com/job/102", "teaser": "", **common}
+
+    text1, depth1 = two_pass_score.deep_enrich_hit(first, repo=tmp_path, jobsdb_retry=0)
+    text2, depth2 = two_pass_score.deep_enrich_hit(second, repo=tmp_path, jobsdb_retry=0)
+
+    assert depth1 == depth2 == "deep"
+    assert text1 and text2
+    # The first uncached URL is handed directly to the visible recovery
+    # session; no headless JobsDB probe is permitted anymore.
+    assert [session for _url, session in calls] == [cdp]
+
+
+def test_jobsdb_pool_never_constructs_headless_profile(tmp_path):
     profile_dir = tmp_path / "jobsdb_profile"
     pool = browser.BrowserSessionPool()
-    pool.configure_jobsdb_profile(profile_dir)
-
-    session = pool.session_for("https://hk.jobsdb.com/job/222")
-
-    assert session is not None
-    assert session.headless is True
-    assert session.channel == "chrome"
-    assert session.user_data_dir == profile_dir
-    pool.close()
+    with pytest.raises(
+        RuntimeError,
+        match="jobsdb_headless_profile_disabled_use_user_chrome_cdp",
+    ):
+        pool.configure_jobsdb_profile(profile_dir)
+    assert pool.session_for("https://hk.jobsdb.com/job/222") is None
 
 
 def test_recovery_failure_never_closes_circuit_or_uses_playwright(
@@ -472,9 +603,9 @@ def test_recovery_endpoint_handoff_is_persisted_and_resumable(tmp_path):
             return self._failure(
                 url,
                 "cdp_endpoint_unavailable",
-                recommended_action="start_chrome_with_debug_port",
-                manual_hint="quit Chrome and restart it with port 9222",
-                manual_command='open -na "Google Chrome" --args --remote-debugging-port=9222 ' + url,
+                recommended_action="enable_primary_chrome_cdp",
+                manual_hint="enable Allow remote debugging in the primary Chrome",
+                manual_command='open -a "Google Chrome" "chrome://inspect/#remote-debugging"',
             )
 
     recovery = FakeRecoveryClass(profile_dir=tmp_path / "profile")
@@ -486,8 +617,588 @@ def test_recovery_endpoint_handoff_is_persisted_and_resumable(tmp_path):
     assert recovery.status == "requires_user_action"
     notice = tmp_path / "JobSearch_2026" / "02_Tracker" / "portal_state" / "jobsdb_manual_recovery.json"
     payload = json.loads(notice.read_text(encoding="utf-8"))
-    assert payload["recommended_action"] == "start_chrome_with_debug_port"
+    assert payload["recommended_action"] == "enable_primary_chrome_cdp"
     assert "cookies" not in notice.read_text(encoding="utf-8").lower()
+
+
+def test_cdp_manual_command_targets_primary_chrome_settings(tmp_path, monkeypatch):
+    recovery = browser.JobsdbHumanVerificationRecovery(
+        profile_dir=tmp_path / "legacy-profile", debug_port=9333
+    )
+    command = recovery._manual_cdp_command("https://hk.jobsdb.com/job/224")
+
+    assert command == 'open -a "Google Chrome" "chrome://inspect/#remote-debugging"'
+    assert "--remote-debugging-port" not in command
+    assert "--user-data-dir" not in command
+    assert "-na" not in command
+    assert "cookie" not in command.lower()
+
+
+def test_direct_scan_adapter_cannot_open_jobsdb_chrome(monkeypatch, tmp_path):
+    """The legacy scan script remains read-only outside the gateway."""
+    from tools.fresh_24h import fresh_24h_scan
+
+    private = tmp_path / "JobSearch_2026"
+    (private / "00_Profile").mkdir(parents=True)
+    monkeypatch.setenv("JOBSEARCH_ROOT", str(private))
+    monkeypatch.delenv("JOBSFLOW_GATEWAY_ACTIVE", raising=False)
+    assert fresh_24h_scan.jobsdb_human_handoff_enabled(tmp_path) is False
+
+
+def test_direct_recovery_object_cannot_open_jobsdb_chrome(monkeypatch, tmp_path):
+    """Importing the recovery class is not a second browser entry point."""
+    monkeypatch.delenv("JOBSFLOW_GATEWAY_ACTIVE", raising=False)
+    monkeypatch.setattr(
+        browser.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("direct recovery must not launch Chrome")
+        ),
+    )
+    recovery = browser.JobsdbHumanVerificationRecovery(
+        profile_dir=tmp_path / "legacy-profile"
+    )
+    result = recovery.recover_search(cache_root=tmp_path)
+    assert result.ok is False
+    assert result.detail_reason == "jobsdb_gateway_only"
+    assert recovery.status == "blocked"
+
+
+def test_missing_cdp_opens_primary_chrome_settings_without_second_profile(
+    tmp_path, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        browser.subprocess,
+        "Popen",
+        lambda argv, **kwargs: calls.append((argv, kwargs)),
+    )
+    recovery = browser.JobsdbHumanVerificationRecovery(
+        profile_dir=tmp_path / "legacy-profile", debug_port=9333
+    )
+
+    recovery._launch_user_chrome_with_debug_port(
+        "https://hk.jobsdb.com/job/224"
+    )
+
+    assert calls
+    argv = calls[0][0]
+    assert argv == [
+        "open",
+        "-a",
+        "Google Chrome",
+        "chrome://inspect/#remote-debugging",
+    ]
+    assert "--user-data-dir" not in " ".join(argv)
+    assert "--remote-debugging-port" not in " ".join(argv)
+
+
+def test_jobsdb_cdp_endpoint_can_be_configured_only_locally(monkeypatch):
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_CDP_URL", "http://localhost:9333/")
+    endpoint = browser._configured_jobsdb_cdp_endpoint()
+    assert endpoint == "http://localhost:9333"
+
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_CDP_URL", "https://example.invalid:9443")
+    # Non-local endpoint values are ignored rather than sending browser state
+    # to a remote host.
+    assert browser._configured_jobsdb_cdp_endpoint() == "http://127.0.0.1:9222"
+
+
+def test_jobsdb_endpoint_ignores_generic_harness_websocket(monkeypatch):
+    """Browser-Use/Playwright WS variables cannot select JobsDB transport."""
+    monkeypatch.delenv("JOBSFLOW_JOBSDB_CDP_URL", raising=False)
+    monkeypatch.setenv("BROWSER_USE_CDP_URL", "ws://127.0.0.1:9333/devtools/browser/x")
+    monkeypatch.setenv("BU_CDP_URL", "ws://127.0.0.1:9444/devtools/browser/y")
+
+    assert browser._configured_jobsdb_cdp_endpoint() == "http://127.0.0.1:9222"
+    assert browser._jobsdb_cdp_endpoint() == "http://127.0.0.1:9222"
+
+
+def test_jobsdb_cdp_status_rejects_headless_browser(monkeypatch):
+    monkeypatch.setattr(browser, "_cdp_endpoint_owned_by_retired_profile", lambda _e: False)
+    monkeypatch.setattr(
+        browser,
+        "_read_cdp_version",
+        lambda _e: {"Browser": "HeadlessChrome/151.0.0.0", "webSocketDebuggerUrl": "ws://secret"},
+    )
+
+    result = browser.jobsdb_cdp_status("http://127.0.0.1:9333")
+
+    assert result["ready"] is False
+    assert result["status"] == "non_primary_browser"
+    assert result["requires_user_action"] is True
+    assert "webSocketDebuggerUrl" not in result
+    assert "secret" not in json.dumps(result)
+
+
+def test_jobsdb_cdp_status_reports_non_headless_chrome_without_secrets(monkeypatch):
+    monkeypatch.setattr(browser, "_cdp_endpoint_owned_by_retired_profile", lambda _e: False)
+    monkeypatch.setattr(
+        browser,
+        "_read_cdp_version",
+        lambda _e: {"Browser": "Chrome/151.0.0.0", "webSocketDebuggerUrl": "ws://secret"},
+    )
+
+    result = browser.jobsdb_cdp_status("http://127.0.0.1:9333")
+
+    assert result["ready"] is True
+    assert result["status"] == "reachable"
+    assert result["browser_channel"] == "user-chrome-cdp"
+    assert "webSocketDebuggerUrl" not in result
+    assert "secret" not in json.dumps(result)
+
+
+def test_jobsdb_cdp_lease_serializes_independent_harnesses(tmp_path):
+    """Two conversations cannot navigate the same primary Chrome together."""
+    first = browser._JobsdbCdpLease(tmp_path / "jobsdb.lock").acquire()
+    second = browser._JobsdbCdpLease(tmp_path / "jobsdb.lock")
+    try:
+        with pytest.raises(RuntimeError, match="cdp_session_busy"):
+            second.acquire()
+        assert first.acquired is True
+        assert second.acquired is False
+    finally:
+        first.release()
+        second.release()
+
+    # Kernel flock releases the lease for a subsequent run; no stale lock
+    # deletion or manual cleanup is needed.
+    third = browser._JobsdbCdpLease(tmp_path / "jobsdb.lock").acquire()
+    third.release()
+
+
+def test_jobsdb_cdp_connect_rejects_headless_discovery_before_attach(monkeypatch):
+    monkeypatch.setattr(browser, "_cdp_endpoint_owned_by_retired_profile", lambda _e: False)
+    monkeypatch.setattr(
+        browser,
+        "_read_cdp_version",
+        lambda _e: {"Browser": "HeadlessChrome/151.0.0.0"},
+    )
+    monkeypatch.setattr(
+        "playwright.sync_api.sync_playwright",
+        lambda: (_ for _ in ()).throw(AssertionError("must reject before attach")),
+    )
+
+    with pytest.raises(RuntimeError, match="cdp_non_primary_browser"):
+        browser.JobsdbCdpBatchSession.connect(cdp_endpoint="http://127.0.0.1:9333")
+
+
+def test_cdp_connection_url_strips_discovery_resource():
+    assert browser._cdp_connection_url("http://127.0.0.1:9222/json/version") == (
+        "http://127.0.0.1:9222"
+    )
+    assert browser._cdp_connection_url("ws://127.0.0.1:9222/devtools/browser/x") == (
+        "ws://127.0.0.1:9222/devtools/browser/x"
+    )
+
+
+def test_cdp_ws_connection_url_supports_chrome_toggle_endpoint():
+    assert browser._cdp_ws_connection_url("http://127.0.0.1:9222") == (
+        "ws://127.0.0.1:9222/devtools/browser"
+    )
+    assert browser._cdp_ws_connection_url("http://127.0.0.1:9222/json/version") == (
+        "ws://127.0.0.1:9222/devtools/browser"
+    )
+    assert browser._cdp_ws_connection_url(
+        "ws://localhost:9222/devtools/browser/abc"
+    ) == "ws://localhost:9222/devtools/browser/abc"
+    with pytest.raises(RuntimeError, match="cdp_websocket_path_invalid"):
+        browser._cdp_ws_connection_url("ws://127.0.0.1:9222/json/list")
+
+
+def test_primary_chrome_version_accepts_browser_get_version_product():
+    assert browser._is_primary_chrome_version(
+        {"product": "Chrome/151.0.0.0", "userAgent": "Mozilla/5.0"}
+    )
+    assert not browser._is_primary_chrome_version(
+        {"product": "HeadlessChrome/151.0.0.0"}
+    )
+
+
+def test_explicit_local_websocket_endpoint_is_allowed_but_generic_is_ignored(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "JOBSFLOW_JOBSDB_CDP_URL",
+        "ws://127.0.0.1:9333/devtools/browser",
+    )
+    assert browser._jobsdb_cdp_endpoint() == (
+        "ws://127.0.0.1:9333/devtools/browser"
+    )
+    monkeypatch.delenv("JOBSFLOW_JOBSDB_CDP_URL", raising=False)
+    monkeypatch.setenv(
+        "BROWSER_USE_CDP_URL", "ws://127.0.0.1:9333/devtools/browser"
+    )
+    assert browser._jobsdb_cdp_endpoint() == "http://127.0.0.1:9222"
+
+
+def test_jobsdb_cdp_status_reports_ws_only_primary_chrome(monkeypatch):
+    monkeypatch.setattr(browser, "_cdp_endpoint_owned_by_retired_profile", lambda _e: False)
+    monkeypatch.setattr(browser, "_read_cdp_version", lambda _e: None)
+    monkeypatch.setattr(browser, "_cdp_local_port_available", lambda _e: True)
+
+    result = browser.jobsdb_cdp_status("http://127.0.0.1:9333")
+
+    assert result["ready"] is True
+    assert result["status"] == "ws_only_transport_pending"
+    assert result["protocol"] == "websocket_only"
+    assert result["identity_verified"] is False
+    assert result["recommended_action"] == "run_gateway_scan_for_cdp_attestation"
+
+
+def test_endpoint_alive_accepts_ws_only_http_404(monkeypatch):
+    recovery = browser.JobsdbHumanVerificationRecovery(
+        cdp_endpoint="http://127.0.0.1:1"
+    )
+    monkeypatch.setattr(browser, "_cdp_endpoint_owned_by_retired_profile", lambda _e: False)
+    monkeypatch.setattr(browser, "_cdp_local_port_available", lambda _e: True)
+    assert recovery._endpoint_alive() is True
+
+
+def test_cdp_batch_connects_to_ws_only_chrome_and_attests_product(monkeypatch):
+    page = _FakePage()
+
+    class CdpSession:
+        def send(self, method):
+            assert method == "Browser.getVersion"
+            return {
+                "product": "Chrome/151.0.0.0",
+                "userAgent": "Mozilla/5.0 Chrome/151.0.0.0",
+            }
+
+        def detach(self):
+            pass
+
+    class Context(_FakeContext):
+        def __init__(self):
+            super().__init__(page=page)
+            self.pages = [page]
+            self.cdp_pages = []
+
+        def new_cdp_session(self, attached_page):
+            self.cdp_pages.append(attached_page)
+            return CdpSession()
+
+    context = Context()
+
+    class Remote:
+        contexts = [context]
+
+    remote = Remote()
+
+    class Chromium:
+        def __init__(self):
+            self.endpoints = []
+
+        def connect_over_cdp(self, endpoint):
+            self.endpoints.append(endpoint)
+            return remote
+
+    chromium = Chromium()
+
+    class Playwright:
+        def __init__(self):
+            self.chromium = chromium
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+    playwright = Playwright()
+    fake_sync_api = SimpleNamespace(
+        sync_playwright=lambda: SimpleNamespace(start=lambda: playwright)
+    )
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync_api)
+    monkeypatch.setattr(browser, "_cdp_endpoint_owned_by_retired_profile", lambda _e: False)
+    monkeypatch.setattr(browser, "_read_cdp_version", lambda _e: None)
+    monkeypatch.setattr(browser, "_cdp_local_port_available", lambda _e: True)
+
+    session = browser.JobsdbCdpBatchSession.connect(
+        cdp_endpoint="http://127.0.0.1:9333"
+    )
+    try:
+        assert chromium.endpoints == [
+            "ws://127.0.0.1:9333/devtools/browser"
+        ]
+        assert context.cdp_pages == [page]
+        assert session._jobsflow_approved_cdp_session is True
+    finally:
+        session.close()
+    assert playwright.stop_calls == 1
+
+
+def test_any_custom_chrome_profile_on_cdp_port_is_rejected(monkeypatch):
+    completed = SimpleNamespace(
+        stdout=(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome "
+            "--remote-debugging-port 9333 --user-data-dir /tmp/another-profile\n"
+        )
+    )
+    monkeypatch.setattr(browser.subprocess, "run", lambda *a, **k: completed)
+    assert browser._cdp_endpoint_owned_by_retired_profile(
+        "http://127.0.0.1:9333"
+    )
+
+
+def test_retired_jobsdb_profile_endpoint_is_rejected(monkeypatch):
+    completed = SimpleNamespace(
+        stdout=(
+            "3227 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome "
+            "--remote-debugging-port=9222 "
+            "--user-data-dir=/tmp/browser_profiles/jobsdb-cdp\n"
+        )
+    )
+    monkeypatch.setattr(browser.subprocess, "run", lambda *a, **k: completed)
+    assert browser._cdp_endpoint_owned_by_retired_profile(
+        "http://127.0.0.1:9222"
+    )
+
+
+def test_cdp_recovery_keeps_one_remote_connection_until_scan_close(tmp_path, monkeypatch):
+    body = _long_jd_body()
+    page = _FakePage(
+        title="Compliance Officer - Example Bank",
+        selectors={'[data-automation="jobAdDetails"]': body},
+    )
+    context = _FakeContext(page=page)
+
+    class Remote:
+        def __init__(self):
+            self.contexts = [context]
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    remote = Remote()
+
+    class Chromium:
+        def __init__(self):
+            self.connect_calls = 0
+
+        def connect_over_cdp(self, _endpoint):
+            self.connect_calls += 1
+            return remote
+
+    class Playwright:
+        def __init__(self):
+            self.chromium = Chromium()
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+    playwright = Playwright()
+    fake_sync_api = SimpleNamespace(sync_playwright=lambda: SimpleNamespace(start=lambda: playwright))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync_api)
+
+    recovery = browser.JobsdbHumanVerificationRecovery(
+        profile_dir=tmp_path / "profile", debug_port=9222
+    )
+    monkeypatch.setattr(recovery, "_endpoint_alive", lambda: True)
+    monkeypatch.setattr(recovery, "_endpoint_retired_profile", lambda: False)
+    monkeypatch.setattr(browser, "_cdp_endpoint_owned_by_retired_profile", lambda _e: False)
+    monkeypatch.setattr(
+        browser,
+        "_read_cdp_version",
+        lambda _e: {"Browser": "Chrome/151.0.0.0", "webSocketDebuggerUrl": "ws://127.0.0.1"},
+    )
+
+    first = recovery._cdp_fetch("https://hk.jobsdb.com/job/301")
+    second = recovery._cdp_fetch("https://hk.jobsdb.com/job/302")
+
+    assert first.ok and second.ok
+    assert recovery.session is recovery._cdp_session
+    assert recovery.navigation_count == 2
+    assert playwright.chromium.connect_calls == 1
+    assert playwright.stop_calls == 0
+    assert remote.close_calls == 0
+
+    recovery.close()
+    assert playwright.stop_calls == 1
+    assert remote.close_calls == 0
+
+
+def test_cdp_batch_session_keeps_main_document_challenge_signal():
+    """Asset responses must not overwrite a challenged document response."""
+    body = _long_jd_body()
+
+    class Page(_FakePage):
+        def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            document = _FakeResponse(self, 403, {"cf-mitigated": "challenge"})
+            document.request.resource_type = "document"
+            asset = _FakeResponse(self, 200, {})
+            asset.request.resource_type = "xhr"
+            for response in (document, asset):
+                for handler in list(self.handlers):
+                    handler(response)
+            return document
+
+    context = _FakeContext(
+        page=Page(
+            title="Paralegal - Example Firm",
+            selectors={'[data-automation="jobAdDetails"]': body},
+            html="<html><body>real-looking body</body></html>",
+        )
+    )
+    session = _approve_cdp_fixture(
+        browser.JobsdbCdpBatchSession(None, None, context)
+    )
+
+    result = session.fetch_once("https://hk.jobsdb.com/job/305")
+
+    assert result.ok is False
+    assert result.fail_reason == "challenge"
+    assert result.response_status == 403
+
+
+def test_cdp_batch_session_accepts_jd_after_in_place_challenge_clear():
+    """A user click may replace the DOM without a second document response."""
+    body = _long_jd_body()
+    page = _FakePage(
+        title="Compliance Officer - Example Bank",
+        body="",
+        status=403,
+        headers={"cf-mitigated": "challenge"},
+        selectors={'[data-automation="jobAdDetails"]': body},
+    )
+    context = _FakeContext(page=page)
+    session = _approve_cdp_fixture(
+        browser.JobsdbCdpBatchSession(None, None, context)
+    )
+
+    result = session.fetch_once(
+        "https://hk.jobsdb.com/job/306",
+        interactive=True,
+        verification_timeout_seconds=1,
+    )
+
+    assert result.ok is True
+    assert result.content_validated is True
+    assert result.session_mode == "cdp-user-profile"
+
+
+def test_unattested_cdp_batch_session_cannot_fetch_details():
+    """Only connect() may mint the JobsDB CDP transport attestation."""
+    body = _long_jd_body()
+    page = _FakePage(
+        title="Compliance Officer - Example Bank",
+        selectors={'[data-automation="jobAdDetails"]': body},
+    )
+    context = _FakeContext(page=page)
+    session = browser.JobsdbCdpBatchSession(None, None, context)
+    result = session.fetch_once("https://hk.jobsdb.com/job/307")
+    assert result.ok is False
+    assert result.detail_reason == "cdp_session_unattested"
+    assert page.goto_calls == []
+
+
+def test_cdp_batch_session_rejects_non_jobsdb_url_before_navigation():
+    """The JobsDB CDP context cannot be used as a generic browser."""
+    page = _FakePage(
+        title="LinkedIn",
+        selectors={'[data-automation="jobAdDetails"]': _long_jd_body()},
+    )
+    context = _FakeContext(page=page)
+    session = _approve_cdp_fixture(
+        browser.JobsdbCdpBatchSession(None, None, context)
+    )
+    result = session.fetch_once("https://www.linkedin.com/jobs/view/307")
+    assert result.ok is False
+    assert result.detail_reason == "jobsdb_session_rejects_non_jobsdb_url"
+    assert page.goto_calls == []
+
+
+def test_closed_cdp_batch_session_loses_detail_attestation():
+    """Detaching the transport must invalidate its approval marker."""
+    context = _FakeContext(page=_FakePage())
+    session = _approve_cdp_fixture(
+        browser.JobsdbCdpBatchSession(None, None, context)
+    )
+    session.close()
+    assert browser._is_user_chrome_cdp_session(session) is False
+
+
+def test_jobsdb_cdp_cli_rejects_non_jobsdb_urls_before_connect(monkeypatch, tmp_path):
+    """The compatibility CLI cannot become a generic browser entry point."""
+    monkeypatch.setattr(
+        portal_jd_cdp.JobsdbCdpBatchSession,
+        "connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid portal must be rejected before CDP")
+        ),
+    )
+    rc = portal_jd_cdp.main(
+        [
+            "--repo",
+            str(tmp_path),
+            "--urls",
+            "https://www.linkedin.com/jobs/view/307",
+        ]
+    )
+    assert rc == 2
+
+
+def test_validated_cdp_session_bypasses_pre_handoff_failure_cache(tmp_path, monkeypatch):
+    body = _long_jd_body()
+    calls = []
+
+    class Session:
+        portal = "jobsdb"
+        headless = False
+        channel = "user-chrome-cdp"
+        user_data_dir = None
+        context = None
+        _jobsflow_approved_cdp_session = True
+        _jobsflow_cdp_attestation = browser._CDP_SESSION_ATTESTATION
+
+        def _session_mode_label(self):
+            return "cdp-user-profile"
+
+        def fetch_once(self, url, **_kwargs):
+            calls.append(url)
+            return browser.JdFetchResult(
+                ok=True,
+                url=url,
+                portal="jobsdb",
+                text=body,
+                chars=len(body),
+                content_validated=True,
+            )
+
+    session = Session()
+    failure_dir = tmp_path / "JobSearch_2026" / "02_Tracker" / "jd_failures"
+    failure_dir.mkdir(parents=True)
+    # The exact filename is produced by the URL hash; writing a matching
+    # recent failure proves the live CDP route is allowed to ignore it.
+    import hashlib
+
+    url = "https://hk.jobsdb.com/job/401"
+    (failure_dir / f"{hashlib.sha256(url.encode()).hexdigest()[:16]}.json").write_text(
+        json.dumps({"reason": "challenge", "saved_at": time.time()}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(browser, "_default_cache_root", lambda: tmp_path)
+
+    result = browser.fetch_jd_body(
+        url,
+        session=session,
+        cache_root=tmp_path,
+        retry=0,
+        failure_cache=True,
+        circuit=None,
+    )
+
+    assert result.ok is True
+    assert calls == [url]
+
+
+def test_cookie_bridge_defaults_outside_runtime_tracker(monkeypatch):
+    monkeypatch.delenv("JOBSDB_COOKIE_FILE", raising=False)
+    path = browser._jobsdb_cookie_header_path(Path("/tmp/ignored-runtime"))
+
+    assert path == Path.home() / ".config" / "jobsearch" / "jobsdb_browser_cookies.txt"
 
 
 def test_storage_state_path_must_be_inside_home(tmp_path):
@@ -555,7 +1266,9 @@ class _FakePlaywright:
 
 def test_second_session_start_cannot_remove_first_sessions_lock(tmp_path, monkeypatch):
     udd = tmp_path / "jobsdb_profile"
-    first = browser.JdBrowserSession(portal="jobsdb", user_data_dir=udd)
+    first = browser.JdBrowserSession(
+        portal="linkedin", user_data_dir=udd, allow_legacy_jobsdb=True
+    )
     first._playwright = _FakePlaywright()
     first._launch_persistent()
     lock_path = udd.parent / f"{udd.name}.lock"
@@ -565,13 +1278,15 @@ def test_second_session_start_cannot_remove_first_sessions_lock(tmp_path, monkey
     # and close() must not unlink a lock this session never owned.
     fake_sync = lambda: SimpleNamespace(start=lambda: _FakePlaywright())  # noqa: E731
     monkeypatch.setattr("playwright.sync_api.sync_playwright", fake_sync)
-    second = browser.JdBrowserSession(portal="jobsdb", user_data_dir=udd)
+    second = browser.JdBrowserSession(
+        portal="linkedin", user_data_dir=udd, allow_legacy_jobsdb=True
+    )
     with pytest.raises(RuntimeError, match="profile_locked"):
         second.start()
     assert lock_path.is_file()
 
     # A third process is still blocked while the owner runs.
-    third = browser.JdBrowserSession(portal="jobsdb", user_data_dir=udd)
+    third = browser.JdBrowserSession(portal="linkedin", user_data_dir=udd)
     third._playwright = _FakePlaywright()
     with pytest.raises(RuntimeError, match="profile_locked"):
         third._launch_persistent()
@@ -622,8 +1337,9 @@ def test_half_open_probe_success_closes_breaker(monkeypatch, tmp_path):
 # Budget: cap rejects without navigation and does not leak between fetches
 # ---------------------------------------------------------------------------
 
-def test_budget_cap_returns_budget_exhausted_without_fetching(monkeypatch):
+def test_budget_cap_returns_budget_exhausted_without_fetching(monkeypatch, tmp_path):
     monkeypatch.setenv("PORTAL_JD_MAX_REQUESTS_PER_SCAN", "1")
+    monkeypatch.setattr(browser, "_is_user_chrome_cdp_session", lambda _s: True)
     browser.reset_portal_budget("jobsdb")
     calls = []
 
@@ -640,10 +1356,18 @@ def test_budget_cap_returns_budget_exhausted_without_fetching(monkeypatch):
 
     monkeypatch.setattr(browser, "_fetch_jd_body_once", fake_once)
     first = browser.fetch_jd_body(
-        "https://hk.jobsdb.com/job/111", retry=0, failure_cache=False
+        "https://hk.jobsdb.com/job/111",
+        retry=0,
+        failure_cache=False,
+        cache_root=tmp_path,
+        allow_legacy_jobsdb=True,
     )
     second = browser.fetch_jd_body(
-        "https://hk.jobsdb.com/job/222", retry=0, failure_cache=False
+        "https://hk.jobsdb.com/job/222",
+        retry=0,
+        failure_cache=False,
+        cache_root=tmp_path,
+        allow_legacy_jobsdb=True,
     )
 
     assert first.ok is True
@@ -794,28 +1518,27 @@ def test_two_pass_circuit_stops_third_url_and_cache_still_wins(monkeypatch, tmp_
         drop_below_final=False,
     )
 
-    # Only the two challenge URLs ever navigated; the third was circuit-stopped.
-    assert calls == ["https://hk.jobsdb.com/job/111", "https://hk.jobsdb.com/job/222"]
+    # No JobsDB headless navigation is permitted.  Without a private recovery
+    # handoff the rows remain provisional and the inner fetch seam is unused.
+    assert calls == []
     by_title = {r.get("职位"): r for r in rows}
     assert len(rows) == 5  # below-gate row dropped at pass 1
     assert by_title["Stopped By Circuit"]["JD深度"] == "paste_needed"
     assert by_title["Cached Hit"]["JD深度"] == "cache"
-    # master's retention controls label an uncached CT row as unavailable.
-    assert by_title["Other Portal"]["JD深度"] == "teaser_unavailable"
+    # Uncached CT row now goes through the AWS WAF solver; with no private
+    # key in this workspace it soft-fails back to the teaser label.
+    assert by_title["Other Portal"]["JD深度"] == "teaser"
 
     status = meta["jobsdb_detail_status"]
     assert status is not None
-    assert status["circuit_state"] == "open"
-    # detail_requests counts real navigations only: the two challenges
-    # navigated; the circuit-stopped row and the cache hit navigated zero
-    # times and must not inflate the counter.
-    assert status["detail_requests"] == 2
+    assert status["detail_requests"] == 0
+    assert status["circuit_state"] == "closed"
     assert status["detail_success"] == 0
-    assert status["challenge_count"] == 2
-    assert status["degraded_count"] == 1
+    assert status["challenge_count"] == 0
+    assert status["degraded_count"] == 0
     assert status["jd_cache_hits"] == 1
     assert status["failure_cache_hits"] == 0
-    assert status["recommended_action"] == "wait_or_manual_verify"
+    assert status["recommended_action"] in {"none", "wait_or_manual_verify"}
 
 
 def test_private_two_pass_hands_first_challenge_to_one_shot_recovery(
@@ -897,7 +1620,9 @@ def test_private_two_pass_hands_first_challenge_to_one_shot_recovery(
         drop_below_final=False,
     )
 
-    assert initial_calls == ["https://hk.jobsdb.com/job/909"]
+    # The first URL is handed directly to recovery; the legacy headless seam
+    # is never called.
+    assert initial_calls == []
     assert len(recovery_calls) == 1
     assert len(FakeRecovery.instances) == 1
     assert rows[0]["JD深度"] == "full"
@@ -999,23 +1724,24 @@ def test_two_pass_budget_stop_navigates_zero_times(monkeypatch, tmp_path):
     )
     assert len(rows) == 2
     status = meta["jobsdb_detail_status"]
-    assert status["detail_requests"] == 1
-    assert status["challenge_count"] == 1
-    assert status["degraded_count"] == 1  # budget_exhausted, zero navigation
+    assert status["detail_requests"] == 0
+    assert status["challenge_count"] == 0
+    assert status["degraded_count"] == 0
 
 
-def test_failure_cache_stop_records_zero_requests_and_one_cache_hit(monkeypatch, tmp_path):
-    """A recent-failure cache stop must not look like a fresh detail request."""
+def test_jobsdb_policy_stop_precedes_legacy_failure_cache(monkeypatch, tmp_path):
+    """A cache entry cannot authorize a headless JobsDB detail fetch."""
     url = "https://hk.jobsdb.com/job/303"
     browser._save_failure(url, "challenge", tmp_path)
 
     hit = {"url": url, "teaser": "operations"}
     text, depth = two_pass_score.deep_enrich_hit(hit, repo=tmp_path)
 
-    assert depth == "teaser_fallback"
+    assert depth == "paste_needed"
     enrich = hit["_enrich"]
-    assert enrich["failure_cached"] == 1
+    assert enrich["failure_cached"] == 0
     assert enrich["attempts"] == 0
+    assert enrich["detail_reason"] == "jobsdb_cdp_session_required"
 
     import portal_jd_browser as short_browser  # noqa: E402
 
@@ -1035,7 +1761,7 @@ def test_failure_cache_stop_records_zero_requests_and_one_cache_hit(monkeypatch,
     )
     status = meta["jobsdb_detail_status"]
     assert status["detail_requests"] == 0
-    assert status["failure_cache_hits"] == 1
+    assert status["failure_cache_hits"] == 0
 
 
 def test_success_cache_precedes_open_circuit_in_enrich(monkeypatch, tmp_path):

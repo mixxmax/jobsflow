@@ -95,7 +95,7 @@ def test_canonical_blocks_and_audit_packet_expose_llmo_placement_metadata(tmp_pa
     assert resumed["status"] == "succeeded"
     task = resumed["audit_task_packet"]
     assert task["audit_scope"] == "jd_mapping_and_presentation"
-    assert {"POS-001", "HYG-001", "BASE-001", "MAP-001", "STAR-001", "LLMO-001", "CON-001", "EDT-001", "CL-001", "OPT-001"} == {item["rule_id"] for item in task["rule_pack"]["rules"]}
+    assert {"POS-001", "HYG-001", "BASE-001", "MAP-001", "STAR-001", "LLMO-001", "CON-001", "EDT-001", "TERM-001", "CL-001", "OPT-001"} == {item["rule_id"] for item in task["rule_pack"]["rules"]}
     assert "layout_contract" in task
     assert all("section" in block for item in task["materials"].values() for block in item["blocks"])
     assert "email" in task["forbidden"]
@@ -105,7 +105,7 @@ def test_canonical_blocks_and_audit_packet_expose_llmo_placement_metadata(tmp_pa
 def test_compiled_rule_pack_is_cv_cl_only_and_covers_star_jd_and_llmo():
     pack = build_rule_pack()
     ids = {rule["rule_id"] for rule in pack["rules"]}
-    assert {"POS-001", "HYG-001", "BASE-001", "MAP-001", "STAR-001", "LLMO-001", "CON-001", "EDT-001", "CL-001", "OPT-001"} == ids
+    assert {"POS-001", "HYG-001", "BASE-001", "MAP-001", "STAR-001", "LLMO-001", "CON-001", "EDT-001", "TERM-001", "CL-001", "OPT-001"} == ids
     assert pack["scope"] == "jd_mapping_and_presentation"
     assert all(set(rule["scope"]).issubset({"cv", "cover_letter"}) for rule in pack["rules"])
     consistency = next(item for item in pack["rules"] if item["rule_id"] == "CON-001")

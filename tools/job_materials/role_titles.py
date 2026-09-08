@@ -73,15 +73,18 @@ _METADATA_WORDS = (
 )
 
 # These are common lexical compounds rather than two separate jobs.  They
-# remain one title even without spaces around the slash.  Unknown slash forms
-# are treated as alternatives so an ambiguous A/B title is surfaced to the
-# user instead of being silently sent as a combined role.
+# remain one title with or without spaces around the slash.  Other
+# all-uppercase acronym pairs are handled by ``_is_compound_slash`` as the same
+# kind of order-insensitive compound; ordinary word-level alternatives are
+# still surfaced to the user instead of being silently combined.
 _COMPOUND_SLASHES = {
     "and/or",
     "aml/kyc",
     "kyc/aml",
     "kyc/cdd",
     "cdd/kyc",
+    "ecm/ipo",
+    "ipo/ecm",
     "ui/ux",
     "ux/ui",
     "qa/qc",
@@ -98,6 +101,8 @@ _COMPOUND_ACRONYMS = {
     "b2b",
     "b2c",
     "cdd",
+    "ecm",
+    "ipo",
     "kyc",
     "ml",
     "qa",
@@ -109,12 +114,57 @@ _COMPOUND_ACRONYMS = {
 }
 
 
+_ACRONYM_TOKEN_RE = re.compile(r"^[A-Z][A-Z0-9&+#-]{1,14}$")
+
+
 def _clean(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
 def _fold(value: str) -> str:
     return _clean(value).casefold()
+
+
+def _slash_components(left: str, right: str) -> tuple[str, str] | None:
+    """Return the acronym tokens around a slash, if they are visible.
+
+    The slash itself is presentation punctuation.  For a title such as
+    ``ECM / IPO Officer`` the left and right *tokens* are still ``ECM`` and
+    ``IPO`` even though whitespace and a trailing title suffix are present.
+    This helper keeps that decision host-owned and independent of another
+    package or a model's preferred wording.
+    """
+
+    left_match = re.search(r"([A-Za-z][A-Za-z0-9&+#-]{1,14})\s*$", str(left or ""))
+    right_match = re.match(r"\s*([A-Za-z][A-Za-z0-9&+#-]{1,14})\b", str(right or ""))
+    if not left_match or not right_match:
+        return None
+    return left_match.group(1), right_match.group(1)
+
+
+def _is_compound_slash(left: str, right: str, *, no_space_around: bool = False) -> bool:
+    """Whether a slash joins one compound title rather than two roles.
+
+    Known lexical compounds are always accepted.  Other all-uppercase
+    acronym pairs (for example ``ECM/IPO`` and ``IPO/ECM``) are also one
+    compound even when the portal inserts spaces around the slash.  Ordinary
+    title alternatives such as ``Paralegal / Legal Assistant`` remain
+    confirmation-worthy.
+    """
+
+    components = _slash_components(left, right)
+    if not components:
+        return False
+    left_token, right_token = components
+    compact = f"{left_token.casefold()}/{right_token.casefold()}"
+    if compact in _COMPOUND_SLASHES:
+        return True
+    if no_space_around:
+        left_folded = left_token.casefold()
+        right_folded = right_token.casefold()
+        if left_folded in _COMPOUND_ACRONYMS and right_folded in _COMPOUND_ACRONYMS:
+            return True
+    return bool(_ACRONYM_TOKEN_RE.fullmatch(left_token) and _ACRONYM_TOKEN_RE.fullmatch(right_token))
 
 
 def _is_metadata_parenthetical(value: str) -> bool:
@@ -205,22 +255,12 @@ def _split_top_level(value: str) -> list[str]:
             continue
         left = text[:index].strip()
         right = text[index + 1 :].strip()
-        compact = f"{left.casefold()}/{right.casefold()}"
-        left_token = re.findall(r"[A-Za-z0-9+#-]+$", left)
-        right_token = re.match(r"[A-Za-z0-9+#-]+", right)
         no_space_around = not (
             index > 0 and text[index - 1].isspace()
         ) and not (index + 1 < len(text) and text[index + 1].isspace())
-        acronym_compound = bool(
-            no_space_around
-            and left_token
-            and right_token
-            and left_token[0].casefold() in _COMPOUND_ACRONYMS
-            and right_token.group(0).casefold() in _COMPOUND_ACRONYMS
-        )
         # A slash in a known lexical compound is not an alternative.  A slash
         # with no visible text on one side is punctuation and is retained.
-        if not left or not right or compact in _COMPOUND_SLASHES or acronym_compound:
+        if not left or not right or _is_compound_slash(left, right, no_space_around=no_space_around):
             continue
         pieces.append(text[start:index].strip())
         start = index + 1
@@ -316,10 +356,19 @@ def build_role_title_contract(role: str, *, selected_primary: str = "") -> dict[
         "selection_mode": selection_mode,
         "ambiguity_status": ambiguity_status,
         "confirmation_needed": ambiguity_status == "pending_confirmation",
+        "slash_order_policy": {
+            "mode": "source_order_preserved",
+            "compound_order_is_non_substantive": True,
+            "equivalence_scope": "known lexical compounds and uppercase acronym pairs",
+            "equivalent_forms": "ECM/IPO == IPO/ECM (and the same pair with spaces around the slash)",
+            "confirmation_trigger": "materially_distinct_top_level_roles_only",
+            "model_action": "use the host-supplied title; do not reorder, verify against another package, or create a new title",
+        },
         "policy": (
             "Use one primary role in outbound material; keep alternatives for confirmation. "
             "Preserve substantive parentheses; remove only obvious location, work-arrangement "
-            "or identifier parentheses from the material-facing title."
+            "or identifier parentheses from the material-facing title. Slash order within "
+            "an acronym compound is non-substantive and never requires confirmation."
         ),
     }
 

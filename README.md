@@ -41,6 +41,14 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
 - **JobsDB 受控恢復更可操作**：日常 Chrome 未暴露 CDP 時，系統不會假裝完成驗證或無限重試，而是產生不含 cookie 的人工恢復交接記錄和可重跑提示；同時對重複門戶請求去重，保留頁碼與查詢別名，並輸出計劃/去重/錯誤/過濾診斷。
 - **驗收**：本次修復後完整 Python 回歸為 `585 passed, 7 skipped, 41 deselected`；個人工作區、Google 憑據、cookie 和運行產物仍不進入公開提交。
 
+## 🆕 最新更新 · 2026-09-08 · SOP Control 控制面接入
+
+- **统一控制入口**：`scan / push / materials / audit / format / apply / base / intent / archive / sync` 现在都先经过统一 workflow gateway，再调用原有业务适配器；模型不能自行切换旧入口或绕过状态机。
+- **规则真正进入运行时**：SOP 规则不只写在 `AGENTS.md` 或 README，而是登记在 `.sopcontrol/`，由 JobsFlow adapter 在动作前检查、动作后写入 receipt；缺少确认、能力凭证、当前输入或必要产物时会 fail-closed。
+- **材料链固定**：材料制作绑定 `materials-vnext-1`，旧材料入口拒绝继续；基础版 → 有界 JD 定制 → CV/CL 内容审计 → DOCX/PDF 格式门的顺序由系统控制。
+- **跨模型可接手**：项目身份、规则摘要、任务状态和证据记录可在不同模型、Harness 和 Worktree 间复用；模型切换不会重新发明一套流程。
+- **发布门**：SOP Control 的规则、测试命令、CI 固定版本和 pre-push gate 已接入；控制面证据与私人求职运行数据分离，不把简历、JD、cookie、Google 凭据或运行台账发布到 GitHub。
+
 ## 🎯 解決什麼問題？
 
 求職難，往往不是「找不到連結」，而是**整條鏈路運營不起來**：
@@ -292,7 +300,7 @@ JobsFlow 不靠關鍵詞堆砌，而是把 **JD 要求 → 已核實證據 → C
       [LLM ① 生成畫像] ──→ 用戶確認 ──→ facts_anchor / capability_upper
                                                    │
 每次深評：掃描後先查 URL 緩存（命中 = 0 網絡請求）   │
-  未命中 → LinkedIn CLI → JobsDB 瀏覽器兜底 → CT 不開瀏覽器 → teaser 兜底
+  未命中 → LinkedIn CLI → JobsDB 主 Chrome CDP 兜底 → CT 不開瀏覽器 → teaser 兜底
               │                         │
               └────────── 已緩存 JD ──────┘
                          │
@@ -324,7 +332,7 @@ DOCX/PDF 由統一 lane-master renderer 生成，模型不能繞過這些入口�
 - 初評 3.3 是內部直接調度線，不是用戶的最終取捨線；摘要缺失/過短、已有緩存或落在灰區的崗位會被救援。
 - 掃描深度把未命中緩存的網絡深取控制在節能約 10、平衡約 20、廣覆蓋約 40 個；緩存讀取不佔預算。沒拿到完整 JD 的崗位會進入 `待審-JD不足`，`/scan temp` 仍只掃上次之後的新崗。
 - 最終保留偏好由用戶選擇寬鬆 3.0、標準 3.3 或精選 3.5；它只重新篩選已保存的深評分數，不觸發新的網絡抓取。
-- LinkedIn 優先使用 CLI detail；JobsDB 才使用 Playwright 兜底；CTgoodjobs 默認不打開瀏覽器。需要時可設置 `PORTAL_JD_BROWSER=0` 完全關閉瀏覽器深取。
+- LinkedIn 優先使用 CLI detail；JobsDB 詳情只使用主 Chrome 的可見 CDP 會話（人工驗證一次後本輪串行復用）；CTgoodjobs 默認不打開瀏覽器。需要時可設置 `PORTAL_JD_BROWSER=0` 完全關閉瀏覽器深取。
 - PDF 繼續使用內容哈希緩存；未改變的 DOCX 不重複轉換。
 
 ## 📁 文件夾 + 臺帳：一套可遷移的求職資料系統
@@ -426,13 +434,22 @@ B1-003  =  商業運營方向 · 一級匹配 · 第 3 號
 JobsDB 是當前唯一需要瀏覽器深取兜底的主要門戶，處理順序固定為：
 
 1. 先按 URL 查 JD 緩存；緩存有效時不打開瀏覽器，也不消耗本輪深取預算。
-2. 緩存沒有全文時，先走受控的瀏覽器 detail 請求；遇到 WAF、Cloudflare、429 或空殼頁不無限重試，
+2. 緩存沒有全文時，先走受控的主 Chrome CDP detail 請求；遇到 WAF、Cloudflare、429 或空殼頁不無限重試，
    連續挑戰會打開門戶熔斷，後續職位明確標記 `paste_needed`/`待審-JD不足`。
-3. 在私人運行實例中，系統最多發起一次人工恢復：在用戶自己的日常 Google Chrome 中打開驗證頁，
-   用戶在彈出的真實瀏覽器窗口中點擊一次 Cloudflare 驗證。驗證通過後，系統復用同一個 Chrome 會話
-   順序抓取後續 JobsDB JD，並把經結構校驗的全文寫入共享緩存。
-4. 該過程不是無頭瀏覽器驗證，也不復制 cookie 到第二個瀏覽器；驗證未通過、超時、429 或內容未
+3. 在私人運行實例中，系統最多發起一次人工恢復：只在用戶自己的日常 Google Chrome 中打開驗證頁，
+   用戶在同一個真實瀏覽器窗口中點擊一次 Cloudflare 驗證。驗證通過後，系統復用同一個已通過 CDP
+   認證的 Chrome context 順序抓取後續 JobsDB JD，並把經結構校驗的全文寫入共享緩存。
+4. 該過程不是無頭瀏覽器驗證，也不復制 cookie 到第二個瀏覽器；不得啟動新的 `--user-data-dir` 或
+   隔離 profile。驗證未通過、超時、429 或內容未
    驗證都不會關閉熔斷。瀏覽器會話、cookie 和個人 token 永遠不進入 GitHub。
+
+這是唯一的 JobsDB 全文入口：`portal_jd_browser.py`、`portal_jd_cdp.py` 直接運行會被
+`jobsdb_gateway_only` 阻斷；JobsDB Bun `detail --teaser-only` 只提供結構化摘要，不能替代
+全文抓取。新模型或新 harness 不得自行設置內部 gateway 標記，也不得另起瀏覽器。
+
+Chrome 136+ 的遠端調試開關模式可能讓 `/json/version` 返回 404，但仍提供
+`/devtools/browser` 的 WebSocket；這是受支持的主 Chrome 路徑。網關只在正式掃描中
+建立一次連接並用 `Browser.getVersion` 驗證，不會因 HTTP 404 反覆探測或改用無頭瀏覽器。
 
 公開產品代碼只提供這套受控接口和安全默認值；私人運行實例才啟用用戶 Chrome 的人工恢復配置。
 JobsDB 的處理不會自動生成材料、不會自動入表，也不會自動投遞。
@@ -538,6 +555,9 @@ JD 中重要且真實的詞語。優先使用已核實的公司業務；如果�
 盡量保留原始標籤；只有超過 80 個字元才壓縮過長公司法律後綴、職位範圍或部門尾綴。
 壓縮只影響對外文件名，完整公司名和職位仍保存在 manifest/材料中，也不會把多個職位拼成
 一個新職位；Cover Letter 通常只在開頭提及主職位一次。
+
+斜槓連接的縮寫順序屬於展示差異而非事實差異，例如 `ECM/IPO` 與 `IPO/ECM` 等價；系統保留職位頁原順序，
+不要求模型改寫、查證或翻閱其他崗位材料。
 
 ### 一個定製示例
 

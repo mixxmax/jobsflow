@@ -57,19 +57,40 @@ than joining unrelated professions.
 Gate: JSON must contain the CLI contract envelope. A successful empty result is
 different from a failed request.
 
-## Step 3: Inspect promising results
+## Step 3: Inspect promising results (teaser only)
 
 ```bash
 bun run .agents/skills/jobsdb-search/cli/src/cli.ts detail <id-or-url> \
-  --format json
+  --teaser-only --format json
 ```
 
-`detail` returns structured fields such as teaser, salary, classification, work
-type, arrangement, location and date. It does not guarantee the full
-client-rendered description. Mark the actual JD depth; for materials, request a
-full-JD paste if deeper retrieval fails.
+`detail --teaser-only` returns structured fields such as teaser, salary,
+classification, work type, arrangement, location and date. It does not
+guarantee the full client-rendered description. The flag is mandatory: without
+it the CLI exits with `DETAIL_REQUIRES_GATEWAY`, so a model cannot accidentally
+promote structured data to a full JD. Mark the actual JD depth; for materials,
+request a full-JD paste if the gateway cannot retrieve it.
 
 Gate: never label structured fields or a teaser as a full JD.
+
+When this skill runs inside JobsFlow, `detail --teaser-only` is not the full-JD
+path and the model must not start a browser itself. Full JobsDB details are
+requested through `python3 -m tools.workflow scan` (or the gateway materials
+flow). If Cloudflare appears, the gateway performs one bounded handoff to a
+**visible user Chrome** CDP session; after the user verifies once, that same
+live context is reused serially for the remaining detail pages. A headless
+browser must never be used for the manual click, and the optional cookie header
+is only a search-API bridge, never a credential for detail-page fetching. If
+the gateway returns `requires_user_action`, follow its printed command and
+rerun the same gateway action instead of improvising another entry point.
+Chrome 136+ toggle mode may expose only the browser WebSocket
+`/devtools/browser` and return 404 from `/json/version`; this is expected. The
+gateway performs the single attach and validates `Browser.getVersion`. Do not
+repeat WebSocket probes or start another browser in response to the HTTP 404.
+The Python compatibility helpers (`portal_jd_browser.py` and
+`portal_jd_cdp.py`) are gateway-owned implementation details; direct JobsDB
+detail invocation is rejected with `jobsdb_gateway_only`. Do not set the
+gateway's internal process marker yourself.
 
 ## Step 4: Handle failures safely
 

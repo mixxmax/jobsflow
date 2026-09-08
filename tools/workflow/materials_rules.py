@@ -13,12 +13,10 @@ import hashlib
 import json
 from typing import Any, Iterable
 
-# v5 keeps the bounded lane-master delta as the primary review target while
-# restoring a lightweight whole-document entity and language sweep. Existing
-# packets must be regenerated because a delta-only audit cannot verify role,
-# employer/recruiter boundaries or sentence integrity across the final CV/CL.
-# CV and CL are parallel profile projections: omission in one is not conflict.
-RULES_VERSION = "materials-rules-v5"
+# v7 keeps the v6 rule set and adds explicit severity definitions plus the
+# change-class routing contract.  Packets must be regenerated because the
+# embedded gate policy participates in the rules digest.
+RULES_VERSION = "materials-rules-v7"
 
 # Keep this list compact.  A rule may point back to the handbook section for a
 # human, but the auditor receives the executable wording below.
@@ -27,9 +25,9 @@ COMPILED_RULES: tuple[dict[str, Any], ...] = (
         "rule_id": "POS-001",
         "severity": "P0",
         "scope": ["cv", "cover_letter"],
-        "check": "The CV and Cover Letter must clearly use entity_contract.role_primary and make its fit legible within a quick first read. For an overlong or top-level slash title, use the host-selected primary role rather than inventing another abbreviation or cramming every alternative into outbound materials; preserve a substantive parenthetical exactly unless the recorded user override selected a shorter title.",
-        "evidence": "Compare the role wording in both documents with entity_contract.role_primary and quote the heading/opening that establishes the target role.",
-        "repair": "use the selected primary role consistently and tighten the opening positioning without inventing facts",
+        "check": "The CV and Cover Letter must clearly use the host-owned entity_contract.role_primary and make its fit legible within a quick first read. The host decides the display string. A slash-separated acronym compound is order-insensitive (for example, ECM/IPO and IPO/ECM are the same role wording); do not flag, rewrite, or investigate a difference in that order. For an overlong or genuinely alternative title, use the host-selected primary role rather than inventing another abbreviation or cramming every alternative into outbound materials; preserve a substantive parenthetical exactly unless the recorded user override selected a shorter title.",
+        "evidence": "Compare the role wording in both documents with the host entity contract, accepting an equivalent acronym slash order, and quote the heading/opening that establishes the target role.",
+        "repair": "use the host-supplied role string; only repair a materially different role, never a harmless slash-order permutation",
         "source": "materials-quality-handbook:role-positioning",
     },
     {
@@ -94,6 +92,15 @@ COMPILED_RULES: tuple[dict[str, Any], ...] = (
         "evidence": "Quote the smallest affected sentence or block and identify the concrete grammar, truncation or edit-integrity problem.",
         "repair": "repair only the affected wording while preserving its evidence and JD purpose",
         "source": "materials-quality-handbook:language-and-edit-integrity",
+    },
+    {
+        "rule_id": "TERM-001",
+        "severity": "P1",
+        "scope": ["cv", "cover_letter"],
+        "check": "Run a domain-terminology sanity pass after JD tailoring and before release only for changes in meaning, scope or hierarchy. Slash-separated acronym order is presentation-only: ECM/IPO and IPO/ECM (with or without spaces) are equivalent and must never be a finding, repair target, confirmation request or reason to inspect another package. The host preserves the source/JD order; the auditor may flag only a genuinely different or contradictory concept.",
+        "evidence": "Quote the terminology only when it changes the JD meaning, scope or hierarchy. Do not cite a reversed slash order as a defect, and do not look for another package as a reference.",
+        "repair": "Leave harmless slash-order permutations unchanged; repair only a material terminology meaning/scope error using the current job's JD and host contract.",
+        "source": "materials-quality-handbook:terminology-normalization",
     },
     {
         "rule_id": "CL-001",
@@ -191,6 +198,20 @@ def build_rule_pack(*, include_p2: bool = True) -> dict[str, Any]:
             "max_repeat_finding": 2,
             "rule_precedence": ["HYG-001", "MAP-001"],
             "unsupported_requirement_policy": "internal_intentionally_omitted_never_outbound",
+            # Severity meanings are part of the contract so every auditor
+            # applies the same gate.  P2 never blocks and never forces a full
+            # rework round on its own.
+            "severity_definitions": {
+                "P0": "fabricated facts, wrong employer attribution, severely wrong numbers, active weakness disclosure, or a role/material that is plainly un-submittable",
+                "P1": "important JD requirement missed, responsibility mis-attributed, scope narrowed, severely insufficient STAR structure, cross-material factual contradiction, severe grammar or template residue",
+                "P2": "wording preference, evidence ordering suggestion, minor style issues, non-blocking expression improvements",
+            },
+            "change_classes": {
+                "wording_only": "synonym, voice, tone, sentence merge/split; host lint only, no independent re-audit",
+                "jd_alignment": "JD keyword adaptation and emphasis changes; audited with the delta",
+                "fact_sensitive": "touches numbers, attribution, scope or evidence verbs; incremental audit required",
+                "structure_change": "block-level reorganisation, heavy rewrite or addition; incremental audit required and key-experience edits need a change_reason",
+            },
         },
     }
 

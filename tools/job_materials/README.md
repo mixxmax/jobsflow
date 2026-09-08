@@ -77,9 +77,11 @@ does.
   未披露客户时不猜公司，也不把猎头名称带出 package。
 
 职位标题由 `role_title_contract` 统一处理：`role_display` 保留职位页原文；顶层
-斜杠（例如 `Paralegal / Legal Assistant` 或 `A/B`）会产生一个推荐的
-`role_primary` 和 `role_alternates`，对外材料默认只使用一个主职位，不把两个职位
-拼成第三个职位。若需要改选，可以先查看再确认：
+斜杠只有在连接两个实质不同的职位（例如 `Paralegal / Legal Assistant`）时才会产生
+一个推荐的 `role_primary` 和 `role_alternates`。缩写复合职位（例如 `ECM/IPO`、
+`IPO/ECM`，以及带空格的写法）是同一个职位，顺序不影响含义，系统保留职位页原顺序，
+不会触发确认、改写或跨包查找。对外材料默认只使用一个主职位，不把两个实质职位拼成
+第三个职位。若确实需要改选实质不同的职位，可以先查看再确认：
 
 ```bash
 python3 -m tools.job_materials role show --package "$PKG"

@@ -269,7 +269,7 @@ def test_cli_entrypoints_drive_the_complete_synthetic_chain(tmp_path):
     assert main(["materials", "draft", "--workspace", str(ws), "--job-id", "C0-001", "--content", str(canonical)]) == 0
     task = json.loads((package / "materials_audit_task.json").read_text(encoding="utf-8"))
     audit_result = tmp_path / "audit_result.json"
-    atomic_write_json(audit_result, {"job_id": "C0-001", "audit_scope": "jd_mapping_and_presentation", "audit_input_fingerprint": task["audit_input_fingerprint"], "auditor_context_id": task["auditor_context_id"], "counts": {"P0": 0, "P1": 0, "P2": 0}, "findings": []})
+    atomic_write_json(audit_result, {"job_id": "C0-001", "audit_scope": "jd_mapping_and_presentation", "audit_input_fingerprint": task["audit_input_fingerprint"], "audit_task_sha256": task["audit_task_sha256"], "delegation_id": task["delegation_id"], "auditor_context_id": task["auditor_context_id"], "counts": {"P0": 0, "P1": 0, "P2": 0}, "findings": []})
     assert main(["audit", "--workspace", str(ws), "--job-id", "C0-001", "--result", str(audit_result)]) == 0
     assert main(["materials", "render", "--workspace", str(ws), "--job-id", "C0-001"]) == 0
     from tools.workflow.materials_renderer import expected_filenames

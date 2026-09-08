@@ -198,9 +198,21 @@ def _python() -> str:
 
 
 def _repo_arg(workspace: Path) -> Path:
-    workspace = Path(workspace)
-    if workspace.name == "JobSearch_2026":
-        return workspace.parent
+    """Resolve the product checkout used to run a runtime workspace.
+
+    The runtime instance is allowed to provide data and configuration, but it
+    must never become a second implementation line.  New harnesses sometimes
+    pass a child directory (for example ``02_Tracker``) rather than the
+    ``JobSearch_2026`` root; resolving upward keeps the adapter on the same
+    product modules in both cases.
+    """
+    try:
+        workspace = Path(workspace).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return REPO
+    for candidate in (workspace, *workspace.parents):
+        if candidate.name == "JobSearch_2026" and (candidate / "00_Profile").is_dir():
+            return candidate.parent
     return REPO
 
 
@@ -222,6 +234,12 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
     repo = _repo_arg(workspace)
     env = os.environ.copy()
     env["JOBSEARCH_ROOT"] = str(workspace)
+    # The scan gateway is the sole owner of JobsDB detail recovery.  Child
+    # adapters receive this process marker; compatibility CLIs and direct
+    # script invocations do not, so they fail closed instead of opening a
+    # browser on their own.  This is intentionally set here (rather than in a
+    # user's shell) so changing models/harnesses cannot alter the route.
+    env["JOBSFLOW_GATEWAY_ACTIVE"] = "1"
     scan_cmd = [
         _python(),
         str(REPO / "tools" / "fresh_24h" / "fresh_24h_scan.py"),
@@ -449,13 +467,19 @@ def _execute_fixture(workspace: Path | None, payload: dict[str, Any], mode: str)
             "简历版本": job.get("lane") or job.get("track_hint") or "",
             "层级": job.get("tier") or "",
             "CareerOps分数": str(job.get("score") or "4.0"),
-            "评估状态": job.get("status") or "",
+            "初评分数": str(job.get("score") or "4.0"),
+            "深评分数": str(job.get("deep_score") or ""),
+            "JD深度": job.get("jd_depth") or "teaser",
+            "评估状态": job.get("status") or ("provisional_needs_jd" if not job.get("deep_score") else "ready"),
         }
         for idx, job in enumerate(jobs, start=1)
     ]
     csv_path = workspace / "02_Tracker" / f"fresh_24h_{day}_twopass_scored.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["岗位编号", "职位", "公司", "链接", "简历版本", "层级", "CareerOps分数", "评估状态"]
+    fields = [
+        "岗位编号", "职位", "公司", "链接", "简历版本", "层级",
+        "CareerOps分数", "初评分数", "深评分数", "JD深度", "评估状态",
+    ]
     lines = [",".join(fields)]
     for row in scored:
         lines.append(",".join(str(row.get(k) or "") for k in fields))

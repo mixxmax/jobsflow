@@ -14,24 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from tools.workflow.fresh_store import default_fresh_store
-from tools.workflow.sync import SyncCoordinator
+from tools.workflow.sync import SyncCoordinator, status_rank
 from tools.workflow.tracker_formats import (
     MATERIAL_STATUS_COMPLETE,
     MATERIAL_STATUS_FIELD,
 )
-
-
-_STATUS_RANK = {
-    "": 0,
-    "未做": 0,
-    "未制作": 0,
-    "已定制": 1,
-    "已制作": 1,
-    "已投递": 2,
-    "面试中": 3,
-    "已结束": 4,
-    "已录用": 5,
-}
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -133,7 +120,7 @@ def mark_materials_created(
         }
 
     current = str(row.get(MATERIAL_STATUS_FIELD) or "").strip()
-    if _STATUS_RANK.get(current, 0) > _STATUS_RANK[MATERIAL_STATUS_COMPLETE]:
+    if status_rank(current) > status_rank(MATERIAL_STATUS_COMPLETE):
         return {
             "status": "preserved",
             "title": title,

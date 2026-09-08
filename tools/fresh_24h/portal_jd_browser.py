@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""Fetch full job-description body via Playwright (JobsDB / CTgoodjobs / LinkedIn).
+"""Fetch full job-description body for the supported portal adapters.
 
 Solves the "no reliable JD body from portal APIs" gap for two-pass scoring.
 
 Design:
-  - Headless Chromium by default; optional channel=chrome / storage_state
+  - LinkedIn/other adapters may use the historical Playwright path.
+  - JobsDB detail pages are **CDP-only**: a retained, user-visible Chrome
+    context is mandatory; no headless or storage-state detail fallback exists.
   - Only used after pass-1 gate (callers decide)
   - Fail soft: return ok=False + stable fail_reason (waf|timeout|empty|error|blocked)
-  - Retry WAF/timeout/empty failures with a bounded delay; reuse private storage state
+  - Retry only the failure classes allowed by the portal policy
   - Successful bodies are written to the shared URL-keyed JD cache
   - Does NOT auto-apply or auto-tailor
 
 Usage:
+  # Product/runtime path (always preferred):
+  python3 -m tools.workflow scan --mode temp
+
+  # Compatibility implementation detail (direct JobsDB CLI is blocked):
   python3 tools/fresh_24h/portal_jd_browser.py --url 'https://hk.jobsdb.com/job/93633598'
-  python3 tools/fresh_24h/portal_jd_browser.py --url '…' --out /tmp/jd.md
-  python3 tools/fresh_24h/portal_jd_browser.py --url '…' --headed \
-    --save-storage-state ~/.config/jobsearch/storage_state_jobsdb.json
+
+For JobsDB, any ``--headed``, ``--interactive-verification``, persistent-profile,
+storage-state or signal-file request is hard-routed to the visible user-Chrome
+CDP recovery path when invoked by the gateway.  Direct JobsDB CLI invocation is
+rejected with ``jobsdb_gateway_only``.  It never opens a Playwright verification
+window or treats a copied storage state as a detail-page credential.  The gateway
+remains the only supported scan entry point.
 """
 
 from __future__ import annotations
@@ -27,6 +37,7 @@ import math
 import os
 import random
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -36,7 +47,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunsplit
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -105,6 +116,31 @@ TRUSTED_SELECTORS: dict[str, list[str]] = {
     portal: [selector for selector in selectors if selector not in _GENERIC_SELECTORS]
     for portal, selectors in SELECTORS.items()
 }
+
+# A JobsDB detail session is not authorized by a collection of public-looking
+# attributes (``portal=jobsdb``, ``headless=False`` and a mode string).  Those
+# attributes are useful diagnostics, but a new harness can accidentally (or
+# deliberately) construct an object that claims them.  ``connect()`` mints
+# this process-local capability only after the endpoint, browser identity,
+# profile guard and exclusive lease have all passed.  The value never leaves
+# this module and is cleared when the transport is detached.
+_CDP_SESSION_ATTESTATION = object()
+
+# JobsDB detail recovery is an orchestration-owned side effect.  The gateway
+# sets this marker only on the scan/score subprocesses it starts.  It is not a
+# user configuration knob and is intentionally not documented as something a
+# model may set.  The marker closes the last accidental bypass: a new harness
+# discovering one of the compatibility CLIs must be redirected to the single
+# ``python3 -m tools.workflow scan`` entry instead of starting a recovery on
+# its own.  The lower-level fetch seam remains safe even without the marker:
+# it can only use a previously attested CDP session or return a blocker.
+_WORKFLOW_GATEWAY_ENV = "JOBSFLOW_GATEWAY_ACTIVE"
+
+
+def _workflow_gateway_active() -> bool:
+    """Whether this process was launched by the official workflow gateway."""
+
+    return os.environ.get(_WORKFLOW_GATEWAY_ENV, "").strip() == "1"
 
 
 @dataclass
@@ -535,7 +571,16 @@ def default_storage_state_path(portal: str) -> Path:
 
 
 def resolve_storage_state(storage_state: str | Path | None, portal: str) -> Path | None:
-    """Resolve explicit/env/default state, silently ignoring missing files."""
+    """Resolve state for portals that allow snapshots.
+
+    JobsDB is intentionally excluded even when an old state file exists.  The
+    browser-bound Cloudflare session is a live primary-Chrome capability, not
+    a portable storage-state credential; keeping this invariant in the shared
+    resolver prevents compatibility callers from accidentally resurrecting the
+    retired cookie/profile route.
+    """
+    if str(portal or "").strip().casefold() == "jobsdb":
+        return None
     raw = storage_state or os.environ.get("PORTAL_JD_STORAGE_STATE")
     path = Path(raw).expanduser() if raw else default_storage_state_path(portal)
     return path if path.is_file() else None
@@ -594,6 +639,7 @@ class JdBrowserSession:
         interactive_verification: bool = False,
         verification_timeout_seconds: int = 600,
         user_data_dir: str | Path | None = None,
+        allow_legacy_jobsdb: bool = False,
     ) -> None:
         if interactive_verification and headless:
             raise ValueError("interactive_verification_requires_headed")
@@ -606,6 +652,13 @@ class JdBrowserSession:
         self.interactive_verification = bool(interactive_verification)
         self.verification_timeout_seconds = int(verification_timeout_seconds)
         self.user_data_dir = Path(user_data_dir).expanduser() if user_data_dir else None
+        # Kept only for source compatibility with old callers/tests.  It is
+        # deliberately ignored: JobsDB details are CDP-only and no runtime
+        # flag may re-enable a second/headless browser.  This is important
+        # when a new model discovers an old helper and passes the historical
+        # ``allow_legacy_jobsdb`` argument.
+        del allow_legacy_jobsdb
+        self._allow_legacy_jobsdb = False
         self._playwright = None
         self._browser = None
         self.context = None
@@ -613,6 +666,13 @@ class JdBrowserSession:
         self._profile_lock_owned = False
 
     def _launch(self, playwright):
+        if str(self.portal or "").strip().casefold() == "jobsdb":
+            # Defensive duplicate of ``start``: a compatibility caller that
+            # reaches this private helper directly still cannot launch a
+            # Playwright browser for a browser-bound JobsDB detail page.
+            raise RuntimeError(
+                "jobsdb_direct_playwright_disabled_use_user_chrome_cdp"
+            )
         last_err = None
         for ch in ([self.channel] if self.channel else []) + [None]:
             try:
@@ -625,6 +685,14 @@ class JdBrowserSession:
         raise RuntimeError(str(last_err))
 
     def start(self) -> "JdBrowserSession":
+        # JobsDB is never allowed to start a Playwright browser.  Its
+        # browser-bound Cloudflare session must come from the user's primary
+        # Chrome over CDP.  Keep this unconditional even for legacy callers;
+        # the old boolean escape hatch is intentionally inert.
+        if str(self.portal or "").strip().casefold() == "jobsdb":
+            raise RuntimeError(
+                "jobsdb_direct_playwright_disabled_use_user_chrome_cdp"
+            )
         if self.context is not None:
             return self
         from playwright.sync_api import sync_playwright
@@ -773,6 +841,12 @@ class JdBrowserSession:
         canon = normalize_job_url(raw, source=portal if portal != "generic" else "")
         if not canon:
             return JdFetchResult(ok=False, url=raw, portal=portal, fail_reason="empty")
+        # Do not let a caller disguise a JobsDB URL as a generic/LinkedIn
+        # session in order to reach ``start()``.  The explicit JobsDB session
+        # is guarded by ``start`` as well; this check closes the mismatched
+        # portal loophole that a new harness could otherwise create.
+        if portal == "jobsdb" and str(self.portal or "").strip().casefold() != "jobsdb":
+            return _jobsdb_cdp_required_result(canon)
         try:
             self.start()
             save_path = _safe_storage_path(save_storage_state) if save_storage_state else None
@@ -1009,6 +1083,8 @@ class JdBrowserSession:
                     pass
         except Exception as exc:
             message = str(exc).lower()
+            if "jobsdb_direct_playwright_disabled" in message:
+                return _jobsdb_cdp_required_result(canon)
             if "profile_locked" in message:
                 return JdFetchResult(
                     ok=False, url=canon, portal=portal,
@@ -1024,10 +1100,13 @@ class JdBrowserSession:
 
 
 def _jobsdb_profile_dir() -> Path | None:
-    """Resolve the optional dedicated JobsDB persistent profile directory.
+    """Return the retired profile path for migration diagnostics only.
 
-    Enabled via ``PORTAL_JD_JOBSDB_PROFILE_DIR``; must live under the user home
-    directory.  When absent, the session pool stays in snapshot mode.
+    This helper is retained for callers that display a migration message, but
+    no production JobsDB detail path calls it.  A value from
+    ``PORTAL_JD_JOBSDB_PROFILE_DIR`` must never select a browser or become a
+    detail credential; the only accepted JobsDB transport is primary-Chrome
+    CDP.  Returning ``None`` also makes accidental legacy use fail closed.
     """
     raw = os.environ.get("PORTAL_JD_JOBSDB_PROFILE_DIR", "").strip()
     if not raw:
@@ -1042,18 +1121,544 @@ def _jobsdb_profile_dir() -> Path | None:
             file=sys.stderr,
         )
         return None
-    return path
+    return None
 
 
 def default_jobsdb_recovery_profile_dir() -> Path:
-    """Dedicated visible-Chrome profile used only for human WAF recovery.
+    """Legacy path retained for compatibility, never used for JobsDB details.
 
-    This deliberately does not attach Playwright to the user's already-open
-    daily Chrome profile.  It launches the installed Google Chrome app in a
-    visible window while keeping JobsDB cookies isolated from unrelated
-    personal browsing data and avoiding Chrome profile-lock corruption.
+    Older releases launched a second Chrome profile from this path.  That
+    profile is not the user's primary browser and therefore cannot be a
+    trusted Cloudflare session.  Current code never launches it; the helper is
+    retained only so old callers can display a migration hint without a
+    missing-symbol error.
     """
-    return Path.home() / ".config" / "jobsearch" / "browser_profiles" / "jobsdb"
+    return Path.home() / ".config" / "jobsearch" / "browser_profiles" / "jobsdb-cdp"
+
+
+def _validate_local_cdp_endpoint(raw: str | int | None) -> str:
+    """Normalize a CDP endpoint while keeping the trust boundary local-only.
+
+    JobsDB authentication must never be sent to a remote debugging endpoint.
+    A caller may provide either a localhost HTTP endpoint (the usual
+    ``http://127.0.0.1:9222``) or a localhost WebSocket endpoint exposed by a
+    browser harness.  Invalid or non-local values fail closed to the default
+    local port.
+    """
+    text = str(raw or "").strip()
+    if text.isdigit():
+        try:
+            port = int(text)
+        except ValueError:
+            port = 9222
+        return f"http://127.0.0.1:{port if 1 <= port <= 65535 else 9222}"
+    if not text:
+        return "http://127.0.0.1:9222"
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https", "ws", "wss"}:
+        return "http://127.0.0.1:9222"
+    host = (parsed.hostname or "").casefold()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return "http://127.0.0.1:9222"
+    try:
+        port = parsed.port
+    except ValueError:
+        return "http://127.0.0.1:9222"
+    if port is None or not 1 <= port <= 65535:
+        return "http://127.0.0.1:9222"
+    # Do not preserve credentials/query strings from an arbitrary env value.
+    # A websocket browser endpoint may retain its /devtools/browser path.
+    netloc = f"[{host}]" if ":" in host and host != "localhost" else host
+    netloc = f"{netloc}:{port}"
+    path = parsed.path.rstrip("/")
+    return f"{parsed.scheme}://{netloc}{path}"
+
+
+def _configured_jobsdb_cdp_endpoint(default_port: int = 9222) -> str:
+    """Resolve one local CDP endpoint for every JobsDB entry point.
+
+    The endpoint is process configuration, not model input.  Supporting an
+    explicit local URL lets browser harnesses expose their already-connected
+    Chrome without teaching the model a second JobsDB workflow.
+    """
+    # JobsDB is intentionally stricter than the generic browser adapters.
+    # Do not inherit a harness-wide Browser-Use/Playwright endpoint here: a
+    # new model must not be able to route a JobsDB detail request into a
+    # headless or otherwise unrelated local browser.  Only the explicit
+    # JobsFlow JobsDB setting is accepted; the default remains Chrome's local
+    # debugging port.
+    for key in ("JOBSFLOW_JOBSDB_CDP_URL",):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            endpoint = _validate_local_cdp_endpoint(raw)
+            # An invalid/non-local value is normalized to the safe default;
+            # do not let it mask a later valid configuration key.
+            if endpoint != "http://127.0.0.1:9222" or raw in {
+                "http://127.0.0.1:9222",
+                "http://localhost:9222",
+            }:
+                return endpoint
+    raw_port = os.environ.get("JOBSFLOW_JOBSDB_CDP_PORT", "").strip()
+    if raw_port:
+        return _validate_local_cdp_endpoint(raw_port)
+    return _validate_local_cdp_endpoint(default_port)
+
+
+def _jobsdb_cdp_endpoint(raw: str | int | None = None) -> str:
+    """Resolve a local primary-Chrome CDP endpoint for JobsDB only.
+
+    Generic browser skills sometimes expose a localhost WebSocket endpoint
+    through ``BROWSER_USE_CDP_URL`` or ``BU_CDP_URL``.  Those endpoints are
+    valid for their own workflows, but they are not an acceptable JobsDB
+    credential because they may belong to a headless browser.  JobsDB accepts
+    only the explicit JobsFlow local endpoint (HTTP discovery or the Chrome
+    136+ WebSocket-only browser endpoint); the attached runtime identity is
+    checked before a session is attested.
+    """
+    endpoint = _validate_local_cdp_endpoint(
+        raw if raw is not None else _configured_jobsdb_cdp_endpoint()
+    )
+    return endpoint
+
+
+def _cdp_probe_url(endpoint: str) -> str | None:
+    """Return the HTTP health URL, or ``None`` for a WebSocket endpoint."""
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if parsed.path.rstrip("/").endswith("/json/version"):
+        return endpoint
+    return endpoint.rstrip("/") + "/json/version"
+
+
+def _cdp_connection_url(endpoint: str) -> str:
+    """Normalize a local CDP health URL into a Playwright connection URL.
+
+    Chrome exposes ``/json/version`` for health/discovery, while
+    ``connect_over_cdp`` expects the browser endpoint (the origin) for HTTP
+    endpoints.  Accepting either spelling is useful for different harnesses,
+    but passing the discovery resource itself can fail or attach
+    inconsistently across Playwright versions.
+    """
+    parsed = urlparse(endpoint)
+    if parsed.scheme in {"http", "https"} and parsed.path.rstrip("/").endswith(
+        "/json/version"
+    ):
+        base_path = parsed.path.rstrip("/")[: -len("/json/version")]
+        return urlunsplit((parsed.scheme, parsed.netloc, base_path.rstrip("/"), "", ""))
+    return endpoint
+
+
+def _cdp_ws_connection_url(endpoint: str) -> str:
+    """Return the browser-level WebSocket URL for a local CDP endpoint.
+
+    Chrome's newer ``Allow remote debugging`` toggle can intentionally expose
+    no ``/json/version`` HTTP discovery document.  It still accepts the
+    browser-level WebSocket handshake at ``/devtools/browser``.  This helper
+    derives that URL from the normal local HTTP endpoint, or validates an
+    explicitly configured local ``ws://`` endpoint.  No discovery URL,
+    websocket token or page data is returned to diagnostics.
+    """
+    parsed = urlparse(endpoint)
+    if parsed.scheme in {"ws", "wss"}:
+        path = parsed.path.rstrip("/")
+        if path in {"", "/json/version"}:
+            path = "/devtools/browser"
+        if not path.startswith("/devtools/browser"):
+            raise RuntimeError("cdp_websocket_path_invalid")
+        return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    if parsed.scheme in {"http", "https"}:
+        return urlunsplit(
+            (
+                "wss" if parsed.scheme == "https" else "ws",
+                parsed.netloc,
+                "/devtools/browser",
+                "",
+                "",
+            )
+        )
+    raise RuntimeError("cdp_endpoint_scheme_invalid")
+
+
+def _cdp_local_port_available(endpoint: str, *, timeout: float = 0.5) -> bool:
+    """Check whether the local CDP TCP listener exists without WS auth.
+
+    The Chrome toggle may show an authorization prompt for every WebSocket
+    handshake that is not yet approved.  Health checks must therefore avoid
+    opening a second WebSocket connection: a plain TCP connect is enough to
+    decide whether the gateway should attempt its single authoritative
+    Playwright attach.  Browser identity and authorization are still enforced
+    by ``JobsdbCdpBatchSession.connect``.
+    """
+    try:
+        parsed = urlparse(endpoint)
+        host = parsed.hostname
+        port = parsed.port
+        if not host or port is None:
+            return False
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _read_cdp_version(endpoint: str) -> dict[str, Any] | None:
+    """Read local Chrome DevTools discovery metadata without exposing it.
+
+    The returned payload is an internal check only.  Callers must never put
+    ``webSocketDebuggerUrl`` or any other discovery value in diagnostics.
+    ``None`` means the endpoint is unavailable or is not a valid discovery
+    document.
+    """
+    probe_url = _cdp_probe_url(endpoint)
+    if probe_url is None:
+        return None
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(probe_url, timeout=1) as response:
+            if response.status != 200:
+                return None
+            payload = json.loads(response.read().decode("utf-8"))
+            return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _is_primary_chrome_version(payload: dict[str, Any] | None) -> bool:
+    """Accept only a non-headless Google Chrome DevTools endpoint."""
+    if not isinstance(payload, dict):
+        return False
+    # HTTP discovery calls this field ``Browser``; CDP ``Browser.getVersion``
+    # returns the same identity as ``product`` (for example
+    # ``Chrome/151.0.0.0``).  Treating both representations identically keeps
+    # the browser trust decision transport-independent.
+    browser = str(
+        payload.get("Browser")
+        or payload.get("browser")
+        or payload.get("product")
+        or payload.get("userAgent")
+        or ""
+    ).strip()
+    lowered = browser.casefold()
+    if "headless" in lowered:
+        return False
+    # Chrome's discovery payload is normally ``Chrome/<version>`` or
+    # ``Google Chrome/<version>``.  Reject Chromium/Firefox/Browser-Use
+    # endpoints rather than guessing that they are the user's primary Chrome.
+    return bool(re.search(r"(?:^|\s|/)google chrome/|(?:^|\s|/)chrome/", lowered))
+
+
+def _read_attached_cdp_version(remote: Any, context: Any) -> dict[str, Any] | None:
+    """Read ``Browser.getVersion`` after a WebSocket-only CDP attach.
+
+    Chrome's WS-only toggle removes the HTTP discovery payload that used to
+    identify the browser.  The CDP command is the authoritative replacement.
+    It is sent through an existing page when possible; if the context has no
+    pages, a blank temporary page is created and immediately closed.  No URL,
+    page text, cookie or storage state is read.  A small ``remote.version``
+    fallback keeps the helper compatible with Playwright/test doubles that do
+    not expose ``new_cdp_session``; real Chrome uses the CDP command above.
+    """
+    pages: list[Any] = []
+    try:
+        pages = list(getattr(context, "pages", []) or [])
+    except Exception:
+        pages = []
+    page = pages[0] if pages else None
+    created_page = False
+    cdp_session = None
+    try:
+        if page is None:
+            new_page = getattr(context, "new_page", None)
+            if not callable(new_page):
+                return None
+            page = new_page()
+            created_page = True
+        new_cdp_session = getattr(context, "new_cdp_session", None)
+        if callable(new_cdp_session):
+            cdp_session = new_cdp_session(page)
+            payload = cdp_session.send("Browser.getVersion")
+            if isinstance(payload, dict):
+                product = payload.get("product") or payload.get("Browser")
+                return {
+                    "Browser": str(product or ""),
+                    "product": str(product or ""),
+                    "userAgent": str(payload.get("userAgent") or ""),
+                }
+        version = getattr(remote, "version", None)
+        if callable(version):
+            version = version()
+        if version:
+            return {"Browser": str(version)}
+    except Exception:
+        return None
+    finally:
+        try:
+            detach = getattr(cdp_session, "detach", None)
+            if callable(detach):
+                detach()
+        except Exception:
+            pass
+        if created_page:
+            try:
+                close = getattr(page, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
+    return None
+
+
+def _connect_over_cdp(chromium: Any, endpoint: str, *, timeout_ms: int = 5000) -> Any:
+    """Attach with a bounded timeout while tolerating tiny test doubles."""
+    connect = getattr(chromium, "connect_over_cdp")
+    try:
+        return connect(endpoint, timeout=timeout_ms)
+    except TypeError as exc:
+        # Older Playwright shims and our lightweight fixtures may only accept
+        # the endpoint positional argument.  Do not hide a real TypeError from
+        # the connection itself: only retry when the keyword is unsupported.
+        message = str(exc).casefold()
+        if "unexpected keyword" not in message and "keyword" not in message:
+            raise
+        return connect(endpoint)
+
+
+def _endpoint_port(endpoint: str, *, fallback: int = 9222) -> int:
+    """Extract a safe display/diagnostic port from a local CDP endpoint."""
+    try:
+        port = urlparse(endpoint).port
+    except ValueError:
+        port = None
+    if port is None or not 1 <= port <= 65535:
+        return int(fallback)
+    return int(port)
+
+
+def jobsdb_cdp_status(endpoint: str | None = None) -> dict[str, Any]:
+    """Return a safe, read-only health snapshot for the JobsDB CDP gate.
+
+    This is intentionally a diagnostic surface, not a second connection path.
+    It reports only transport state, port and the next action; it never reads
+    cookies, storage state, page text or the browser websocket URL.  A model
+    can therefore run ``workflow doctor`` before scanning without guessing
+    whether it may launch a browser.
+    """
+    configured = _jobsdb_cdp_endpoint(endpoint)
+    result: dict[str, Any] = {
+        "transport": "primary_chrome_cdp",
+        "endpoint_port": _endpoint_port(configured),
+        "headless": False,
+        "browser_channel": "user-chrome-cdp",
+        "entrypoint": "workflow_gateway",
+        "detail_transport": "primary_chrome_cdp_only",
+        "cookie_scope": "search_api_only",
+        "ready": False,
+        "status": "unavailable",
+        "requires_user_action": False,
+        "recommended_action": "enable_primary_chrome_cdp",
+        "manual_command": 'open -a "Google Chrome" "chrome://inspect/#remote-debugging"',
+        "manual_hint": (
+            "请在主 Chrome 的 chrome://inspect/#remote-debugging 页面启用 "
+            "Allow remote debugging，然后重跑统一 scan。"
+        ),
+    }
+    if _cdp_endpoint_owned_by_retired_profile(configured):
+        result.update(
+            {
+                "status": "retired_profile",
+                "requires_user_action": True,
+                "recommended_action": "close_retired_jobsdb_profile",
+                "manual_hint": (
+                    "请关闭旧的 JobsDB 专用 Chrome 窗口，再在主 Chrome 的 "
+                    "chrome://inspect/#remote-debugging 页面启用 Allow remote debugging。"
+                ),
+            }
+        )
+        return result
+
+    payload = _read_cdp_version(configured)
+    if payload is None:
+        # Do not open a WebSocket from ``doctor``.  Chrome's new toggle may
+        # surface an Allow-remote-debugging prompt per handshake; the gateway
+        # must own the one real attach.  A listening local port is sufficient
+        # here to report that the WS-only transport is available/pending.
+        if not _cdp_local_port_available(configured):
+            result["requires_user_action"] = True
+            return result
+        result.update(
+            {
+                "ready": True,
+                "status": "ws_only_transport_pending",
+                "protocol": "websocket_only",
+                "identity_verified": False,
+                "requires_user_action": False,
+                "recommended_action": "run_gateway_scan_for_cdp_attestation",
+                "manual_hint": (
+                    "主 Chrome 的 WS-only CDP 端口已监听；首次 scan 会进行唯一一次"
+                    "连接并验证 Browser.getVersion，不要重复运行 doctor 或手动启动第二个浏览器。"
+                ),
+            }
+        )
+        return result
+    if not _is_primary_chrome_version(payload):
+        result.update(
+            {
+                "status": "non_primary_browser",
+                "requires_user_action": True,
+                "recommended_action": "enable_primary_chrome_cdp",
+                "manual_hint": (
+                    "当前端点不是可接受的主 Chrome；请在主 Chrome 中启用 "
+                    "Allow remote debugging 后重试。"
+                ),
+            }
+        )
+        return result
+
+    result.update(
+        {
+            "ready": True,
+            "status": "reachable",
+            "requires_user_action": False,
+            "recommended_action": "none",
+        }
+    )
+    return result
+
+
+def _cdp_endpoint_owned_by_retired_profile(endpoint: str) -> bool:
+    """Fail closed when the endpoint belongs to the retired second profile.
+
+    An older JobsFlow run could leave a visible Chrome started with
+    ``--user-data-dir=.../browser_profiles/jobsdb-cdp`` on the default CDP
+    port.  The endpoint is technically reachable, but it is not the user's
+    primary Chrome session and must not be reused for Cloudflare details.  On
+    macOS, inspect only process arguments (never cookies or browser data) to
+    distinguish that stale process.  If process inspection is unavailable we
+    simply return ``False`` and let the normal CDP handshake decide.
+    """
+    if os.name != "posix":
+        return False
+    port = _endpoint_port(endpoint)
+    # Chrome accepts both ``--remote-debugging-port=9222`` and
+    # ``--remote-debugging-port 9222``.  The old detector only recognised the
+    # first form, so a new harness could accidentally attach to the retired
+    # profile when the second form was used.
+    port_pattern = re.compile(
+        rf"(?:^|\s)--remote-debugging-port(?:=|\s+){port}(?:\s|$)"
+    )
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        return False
+    for line in (completed.stdout or "").splitlines():
+        command = line.strip()
+        if not port_pattern.search(command) or "Google Chrome" not in command:
+            continue
+        lowered = command.casefold()
+        # Any custom user-data-dir on the JobsDB debugging port is a
+        # non-primary profile.  It is unsafe to guess that it happens to be
+        # the user's daily Chrome; reject it and ask the user to expose the
+        # primary profile instead.  Support both ``=path`` and `` path``.
+        if "--user-data-dir" not in lowered:
+            continue
+        if "google chrome helper" not in lowered:
+            return True
+    return False
+
+
+def _jobsdb_cdp_lease_path() -> Path:
+    """Return the machine-local lease path for the primary Chrome session.
+
+    The lease contains no browser state or credentials.  It is deliberately
+    outside the repository and runtime tracker so two independent harnesses
+    cannot navigate the same visible Chrome at the same time.  A kernel file
+    lock (when available) is used so a crashed process does not leave a stale
+    logical lock behind.
+    """
+    return Path.home() / ".config" / "jobsearch" / "jobsdb_primary_cdp.lock"
+
+
+class _JobsdbCdpLease:
+    """Process-safe exclusive lease for one JobsDB primary-Chrome session."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = Path(path or _jobsdb_cdp_lease_path()).expanduser()
+        self._fd: int | None = None
+        self._fallback_path: Path | None = None
+
+    def acquire(self) -> "_JobsdbCdpLease":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
+        # POSIX flock is released by the kernel if the owner dies.  This is
+        # the normal path on macOS/Linux (the supported JobsFlow runtime).
+        try:
+            import fcntl
+
+            fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError) as exc:
+                os.close(fd)
+                raise RuntimeError("cdp_session_busy") from exc
+            os.ftruncate(fd, 0)
+            os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
+            self._fd = fd
+            return self
+        except ImportError:
+            # Minimal fallback for non-POSIX hosts.  It is only a compatibility
+            # path; the caller still receives a clear busy result.
+            marker = self.path.with_name(self.path.name + ".owner")
+            try:
+                fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
+                os.close(fd)
+                self._fallback_path = marker
+                return self
+            except FileExistsError as exc:
+                raise RuntimeError("cdp_session_busy") from exc
+        except OSError as exc:
+            raise RuntimeError("cdp_session_lease_unavailable") from exc
+
+    @property
+    def acquired(self) -> bool:
+        return self._fd is not None or self._fallback_path is not None
+
+    def release(self) -> None:
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        marker, self._fallback_path = self._fallback_path, None
+        if marker is not None:
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def __enter__(self) -> "_JobsdbCdpLease":
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.release()
 
 
 class BrowserSessionPool:
@@ -1061,33 +1666,41 @@ class BrowserSessionPool:
 
     def __init__(self, *, headless: bool = True) -> None:
         self.headless = headless
-        self._sessions: dict[str, JdBrowserSession] = {}
+        self._sessions: dict[str, Any] = {}
         self._jobsdb_profile_override: Path | None = None
 
     def configure_jobsdb_profile(self, profile_dir: str | Path) -> None:
-        """Use one persistent JobsDB profile for headless scans and recovery."""
-        self._jobsdb_profile_override = Path(profile_dir).expanduser()
+        """Reject the retired headless JobsDB profile configuration.
 
-    def session_for(self, url: str) -> JdBrowserSession | None:
+        JobsDB detail pages are protected by a browser-bound challenge.  A
+        persistent Playwright profile is not the user's verified browser and
+        routinely re-enters the challenge loop.  Keep this method as a
+        compatibility seam so an old caller fails with an actionable error
+        instead of silently selecting the wrong browser.
+        """
+        del profile_dir
+        raise RuntimeError(
+            "jobsdb_headless_profile_disabled_use_user_chrome_cdp"
+        )
+
+    def session_for(self, url: str) -> Any | None:
         portal = detect_portal(url)
         # CTgoodjobs is intentionally teaser-only in two-pass; never create a
         # browser session for it unless a future explicit policy enables one.
-        if portal not in {"jobsdb", "linkedin"}:
+        # JobsDB is deliberately absent: detail pages may only use the
+        # validated visible-Chrome CDP session supplied by recovery.
+        if portal == "jobsdb":
+            return None
+        if portal not in {"linkedin"}:
             return None
         if portal not in self._sessions:
-            user_data_dir = (
-                self._jobsdb_profile_override or _jobsdb_profile_dir()
-                if portal == "jobsdb"
-                else None
-            )
             self._sessions[portal] = JdBrowserSession(
                 portal=portal,
                 headless=self.headless,
-                user_data_dir=user_data_dir,
             )
         return self._sessions[portal]
 
-    def replace_session(self, portal: str, session: JdBrowserSession) -> None:
+    def replace_session(self, portal: str, session: Any) -> None:
         """Replace one portal session, closing the stale context first."""
         previous = self._sessions.get(portal)
         if previous is not None and previous is not session:
@@ -1106,6 +1719,349 @@ class BrowserSessionPool:
         self._sessions.clear()
 
 
+class JobsdbCdpBatchSession:
+    """A reusable, user-visible JobsDB session attached over CDP.
+
+    This is deliberately a small duck-typed companion to ``JdBrowserSession``
+    so that ``fetch_jd_body`` and the existing browser pool can use the same
+    seam.  The Playwright connection is kept open for the whole scan.  Closing
+    this object only stops the local Playwright transport; it never calls a
+    browser shutdown command, so the user's Chrome window remains open.
+    """
+
+    portal = "jobsdb"
+    headless = False
+    channel = "user-chrome-cdp"
+    user_data_dir = None
+
+    def __init__(self, playwright, remote, context, *, lease: _JobsdbCdpLease | None = None) -> None:
+        self._playwright = playwright
+        self._remote = remote
+        self.context = context
+        self._lease = lease
+        self.browser_version: str | None = None
+        self._closed = False
+        # Attestation is set only after ``connect`` has completed the local
+        # endpoint/profile checks and a real CDP context has been obtained.
+        # It prevents a stale duck-typed object from being mistaken for the
+        # approved detail transport by the workflow gate.
+        self._jobsflow_approved_cdp_session = False
+        self._jobsflow_cdp_attestation: object | None = None
+
+    @classmethod
+    def connect(
+        cls,
+        debug_port: int = 9222,
+        *,
+        cdp_endpoint: str | None = None,
+    ) -> "JobsdbCdpBatchSession":
+        from playwright.sync_api import sync_playwright
+
+        endpoint = _jobsdb_cdp_endpoint(
+            cdp_endpoint or _configured_jobsdb_cdp_endpoint(debug_port)
+        )
+        if _cdp_endpoint_owned_by_retired_profile(endpoint):
+            raise RuntimeError("cdp_endpoint_retired_profile")
+        payload = _read_cdp_version(endpoint)
+        ws_only = payload is None
+        if payload is not None and not _is_primary_chrome_version(payload):
+            raise RuntimeError("cdp_non_primary_browser")
+        if ws_only and not _cdp_local_port_available(endpoint):
+            raise RuntimeError("cdp_endpoint_unavailable")
+        lease = _JobsdbCdpLease().acquire()
+        playwright = None
+        try:
+            playwright = sync_playwright().start()
+            connection_url = (
+                _cdp_ws_connection_url(endpoint)
+                if ws_only
+                else _cdp_connection_url(endpoint)
+            )
+            try:
+                remote = _connect_over_cdp(
+                    playwright.chromium,
+                    connection_url,
+                    timeout_ms=5000,
+                )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError("cdp_endpoint_unavailable") from exc
+            contexts = list(remote.contexts)
+            if not contexts:
+                raise RuntimeError("cdp_no_context")
+            if ws_only:
+                # The WS-only path has no HTTP Browser field to trust.  Do
+                # not mint the JobsDB detail capability until the attached
+                # context proves it is the user's non-headless Chrome.
+                attached_payload = _read_attached_cdp_version(
+                    remote, contexts[0]
+                )
+                if not _is_primary_chrome_version(attached_payload):
+                    raise RuntimeError("cdp_non_primary_browser")
+                browser_version = str(
+                    (attached_payload or {}).get("product")
+                    or (attached_payload or {}).get("Browser")
+                    or ""
+                )
+            else:
+                browser_version = str(
+                    (payload or {}).get("Browser")
+                    or (payload or {}).get("product")
+                    or ""
+                )
+            session = cls(playwright, remote, contexts[0], lease=lease)
+            session.browser_version = browser_version or None
+            session._jobsflow_approved_cdp_session = True
+            session._jobsflow_cdp_attestation = _CDP_SESSION_ATTESTATION
+            return session
+        except Exception:
+            # ``stop`` disconnects the local transport.  We intentionally do
+            # not call ``remote.close`` here because a remote browser belongs
+            # to the user's Chrome process, not to this scan.
+            try:
+                if playwright is not None:
+                    playwright.stop()
+            except Exception:
+                pass
+            lease.release()
+            raise
+
+    def _session_mode_label(self) -> str:
+        return "cdp-user-profile"
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # Playwright's stop detaches from a CDP browser.  Do not call
+        # ``Browser.close``/``remote.close``: that could terminate the user's
+        # visible Chrome session on some Chromium versions.
+        try:
+            if self._playwright is not None:
+                self._playwright.stop()
+        except Exception:
+            pass
+        self._playwright = None
+        self._remote = None
+        self.context = None
+        # A detached transport is never a valid detail credential.  Clearing
+        # the attestation also makes accidental reuse fail at the policy gate
+        # instead of being reported as a live CDP session.
+        self._jobsflow_approved_cdp_session = False
+        self._jobsflow_cdp_attestation = None
+        if self._lease is not None:
+            self._lease.release()
+            self._lease = None
+
+    def fetch_once(
+        self,
+        url: str,
+        *,
+        timeout_ms: int = 45000,
+        max_chars: int = MAX_CHARS,
+        save_storage_state: str | Path | None = None,
+        signal_file: str | Path | None = None,
+        interactive: bool = False,
+        verification_timeout_seconds: int = 600,
+    ) -> JdFetchResult:
+        """Fetch one URL in the retained CDP context, without new launch."""
+        del save_storage_state, signal_file  # CDP state stays in user Chrome.
+        raw = (url or "").strip()
+        if detect_portal(raw) != "jobsdb":
+            return JdFetchResult(
+                ok=False,
+                url=raw,
+                portal="jobsdb",
+                fail_reason="error",
+                detail_reason="jobsdb_session_rejects_non_jobsdb_url",
+                session_mode=self._session_mode_label(),
+                headless=False,
+                browser_channel=self.channel,
+            )
+        canon = normalize_job_url(raw, source="jobsdb")
+        if not canon:
+            return JdFetchResult(
+                ok=False, url=raw, portal="jobsdb", fail_reason="empty",
+                session_mode=self._session_mode_label(), headless=False,
+                browser_channel=self.channel,
+            )
+        if self.context is None or self._closed:
+            return JdFetchResult(
+                ok=False, url=canon, portal="jobsdb", fail_reason="error",
+                detail_reason="cdp_session_closed", session_mode=self._session_mode_label(),
+                headless=False, browser_channel=self.channel,
+            )
+        if not (
+            self._jobsflow_approved_cdp_session
+            and self._jobsflow_cdp_attestation is _CDP_SESSION_ATTESTATION
+        ):
+            # Direct construction is intentionally not an approved transport;
+            # only ``connect()`` performs the local-endpoint/profile checks and
+            # sets the process-local attestation.  This keeps compatibility
+            # callers and newly attached models from turning an arbitrary
+            # Playwright context into a JobsDB credential.
+            return JdFetchResult(
+                ok=False,
+                url=canon,
+                portal="jobsdb",
+                fail_reason="degraded",
+                detail_reason="cdp_session_unattested",
+                attempts=0,
+                last_reason="cdp_session_unattested",
+                session_mode=self._session_mode_label(),
+                headless=False,
+                browser_channel=self.channel,
+                recommended_action="run_workflow_scan_with_user_chrome_cdp",
+                requires_user_action=True,
+                manual_hint=(
+                    "JobsDB 详情必须通过统一 gateway 连接主 Chrome；"
+                    "请不要直接构造 CDP session。"
+                ),
+            )
+
+        page = None
+        main_response: dict[str, Any] = {}
+        challenge_cleared = False
+
+        def _capture_response(response) -> None:
+            try:
+                headers = {k.lower(): v for k, v in response.headers.items()}
+                main_response.update(
+                    {
+                        "status": response.status,
+                        "cf_mitigated": headers.get("cf-mitigated"),
+                        "retry_after_seconds": _parse_retry_after(
+                            headers.get("retry-after")
+                        ),
+                        "cf_ray": headers.get("cf-ray"),
+                    }
+                )
+            except Exception:
+                pass
+
+        try:
+            page = self.context.new_page()
+            def _on_response(response) -> None:
+                # A JobsDB page emits many asset/API responses after the
+                # document navigation.  Only the main document is allowed to
+                # decide whether the page was challenged; otherwise a later
+                # 200 asset response could overwrite the document's 403/CF
+                # signal and make an interstitial look like a valid JD.
+                try:
+                    is_document = (
+                        getattr(response.request, "resource_type", "") == "document"
+                    )
+                    same_frame = getattr(response, "frame", None) == page.main_frame
+                    if is_document and same_frame:
+                        _capture_response(response)
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+            page.goto(canon, wait_until="domcontentloaded", timeout=timeout_ms)
+            title, text, selector = _observe_cdp(page)
+            initial_outcome = classify_outcome(
+                main_response=main_response,
+                title=title,
+                body=text,
+                html_snip=page.content()[:1500],
+            )
+            # A 429 is a server-side rate limit, not a human challenge.  Do
+            # not leave the user waiting ten minutes for a click that cannot
+            # clear it; return the structured retry signal immediately.
+            challenged = initial_outcome in {"challenge", "blocked"}
+            if challenged and interactive:
+                print(
+                    "请在你的 Chrome 窗口中完成 Cloudflare 验证"
+                    f"（等待 {int(verification_timeout_seconds)}s）……",
+                    file=sys.stderr,
+                )
+                validated, reason = _poll_until_real_jd_cdp(
+                    page, verification_timeout_seconds
+                )
+                if not validated:
+                    return JdFetchResult(
+                        ok=False, url=canon, portal="jobsdb",
+                        fail_reason="challenge" if reason == "challenge_timeout" else "blocked",
+                        detail_reason=f"cdp_{reason}",
+                        session_mode=self._session_mode_label(), headless=False,
+                        browser_channel=self.channel,
+                        response_status=main_response.get("status"),
+                        cf_mitigated=main_response.get("cf_mitigated"),
+                        cf_ray=main_response.get("cf_ray"),
+                    )
+                title, text, selector = _observe_cdp(page)
+                # Cloudflare may replace the interstitial DOM in-place without
+                # issuing a second top-level navigation.  The original
+                # response can therefore still carry ``cf-mitigated:
+                # challenge`` even though the user has just cleared it.  Do
+                # not let that stale header veto the validated post-click JD.
+                challenge_cleared = True
+                # The structural selector is the post-click success signal;
+                # challenge marker strings may remain in unrelated scripts on
+                # an otherwise valid JobsDB page.
+                challenged = not bool(selector and text)
+
+            if challenged or initial_outcome == "rate_limited":
+                reason = "rate_limited" if initial_outcome == "rate_limited" else "challenge"
+                return JdFetchResult(
+                    ok=False, url=canon, portal="jobsdb", title=title,
+                    text=text[:500], fail_reason=reason, detail_reason=reason,
+                    chars=len(text), session_mode=self._session_mode_label(),
+                    headless=False, browser_channel=self.channel,
+                    response_status=main_response.get("status"),
+                    cf_mitigated=main_response.get("cf_mitigated"),
+                    cf_ray=main_response.get("cf_ray"),
+                    retry_after_seconds=main_response.get("retry_after_seconds"),
+                )
+            if not selector or not text:
+                return JdFetchResult(
+                    ok=False, url=canon, portal="jobsdb", title=title,
+                    text=text[:500], fail_reason="empty", detail_reason="cdp_no_jd_content",
+                    chars=len(text), session_mode=self._session_mode_label(),
+                    headless=False, browser_channel=self.channel,
+                )
+            if not is_real_jd(
+                title=title, body=text, html_snip="", has_jd_container=True,
+                cf_mitigated=(
+                    None if challenge_cleared else main_response.get("cf_mitigated")
+                ),
+            ):
+                return JdFetchResult(
+                    ok=False, url=canon, portal="jobsdb", title=title,
+                    text=text[:500], fail_reason="empty", detail_reason="cdp_content_not_validated",
+                    chars=len(text), session_mode=self._session_mode_label(),
+                    headless=False, browser_channel=self.channel,
+                )
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n…"
+            return JdFetchResult(
+                ok=True, url=canon, portal="jobsdb", text=text, title=title,
+                chars=len(text), selector=selector, content_validated=True,
+                attempts=1, detail_reason="success",
+                session_mode=self._session_mode_label(), headless=False,
+                browser_channel=self.channel,
+                response_status=main_response.get("status"),
+                cf_mitigated=main_response.get("cf_mitigated"),
+                cf_ray=main_response.get("cf_ray"),
+            )
+        except Exception as exc:
+            message = str(exc).lower()
+            reason = "timeout" if "timeout" in message else "error"
+            return JdFetchResult(
+                ok=False, url=canon, portal="jobsdb", fail_reason=reason,
+                detail_reason=reason, session_mode=self._session_mode_label(),
+                headless=False, browser_channel=self.channel,
+            )
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+
 class JobsdbHumanVerificationRecovery:
     """One-shot human verification in the user's *daily* Chrome over CDP.
 
@@ -1115,8 +2071,8 @@ class JobsdbHumanVerificationRecovery:
     that actually works attaches to the user's running daily Chrome via CDP:
 
     1. probe the local debugging endpoint (default 127.0.0.1:9222);
-    2. if down, ask the installed Google Chrome to open with
-       ``--remote-debugging-port`` on the target URL and wait briefly;
+    2. if down, ask the installed Google Chrome to open its remote-debugging
+       settings page in the primary profile and wait briefly;
     3. open the URL inside the user's real profile, poll until the page is a
        real JD (the user clicks any live challenge in their own window);
     4. validate with the standard structural checks, cache the text, then
@@ -1132,28 +2088,46 @@ class JobsdbHumanVerificationRecovery:
         profile_dir: str | Path | None = None,
         verification_timeout_seconds: int = 600,
         before_visible: Callable[[], None] | None = None,
-        on_validated_session: Callable[[JdBrowserSession], None] | None = None,
+        on_validated_session: Callable[[Any], None] | None = None,
         debug_port: int = 9222,
+        cdp_endpoint: str | None = None,
     ) -> None:
-        profile = (
-            profile_dir
-            or _jobsdb_profile_dir()
-            or default_jobsdb_recovery_profile_dir()
-        )
-        self.profile_dir = Path(profile).expanduser()
+        # ``profile_dir`` is retained as a source-compatible argument only.
+        # It must never select a JobsDB browser: a second profile is not the
+        # user's trusted Cloudflare session.  The only live detail transport
+        # is the user's primary Chrome context exposed over localhost CDP.
+        del profile_dir
         self.verification_timeout_seconds = max(
             1, int(verification_timeout_seconds)
         )
         self.before_visible = before_visible
-        # Retained for call-site compatibility; a CDP attach owns no
-        # JdBrowserSession, so a validated session is never handed off.
+        # The callback transfers the retained CDP session to the scan's
+        # BrowserSessionPool.  It is intentionally duck-typed so old callers
+        # accepting JdBrowserSession remain source-compatible.
         self.on_validated_session = on_validated_session
-        self.debug_port = int(debug_port)
+        self.cdp_endpoint = _jobsdb_cdp_endpoint(
+            cdp_endpoint or _configured_jobsdb_cdp_endpoint(debug_port)
+        )
+        self.debug_port = _endpoint_port(self.cdp_endpoint, fallback=debug_port)
         self.attempted = False
         self.status = "not_attempted"
         self.navigation_count = 0
         self.manual_hint: str | None = None
         self.manual_command: str | None = None
+        self._cdp_session: JobsdbCdpBatchSession | None = None
+        self._validated_session: JobsdbCdpBatchSession | None = None
+
+    @property
+    def session(self) -> JobsdbCdpBatchSession | None:
+        """The validated CDP session, if this recovery succeeded."""
+        return self._validated_session
+
+    def close(self) -> None:
+        """Detach local Playwright state without closing the user's Chrome."""
+        if self._cdp_session is not None:
+            self._cdp_session.close()
+        self._cdp_session = None
+        self._validated_session = None
 
     @staticmethod
     def _failure(
@@ -1172,41 +2146,123 @@ class JobsdbHumanVerificationRecovery:
             detail_reason=reason,
             attempts=0,
             last_reason=reason,
+            session_mode="none",
+            headless=False,
+            browser_channel="user-chrome-cdp",
             recommended_action=recommended_action,
             requires_user_action=bool(manual_hint or manual_command),
             manual_hint=manual_hint,
             manual_command=manual_command,
         )
 
+    @staticmethod
+    def _gateway_only_failure(url: str) -> JdFetchResult:
+        """Reject direct recovery calls without opening or mutating Chrome.
+
+        The public gateway is the only component allowed to turn a JobsDB
+        failure into a human-verification handoff.  Checking this at the
+        recovery object as well as at the compatibility CLIs closes the import
+        seam: a newly attached model cannot instantiate this class and call
+        ``recover()`` directly to make a browser side effect.
+        """
+        return JdFetchResult(
+            ok=False,
+            url=url,
+            portal="jobsdb",
+            fail_reason="degraded",
+            detail_reason="jobsdb_gateway_only",
+            attempts=0,
+            last_reason="jobsdb_gateway_only",
+            session_mode="none",
+            headless=None,
+            browser_channel="user-chrome-cdp",
+            recommended_action="run_workflow_scan_with_user_chrome_cdp",
+            requires_user_action=False,
+        )
+
     def _endpoint_alive(self) -> bool:
         """Probe the Chrome debugging endpoint without starting Playwright."""
         import urllib.request
 
+        if _cdp_endpoint_owned_by_retired_profile(self.cdp_endpoint):
+            return False
+        probe_url = _cdp_probe_url(self.cdp_endpoint)
+        # A websocket endpoint cannot be probed with urllib.  Let
+        # connect_over_cdp perform the authoritative handshake instead.
+        if probe_url is None:
+            return _cdp_local_port_available(self.cdp_endpoint)
         try:
             with urllib.request.urlopen(
-                f"http://127.0.0.1:{self.debug_port}/json/version", timeout=1
+                probe_url, timeout=1
             ) as response:
-                return bool(response.status == 200)
+                if response.status == 200:
+                    return True
         except Exception:
-            return False
+            pass
+        # Chrome 136+ toggle mode can deliberately return 404 for all HTTP
+        # discovery paths while the browser-level WebSocket is available.
+        # Treat that transport as alive so recovery does not repeatedly open
+        # the settings page and then time out before ``connect()`` gets a
+        # chance to attach and run Browser.getVersion.
+        return _cdp_local_port_available(self.cdp_endpoint)
+
+    def _endpoint_retired_profile(self) -> bool:
+        """Whether a reachable-looking CDP port is owned by old JobsFlow code."""
+        return _cdp_endpoint_owned_by_retired_profile(self.cdp_endpoint)
+
+    def _manual_cdp_command(self, url: str) -> str:
+        """Return the primary-Chrome handoff command.
+
+        Chrome 136+ may keep the ordinary profile alive while refusing a new
+        ``--remote-debugging-port`` launch.  Starting another profile would
+        lose the browser-bound Cloudflare clearance.  The supported recovery
+        therefore opens Chrome's own remote-debugging settings in the already
+        running primary browser.  The user enables *Allow remote debugging*
+        once, then reruns the same gateway command; the next run attaches to
+        that exact Chrome context.  The target URL is deliberately omitted so
+        this command never puts a job URL or credential into a shell snippet.
+        """
+        del url
+        return 'open -a "Google Chrome" "chrome://inspect/#remote-debugging"'
+
+    @staticmethod
+    def _cdp_startup_timeout() -> float:
+        try:
+            return max(
+                5.0,
+                min(
+                    90.0,
+                    float(os.environ.get("JOBSFLOW_JOBSDB_CDP_STARTUP_TIMEOUT", "30")),
+                ),
+            )
+        except (TypeError, ValueError):
+            return 30.0
+
+    def _connect_cdp_session(self) -> JobsdbCdpBatchSession:
+        if self._cdp_session is not None:
+            return self._cdp_session
+        if not self._endpoint_alive():
+            raise RuntimeError("cdp_endpoint_unavailable")
+        self._cdp_session = JobsdbCdpBatchSession.connect(
+            self.debug_port, cdp_endpoint=self.cdp_endpoint
+        )
+        return self._cdp_session
 
     def _launch_user_chrome_with_debug_port(self, url: str) -> None:
-        """Ask the installed Google Chrome to open with the debug port.
+        """Open the remote-debugging settings in the primary Chrome window.
 
-        macOS runs a single Chrome instance: when the daily Chrome is already
-        open without the port, this call merely focuses it and the endpoint
-        stays down; the caller keeps polling and reports the exact manual
-        command if the endpoint never appears.
+        This method must not launch ``-n``/``-na`` or pass ``--user-data-dir``:
+        those options create a second profile and are exactly the path that
+        made a new model show a misleading empty/headless verification page.
         """
+        del url
         try:
             subprocess.Popen(
                 [
                     "open",
-                    "-na",
+                    "-a",
                     "Google Chrome",
-                    "--args",
-                    f"--remote-debugging-port={self.debug_port}",
-                    url,
+                    "chrome://inspect/#remote-debugging",
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1215,24 +2271,42 @@ class JobsdbHumanVerificationRecovery:
             pass
 
     def _cdp_fetch(self, url: str) -> JdFetchResult:
-        """Drive one URL inside the user's daily Chrome over CDP."""
-        from playwright.sync_api import sync_playwright
-
-        manual_hint = (
-            'open -na "Google Chrome" --args '
-            f"--remote-debugging-port={self.debug_port} {url}"
-        )
+        """Drive one URL inside the retained user-visible Chrome over CDP."""
+        if not _workflow_gateway_active():
+            self.status = "blocked"
+            return self._gateway_only_failure(url)
+        if detect_portal(url) != "jobsdb":
+            self.status = "failed"
+            return self._failure(
+                url,
+                "jobsdb_recovery_rejects_non_jobsdb_url",
+                recommended_action="use_portal_specific_gateway",
+            )
+        manual_hint = self._manual_cdp_command(url)
         self.manual_hint = manual_hint
         self.manual_command = manual_hint
+        if self._endpoint_retired_profile():
+            self.status = "requires_user_action"
+            return self._failure(
+                url,
+                "cdp_endpoint_retired_profile",
+                recommended_action="close_retired_jobsdb_profile",
+                manual_hint=(
+                    "检测到旧版 JobsDB 隔离浏览器仍占用 CDP 端口。请关闭该旧窗口，"
+                    "再在主 Chrome 的 chrome://inspect/#remote-debugging 页面启用 "
+                    "Allow remote debugging，并重跑同一条扫描命令。"
+                ),
+                manual_command=manual_hint,
+            )
         if not self._endpoint_alive():
             print(
-                "JobsDB 需要人工验证：调试端口未开，正在尝试以调试端口启动你的 "
-                "Google Chrome；若你的 Chrome 已在运行，请完全退出（⌘Q）后手动执行：\n"
+                "JobsDB 需要人工验证：正在准备一个可复用的用户可见 Chrome 会话；"
+                "若端口仍未出现，请在主 Chrome 的远程调试设置中启用后重试：\n"
                 f"  {manual_hint}",
                 file=sys.stderr,
             )
             self._launch_user_chrome_with_debug_port(url)
-            launch_deadline = time.monotonic() + 90
+            launch_deadline = time.monotonic() + self._cdp_startup_timeout()
             while time.monotonic() < launch_deadline:
                 if self._endpoint_alive():
                     break
@@ -1242,100 +2316,83 @@ class JobsdbHumanVerificationRecovery:
                 return self._failure(
                     url,
                     "cdp_endpoint_unavailable",
-                    recommended_action="start_chrome_with_debug_port",
+                    recommended_action="enable_primary_chrome_cdp",
                     manual_hint=(
-                        "完全退出当前 Chrome（⌘Q），再在终端执行命令；完成验证后重新运行同一条扫描命令。"
+                        "请在主 Chrome 的远程调试设置中启用 Allow remote debugging；"
+                        "端口出现后重新运行同一条扫描命令。"
                     ),
                     manual_command=manual_hint,
                 )
-        with sync_playwright() as p:
-            try:
-                remote = p.chromium.connect_over_cdp(
-                    f"http://127.0.0.1:{self.debug_port}"
-                )
-            except Exception:
-                return self._failure(
-                    url,
-                    "cdp_connect_failed",
-                    recommended_action="retry_cdp_after_manual_start",
-                    manual_hint="确认带 remote-debugging-port 的 Chrome 已启动后重试。",
-                    manual_command=manual_hint,
-                )
-            try:
-                contexts = remote.contexts
-                if not contexts:
-                    return self._failure(url, "cdp_no_context")
-                page = contexts[0].new_page()
+        try:
+            session = self._connect_cdp_session()
+        except RuntimeError as exc:
+            reason = str(exc)
+            return self._failure(
+                url,
+                reason
+                if reason
+                in {
+                    "cdp_endpoint_unavailable",
+                    "cdp_non_primary_browser",
+                    "cdp_session_busy",
+                    "cdp_session_lease_unavailable",
+                }
+                else "cdp_connect_failed",
+                recommended_action="retry_after_primary_chrome_cdp",
+                manual_hint=(
+                    "确认主 Chrome 已允许远程调试且本地 CDP 端点可连接后重试。"
+                ),
+                manual_command=manual_hint,
+            )
+        self.navigation_count += 1
+        result = session.fetch_once(
+            url,
+            timeout_ms=60000,
+            interactive=True,
+            verification_timeout_seconds=self.verification_timeout_seconds,
+        )
+        if result.ok and result.content_validated:
+            self._validated_session = session
+            if self.on_validated_session is not None:
                 try:
-                    self.navigation_count += 1
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    title, text, selector = _observe_cdp(page)
-                    if not selector and _looks_challenged_cdp(title, text, page):
-                        print(
-                            "请在你的 Chrome 窗口中完成 Cloudflare 验证"
-                            f"（等待 {self.verification_timeout_seconds}s）……",
-                            file=sys.stderr,
-                        )
-                        validated, reason = _poll_until_real_jd_cdp(
-                            page, self.verification_timeout_seconds
-                        )
-                        if not validated:
-                            return self._failure(url, f"cdp_{reason}")
-                        title, text, selector = _observe_cdp(page)
-                    if not selector or not text:
-                        return self._failure(url, "cdp_no_jd_content")
-                    if not is_real_jd(
-                        title=title,
-                        body=text,
-                        html_snip="",
-                        has_jd_container=True,
-                        cf_mitigated=None,
-                    ):
-                        return self._failure(url, "cdp_content_not_validated")
-                    return JdFetchResult(
-                        ok=True,
-                        url=url,
-                        portal="jobsdb",
-                        text=text,
-                        chars=len(text),
-                        selector=selector,
-                        content_validated=True,
-                        attempts=1,
-                        browser_channel="user-chrome-cdp",
-                        session_mode="cdp-user-profile",
-                        headless=False,
-                    )
-                finally:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-            finally:
-                try:
-                    remote.close()
+                    self.on_validated_session(session)
                 except Exception:
+                    # A pool callback is an optimisation; it must not turn a
+                    # validated JD into a failed recovery result.
                     pass
+        return result
 
     def _cdp_verify_search(self, root: Path | None) -> JdFetchResult:
         """Validate the JobsDB session in the user's Chrome for API search."""
-        from playwright.sync_api import sync_playwright
-
         probe_url = "https://hk.jobsdb.com/"
-        manual_hint = (
-            'open -na "Google Chrome" --args '
-            f"--remote-debugging-port={self.debug_port} {probe_url}"
-        )
+        if not _workflow_gateway_active():
+            self.status = "blocked"
+            return self._gateway_only_failure(probe_url)
+        manual_hint = self._manual_cdp_command(probe_url)
         self.manual_hint = manual_hint
         self.manual_command = manual_hint
+        if self._endpoint_retired_profile():
+            self.status = "requires_user_action"
+            return self._failure(
+                probe_url,
+                "cdp_endpoint_retired_profile",
+                recommended_action="close_retired_jobsdb_profile",
+                manual_hint=(
+                    "检测到旧版 JobsDB 隔离浏览器仍占用 CDP 端口。请关闭该旧窗口，"
+                    "再在主 Chrome 的 chrome://inspect/#remote-debugging 页面启用 "
+                    "Allow remote debugging，并重试扫描。"
+                ),
+                manual_command=manual_hint,
+            )
         if not self._endpoint_alive():
             print(
-                "JobsDB 需要人工验证：正在尝试打开你的主 Google Chrome；"
-                "如果端口未出现，请完全退出 Chrome 后执行：\n"
+                "JobsDB 需要人工验证：正在准备一个可复用的用户可见 Chrome 会话；"
+                "如果端口未出现，请在主 Chrome 的远程调试设置中启用后重试：\n"
                 f"  {manual_hint}",
                 file=sys.stderr,
             )
             self._launch_user_chrome_with_debug_port(probe_url)
-            deadline = time.monotonic() + 90
+            deadline = time.monotonic() + self._cdp_startup_timeout()
             while time.monotonic() < deadline:
                 if self._endpoint_alive():
                     break
@@ -1345,70 +2402,129 @@ class JobsdbHumanVerificationRecovery:
                 return self._failure(
                     probe_url,
                     "cdp_endpoint_unavailable",
-                    recommended_action="start_chrome_with_debug_port",
-                    manual_hint="完全退出当前 Chrome（⌘Q），再执行带 remote-debugging-port 的命令并重试扫描。",
+                    recommended_action="enable_primary_chrome_cdp",
+                    manual_hint=(
+                        "请在主 Chrome 的 chrome://inspect/#remote-debugging 页面启用 "
+                        "Allow remote debugging，端口出现后重试扫描。"
+                    ),
                     manual_command=manual_hint,
                 )
-        with sync_playwright() as p:
-            try:
-                remote = p.chromium.connect_over_cdp(
-                    f"http://127.0.0.1:{self.debug_port}"
-                )
-            except Exception:
-                return self._failure(
-                    probe_url,
-                    "cdp_connect_failed",
-                    recommended_action="retry_cdp_after_manual_start",
-                    manual_hint="确认带 remote-debugging-port 的 Chrome 已启动后重试。",
-                    manual_command=manual_hint,
-                )
-            try:
-                contexts = remote.contexts
-                if not contexts:
-                    return self._failure(probe_url, "cdp_no_context")
-                context = contexts[0]
-                page = context.new_page()
+        try:
+            session = self._connect_cdp_session()
+        except RuntimeError as exc:
+            reason = str(exc)
+            return self._failure(
+                probe_url,
+                reason
+                if reason
+                in {
+                    "cdp_endpoint_unavailable",
+                    "cdp_non_primary_browser",
+                    "cdp_session_busy",
+                    "cdp_session_lease_unavailable",
+                }
+                else "cdp_connect_failed",
+                recommended_action="retry_after_primary_chrome_cdp",
+                manual_hint=(
+                    "确认主 Chrome 已允许远程调试且本地 CDP 端点可连接后重试。"
+                ),
+                manual_command=manual_hint,
+            )
+        context = session.context
+        if context is None:
+            return self._failure(probe_url, "cdp_no_context")
+        page = None
+        main_response: dict[str, Any] = {}
+        challenge_cleared = False
+        try:
+            page = context.new_page()
+
+            def _capture_search_response(response) -> None:
+                # Only the top-level document can classify a challenge.  A
+                # later API/asset 200 must never hide the document's 403/429.
                 try:
-                    self.navigation_count += 1
-                    page.goto(probe_url, wait_until="domcontentloaded", timeout=60000)
-                    title, text, _selector = _observe_cdp(page)
-                    if _looks_challenged_cdp(title, text, page):
-                        print(
-                            "请在你的主 Chrome 窗口中完成 JobsDB/Cloudflare 验证"
-                            f"（等待 {self.verification_timeout_seconds}s）……",
-                            file=sys.stderr,
-                        )
-                        deadline = time.monotonic() + self.verification_timeout_seconds
-                        while time.monotonic() < deadline:
-                            title, text, _selector = _observe_cdp(page)
-                            if not _looks_challenged_cdp(title, text, page):
-                                break
-                            time.sleep(2.0)
-                        else:
-                            return self._failure(probe_url, "challenge_timeout")
-                    if _looks_challenged_cdp(title, text, page):
-                        return self._failure(probe_url, "challenge_still_present")
-                    if _write_jobsdb_cookie_header(context, root) is None:
-                        return self._failure(probe_url, "cdp_cookie_capture_failed")
-                    return JdFetchResult(
-                        ok=True,
-                        url=probe_url,
-                        portal="jobsdb",
-                        detail_reason="manual_recovery_cdp_user_chrome",
-                        content_validated=True,
-                        attempts=1,
-                        browser_channel="user-chrome-cdp",
-                        session_mode="cdp-user-profile",
-                        headless=False,
+                    is_document = (
+                        getattr(response.request, "resource_type", "") == "document"
                     )
-                finally:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-            finally:
+                    same_frame = getattr(response, "frame", None) == page.main_frame
+                    if not (is_document and same_frame):
+                        return
+                    headers = {k.lower(): v for k, v in response.headers.items()}
+                    main_response.update(
+                        {
+                            "status": response.status,
+                            "cf_mitigated": headers.get("cf-mitigated"),
+                            "retry_after_seconds": _parse_retry_after(
+                                headers.get("retry-after")
+                            ),
+                            "cf_ray": headers.get("cf-ray"),
+                        }
+                    )
+                except Exception:
+                    pass
+
+            page.on("response", _capture_search_response)
+            self.navigation_count += 1
+            page.goto(probe_url, wait_until="domcontentloaded", timeout=60000)
+            title, text, _selector = _observe_cdp(page)
+            initial_outcome = classify_outcome(
+                main_response=main_response,
+                title=title,
+                body=text,
+                html_snip=page.content()[:1500],
+            )
+            if initial_outcome in {"challenge", "blocked"}:
+                print(
+                    "请在你的 Chrome 窗口中完成 JobsDB/Cloudflare 验证"
+                    f"（等待 {self.verification_timeout_seconds}s）……",
+                    file=sys.stderr,
+                )
+                deadline = time.monotonic() + self.verification_timeout_seconds
+                while time.monotonic() < deadline:
+                    title, text, _selector = _observe_cdp(page)
+                    # During a manual click Cloudflare may replace the DOM
+                    # without issuing a second document response.  The old
+                    # response must inform the initial classification, but it
+                    # must not veto a later in-place success.
+                    if not _looks_challenged_cdp(title, text, page):
+                        challenge_cleared = True
+                        break
+                    time.sleep(2.0)
+                else:
+                    return self._failure(probe_url, "challenge_timeout")
+            if initial_outcome == "rate_limited":
+                return self._failure(probe_url, "rate_limited")
+            if not challenge_cleared and _looks_challenged_cdp(
+                title, text, page, main_response=main_response
+            ):
+                return self._failure(probe_url, "challenge_still_present")
+            # The cookie file is an optional *search API* bridge only.  Detail
+            # pages continue to use the retained live CDP context above.
+            if _write_jobsdb_cookie_header(context, root) is None:
+                return self._failure(probe_url, "cdp_cookie_capture_failed")
+            self._validated_session = session
+            if self.on_validated_session is not None:
                 try:
-                    remote.close()
+                    self.on_validated_session(session)
+                except Exception:
+                    pass
+            return JdFetchResult(
+                ok=True,
+                url=probe_url,
+                portal="jobsdb",
+                detail_reason="manual_recovery_cdp_user_chrome",
+                content_validated=True,
+                attempts=1,
+                browser_channel="user-chrome-cdp",
+                session_mode="cdp-user-profile",
+                headless=False,
+            )
+        except Exception:
+            return self._failure(probe_url, "cdp_search_recovery_error")
+        finally:
+            if page is not None:
+                try:
+                    page.close()
                 except Exception:
                     pass
 
@@ -1420,6 +2536,9 @@ class JobsdbHumanVerificationRecovery:
     ) -> JdFetchResult:
         """Perform one interactive recovery for a failed JobsDB search batch."""
         probe_url = "https://hk.jobsdb.com/"
+        if not _workflow_gateway_active():
+            self.status = "blocked"
+            return self._gateway_only_failure(probe_url)
         if self.attempted:
             return self._failure(probe_url, "manual_recovery_already_attempted")
         self.attempted = True
@@ -1437,6 +2556,11 @@ class JobsdbHumanVerificationRecovery:
             return self._failure(probe_url, "cdp_recovery_error")
         if not (result.ok and result.content_validated):
             self.status = "requires_user_action" if result.requires_user_action else "failed"
+            # A failed handoff is not a reusable session.  Release the local
+            # CDP transport so a later scan can attach cleanly; this never
+            # closes the user's Chrome process.
+            if self._validated_session is None:
+                self.close()
             if result.requires_user_action:
                 _write_manual_recovery_notice(
                     result.url,
@@ -1458,6 +2582,9 @@ class JobsdbHumanVerificationRecovery:
         circuit: PortalCircuitBreaker | None = None,
         cache_root: Path | None = None,
     ) -> JdFetchResult:
+        if not _workflow_gateway_active():
+            self.status = "blocked"
+            return self._gateway_only_failure(url)
         if self.attempted:
             return self._failure(url, "manual_recovery_already_attempted")
         self.attempted = True
@@ -1476,6 +2603,8 @@ class JobsdbHumanVerificationRecovery:
             return self._failure(url, "cdp_recovery_error")
         if not (result.ok and result.content_validated):
             self.status = "requires_user_action" if result.requires_user_action else "failed"
+            if self._validated_session is None:
+                self.close()
             if result.requires_user_action:
                 _write_manual_recovery_notice(
                     url,
@@ -1521,13 +2650,22 @@ def _observe_cdp(page) -> tuple[str, str, str]:
     return title, text, selector
 
 
-def _looks_challenged_cdp(title: str, text: str, page) -> bool:
+def _looks_challenged_cdp(
+    title: str,
+    text: str,
+    page,
+    *,
+    main_response: dict[str, Any] | None = None,
+) -> bool:
     try:
         html = page.content()[:1500]
     except Exception:
         html = ""
     outcome = classify_outcome(
-        main_response=None, title=title, body=text, html_snip=html
+        main_response=main_response,
+        title=title,
+        body=text,
+        html_snip=html,
     )
     return outcome in {"challenge", "rate_limited", "blocked"}
 
@@ -1556,6 +2694,10 @@ def _stamp_session_meta(result: JdFetchResult, session: "JdBrowserSession") -> N
     result.browser_channel = session.channel or None
     result.session_mode = session._session_mode_label()
     try:
+        known_version = getattr(session, "browser_version", None)
+        if known_version:
+            result.browser_version = str(known_version)
+            return
         browser = session._browser
         if browser is None and session.context is not None:
             browser = getattr(session.context, "browser", None)
@@ -1606,7 +2748,13 @@ def _fetch_jd_body_once(
             portal=detect_portal(url),
             fail_reason="error",
         )
-    except Exception:
+    except Exception as exc:
+        # Direct/legacy callers may still reach this low-level helper.  Keep
+        # the same actionable contract as ``fetch_jd_body`` instead of
+        # collapsing the hard JobsDB transport rule into a generic error that
+        # invites a new model to try another browser path.
+        if "jobsdb_direct_playwright_disabled" in str(exc).lower():
+            return _jobsdb_cdp_required_result(url)
         return JdFetchResult(
             ok=False,
             url=url,
@@ -1710,10 +2858,25 @@ def _manual_recovery_notice_path(root: Path | None) -> Path:
 
 
 def _jobsdb_cookie_header_path(root: Path | None) -> Path:
-    """Private portal-scoped cookie handoff for the JobsDB search CLI."""
-    cache_root = Path(root or _default_cache_root()).expanduser().resolve()
-    workspace = cache_root if cache_root.name == "JobSearch_2026" else cache_root / "JobSearch_2026"
-    return workspace / "02_Tracker" / "portal_state" / "jobsdb_browser_cookies.txt"
+    """Return the private search-API cookie bridge path.
+
+    Cookie material is deliberately kept outside both the repository and the
+    runtime tracker.  ``JOBSDB_COOKIE_FILE`` remains an explicit override for
+    operators that manage a separate secret store; an unsafe path is ignored.
+    The ``root`` argument is retained for source compatibility only.
+    """
+    del root
+    raw = os.environ.get("JOBSDB_COOKIE_FILE", "").strip()
+    candidate = (
+        Path(raw).expanduser()
+        if raw
+        else Path.home() / ".config" / "jobsearch" / "jobsdb_browser_cookies.txt"
+    )
+    try:
+        candidate.resolve().relative_to(Path.home().resolve())
+    except ValueError:
+        candidate = Path.home() / ".config" / "jobsearch" / "jobsdb_browser_cookies.txt"
+    return candidate
 
 
 def _write_jobsdb_cookie_header(context: Any, root: Path | None) -> Path | None:
@@ -1729,6 +2892,7 @@ def _write_jobsdb_cookie_header(context: Any, root: Path | None) -> Path | None:
             return None
         path = _jobsdb_cookie_header_path(root)
         path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
         path.write_text("; ".join(pairs) + "\n", encoding="utf-8")
         os.chmod(path, 0o600)
         return path
@@ -1756,7 +2920,11 @@ def _write_manual_recovery_notice(
         "manual_hint": result.manual_hint,
         "manual_command": result.manual_command,
         "debug_port": int(debug_port),
-        "resume": "rerun the same scan after starting Chrome with the debug port and completing verification",
+        "resume": (
+            "open the primary Chrome remote-debugging settings, enable Allow "
+            "remote debugging, complete verification if shown, then rerun "
+            "the same scan"
+        ),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1775,7 +2943,17 @@ def _clear_manual_recovery_notice(root: Path | None) -> None:
 def _failure_cache_path(url: str, root: Path | None) -> Path:
     cache_root = Path(root or _default_cache_root()).expanduser().resolve()
     workspace = cache_root if cache_root.name == "JobSearch_2026" else cache_root / "JobSearch_2026"
-    key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    # Cache reads happen after URL canonicalisation while a failed fetch may
+    # hand us the raw URL from a result object.  Hashing those two spellings
+    # separately made a just-recorded failure impossible to reuse (for
+    # example, ``/jobs/view/123`` versus ``/jobs/view/123/``).  Use the same
+    # portal-aware identity at both ends of the cache path.  This is also
+    # important for model portability: a new harness must not accidentally
+    # re-open a URL just because it formatted the trailing slash differently.
+    raw = str(url or "").strip()
+    portal = detect_portal(raw)
+    identity = normalize_job_url(raw, source=portal if portal != "generic" else "") or raw
+    key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return workspace / "02_Tracker" / "jd_failures" / f"{key}.json"
 
 
@@ -1847,14 +3025,55 @@ def _write_success_cache(result: JdFetchResult, root: Path | None) -> None:
         pass
 
 
+def _load_success_cache_result(
+    canon: str, portal: str, root: Path | None
+) -> JdFetchResult | None:
+    """Return a validated cache result without touching a browser.
+
+    A cached full JD is already a completed acquisition.  It must be checked
+    before the JobsDB CDP gate and circuit so a temporary browser/Cloudflare
+    outage cannot invalidate material already acquired in an earlier run.
+    Explicit storage-state arguments still bypass this helper and are rejected
+    for JobsDB below; callers cannot use a cache hit to disguise a cookie
+    transport request.
+    """
+    try:
+        from tools.fresh_24h.jd_cache import load_jd_cache
+
+        text, meta = load_jd_cache(canon, Path(root or _default_cache_root()))
+    except (ImportError, OSError, TypeError, ValueError):
+        return None
+    if not text:
+        return None
+    return JdFetchResult(
+        ok=True,
+        url=canon,
+        portal=portal,
+        text=text,
+        chars=len(text),
+        selector=meta.get("selector") if isinstance(meta, dict) else None,
+        detail_reason="cache",
+        content_validated=True,
+        attempts=0,
+        last_reason=None,
+        session_mode="cache",
+        headless=None,
+        browser_channel=None,
+    )
+
+
 def _recommended_action(result: JdFetchResult) -> str:
     if result.ok:
         return "none"
     if result.requires_user_action or result.detail_reason in {
         "cdp_endpoint_unavailable",
+        "cdp_endpoint_retired_profile",
         "cdp_connect_failed",
+        "cdp_non_primary_browser",
+        "cdp_session_busy",
+        "cdp_session_lease_unavailable",
     }:
-        return result.recommended_action or "start_chrome_with_debug_port"
+        return result.recommended_action or "enable_primary_chrome_cdp"
     if result.detail_reason in {"circuit_open", "budget_exhausted"}:
         return "wait_or_manual_verify"
     if result.fail_reason in {"challenge", "rate_limited", "blocked"}:
@@ -1895,6 +3114,81 @@ def _degraded_result(
     return result
 
 
+def _is_user_chrome_cdp_session(session: Any | None) -> bool:
+    """Return whether ``session`` is the approved JobsDB detail transport.
+
+    The check is based on a small stable session contract, but it also
+    requires the process-local attestation minted by ``connect()``.  A
+    persistent Playwright context, a storage-state file, a headless session,
+    or a model-created duck-typed object must never qualify as a JobsDB detail
+    credential.
+    """
+    if session is None:
+        return False
+    try:
+        portal = str(getattr(session, "portal", "") or "").casefold()
+        mode_fn = getattr(session, "_session_mode_label", None)
+        mode = str(mode_fn() if callable(mode_fn) else "")
+    except Exception:
+        return False
+    # Every accepted adapter must explicitly carry the same marker.  The
+    # marker is set only by the central ``connect`` method (tests/approved
+    # adapters may set it in their fixture constructor); merely claiming the
+    # right portal/mode/headless values is not enough for a new model to
+    # smuggle a different browser into the detail path.
+    if getattr(session, "_jobsflow_approved_cdp_session", False) is not True:
+        return False
+    if getattr(session, "_jobsflow_cdp_attestation", None) is not _CDP_SESSION_ATTESTATION:
+        return False
+    if getattr(session, "_closed", False):
+        return False
+    if not callable(getattr(session, "fetch_once", None)):
+        return False
+    return (
+        portal == "jobsdb"
+        and mode == "cdp-user-profile"
+        and getattr(session, "headless", True) is False
+    )
+
+
+def _jobsdb_cdp_required_result(
+    url: str,
+    *,
+    detail_reason: str = "jobsdb_cdp_session_required",
+) -> JdFetchResult:
+    """Build the fail-soft result for an unapproved JobsDB detail request.
+
+    This is the hard stop that prevents a new model or a legacy adapter from
+    silently opening a headless browser.  It contains only an actionable
+    visible-Chrome handoff; no cookie or storage-state material is returned.
+    """
+    canon = normalize_job_url(url, source="jobsdb") or str(url or "").strip()
+    try:
+        recovery = JobsdbHumanVerificationRecovery()
+        command = recovery._manual_cdp_command(canon)
+    except Exception:
+        command = None
+    return JdFetchResult(
+        ok=False,
+        url=canon,
+        portal="jobsdb",
+        fail_reason="degraded",
+        detail_reason=detail_reason,
+        attempts=0,
+        last_reason=detail_reason,
+        session_mode="none",
+        headless=None,
+        browser_channel="user-chrome-cdp",
+        recommended_action="run_workflow_scan_with_user_chrome_cdp",
+        requires_user_action=True,
+        manual_hint=(
+            "JobsDB 详情只能通过已验证的可见 Chrome CDP 会话；"
+            "请运行统一 scan 入口并按提示完成一次验证。"
+        ),
+        manual_command=command,
+    )
+
+
 def fetch_jd_body(
     url: str,
     *,
@@ -1907,15 +3201,24 @@ def fetch_jd_body(
     retry_delay: float = 30.0,
     save_storage_state: str | Path | None = None,
     cache_root: Path | None = None,
-    session: JdBrowserSession | None = None,
+    session: Any | None = None,
     failure_cache: bool = True,
     circuit: PortalCircuitBreaker | None = None,
     circuit_state_path: str | Path | None = None,
     signal_file: str | Path | None = None,
     reset_budget: bool = False,
     workspace: str | Path | None = None,
+    allow_legacy_jobsdb: bool = False,
 ) -> JdFetchResult:
-    """Fetch a JD with bounded retries, session reuse, caching and a portal breaker."""
+    """Fetch a JD with bounded retries, session reuse, caching and a portal breaker.
+
+    JobsDB detail fetching has one additional invariant: production callers
+    must provide the retained, user-visible Chrome CDP session.  The historical
+    ``allow_legacy_jobsdb`` argument remains accepted for source compatibility
+    but is a no-op.  This prevents a model that discovers the old helper from
+    opening a headless challenge browser or treating copied storage state as a
+    detail-page credential.
+    """
     raw = (url or "").strip()
     portal = detect_portal(raw)
     if reset_budget:
@@ -1946,6 +3249,36 @@ def fetch_jd_body(
         )
 
     canon = normalize_job_url(raw, source=portal if portal != "generic" else "")
+    if not canon:
+        return JdFetchResult(
+            ok=False,
+            url=raw,
+            portal=portal,
+            fail_reason="empty",
+            attempts=0,
+            last_reason="empty",
+        )
+    # The old compatibility flag is intentionally inert.  Never let a caller
+    # (including a newly attached model) turn JobsDB details back into a
+    # Playwright/storage-state operation.  A valid cache is handled just
+    # below, so cached JDs still work when Chrome is temporarily unavailable.
+    del allow_legacy_jobsdb
+    jobsdb_storage_state_env = os.environ.get("PORTAL_JD_STORAGE_STATE", "").strip()
+    if portal == "jobsdb" and (
+        storage_state or save_storage_state or jobsdb_storage_state_env
+    ):
+        return _jobsdb_cdp_required_result(
+            raw,
+            detail_reason="jobsdb_cdp_rejects_storage_state",
+        )
+
+    if not storage_state and not save_storage_state:
+        cached_result = _load_success_cache_result(canon, portal, cache_root)
+        if cached_result is not None:
+            return cached_result
+
+    if portal == "jobsdb" and not _is_user_chrome_cdp_session(session):
+        return _jobsdb_cdp_required_result(raw)
     if circuit is None and circuit_state_path is not None:
         threshold = 2
         if portal == "jobsdb":
@@ -1971,10 +3304,23 @@ def fetch_jd_body(
     # The failure cache only yields to an *explicit* recovery attempt (caller
     # passes a state path or a persistent profile).  A default/env state file
     # is the normal configuration and must not disable failure caching.
+    session_mode = ""
+    if session is not None:
+        try:
+            session_mode = str(session._session_mode_label())
+        except Exception:
+            session_mode = ""
     has_session_state = bool(
         storage_state
         or save_storage_state
-        or (session is not None and session.user_data_dir is not None)
+        or (
+            session is not None
+            and getattr(session, "user_data_dir", None) is not None
+        )
+        # A retained CDP context is already the user's validated live
+        # session; a failure cache entry from the pre-handoff headless route
+        # must never mask a later URL in that context.
+        or session_mode == "cdp-user-profile"
     )
     failure_cache_active = bool(
         failure_cache and cache_root is not None and not has_session_state
@@ -2136,16 +3482,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--headed", action="store_true", help="Show browser window")
     ap.add_argument("--channel", default=None, help="Playwright channel e.g. chrome")
     ap.add_argument(
+        "--cdp-url",
+        default=None,
+        help="Optional localhost CDP endpoint for the primary Chrome session",
+    )
+    ap.add_argument(
         "--storage-state",
         type=Path,
         default=None,
-        help="Path to storage_state.json (cookies)",
+        help=(
+            "Path to storage_state.json (other portals only; rejected for "
+            "JobsDB details)"
+        ),
     )
     ap.add_argument(
         "--save-storage-state",
         type=Path,
         default=None,
-        help="Save cookies/localStorage after success only (must be under home)",
+        help=(
+            "Save cookies/localStorage after success only for other portals "
+            "(must be under home; rejected for JobsDB details)"
+        ),
     )
     ap.add_argument(
         "--retry",
@@ -2167,8 +3524,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--interactive-verification",
         action="store_true",
-        help="Wait for human verification in the visible browser window "
-        "(requires --headed; independent of TTY)",
+        help=(
+            "Wait for human verification in an explicitly allowed non-JobsDB "
+            "browser; JobsDB always uses primary Chrome CDP"
+        ),
     )
     ap.add_argument(
         "--verification-timeout-seconds",
@@ -2180,7 +3539,10 @@ def main(argv: list[str] | None = None) -> int:
         "--user-data-dir",
         type=Path,
         default=None,
-        help="Dedicated persistent browser profile directory (recovery mode)",
+        help=(
+            "Dedicated persistent profile for other portals only; ignored for "
+            "JobsDB, which is primary-Chrome-CDP-only"
+        ),
     )
     ap.add_argument(
         "--verification-signal-file",
@@ -2205,13 +3567,66 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Print full JSON result")
     args = ap.parse_args(argv)
 
-    if args.interactive_verification and not args.headed:
+    portal = detect_portal(args.url)
+    if args.interactive_verification and not args.headed and portal != "jobsdb":
         ap.error("--interactive-verification requires --headed")
-
+    if portal == "jobsdb" and (args.storage_state or args.save_storage_state):
+        ap.error(
+            "JobsDB detail is CDP-only; remove --storage-state/--save-storage-state "
+            "and use the visible primary Chrome session"
+        )
+    if portal == "jobsdb" and not _workflow_gateway_active():
+        # This file is a compatibility implementation detail, not a second
+        # product entry point.  Refuse before constructing the recovery object
+        # so a newly attached model cannot make a manual browser handoff from
+        # an ad-hoc command.  The official adapter sets the marker on its
+        # child process and is the only supported route to this code.
+        payload = {
+            "ok": False,
+            "portal": "jobsdb",
+            "fail_reason": "degraded",
+            "detail_reason": "jobsdb_gateway_only",
+            "recommended_action": "run_workflow_scan_with_user_chrome_cdp",
+            "requires_user_action": True,
+            "manual_hint": (
+                "JobsDB 完整 JD 只能通过统一 gateway 扫描；"
+                "不要直接运行 portal_jd_browser.py。"
+            ),
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(
+                "FAIL (degraded) portal=jobsdb detail=jobsdb_gateway_only",
+                file=sys.stderr,
+            )
+            print(
+                "请运行：python3 -m tools.workflow scan --mode temp",
+                file=sys.stderr,
+            )
+        return 2
     session = None
-    if args.interactive_verification or args.user_data_dir or args.signal_file:
+    cdp_recovery = None
+    # JobsDB manual/persistent requests are never allowed to instantiate a
+    # Playwright browser.  That was the source of the misleading "complete
+    # Cloudflare in a headless window" path when a new model called this
+    # compatibility CLI directly.  The only JobsDB interactive path is the
+    # retained user-Chrome CDP session; other portals keep their historical
+    # explicit interactive behavior.
+    # JobsDB detail is always a user-Chrome CDP operation, even when a caller
+    # forgets the historical ``--headed`` flag.  Making the route unconditional
+    # is important for model portability: a new harness cannot accidentally
+    # fall back to a headless Playwright challenge window by omitting one flag.
+    jobsdb_cdp_requested = portal == "jobsdb"
+    if jobsdb_cdp_requested:
+        cdp_recovery = JobsdbHumanVerificationRecovery(
+            profile_dir=args.user_data_dir,
+            verification_timeout_seconds=args.verification_timeout_seconds,
+            cdp_endpoint=args.cdp_url,
+        )
+    elif args.interactive_verification or args.user_data_dir or args.signal_file:
         session = JdBrowserSession(
-            portal=detect_portal(args.url),
+            portal=portal,
             headless=not args.headed,
             storage_state=args.storage_state,
             channel=args.channel,
@@ -2220,7 +3635,11 @@ def main(argv: list[str] | None = None) -> int:
             user_data_dir=args.user_data_dir,
         )
 
-    manual_recovery = args.interactive_verification or args.user_data_dir is not None
+    manual_recovery = bool(
+        cdp_recovery is not None
+        or args.interactive_verification
+        or args.user_data_dir is not None
+    )
 
     # The interactive/persistent path is the manual recovery path: it must
     # never be blocked by the persisted breaker or a stale failure cache.
@@ -2229,28 +3648,37 @@ def main(argv: list[str] | None = None) -> int:
         circuit_path = default_circuit_state_path()
 
     try:
-        res = fetch_jd_body(
-            args.url,
-            headless=not args.headed,
-            timeout_ms=args.timeout_ms,
-            storage_state=args.storage_state,
-            channel=args.channel,
-            retry=args.retry,
-            retry_delay=args.retry_delay,
-            save_storage_state=args.save_storage_state,
-            session=session,
-            failure_cache=not args.no_failure_cache and not manual_recovery,
-            circuit_state_path=circuit_path,
-            signal_file=args.signal_file,
-            reset_budget=True,
-        )
+        if cdp_recovery is not None:
+            # This path attaches to (or asks the user to start) a visible
+            # Chrome CDP endpoint and keeps its context alive for the caller's
+            # batch.  It never creates a headless browser or copies cookies.
+            res = cdp_recovery.recover(
+                args.url,
+                cache_root=_default_cache_root(),
+            )
+        else:
+            res = fetch_jd_body(
+                args.url,
+                headless=not args.headed,
+                timeout_ms=args.timeout_ms,
+                storage_state=args.storage_state,
+                channel=args.channel,
+                retry=args.retry,
+                retry_delay=args.retry_delay,
+                save_storage_state=args.save_storage_state,
+                session=session,
+                failure_cache=not args.no_failure_cache and not manual_recovery,
+                circuit_state_path=circuit_path,
+                signal_file=args.signal_file,
+                reset_budget=True,
+            )
 
         if manual_recovery and res.ok and res.content_validated:
             # A validated manual JD proves the portal is reachable again:
             # close the persisted breaker so the next scan can fetch normally.
             # Challenge/429/timeout/empty results never close it.
             PortalCircuitBreaker(
-                portal=detect_portal(args.url),
+                portal=portal,
                 state_path=default_circuit_state_path(),
             ).reconcile_success()
 
@@ -2286,9 +3714,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(res.text[:400] if res.text else "")
                 if res.fail_reason in {"challenge", "waf"}:
                     print(
-                        "提示：如持续被拦截，请使用 "
-                        "--headed --interactive-verification [--user-data-dir <dir>] "
-                        "完成一次人工验证后重试。"
+                        "提示：如持续被拦截，请通过 python3 -m tools.workflow scan "
+                        "按返回的可见 Chrome CDP 命令完成一次人工验证后重试。"
                     )
 
         if args.out and res.ok:
@@ -2310,6 +3737,8 @@ def main(argv: list[str] | None = None) -> int:
         # on success, failure and exception alike.
         if session is not None:
             session.close()
+        if cdp_recovery is not None:
+            cdp_recovery.close()
 
 
 if __name__ == "__main__":

@@ -27,6 +27,14 @@ and how to tailor the application without giving up final control.
 - **JobsDB recovery is actionable and bounded:** if daily Chrome does not expose CDP, the system does not pretend verification succeeded or retry forever. It writes a cookie-free manual-recovery handoff and a resumable command, deduplicates identical portal requests while preserving page/query aliases, and reports planned/deduplicated/error/filter diagnostics.
 - **Verification:** the full Python regression after this repair is `585 passed, 7 skipped, 41 deselected`; private workspace data, Google credentials, cookies, and runtime artifacts remain outside the public commit.
 
+## 🆕 Latest update · 2026-09-08 · SOP Control control plane
+
+- **One governed entry boundary:** `scan / push / materials / audit / format / apply / base / intent / archive / sync` now pass through the unified workflow gateway before calling their business adapters. A model cannot switch to a legacy route or bypass the state machine.
+- **Rules are runtime-enforced:** SOP rules are registered in `.sopcontrol/`, not merely written in `AGENTS.md` or the README. The JobsFlow adapter checks them before an action and records a receipt afterward; missing confirmation, capability tickets, current inputs or required artifacts fail closed.
+- **Materials are fixed to one chain:** material generation is bound to `materials-vnext-1`; legacy material entrypoints are rejected. The controlled order is baseline → bounded JD delta → independent CV/CL content audit → DOCX/PDF format gates.
+- **Safe model handoff:** project identity, rule summaries, task state and evidence can be reused across models, harnesses and worktrees, so switching models does not recreate the workflow from memory.
+- **Release boundary:** the SOP rules, test command, fixed CI revision and pre-push gate are wired into the product. Control-plane evidence remains separate from private job-search runtime data; resumes, JDs, cookies, Google credentials and runtime ledgers are not published to GitHub.
+
 ### Why JobsFlow?
 
 | Generic AI job tool | JobsFlow |
@@ -314,6 +322,11 @@ compression: the full company and role remain in the manifest/material content,
 and the Cover Letter normally names the primary role once rather than listing
 alternatives.
 
+The order of an acronym compound is presentation-only: `ECM/IPO` and `IPO/ECM`
+(including spaced forms) are equivalent. JobsFlow preserves the JD/source order;
+the model is not asked to rewrite or verify it, and must not inspect another
+package for a wording example.
+
 A deterministic preflight extracts salary, availability, work authorization, language/licence, experience and attachment requirements. A separate language gate compares explicit job-language requirements with the private language profile: an undeclared required language is excluded, a potentially higher level is flagged for human judgment, and the language used to write the advert is not mistaken for a job requirement. Salary parsing also handles localized numbers, range hyphens, and `k/M/B` or `千/万/亿` amount suffixes; ambiguous formats stay neutral and visible for confirmation. The system then produces an evidence map, four-slot cover-letter blueprint and quality gate, so models with different capability levels follow the same analysis rather than improvising or silently skipping questions.
 
 DOCX masters remain the source. LibreOffice runs headlessly, CVs and cover letters default to one page (unless you explicitly need otherwise), and unchanged documents reuse a content-hash PDF cache.
@@ -393,6 +406,18 @@ JobsDB is the main portal that may require a browser fallback. Its fixed order i
 4. This is not headless verification and does not copy cookies into another browser.
    Failed verification, timeout, 429 or unvalidated content never closes the breaker.
    Browser profiles, cookies and personal tokens stay outside GitHub.
+
+This is the only JobsDB full-JD route. Direct execution of `portal_jd_browser.py`
+or `portal_jd_cdp.py` is blocked with `jobsdb_gateway_only`; the JobsDB Bun
+`detail --teaser-only` command returns structured listing data only. A new model
+or harness must not set the internal gateway marker, launch another browser or
+copy cookies for detail retrieval.
+
+Chrome 136+ toggle mode may return 404 for `/json/version` while exposing only
+the browser WebSocket at `/devtools/browser`; this is a supported primary-Chrome
+path. The gateway performs one attach during the real scan and validates
+`Browser.getVersion`, so an HTTP 404 must not trigger repeated probes or a
+headless/second browser.
 
 The public product ships the controlled interface and safe defaults; the private
 runtime enables the user-Chrome handoff. JobsDB never auto-generates materials, enters

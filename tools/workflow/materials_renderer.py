@@ -24,12 +24,61 @@ from tools.workflow.materials_metadata import metadata_violations, sanitize_docx
 
 RENDER_RECEIPT_NAME = "materials_render_receipt.json"
 FORMAT_REPORT_NAME = "materials_format_report.json"
-RENDERER_VERSION = "canonical-template-docx-v4"
+RENDERER_VERSION = "canonical-template-docx-v5"
 
 TEMPLATE_STYLES: dict[str, tuple[str, ...]] = {
     "cv": ("Resume Section", "Job Heading", "Resume Bullet", "Compact Line"),
     "cover_letter": ("Letter Body", "Letter Bullet", "Letter Compact"),
 }
+
+# Calibrated wrapped-line widths (characters per line) of the lane masters.
+# These feed the pre-render capacity estimate.  The estimate is advisory: the
+# LibreOffice PDF page count stays the only authoritative one-page fact, but
+# comparing the canonical against the same master's estimate catches gross
+# overruns before any DOCX/PDF cycle starts.
+CAPACITY_CHARS_PER_LINE: dict[str, int] = {
+    "Normal": 92,
+    "Compact Line": 104,
+    "Letter Compact": 104,
+    "Resume Bullet": 94,
+    "Letter Bullet": 94,
+    "Job Heading": 92,
+    "Resume Section": 92,
+}
+
+
+def estimate_canonical_capacity(canonical: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+    """Estimate wrapped-line growth of the canonical against its lane master.
+
+    The master renders one page by construction, so its estimated line count
+    is the budget.  This is a pure function: no template, no renderer and no
+    PDF conversion is involved, which is exactly what makes it cheap enough to
+    run on every transform instead of after every render.
+    """
+
+    def _lines(blocks: list[dict[str, Any]]) -> int:
+        total = 0
+        for block in blocks:
+            if not isinstance(block, dict) or bool(block.get("host_managed_optional")):
+                continue
+            width = CAPACITY_CHARS_PER_LINE.get(str(block.get("source_style") or "Normal"), 92)
+            chars = len(str(block.get("text") or ""))
+            total += max(1, -(-chars // max(1, width)))
+        return total
+
+    report: dict[str, Any] = {}
+    for material in ("cv", "cover_letter"):
+        master_blocks = [dict(item) for item in ((baseline.get(material) or {}).get("blocks") or []) if isinstance(item, dict)]
+        current_blocks = [dict(item) for item in ((canonical.get(material) or {}).get("blocks") or []) if isinstance(item, dict)]
+        master_lines = _lines(master_blocks)
+        estimated_lines = _lines(current_blocks)
+        report[material] = {
+            "master_lines": master_lines,
+            "estimated_lines": estimated_lines,
+            "over_master_lines": estimated_lines - master_lines,
+            "ratio": round(estimated_lines / max(1, master_lines), 3),
+        }
+    return report
 
 
 def _now() -> str:
@@ -100,13 +149,26 @@ def expected_filenames(package: Path, workspace: Path) -> dict[str, str]:
 
 def _audit_current(package: Path) -> bool:
     report = _load(Path(package) / "materials_audit.json")
-    return bool(
+    if (
         report.get("status") == "passed"
         and report.get("content_gate") == "passed"
         and isinstance(report.get("semantic_material_hashes"), dict)
         and report.get("semantic_material_hashes") == semantic_material_hashes(Path(package))
         and int((report.get("open_counts") or {}).get("P0", 0)) == 0
         and int((report.get("open_counts") or {}).get("P1", 0)) == 0
+    ):
+        return True
+    # A hash-bound user acceptance is an explicit gate outcome.  The semantic
+    # hash comparison still guarantees the canonical was not edited after the
+    # user accepted it, and the record never claims an independent audit.
+    acceptance = _load(Path(package) / "materials_vnext" / "audit_acceptance.json")
+    canonical = _load(Path(package) / "materials_draft.canonical.json")
+    return bool(
+        acceptance.get("user_accepted")
+        and acceptance.get("accepted_material_hash") == canonical.get("canonical_sha256")
+        and isinstance(acceptance.get("semantic_material_hashes"), dict)
+        and acceptance.get("semantic_material_hashes") == semantic_material_hashes(Path(package))
+        and acceptance.get("independent_audit_passed") is False
     )
 
 
@@ -396,7 +458,11 @@ def _apply_visual_balance(
     actual_units = _layout_units(document, material=material)
     gap_units = max(0.0, target_units - actual_units)
     paragraph_gap = max(0, int(target_paragraphs) - len(document.paragraphs))
-    if gap_units < 1.0 and paragraph_gap < 2:
+    # Wrapped-line slack is the only evidence that the page is underfilled.  A
+    # draft with fewer paragraphs than the master can still demand *more* lines
+    # than the master (longer tailored bullets), and adding rhythm there pushes
+    # the sign-off or the qualifications block onto a second page.
+    if gap_units < 1.0:
         return {
             "mode": "template_native",
             "target_units": round(target_units, 2),
@@ -427,11 +493,9 @@ def _apply_visual_balance(
             "extra_space_after_pt": 0.0,
         }
 
-    # Paragraph-count differences capture omitted optional template slots (for
-    # example a shorter recipient block); wrapped-line differences capture
-    # fewer experience bullets.  Keep the adjustment bounded so a sparse draft
-    # never becomes artificially airy.
-    target_points = min(90.0, max(gap_units * 10.5, paragraph_gap * 14.0))
+    # Wrapped-line slack is the whole budget, so a sparse draft never becomes
+    # artificially airy and rhythm can never consume space the text needs.
+    target_points = min(90.0, gap_units * 10.5)
     per_paragraph = min(7.0, target_points / len(candidates))
     for paragraph in candidates:
         current = paragraph.paragraph_format.space_after.pt if paragraph.paragraph_format.space_after else 0.0

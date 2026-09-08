@@ -136,6 +136,18 @@ _POSTING_LANGUAGE_HINT = re.compile(
     r"\b(?:written|posted|published|provided|available)\s+in\b",
     re.IGNORECASE,
 )
+# Soft preference only — must not become language-gate FAIL.
+_SOFT_PREFERENCE_HINT = re.compile(
+    r"\b(?:advantage|preferred|preferable|desirable|optional|bonus|"
+    r"nice\s+to\s+have|a\s+plus|would\s+be\s+an?\s+advantage)\b|"
+    r"优先|优先考虑|加分|更佳|更好|优势",
+    re.IGNORECASE,
+)
+_HARD_REQUIREMENT_HINT = re.compile(
+    r"\b(?:must|required|required\s+to|essential|mandatory|need(?:s)?\s+to)\b|"
+    r"必须|要求|必需|需要",
+    re.IGNORECASE,
+)
 
 
 def canonical_language(value: Any) -> tuple[str, str] | None:
@@ -248,6 +260,10 @@ def extract_language_requirements(jd_text: str) -> list[LanguageRequirement]:
         if _NON_REQUIREMENT_HINT.search(window) and not _REQUIREMENT_HINT.search(window):
             continue
         if not _REQUIREMENT_HINT.search(window):
+            continue
+        # "Japanese would be an advantage" / "优先" without must/required is
+        # preference, not a hard working-language gate.
+        if _SOFT_PREFERENCE_HINT.search(window) and not _HARD_REQUIREMENT_HINT.search(window):
             continue
         resolved = canonical_language(match.group(0))
         if not resolved:

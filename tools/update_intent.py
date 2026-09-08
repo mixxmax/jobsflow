@@ -426,10 +426,18 @@ def create_preference_proposal(
         raise RuntimeError("没有私有搜索配置，请先运行 /setup")
     before = resolve_workflow_preferences(config)
     next_config = copy.deepcopy(config)
+    existing_workflow = config.get("workflow_preferences")
     workflow = {
         "scan_depth": before["scan_depth"],
         "retention_preference": before["retention_preference"],
     }
+    # Preference updates must not silently disable a separately confirmed
+    # review-first policy. Preserve only the machine-owned optional controls;
+    # the user is still required to change them through their own policy path.
+    if isinstance(existing_workflow, dict):
+        for key in ("preview_floor", "defer_deep_until_selection", "default_entry_policy"):
+            if key in existing_workflow:
+                workflow[key] = existing_workflow[key]
     if preference == "scan_depth":
         workflow["scan_depth"] = parse_scan_depth(value)
     elif preference == "retention_preference":

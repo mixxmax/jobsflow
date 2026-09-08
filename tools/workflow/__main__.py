@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from uuid import uuid4
@@ -33,10 +34,25 @@ def _materials_engine_info() -> dict[str, str]:
 
 
 def _workspace(ns: argparse.Namespace) -> Path:
+    """Resolve the runtime workspace without guessing a sibling private tree.
+
+    The product checkout and a user's ``JobSearch_2026`` instance commonly
+    live side by side.  Earlier versions silently preferred the sibling when
+    a command was started from the product root.  That made a new model (or a
+    different harness) able to operate on private data simply by omitting
+    ``--workspace``.  A runtime is now selected only by an explicit argument,
+    ``JOBSEARCH_ROOT`` (which the gateway passes to its adapters), or by
+    actually running from inside the private runtime itself.
+    """
     if ns.workspace:
-        return Path(ns.workspace)
-    candidate = Path.cwd() / "JobSearch_2026"
-    return candidate if candidate.is_dir() else Path.cwd()
+        return Path(ns.workspace).expanduser().resolve()
+    configured = os.environ.get("JOBSEARCH_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    if cwd.name == "JobSearch_2026" and (cwd / "00_Profile").is_dir():
+        return cwd
+    return cwd
 
 
 def _load_store(path: Path | None, title: str, workspace: Path):
@@ -131,6 +147,12 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="仅预览/入表指定岗位；用逗号分隔 URL、scan_id 或已有岗位编号",
     )
+    push.add_argument(
+        "--entry-policy",
+        choices=["standard", "all"],
+        default="",
+        help="入表策略：standard=深评达到默认线才入表；all=明确覆盖并纳入已展示候选",
+    )
     push.add_argument("--backend", choices=["auto", "csv", "gsheet", "file"], default="auto")
     push.add_argument(
         "--confirm",
@@ -154,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     materials.add_argument(
         "materials_cmd",
         nargs="?",
-        choices=["run", "status", "reset", "draft", "resolve", "repair", "render", "pdf", "batch"],
+        choices=["run", "status", "reset", "draft", "resolve", "accept", "repair", "render", "pdf", "batch"],
         default="run",
     )
     materials.add_argument("--job-id", default="")
@@ -162,6 +184,12 @@ def main(argv: list[str] | None = None) -> int:
     materials.add_argument("--content", type=Path, help="Bounded baseline transform JSON (not a full CV/CL replacement)")
     materials.add_argument("--patch", type=Path, help="Finding-scoped canonical repair JSON")
     materials.add_argument("--resolution", type=Path, help="Accept/dispute decisions for current audit findings")
+    materials.add_argument(
+        "--accept-reason",
+        dest="accept_reason",
+        default="",
+        help="Recorded reason when accepting materials without an independent audit",
+    )
     materials.add_argument(
         "--stage",
         choices=["drafting", "pdf_generated"],
@@ -188,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
     audit.add_argument("--audit-timeout", type=int, default=900)
     audit.add_argument("--result", type=Path, default=None, help="Structured independent audit result JSON")
     audit.add_argument("--producer-context-id", default="")
+    audit.add_argument("--suspend-audit", action="store_true", help="Stop automatic audit dispatch until explicitly resumed")
+    audit.add_argument("--resume-audit", action="store_true", help="Resume automatic audit dispatch")
 
     format_p = sub.add_parser("format", parents=[common], help="Run the final PDF/format gate")
     format_p.add_argument("--job-id", default="")
@@ -230,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
     if action == "doctor":
         import setup as setup_module
         from tools.workflow.base_onboarding import status as base_status
+        from tools.workflow.portal_policy import resolve_workspace_profile
 
         out = setup_module.doctor_snapshot()
         # Environment checks belong to the product checkout, while base
@@ -246,6 +277,34 @@ def main(argv: list[str] | None = None) -> int:
         out["workflow_ready"] = out["ready"]
         out["materials_base"] = runtime_base
         out["materials_ready"] = bool(runtime_base.get("ready"))
+        # JobsDB detail transport is a private-runtime capability.  Product
+        # doctor must never probe or take over a user's browser; the private
+        # JobSearch_2026 instance may report the safe primary-Chrome CDP
+        # readiness so a new model has an explicit next action instead of
+        # inventing a Playwright/cookie workflow.
+        profile = resolve_workspace_profile(workspace)
+        if profile == "private":
+            try:
+                from tools.fresh_24h.portal_jd_browser import jobsdb_cdp_status
+
+                out["jobsdb_detail_transport"] = jobsdb_cdp_status()
+            except Exception as exc:
+                out["jobsdb_detail_transport"] = {
+                    "transport": "primary_chrome_cdp",
+                    "ready": False,
+                    "status": "diagnostic_unavailable",
+                    "requires_user_action": False,
+                    "recommended_action": "run_workflow_scan_with_user_chrome_cdp",
+                    "error": exc.__class__.__name__,
+                }
+        else:
+            out["jobsdb_detail_transport"] = {
+                "transport": "primary_chrome_cdp",
+                "ready": False,
+                "status": "product_policy_disabled",
+                "requires_user_action": False,
+                "recommended_action": "use_private_runtime_for_user_chrome_handoff",
+            }
         if getattr(args, "strict_materials", False) and not out.get("materials_ready"):
             out = dict(out)
             out["next_action"] = "prepare_base_masters"
@@ -290,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
                 "allow_pending_semantic": args.allow_pending_semantic,
                 "fresh_title": args.fresh_title,
                 "selected_keys": [value.strip() for value in args.select.split(",") if value.strip()],
+                "entry_policy": args.entry_policy,
                 "backend": "csv" if args.local_only else args.backend,
                 "confirmation_id": args.confirmation_id,
             }
@@ -454,6 +514,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.resolution:
                 value = json.loads(Path(args.resolution).read_text(encoding="utf-8"))
                 payload["decisions"] = value.get("decisions") if isinstance(value, dict) else value
+        elif args.materials_cmd == "accept":
+            payload["stage"] = "accept"
+            if args.accept_reason:
+                payload["acceptance_reason"] = args.accept_reason
         elif args.materials_cmd == "render":
             payload.update({"stage": "render", "force": bool(args.force)})
         elif args.materials_cmd == "pdf":
@@ -489,6 +553,10 @@ def main(argv: list[str] | None = None) -> int:
             payload["auto_audit"] = bool(args.auto_audit)
             payload["audit_timeout"] = int(args.audit_timeout)
             payload["producer_context_id"] = args.producer_context_id
+            if args.suspend_audit:
+                payload["audit_dispatch"] = "suspend"
+            elif args.resume_audit:
+                payload["audit_dispatch"] = "resume"
             if args.result:
                 payload["audit_result"] = json.loads(Path(args.result).read_text(encoding="utf-8"))
     elif action == "archive":

@@ -846,19 +846,27 @@ def build_queries_config(
             clone["terms"] = dict(seed.get("terms") or {})
             queries.append(clone)
 
+    workflow_preferences = {
+        "scan_depth": normalize_scan_depth(
+            (profession.get("workflow_preferences") or {}).get("scan_depth")
+        ),
+        "retention_preference": normalize_retention_preference(
+            (profession.get("workflow_preferences") or {}).get(
+                "retention_preference"
+            )
+        ),
+    }
+    # Preserve explicitly configured review-first controls when setup is
+    # rerun. They are opt-in runtime policy, not setup defaults, so do not add
+    # them to a fresh public/industry-neutral configuration.
+    for key in ("preview_floor", "defer_deep_until_selection", "default_entry_policy"):
+        if key in (profession.get("workflow_preferences") or {}):
+            workflow_preferences[key] = (profession.get("workflow_preferences") or {})[key]
+
     return {
         "description": "Jobsflow search queries generated from local setup preferences",
         "location_linkedin": location,
-        "workflow_preferences": {
-            "scan_depth": normalize_scan_depth(
-                (profession.get("workflow_preferences") or {}).get("scan_depth")
-            ),
-            "retention_preference": normalize_retention_preference(
-                (profession.get("workflow_preferences") or {}).get(
-                    "retention_preference"
-                )
-            ),
-        },
+        "workflow_preferences": workflow_preferences,
         "query_policy": {
             "mandatory_buckets": mandatory_buckets,
             "notes": "Private setup output; buckets reflect this user's target domain.",
@@ -1026,7 +1034,23 @@ def generate_config(
     prof = classify_profession(intent, resume_text)
     prof["candidate_languages"] = prof_languages
     prof["semantic_profile"] = semantic_profile_for_level(semantic_upper_level)
-    prof["workflow_preferences"] = dict(workflow_preferences or {})
+    resolved_workflow_preferences = dict(workflow_preferences or {})
+    # A setup rerun owns the newly collected search/retention choices but must
+    # not erase an already confirmed review-first policy from the private
+    # runtime. This keeps the 2.8 display/deferred-deep trial stable across
+    # model or setup handoffs.
+    try:
+        previous_queries = json.loads(
+            personal_queries_path(REPO).read_text(encoding="utf-8")
+        )
+        previous_workflow = previous_queries.get("workflow_preferences")
+        if isinstance(previous_workflow, dict):
+            for key in ("preview_floor", "defer_deep_until_selection", "default_entry_policy"):
+                if key not in resolved_workflow_preferences and key in previous_workflow:
+                    resolved_workflow_preferences[key] = previous_workflow[key]
+    except (OSError, ValueError, TypeError):
+        pass
+    prof["workflow_preferences"] = resolved_workflow_preferences
     # Parse only explicit, machine-checkable constraints from the user's intent;
     # missing values stay unknown rather than being guessed from résumé history.
     intent_lower = str(intent or "").casefold()
@@ -1184,6 +1208,19 @@ def generate_config(
     }
     config_path = personal_config_path(REPO)
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    # Preserve private integration keys on re-run: setup only owns the
+    # candidate fields above and must never wipe solver tokens a user added
+    # by hand (e.g. ct2captcha_key, ct2captcha_proxy).
+    _PRIVATE_KEY_FIELDS = ("ct2captcha_key", "ct2captcha_proxy",
+                           "ct2captcha_proxytype")
+    try:
+        existing = json.loads(config_path.read_text(encoding="utf-8"))
+        if isinstance(existing, dict):
+            for field in _PRIVATE_KEY_FIELDS:
+                if existing.get(field):
+                    config[field] = existing[field]
+    except (OSError, ValueError):
+        pass
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     ok(f"{config_path.relative_to(REPO)} -> personal profile saved privately")
 
