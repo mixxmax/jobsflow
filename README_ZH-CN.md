@@ -39,7 +39,6 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 - **扫描入口已收敛**：`temp_two_pass.sh` 现在只是兼容入口，统一转到 workflow gateway；每轮生成绑定窗口、评分产物哈希、语义状态和游标提交的官方 `run.json`。省略 `run_id` 时只解析最新官方运行，不再误用旧的 `temp`/`daily` 状态哨兵。
 - **台账身份与投影已分离**：本地 workflow ledger 是岗位行身份和编号的权威来源；同一批已确认岗位可以安全投影到 CSV 和 Google Sheets，不会因为另一投影为空而重新编号。每次 push 都返回后端解析结果，配置缺失时明确警告 `auto → local CSV`。
 - **JobsDB 受控恢复更可操作**：日常 Chrome 未暴露 CDP 时，系统不会假装完成验证或无限重试，而是生成不含 cookie 的人工恢复交接记录和可重跑提示；同时对重复门户请求去重，保留页码与查询别名，并输出计划/去重/错误/过滤诊断。
-- **验收**：本次修复后完整 Python 回归为 `585 passed, 7 skipped, 41 deselected`；个人工作区、Google 凭据、cookie 和运行产物仍不进入公开提交。
 
 ## 🆕 最新更新 · 2026-09-08 · SOP Control 控制面接入
 
