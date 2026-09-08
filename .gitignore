@@ -139,3 +139,17 @@ docs/superpowers/
 .sopcontrol/worktrees/
 .sopcontrol/rules/candidates.yaml
 .sopcontrol/archive/candidates-*.yaml
+
+# === Local agent/runtime artifacts (never commit) ===
+.dsh/
+.planning/
+.pnpm-store/
+.sopcontrol/archive/
+02_Tracker/
+05_Archive/
+desktop_pet/
+tmp_extract.json
+install-dsh-anchored-standard.sh
+tools/notify_wechat.sh
+tools/fresh_24h/aws_waf_solver.py
+tests/test_aws_waf_solver.py
