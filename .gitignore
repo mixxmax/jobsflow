@@ -138,3 +138,4 @@ docs/superpowers/
 .sopcontrol/tasks/
 .sopcontrol/worktrees/
 .sopcontrol/rules/candidates.yaml
+.sopcontrol/archive/candidates-*.yaml
