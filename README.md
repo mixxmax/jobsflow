@@ -15,7 +15,7 @@
 JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗位，做材料，整理投遞資訊**的本地優先求職執行系統。
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.9.5-1F4E79?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-1.0.0-1F4E79?style=flat-square">
   <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
   <img alt="privacy" src="https://img.shields.io/badge/%E9%BB%98%E8%AE%A4-%E6%9C%AC%E5%9C%B0%E4%BC%98%E5%85%88-555?style=flat-square">
@@ -33,12 +33,6 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
 </p>
 
 ---
-
-## 🆕 最新更新 · 2026-08-23 · workflow reliability patch
-
-- **掃描入口已收斂**：`temp_two_pass.sh` 現在只是兼容入口，統一轉到 workflow gateway；每輪產生帶窗口、評分產物雜湊、語義狀態和游標提交的官方 `run.json`。省略 `run_id` 時只解析最新官方運行，不再誤用舊的 `temp`/`daily` 狀態哨兵。
-- **台帳身份與投影已分離**：本地 workflow ledger 是崗位行身份和編號的權威來源；同一批已確認職位可以安全投影到 CSV 和 Google Sheets，不會因另一個投影為空而重新編號。每次 push 都回報後端解析結果，配置缺失時明確警告 `auto → local CSV`。
-- **JobsDB 受控恢復更可操作**：日常 Chrome 未暴露 CDP 時，系統不會假裝完成驗證或無限重試，而是產生不含 cookie 的人工恢復交接記錄和可重跑提示；同時對重複門戶請求去重，保留頁碼與查詢別名，並輸出計劃/去重/錯誤/過濾診斷。
 
 ## 🆕 最新更新 · 2026-09-08 · SOP Control 控制面接入
 
@@ -667,7 +661,7 @@ pytest -q
 
 ## 📦 版本
 
-當前主線：**0.9.5** - 統一 SOP gateway 與狀態機、lane 鎖定和確認入表、基礎版增量材料鏈、獨立 CV/CL 內容審計、固定 lane-master DOCX/PDF 渲染、JD 緩存與受控 JobsDB 恢復。
+當前主線：**1.0.0** - 統一 SOP gateway 與狀態機、lane 鎖定和確認入表、基礎版增量材料鏈、獨立 CV/CL 內容審計、固定 lane-master DOCX/PDF 渲染、JD 緩存與受控 JobsDB 恢復。
 
 ---
 
