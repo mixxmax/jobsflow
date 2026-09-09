@@ -55,6 +55,28 @@ def _role_present(role: str, text: str) -> bool:
     return len(tokens) >= 2 and sum(token in present for token in tokens) >= 2
 
 
+def _is_cv_artifact(path: Path, found: dict[str, Path | None]) -> bool:
+    """Return whether *path* is a CV rather than a CL/email artifact.
+
+    The legacy audit used to require the target employer in every outbound
+    file.  A CV is intentionally employer-neutral: the target employer is a
+    host-managed identity requirement for the Cover Letter/email, not for the
+    candidate profile.  Prefer the authoritative discovery result, then keep
+    a conservative filename fallback for stale CV variants that are still
+    included by ``all_outbound_files``.
+    """
+
+    known_cv = {
+        Path(value).resolve()
+        for key in ("cv_txt", "cv_docx", "cv_pdf")
+        if (value := found.get(key)) is not None
+    }
+    if path.resolve() in known_cv:
+        return True
+    name = path.name.casefold()
+    return "cv" in name and "cover" not in name and "letter" not in name
+
+
 def audit_outbound(package: Path) -> dict[str, Any]:
     """Return independent high-risk findings for one package."""
     package = Path(package)
@@ -89,7 +111,7 @@ def audit_outbound(package: Path) -> dict[str, Any]:
             continue
         if role and not _role_present(role, text):
             findings.append({"rule_id": "MAT-004", "severity": "P0", "code": "independent_role_missing", "artifact": path.name})
-        if employer and _fold(employer) not in _fold(text):
+        if employer and not _is_cv_artifact(path, found) and _fold(employer) not in _fold(text):
             findings.append({"rule_id": "MAT-004", "severity": "P0", "code": "independent_employer_missing", "artifact": path.name})
         if recruiter_needle and (recruiter_needle in _fold(path.name) or recruiter_needle in _fold(text)):
             findings.append({"rule_id": "MAT-002", "severity": "P0", "code": "independent_recruiter_leak", "artifact": path.name})
