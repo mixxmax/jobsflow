@@ -1,7 +1,9 @@
 # /materials — 唯一产品材料链（materials-vnext-1）
 
 `JobSearch_2026` 只是本产品的一个运行实例：保存用户画像、JD 缓存、岗位包和产物；它不拥有
-另一套材料规则或审计代码。所有环境都调用同一个产品入口；gateway 固定引擎版本：
+另一套材料规则或审计代码。所有环境都调用同一个产品入口；gateway 固定引擎版本。
+
+若 JSON 含 `user_prompt` / `assistant_protocol`：**必须**原样向用户展示选项，**禁止**自行发明选项或替用户确认；用户选定后再按 `reply_contract` 回调 gateway。
 
 ```bash
 python3 -m tools.workflow materials --job-id C0-005

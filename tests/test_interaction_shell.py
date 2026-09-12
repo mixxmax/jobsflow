@@ -65,17 +65,41 @@ def test_redact_hides_secret_and_jd():
     assert "SECRET JD" not in json.dumps(safe)
 
 
-def test_workspace_does_not_silently_pick_private_tree(tmp_path, monkeypatch):
+def test_workspace_does_not_guess_among_multiple_runtimes(tmp_path, monkeypatch):
     product = tmp_path / "jobsflow"
     private = product / "JobSearch_2026"
+    other = product / "OtherSearch"
+    product.mkdir()
     private.mkdir(parents=True)
     (private / "00_Profile").mkdir()
-    product.mkdir(exist_ok=True)
+    other.mkdir()
+    (other / "00_Profile").mkdir()
     monkeypatch.delenv("JOBSEARCH_ROOT", raising=False)
-    monkeypatch.chdir(product)
-    resolved = resolve_workspace(cwd=product, env={}, allow_pointer=False)
+    monkeypatch.setattr(
+        "tools.workflow.interaction_shell.product_root",
+        lambda: product,
+    )
+    resolved = resolve_workspace(cwd=product, env={}, allow_pointer=True, autobind_singleton=True)
+    # Multiple candidates → do not guess.
     assert resolved == product.resolve()
-    assert resolved != private.resolve()
+
+
+def test_singleton_child_runtime_autobinds_from_product_root(tmp_path, monkeypatch):
+    from tools.workflow.interaction_shell import load_runtime_pointer
+
+    product = tmp_path / "jobsflow"
+    private = product / "JobSearch_2026"
+    product.mkdir()
+    private.mkdir()
+    (private / "00_Profile").mkdir()
+    monkeypatch.delenv("JOBSEARCH_ROOT", raising=False)
+    monkeypatch.setattr(
+        "tools.workflow.interaction_shell.product_root",
+        lambda: product,
+    )
+    resolved = resolve_workspace(cwd=product, env={}, allow_pointer=True, autobind_singleton=True)
+    assert resolved == private.resolve()
+    assert load_runtime_pointer(product) == private.resolve()
 
 
 def test_explicit_workspace_and_env_win(tmp_path, monkeypatch):
@@ -151,8 +175,118 @@ def test_produce_stops_on_blocker():
 def test_doctor_next_is_read_only(tmp_path):
     snap = {"failed": ["libreoffice"], "materials_ready": False, "materials_base": {}}
     out = doctor_next_actions(snap, workspace=tmp_path, runtime_ok=False)
-    assert out["next"]["command"]
+    assert out["next"]["id"] == "bind_runtime"
     assert len(out["queue"]) <= 3
+
+
+def test_doctor_bind_runtime_beats_fix_environment_when_unbound(tmp_path):
+    snap = {
+        "failed": ["libreoffice", "tracker"],
+        "checks": {"tracker": False},
+        "materials_ready": False,
+        "materials_base": {},
+    }
+    out = doctor_next_actions(snap, workspace=tmp_path, runtime_ok=False)
+    assert out["next"]["id"] == "bind_runtime"
+    assert any(item["id"] == "fix_environment" for item in out["queue"])
+
+
+def test_doctor_create_tracker_when_runtime_ok_but_tracker_missing(tmp_path):
+    snap = {
+        "failed": ["tracker"],
+        "checks": {"tracker": False},
+        "materials_ready": True,
+        "materials_base": {"ready": True},
+    }
+    out = doctor_next_actions(snap, workspace=tmp_path, runtime_ok=True)
+    assert out["next"]["id"] == "create_tracker"
+
+
+def test_doctor_fix_environment_only_after_runtime_and_tracker(tmp_path):
+    snap = {
+        "failed": ["libreoffice"],
+        "checks": {"tracker": True},
+        "materials_ready": True,
+        "materials_base": {"ready": True},
+    }
+    out = doctor_next_actions(snap, workspace=tmp_path, runtime_ok=True)
+    assert out["next"]["id"] == "fix_environment"
+
+
+def test_setup_pointer_roundtrip_and_priority(tmp_path, monkeypatch):
+    from tools.workflow.interaction_shell import (
+        load_runtime_pointer,
+        product_root,
+        save_runtime_pointer,
+    )
+
+    product = tmp_path / "product"
+    runtime = tmp_path / "JobSearch_2026"
+    other = tmp_path / "OtherRuntime"
+    product.mkdir()
+    runtime.mkdir()
+    (runtime / "00_Profile").mkdir()
+    other.mkdir()
+    (other / "00_Profile").mkdir()
+    pointer = save_runtime_pointer(product, runtime)
+    assert pointer.name == ".jobsflow-runtime.json"
+    data = json.loads(pointer.read_text(encoding="utf-8"))
+    assert set(data.keys()) == {"workspace", "schema_version"}
+    assert data["workspace"] == str(runtime.resolve())
+    assert data["schema_version"] == 1
+    monkeypatch.setattr(
+        "tools.workflow.interaction_shell.product_root",
+        lambda: product,
+    )
+    assert resolve_workspace(cwd=product, env={}, allow_pointer=True) == runtime.resolve()
+    assert resolve_workspace(explicit=other, env={}, allow_pointer=True) == other.resolve()
+    assert (
+        resolve_workspace(env={"JOBSEARCH_ROOT": str(other)}, cwd=product, allow_pointer=True)
+        == other.resolve()
+    )
+    # Invalid pointer must not fall back to guessing OtherRuntime.
+    pointer.write_text(
+        json.dumps({"workspace": str(tmp_path / "missing"), "schema_version": 1}),
+        encoding="utf-8",
+    )
+    assert load_runtime_pointer(product) is None
+    assert resolve_workspace(cwd=product, env={}, allow_pointer=True) == product.resolve()
+
+
+def test_runtime_pointer_is_gitignored():
+    text = Path("/Users/xiezhijie/ai-job-search/.gitignore").read_text(encoding="utf-8")
+    assert ".jobsflow-runtime.json" in text
+
+
+def test_setup_success_writes_runtime_pointer(tmp_path, monkeypatch):
+    """setup.py must bind product root → JobSearch_2026 after config generation."""
+
+    import setup as setup_mod
+
+    product = tmp_path / "jobsflow"
+    runtime = product / "JobSearch_2026"
+    product.mkdir()
+    runtime.mkdir()
+    (runtime / "00_Profile").mkdir()
+    (runtime / "02_Tracker").mkdir()
+
+    monkeypatch.setattr(setup_mod, "REPO", product)
+    monkeypatch.setattr(setup_mod, "check_prerequisites", lambda: {"python": True})
+    monkeypatch.setattr(setup_mod, "create_directories", lambda: runtime)
+    monkeypatch.setattr(setup_mod, "ask_tracking", lambda: "csv")
+    monkeypatch.setattr(setup_mod, "ask", lambda *a, **k: "junior roles")
+    monkeypatch.setattr(setup_mod, "ask_semantic_profile_level", lambda: "standard")
+    monkeypatch.setattr(setup_mod, "ask_workflow_preferences", lambda: {})
+    monkeypatch.setattr(setup_mod, "ask_yes_no", lambda *a, **k: False)
+    monkeypatch.setattr(setup_mod, "read_resume", lambda folder: "Name\nExperience")
+    monkeypatch.setattr(setup_mod, "generate_config", lambda *a, **k: None)
+
+    code = setup_mod.main(["--resume-folder", str(tmp_path / "cv")])
+    assert code == 0
+    pointer = product / ".jobsflow-runtime.json"
+    assert pointer.is_file()
+    data = json.loads(pointer.read_text(encoding="utf-8"))
+    assert data == {"workspace": str(runtime.resolve()), "schema_version": 1}
 
 
 def test_dispatch_scan_auto_redeems_once(tmp_path, monkeypatch):
@@ -235,6 +369,8 @@ def test_materials_ticket_challenge_includes_prompt_and_retry():
     assert wrapped["user_prompt"]["kind"] == "ask_preflight"
     assert wrapped["retry"]["capability_ticket_secret"] == "s-mat"
     assert "s-mat" not in json.dumps(wrapped["result"])
+    assert wrapped["assistant_protocol"]["must_display_user_prompt"] is True
+    assert wrapped["assistant_protocol"]["must_not_confirm_for_user"] is True
 
 
 def test_next_produce_stages_for_transformed_and_complete():

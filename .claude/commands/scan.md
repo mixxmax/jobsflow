@@ -2,6 +2,8 @@
 
 只调用统一入口。不要再单独运行旧扫描脚本。
 
+若 JSON 含 `user_prompt` / `assistant_protocol`：**必须**原样向用户展示选项，**禁止**自行发明选项或替用户确认；用户选定后再按 `reply_contract` 回调 gateway。
+
 ```bash
 python3 -m tools.workflow scan --mode temp
 python3 -m tools.workflow scan --mode daily

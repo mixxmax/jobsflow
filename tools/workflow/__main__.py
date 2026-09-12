@@ -13,9 +13,11 @@ from tools.workflow.fresh_store import FileFreshStore, default_fresh_store
 from tools.workflow.interaction_shell import (
     doctor_next_actions,
     is_runtime_workspace,
+    product_root,
     redact_output,
     resolve_workspace,
     runtime_gate,
+    save_runtime_pointer,
     wrap_result,
 )
 
@@ -142,6 +144,18 @@ def main(argv: list[str] | None = None) -> int:
 
     doctor = sub.add_parser("doctor", parents=[common], help="Read-only environment and base readiness check")
     doctor.add_argument("--strict-materials", action="store_true", help="Return non-zero until every configured lane has an active base pair")
+
+    bind = sub.add_parser(
+        "bind-runtime",
+        parents=[common],
+        help="Bind product root to an existing runtime instance (writes .jobsflow-runtime.json)",
+    )
+    bind.add_argument(
+        "--target",
+        type=Path,
+        default=None,
+        help="Runtime path to bind; defaults to --workspace if it is already a valid runtime",
+    )
 
     push = sub.add_parser("push", parents=[common], help="Preview or confirm entry of a completed scan run")
     push.add_argument("--mode", default="temp")
@@ -297,6 +311,28 @@ def main(argv: list[str] | None = None) -> int:
         payload["capability_ticket_id"] = args.capability_ticket_id
     if getattr(args, "capability_ticket_secret", ""):
         payload["capability_ticket_secret"] = args.capability_ticket_secret
+
+    if action == "bind-runtime":
+        target = Path(getattr(args, "target", None) or workspace).expanduser().resolve()
+        try:
+            pointer = save_runtime_pointer(product_root(), target)
+        except ValueError as exc:
+            out = {
+                "status": "blocked",
+                "blockers": [str(exc)],
+                "message": "目标不是合法运行实例（需要 00_Profile/）",
+            }
+            print(json.dumps(wrap_result(out, action="bind-runtime"), ensure_ascii=False, indent=2))
+            return 2
+        out = {
+            "status": "succeeded",
+            "workspace": str(target),
+            "pointer": str(pointer),
+            "side_effects": ["runtime_pointer_saved"],
+            "message": "已绑定运行实例；之后可在产品根目录直接调用 workflow",
+        }
+        print(json.dumps(wrap_result(out, action="bind-runtime"), ensure_ascii=False, indent=2))
+        return 0
 
     if action == "doctor":
         import setup as setup_module

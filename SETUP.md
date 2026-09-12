@@ -80,7 +80,9 @@ silently migrated.
 
 Use `/scan daily` for 24 hours or `/scan 3` for a three-hour window. `/materials` performs source-aware company research before company/JD tailoring. `/apply` verifies the one-page DOCX/PDF outputs and asks before any submission.
 
-CLI JSON uses `succeeded` / `needs_user` / `blocked` / `failed`. When `needs_user` appears, show `user_prompt` unchanged and call back with `reply_contract`. Scan may auto-redeem one low-risk capability ticket in-process (secret is not printed); write actions still require explicit confirmation. Pass `--workspace` or `JOBSEARCH_ROOT`; the product root will not silently select `JobSearch_2026/`. Doctor is read-only and includes `next` / `queue`.
+CLI JSON uses `succeeded` / `needs_user` / `blocked` / `failed`. When `needs_user` appears, assistants **MUST** display `user_prompt` unchanged, **MUST NOT** invent options or confirm for the user, and **MUST** call gateway back with `reply_contract` (see `assistant_protocol`). Scan may auto-redeem one low-risk capability ticket in-process (secret is not printed); write actions still require explicit confirmation.
+
+Runtime binding: setup writes `.jobsflow-runtime.json`. Old checkouts with exactly one child runtime under the product root are auto-bound on first resolve. Otherwise use `python3 -m tools.workflow bind-runtime --workspace <runtime>`, `--workspace`, or `JOBSEARCH_ROOT`. Doctor is read-only and includes `next` / `queue` (bind-runtime first when unbound).
 
 External materials facades: `materials check` (freeze/plan, no DOCX/PDF), `materials produce` (bounded internal stages), `materials role-choose --job-id … --title …`.
 

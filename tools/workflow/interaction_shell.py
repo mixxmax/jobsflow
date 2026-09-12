@@ -92,19 +92,59 @@ def load_runtime_pointer(product_root: Path) -> Path | None:
 def save_runtime_pointer(product_root: Path, workspace: Path) -> Path:
     """Persist an explicit, local, untracked runtime pointer."""
 
+    from tools.io_utils import atomic_write_json
+
     target = Path(workspace).expanduser().resolve()
     if not is_runtime_workspace(target):
         raise ValueError("runtime_workspace_invalid")
     path = pointer_path(product_root)
-    path.write_text(
-        json.dumps({"workspace": str(target), "schema_version": 1}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(path, {"workspace": str(target), "schema_version": 1})
     return path
 
 
 def product_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def discover_runtime_candidates(root: Path) -> list[Path]:
+    """Return direct child directories that look like valid runtimes."""
+
+    base = Path(root).expanduser().resolve()
+    if not base.is_dir():
+        return []
+    found: list[Path] = []
+    try:
+        children = list(base.iterdir())
+    except OSError:
+        return []
+    for child in sorted(children):
+        try:
+            if child.is_dir() and is_runtime_workspace(child):
+                found.append(child.resolve())
+        except OSError:
+            continue
+    return found
+
+
+def maybe_autobind_singleton_runtime(root: Path) -> Path | None:
+    """If exactly one child runtime exists, bind it once and return the path.
+
+    Old product checkouts that already have a single JobSearch_* instance should
+    not need a full setup rerun just to create the pointer.  Zero or multiple
+    candidates still refuse to guess.
+    """
+
+    existing = load_runtime_pointer(root)
+    if existing is not None:
+        return existing
+    candidates = discover_runtime_candidates(root)
+    if len(candidates) != 1:
+        return None
+    try:
+        save_runtime_pointer(root, candidates[0])
+    except (OSError, ValueError, TypeError):
+        return None
+    return candidates[0]
 
 
 def resolve_workspace(
@@ -113,8 +153,9 @@ def resolve_workspace(
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
     allow_pointer: bool = True,
+    autobind_singleton: bool = True,
 ) -> Path:
-    """Resolve runtime without silently picking a sibling private tree."""
+    """Resolve runtime without guessing among multiple private trees."""
 
     if explicit:
         return Path(explicit).expanduser().resolve()
@@ -127,8 +168,15 @@ def resolve_workspace(
         return here
     if here.name == "JobSearch_2026" and (here / "00_Profile").is_dir():
         return here
+    root = product_root()
     if allow_pointer:
-        bound = load_runtime_pointer(product_root())
+        bound = load_runtime_pointer(root)
+        if bound is not None:
+            return bound
+    # Usability: from the product checkout, auto-bind a single existing child
+    # runtime so legacy installs do not need another full setup.
+    if autobind_singleton and here == root:
+        bound = maybe_autobind_singleton_runtime(root)
         if bound is not None:
             return bound
     return here
@@ -141,12 +189,41 @@ def runtime_gate(action: str, workspace: Path) -> dict[str, Any] | None:
         return None
     if is_runtime_workspace(workspace):
         return None
+    candidates = discover_runtime_candidates(product_root())
+    options: list[dict[str, Any]] = []
+    if len(candidates) == 1:
+        options.append(
+            {
+                "id": "bind_existing",
+                "label": f"绑定已有实例 {candidates[0].name}",
+                "recommended": True,
+            }
+        )
+        options.append({"id": "run_setup", "label": "重新运行 setup", "recommended": False})
+        reply = {
+            "action": "bind-runtime",
+            "workspace": str(candidates[0]),
+        }
+        hint = "回复「绑定已有实例」或运行 python3 -m tools.workflow bind-runtime"
+    else:
+        options.append({"id": "run_setup", "label": "运行 setup", "recommended": True})
+        if candidates:
+            for path in candidates[:5]:
+                options.append(
+                    {
+                        "id": f"bind:{path.name}",
+                        "label": f"绑定 {path.name}",
+                        "recommended": False,
+                    }
+                )
+        reply = {"action": "setup"}
+        hint = "回复「运行 setup」，或 python3 -m tools.workflow bind-runtime --workspace <path>"
     prompt = build_user_prompt(
         "setup_required",
         question="尚未绑定求职运行实例。",
-        options=[{"id": "run_setup", "label": "运行 setup", "recommended": True}],
-        reply_hint="回复「运行 setup」或传入 --workspace / JOBSEARCH_ROOT",
-        reply_contract={"action": "setup"},
+        options=options,
+        reply_hint=hint,
+        reply_contract=reply,
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -155,6 +232,14 @@ def runtime_gate(action: str, workspace: Path) -> dict[str, Any] | None:
         "blockers": ["runtime_workspace_invalid"],
         "message": "需要合法求职运行实例后才能执行此动作",
         "user_prompt": prompt,
+        "assistant_protocol": {
+            "must_display_user_prompt": True,
+            "must_not_invent_options": True,
+            "must_not_confirm_for_user": True,
+            "must_echo_reply_contract": True,
+            "instruction": "向用户原样展示 user_prompt；禁止跳过提问或自行确认。",
+        },
+        "runtime_candidates": [str(path) for path in candidates],
         "next_action": "answer_user_prompt",
         "internal": {"phase": "blocked"},
     }
@@ -421,6 +506,14 @@ def wrap_result(
     }
     if prompt is not None:
         out["user_prompt"] = prompt
+        # Hard contract for every harness/model: pause cards are host-owned.
+        out["assistant_protocol"] = {
+            "must_display_user_prompt": True,
+            "must_not_invent_options": True,
+            "must_not_confirm_for_user": True,
+            "must_echo_reply_contract": True,
+            "instruction": "向用户原样展示 user_prompt.question 与 options；仅在用户明确选择后，按 reply_contract 回调 gateway。禁止跳过提问或自行确认。",
+        }
     if retry is not None:
         out["retry"] = retry
     return out
@@ -458,9 +551,31 @@ def doctor_next_actions(
     workspace: Path,
     runtime_ok: bool,
 ) -> dict[str, Any]:
-    """Read-only next/queue. Does not write files or advance cursors."""
+    """Read-only next/queue. Does not write files or advance cursors.
+
+    Priority:
+    1. invalid runtime → bind/create runtime
+    2. valid runtime but missing tracker → setup / create tracker
+    3. only then → fix environment dependencies
+    """
 
     failed = [str(item) for item in (snapshot.get("failed") or [])]
+    # Tracker readiness is about the bound runtime, not product-root cosmetics.
+    checks = dict(snapshot.get("checks") or {})
+    projections = dict(snapshot.get("tracker_projections") or {})
+    tracker_ok = bool(
+        checks.get("tracker")
+        or projections.get("ledger")
+        or projections.get("fresh_csv")
+        or projections.get("tracker_csv")
+    )
+    # Missing tracker alone is not an "environment" failure when the cwd is
+    # the product root rather than a bound runtime.
+    env_failed = [
+        name
+        for name in failed
+        if name not in {"tracker"} or runtime_ok
+    ]
     next_item: dict[str, str] | None = None
     queue: list[dict[str, str]] = []
 
@@ -468,10 +583,56 @@ def doctor_next_actions(
         nonlocal next_item
         if primary and next_item is None:
             next_item = item
-        elif len(queue) < 3 and item != next_item:
+        elif len(queue) < 3 and item != next_item and item not in queue:
             queue.append(item)
 
-    if failed:
+    if not runtime_ok:
+        # Search under the current workspace (usually the product checkout).
+        candidates = discover_runtime_candidates(Path(workspace))
+        if len(candidates) == 1:
+            add(
+                {
+                    "id": "bind_runtime",
+                    "say": f"发现已有运行实例 {candidates[0].name}，绑定后即可继续",
+                    "command": f"python3 -m tools.workflow bind-runtime --workspace {candidates[0]}",
+                },
+                primary=True,
+            )
+        else:
+            add(
+                {
+                    "id": "bind_runtime",
+                    "say": "绑定或创建求职运行实例后再扫描",
+                    "command": "python3 -m tools.workflow bind-runtime --workspace <runtime>  # 或 python3 setup.py --resume-folder <cv-folder>",
+                },
+                primary=True,
+            )
+        if env_failed:
+            add(
+                {
+                    "id": "fix_environment",
+                    "say": "运行实例绑定后再修复 doctor 报告的依赖缺失项",
+                    "command": "python3 setup.py --doctor",
+                }
+            )
+    elif not tracker_ok:
+        add(
+            {
+                "id": "create_tracker",
+                "say": "运行 setup 或创建初始 tracker 后再扫描",
+                "command": "python3 setup.py --resume-folder <cv-folder>",
+            },
+            primary=True,
+        )
+        if env_failed:
+            add(
+                {
+                    "id": "fix_environment",
+                    "say": "tracker 就绪后再修复环境依赖",
+                    "command": "python3 setup.py --doctor",
+                }
+            )
+    elif env_failed:
         add(
             {
                 "id": "fix_environment",
@@ -480,17 +641,9 @@ def doctor_next_actions(
             },
             primary=True,
         )
-    if not runtime_ok:
-        add(
-            {
-                "id": "bind_runtime",
-                "say": "绑定或创建求职运行实例后再扫描",
-                "command": "python3 setup.py --resume-folder <cv-folder>",
-            },
-            primary=True,
-        )
+
     materials = snapshot.get("materials_base") or {}
-    if runtime_ok and not bool(snapshot.get("materials_ready") or materials.get("ready")):
+    if runtime_ok and tracker_ok and not bool(snapshot.get("materials_ready") or materials.get("ready")):
         add(
             {
                 "id": "confirm_base",
@@ -499,7 +652,7 @@ def doctor_next_actions(
             },
             primary=True,
         )
-    if next_item is None and runtime_ok:
+    if next_item is None and runtime_ok and tracker_ok:
         add(
             {
                 "id": "scan_temp",

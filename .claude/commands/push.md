@@ -1,6 +1,6 @@
 # /push - 预览并在用户确认后写入 fresh
 
-只调用统一入口：
+只调用统一入口。若 JSON 含 `user_prompt` / `assistant_protocol`：**必须**原样向用户展示选项，**禁止**自行发明选项或替用户确认；用户选定后再按 `reply_contract` 回调 gateway。
 
 ```bash
 # 第一步：只生成入表预览和 proposal，不写表、不分配永久编号
