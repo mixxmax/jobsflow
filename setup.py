@@ -1469,6 +1469,16 @@ def main(argv: list[str] | None = None) -> int:
         workflow_preferences=workflow_preferences,
     )
 
+    # Bind product root → this runtime so later doctor/workflow calls from the
+    # product checkout do not ask users to re-pass --workspace every time.
+    try:
+        from tools.workflow.interaction_shell import save_runtime_pointer
+
+        pointer = save_runtime_pointer(REPO, js_root)
+        print(f"\n  Runtime pointer: {pointer.relative_to(REPO)} -> {js_root.name}")
+    except (OSError, ValueError, TypeError, ImportError) as exc:
+        warn(f"runtime pointer not saved ({exc})")
+
     print(f"\n  Done! Config files generated.")
 
     path = ask_yes_no("你想先做什么？\n  先做基础版简历（按刚才说的方向分 A-F 版本）\n  还是先开始检索新职位？\n  输入 y 先做基础版，n 先检索", default=False)
