@@ -22,12 +22,11 @@ and how to tailor the application without giving up final control.
 
 ## 🆕 Latest update · 2026-09-12 · bundled control plane · pull-only upgrade · faster materials
 
-- **Control plane ships in-repo:** SOP Control is vendored at a fixed pin under `vendor/sopcontrol/` (including `plugins/`). A public clone is enough — no second private upstream checkout.
-- **Existing installs just update:** after `git pull origin main`, the workflow loads the in-repo vendor automatically. Day-to-day use needs no separate control-plane `pip install` (`pip install -e vendor/sopcontrol` is optional, only to put `sopctl` on PATH).
-- **Missing package fail-closes:** under enforce, an unavailable control plane blocks side effects instead of soft-degrading to a fake pass — matching the README promise.
-- **Capability-ticket scan loop:** write paths such as scan/push support challenge → return the ticket / keep `run_id` on retry, so tickets no longer mismatch or die when the run id changes.
-- **Faster materials, less rework:** pre-render capacity checks, rewrite only over-budget CV/CL, at most three parallel jobs, a shared human-audit queue when no auditor model is configured, plus timing/cache/re-render/failure telemetry; company research is cost-tiered.
-- **Portable identity:** `.sopcontrol/identity.yaml` uses portable `root: .`; CI SOP Control gate and python-tests both install the same vendor pin.
+- **SOP Control ships with the product:** a fresh clone uses the same rules, state checks and confirmation gates; an unavailable control plane cannot silently allow side effects.
+- **The workflow stays the same across models:** scan, push, materials and apply keep one governed entry path; a model cannot choose a legacy route or skip confirmation.
+- **Faster, lower-rework materials:** capacity is checked before rendering, only the over-budget CV or cover letter is revised, and independent jobs may run in a bounded batch with timing/cache/re-render telemetry.
+- **More reliable retrieval:** JD caching, bounded retries and the JobsDB recovery hand-off are coordinated by the gateway, so an unverified result is never recorded as success.
+- **Portable hand-off:** project rules and runtime state can continue across models, harnesses and worktrees without asking the user to restate the entire SOP.
 
 ### Why JobsFlow?
 
@@ -41,7 +40,7 @@ and how to tailor the application without giving up final control.
 
 ## Product structure: standards, inputs, outputs and hand-offs
 
-JobsFlow does not let a model freestyle a pile of scripts. Business SOP is a bounded pipeline: `scan / push / materials / audit / format / apply / base / intent / archive / sync` all enter the unified workflow gateway before their business adapters; a model cannot switch to a legacy route or bypass the state machine. Rules live in `.sopcontrol/` and are checked by the JobsFlow adapter before an action, with a receipt afterward; missing confirmation, capability tickets, current inputs or required artifacts fail closed. Materials are bound to the single chain `materials-vnext-1` (baseline → bounded JD delta → CV/CL content audit → DOCX/PDF format gates).
+JobsFlow keeps business SOP inside one bounded pipeline: `scan / push / materials / audit / format / apply / base / intent / archive / sync` all enter the unified gateway before their business adapters. A model cannot switch to a legacy route or bypass the state machine; missing confirmation, current inputs or required artifacts stop the action. Materials use one chain, `materials-vnext-1`: baseline → bounded JD delta → CV/CL content audit → DOCX/PDF format gates.
 
 | Stage | Non-negotiable standard | User action | Main output | Downstream hand-off |
 |---|---|---|---|---|
@@ -69,6 +68,27 @@ submits only `rewrite / reorder / merge / add` operations, the host retains ever
 unmentioned baseline block, and the child auditor focuses on the delta before one
 compact full-document sweep. This avoids rebuilding a résumé from scratch for
 every posting while keeping output quality bounded for less capable models.
+
+## 🛡️ SOP Control: one control layer across models
+
+SOP Control is JobsFlow's project-level control plane, not another job-search engine. It turns “what may happen next, what needs confirmation, and what evidence must remain” into rules that travel with the product:
+
+```text
+Your instruction / model
+          ↓
+JobsFlow unified gateway
+          ↓  policy, state, confirmation and input checks
+Business action (scan / push / materials / apply)
+          ↓
+Artifacts, state and traceable evidence
+```
+
+- **Initialize once, use normally:** rules live with the project and are read by the governed entrypoints. Users do not need to restate the SOP in every conversation.
+- **Hard boundaries, flexible judgment:** the system owns previews, confirmations, legal state transitions, package boundaries and required outputs; the model still handles company research, JD interpretation and wording.
+- **Safe hand-off:** another model or harness can continue from the same workspace and state. Harnesses with hooks can intercept before an action; without hooks, the gateway's final gates still apply.
+- **Fail closed with a next step:** missing inputs, stale artifacts or unconfirmed side effects return a diagnostic next action instead of inviting the model to guess, browse another package or silently modify unrelated work.
+
+SOP Control therefore reduces cross-model drift and rework without adding a daily control conversation. Most users only need the normal `/setup`, `/scan`, `/push`, `/materials` and `/apply` commands.
 
 ## Quick start
 
@@ -162,38 +182,21 @@ CV + intent → setup → search → quick score → JD deep read
 
 ### Operational reliability and diagnostics
 
-These capabilities are now workflow contracts, not model memory.
-`temp_two_pass.sh` is only a compatibility wrapper; the workflow
-gateway owns the scan. Every run creates an official
-`scan_runs/<run-id>/run.json` binding the window, scored-artifact hash, semantic
-task status and refresh-cursor commit; the cursor is committed only after the
-scored artifact is verified. If `/push` has no `run_id`, it resolves the newest
-official run instead of treating a legacy `temp`/`daily` sentinel as current.
-The run record reports planned and deduplicated requests, portal errors,
-pass-1 drops, provisional rows and deep-fetch outcomes. Scan-level job
-de-duplication is bounded by policy: temporary scans suppress identities from
-the latest three temporary observations, while daily/preview scans suppress
-identities observed inside the requested window. The scanner does not reread
-the entire tracker for this, and a degraded scan remembers successful-portal
-identities without advancing the refresh watermark, so a retry does not
-immediately show the same rows again.
+These capabilities are workflow contracts, not model memory. `temp_two_pass.sh`
+is only a compatibility wrapper; the workflow gateway owns scanning. Each run
+records its window, scored artifact, semantic status and refresh cursor, and the
+cursor moves only after the artifact is verified. Temporary scans suppress
+identities from the latest three temporary observations; daily/preview scans
+use the requested time window. The scanner does not reread the entire tracker,
+and a partial run remembers jobs already seen without moving the refresh
+watermark, so a retry does not immediately show the same rows.
 
-The local ledger is authoritative for row identity and numbering; CSV and Google
-Sheets are replayable projections. A confirmed batch can create separate
-proposals for multiple backends without allocating a second ID when one
-projection is empty. Push returns `backend_resolution` and explicitly warns
-when `auto` falls back to local CSV because Google configuration is incomplete.
-Private deployments may keep the sheet ID and credential path in
-`JobSearch_2026/00_Profile/tracker_backend.json`; the credential itself never
-belongs in the product repository.
-
-JobsDB remains cache-first with bounded human recovery and a portal circuit
-breaker: Cloudflare/WAF never causes infinite retries. If daily Chrome does not
-expose CDP, the system writes a cookie-free manual-recovery handoff and a
-resumable hint; an unverified challenge cannot be recorded as success. Identical
-portal requests are deduplicated while query aliases and page numbers are kept
-for recall attribution. These diagnostics and fallbacks affect only a private
-runtime; tokens, cookies and candidate data stay out of the public product.
+The local ledger owns row identity and numbering; CSV and Google Sheets are
+replayable projections. `push` reports which backend it used and warns when
+incomplete Google configuration means local CSV is the fallback. JobsDB's
+cache, human recovery and circuit-breaker behavior are described below; these
+fallbacks affect only a private runtime and never publish tokens, cookies or
+candidate data.
 
 ### Our LLMO strategy
 
@@ -495,10 +498,9 @@ JobsFlow has one product implementation, rule set and state machine. `JobSearch_
 is not a separate private code or policy line; it is one local runtime instance of the
 product, holding a user's résumé, queries, job descriptions, scores, tracker and generated
 artifacts. Runtime data is Git-ignored, while GitHub publishes the same product code and
-empty templates without personal data. Control-plane evidence (`.sopcontrol/` / vendor)
-stays separate from private job-search runtime data; SOP rules, the test command, the
-fixed CI revision and the pre-push gate are wired into the product. Resumes, JDs,
-cookies, Google credentials and runtime ledgers are not published to GitHub. Project
+empty templates without personal data. SOP Control's project rules stay separate from
+private runtime data, while the fixed gates and tests are wired into the product. Resumes,
+JDs, cookies, Google credentials and runtime ledgers are not published to GitHub. Project
 identity, rule summaries, task state and evidence can be reused across models, harnesses
 and worktrees, so switching models does not recreate the workflow from scratch.
 `/setup` generates industry-aware directions, tracker headers, scoring weights, and
