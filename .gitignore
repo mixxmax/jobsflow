@@ -24,7 +24,11 @@ job_scraper/*.md
 *_BehavioralReport.pdf
 linkedin_Profile.pdf
 
+# Local explicit runtime pointer (never commit; user-selected only)
+.jobsflow-runtime.json
+
 # === Personal workspace: entire JobSearch_2026/ directory ===
+
 # Contains real CV/CL, career history, tracker data, application materials.
 # System docs live in docs/ (scrubbed); this dir is personal data only.
 JobSearch_2026/
