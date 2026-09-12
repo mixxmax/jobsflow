@@ -190,10 +190,9 @@ def _vendor_sopcontrol_root() -> Path:
 def _import_sopcontrol() -> tuple[Any, str | None]:
     """Import sopcontrol, preferring an installed package then vendor/.
 
-    JobsFlow ships ``vendor/sopcontrol`` at the pinned revision so a normal
-    clone works without a second download.  If the package is still missing,
-    callers soft-degrade: the product workflow continues without the external
-    control-plane runtime.
+    JobsFlow ships ``vendor/sopcontrol`` (package + ``plugins/``) at the pinned
+    revision so a normal clone does not need a second download.  Under
+    ``enforce``, a missing package fail-closes side effects.
     """
 
     def _load() -> dict[str, Any]:
@@ -591,13 +590,16 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
     writing = _write_path_requested(request)
 
     blockers: list[str] = []
-    # The external control-plane package is optional for basic JobsFlow use.
-    # When it is missing, skip tickets/events/registry I/O and continue; JobsFlow
-    # native consumers below still apply.  Do not fail-closed solely because
-    # sopcontrol is unavailable.
+    # With a portable registry present, enforce fail-closes when the control
+    # plane package cannot be loaded or the registry cannot be read.
     package_available = not (load_err or "").startswith("import_error")
-    if load_err and mode == "enforce" and writing and package_available:
-        blockers.append("sopcontrol_registry_unavailable")
+    if mode == "enforce" and writing:
+        if not package_available:
+            blockers.append("sopcontrol_unavailable")
+        elif load_err:
+            blockers.append("sopcontrol_registry_unavailable")
+        elif not (root / ".sopcontrol" / "rules" / "registry.yaml").is_file():
+            blockers.append("sopcontrol_registry_unavailable")
 
     if action == "push":
         blockers.extend(_check_push_preview(request, Path(workspace)))
@@ -615,9 +617,8 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
             # the caller must present it on the real write. Zero side effects.
             issued_ticket = issue_capability_ticket(action=action, payload=payload, run_id=run_id)
             if issued_ticket is None:
-                # Package present but ticket mint failed — skip tickets and
-                # continue rather than blocking the whole product workflow.
-                pass
+                blockers.append("capability_ticket_required")
+                blockers.append("sopcontrol_unavailable")
             else:
                 ticket_challenge = True
                 blockers.append("capability_ticket_required")
@@ -666,13 +667,7 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         run_id=run_id,
         detail={"admit": {"blockers": blockers, "mode": mode, "ticket_challenge": ticket_challenge}},
     )
-    if (
-        not emitted
-        and mode == "enforce"
-        and writing
-        and not ticket_challenge
-        and package_available
-    ):
+    if not emitted and mode == "enforce" and writing and not ticket_challenge:
         blockers = sorted(set(blockers + ["sopcontrol_receipt_failed"]))
         report["blockers"] = blockers
         report["verdict"] = "fail"
@@ -680,10 +675,6 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         report["emit_error"] = emit_err
     elif emit_err:
         report["emit_error"] = emit_err
-        # Missing package: keep report observational; do not block the workflow.
-        if not package_available:
-            report["blocking"] = False
-            report["verdict"] = "pass" if not blockers else report.get("verdict") or "pass"
 
     return report
 

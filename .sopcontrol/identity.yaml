@@ -1,5 +1,5 @@
 project_id: proj-3acc9ffc1301ac64
-root: /Users/xiezhijie/ai-job-search
+root: .
 locked: true
 created_at: '2026-08-25 16:59:25'
-note: locked：project_id 固定，挪目录不重算（仍非全局 registry）
+note: locked project_id is portable; local sopctl refreshes root to the clone path

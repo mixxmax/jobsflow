@@ -1,17 +1,11 @@
 # Vendored dependencies
 
-## `sopcontrol/`
+## sopcontrol/
 
-Pinned SOP Control control-plane runtime shipped with JobsFlow so a normal
-`git clone` does not require a second download.
+Pinned runnable SOP Control (``sopcontrol/`` + ``plugins/``).
 
-- Pin file: `../tools/sopcontrol_pin.txt`
+- Pin: ``tools/sopcontrol_pin.txt`` / ``vendor/sopcontrol/PIN.txt``
+
+- Install: ``pip install -e vendor/sopcontrol``
+
 - Upstream: https://github.com/mixxmax/sopcontrol
-- Import: JobsFlow’s adapter loads this tree automatically when the package is
-  not already installed into the active virtualenv.
-
-Optional explicit install (same pin, editable):
-
-```bash
-python3 -m pip install -e vendor/sopcontrol
-```

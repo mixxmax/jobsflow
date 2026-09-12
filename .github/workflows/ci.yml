@@ -58,6 +58,11 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install --require-hashes -r requirements-dev.lock
+      - name: Install vendored SOP Control
+        run: |
+          test -f vendor/sopcontrol/plugins/__init__.py
+          test -f vendor/sopcontrol/sopcontrol/__init__.py
+          pip install -e vendor/sopcontrol
       - run: python -m pytest -q
       - run: python tools/fresh_24h/validate_queries.py
 
@@ -75,13 +80,14 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      - name: Install vendored sopcontrol (pinned)
+      - name: Install vendored sopcontrol (pinned, with plugins)
         run: |
           test -f vendor/sopcontrol/sopcontrol/__init__.py
+          test -f vendor/sopcontrol/plugins/__init__.py
           test -f vendor/sopcontrol/pyproject.toml
-          # The vendor tree is the product-shipped pin; refuse drift.
-          grep -q "${{ steps.pin.outputs.ref }}" tools/sopcontrol_pin.txt
+          test "$(cat vendor/sopcontrol/PIN.txt)" = "${{ steps.pin.outputs.ref }}"
           pip install -e vendor/sopcontrol
+          python -c "from plugins import DETECTORS, SENSORS; assert SENSORS and DETECTORS"
       - name: Require portable control-plane files
         run: |
           test -f .sopcontrol/rules/registry.yaml

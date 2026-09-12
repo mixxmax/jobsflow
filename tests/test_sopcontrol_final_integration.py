@@ -355,27 +355,23 @@ def test_missing_control_plane_blocks_side_effects(tmp_path, monkeypatch):
     root = tmp_path / "empty-product"
     root.mkdir()
     monkeypatch.setenv("JOBSFLOW_SOPCONTROL_ROOT", str(root))
-    monkeypatch.delenv("JOBSFLOW_SOPCONTROL_ALLOW_RELAX", raising=False)
-    monkeypatch.delenv("JOBSFLOW_SOPCONTROL_TEST", raising=False)
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "off")
-    assert current_mode() == "off"
-    ws = build_workspace(tmp_path / "ws")
-    # Without registry, production mode is off — but writing still must not
-    # silently succeed under a forced enforce with empty root. Re-enable enforce
-    # via relax+explicit for the empty-registry fail-closed path.
     monkeypatch.setenv("JOBSFLOW_SOPCONTROL_ALLOW_RELAX", "1")
     monkeypatch.setenv("JOBSFLOW_SOPCONTROL_TEST", "1")
     monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "enforce")
     monkeypatch.setenv("JOBSFLOW_SOPCONTROL_TICKETS", "on")
+    ws = build_workspace(tmp_path / "ws")
     out = dispatch(
         "apply",
         workspace=ws,
         payload={"job_id": "C0-001"},
     )
-    assert out["status"] in {"blocked", "planned"}
-    assert out.get("side_effects") == [] or "sopcontrol_registry_unavailable" in (
-        out.get("blockers") or []
+    assert out["status"] == "blocked"
+    blockers = out.get("blockers") or []
+    assert out.get("side_effects") == []
+    assert (
+        "sopcontrol_registry_unavailable" in blockers
+        or "sopcontrol_unavailable" in blockers
+        or "sop_control_blocked" in blockers
     )
 
 
