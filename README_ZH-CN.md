@@ -15,7 +15,7 @@
 JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗位，做材料，整理投递信息**的本地优先求职执行系统。
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.9.5-1F4E79?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-1.1-1F4E79?style=flat-square">
   <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
   <img alt="privacy" src="https://img.shields.io/badge/%E9%BB%98%E8%AE%A4-%E6%9C%AC%E5%9C%B0%E4%BC%98%E5%85%88-555?style=flat-square">
@@ -649,7 +649,7 @@ pytest -q
 
 ## 📦 版本
 
-当前主线：**0.9.5** - 统一 SOP 网关与状态机、lane 锁定和确认入表、基础版增量材料链、独立 CV/CL 内容审计、固定 lane-master DOCX/PDF 渲染、JD 缓存与受控 JobsDB 恢复。
+当前主线：**1.1** - 统一 SOP 网关与状态机、lane 锁定和确认入表、基础版增量材料链、独立 CV/CL 内容审计、固定 lane-master DOCX/PDF 渲染、JD 缓存与受控 JobsDB 恢复。
 
 ---
 
