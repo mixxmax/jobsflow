@@ -547,6 +547,7 @@ def test_workflow_gateway_requires_confirmation_for_pull(tmp_path):
 def test_local_only_is_a_csv_backend_alias(tmp_path):
     ws = tmp_path / "JobSearch_2026"
     ws.mkdir()
+    (ws / "00_Profile").mkdir()
     tracker = ws / "02_Tracker"
     tracker.mkdir()
     scored = tracker / "fresh_24h_2026-08-14_twopass_scored.csv"
