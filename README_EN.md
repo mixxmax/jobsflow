@@ -523,7 +523,7 @@ See [PUBLIC_RELEASE.md](PUBLIC_RELEASE.md) for release hygiene and history handl
 
 ## Version
 
-**0.9.5** — governed SOP gateway and state machine, locked lane/confirmed entry,
+**1.1** — governed SOP gateway and state machine, locked lane/confirmed entry,
 baseline-anchored bounded material tailoring, independent CV/CL content audit,
 fixed lane-master DOCX/PDF rendering, cached JD retrieval and controlled JobsDB
 recovery.
