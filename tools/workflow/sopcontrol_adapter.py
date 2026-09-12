@@ -188,11 +188,12 @@ def _vendor_sopcontrol_root() -> Path:
 
 
 def _import_sopcontrol() -> tuple[Any, str | None]:
-    """Import sopcontrol, preferring an installed package then vendor/.
+    """Import the bundled control-plane runtime.
 
-    JobsFlow ships ``vendor/sopcontrol`` (package + ``plugins/``) at the pinned
-    revision so a normal clone does not need a second download.  Under
-    ``enforce``, a missing package fail-closes side effects.
+    Prefer ``vendor/sopcontrol`` (updated by ``git pull``) over any older
+    site-packages install so existing users do not need a separate
+    ``pip install -e`` step after upgrading.  Under ``enforce``, a missing
+    package fail-closes side effects.
     """
 
     def _load() -> dict[str, Any]:
@@ -210,21 +211,25 @@ def _import_sopcontrol() -> tuple[Any, str | None]:
             "RegistryError": RegistryError,
         }
 
+    import sys
+
+    vendor = _vendor_sopcontrol_root()
+    if vendor.is_dir():
+        path = str(vendor)
+        # Always prefer the in-repo pin so ``git pull`` alone upgrades the
+        # control plane for existing installs.
+        while path in sys.path:
+            sys.path.remove(path)
+        sys.path.insert(0, path)
+        # Drop cached modules from a previous/different install so the
+        # bundled tree is what actually loads after an upgrade.
+        for name in list(sys.modules):
+            if name == "sopcontrol" or name.startswith("sopcontrol.") or name == "plugins" or name.startswith("plugins."):
+                del sys.modules[name]
     try:
         return _load(), None
-    except ImportError:
-        vendor = _vendor_sopcontrol_root()
-        if vendor.is_dir():
-            import sys
-
-            path = str(vendor)
-            if path not in sys.path:
-                sys.path.insert(0, path)
-            try:
-                return _load(), None
-            except ImportError as exc:
-                return None, f"import_error:{type(exc).__name__}"
-        return None, "import_error:ImportError"
+    except ImportError as exc:
+        return None, f"import_error:{type(exc).__name__}"
 
 
 

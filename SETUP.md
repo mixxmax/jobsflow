@@ -8,15 +8,27 @@ PYTHON_BIN="$(command -v python3.12 || command -v python3.11 || command -v pytho
 "$PYTHON_BIN" -m venv .venv
 source .venv/bin/activate
 python3 -m pip install --require-hashes -r requirements.lock
-# Bundled SOP Control (package + plugins/, pinned in tools/sopcontrol_pin.txt).
-# Required for enforce/gate/tickets; ships inside this repo under vendor/.
-python3 -m pip install -e vendor/sopcontrol
 python3 setup.py --doctor
 ```
 
-The adapter also auto-discovers `vendor/sopcontrol` on `sys.path` when the
-editable install is missing. Under enforce, a missing control-plane package
-fail-closes side-effect actions instead of silently continuing.
+### Already installed? Just update
+
+```bash
+git pull origin main
+python3 setup.py --doctor
+```
+
+That is enough for normal JobsFlow use (`python3 -m tools.workflow …`).
+SOP Control ships in-repo as `vendor/sopcontrol/` and is loaded automatically
+after pull — no second install step. Optional (only if you want the `sopctl`
+command on PATH):
+
+```bash
+python3 -m pip install -e vendor/sopcontrol
+```
+
+Under enforce, a missing/broken control-plane package fail-closes side-effect
+actions instead of silently continuing.
 
 Install the four portal CLI development dependencies:
 
