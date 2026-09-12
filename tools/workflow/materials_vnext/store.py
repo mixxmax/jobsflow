@@ -50,6 +50,33 @@ def load_run(package: Path) -> dict[str, Any]:
 
 def save_run(package: Path, value: dict[str, Any]) -> dict[str, Any]:
     value = dict(value)
+    # Engine stage transitions often operate on a run snapshot that was
+    # loaded just before telemetry was appended.  Merge the monotonic
+    # ``performance`` projection instead of letting that stale snapshot erase
+    # timing, rerender and failure evidence.
+    existing = load_run(Path(package))
+    current_performance = existing.get("performance") if isinstance(existing.get("performance"), dict) else {}
+    incoming_performance = value.get("performance") if isinstance(value.get("performance"), dict) else {}
+    if current_performance or incoming_performance:
+        merged_performance = dict(current_performance)
+        merged_stages = dict(current_performance.get("stages") or {})
+        for stage_name, incoming_stage in (incoming_performance.get("stages") or {}).items():
+            if not isinstance(incoming_stage, dict):
+                continue
+            current_stage = merged_stages.get(stage_name) if isinstance(merged_stages.get(stage_name), dict) else {}
+            incoming_attempts = int(incoming_stage.get("attempts") or 0)
+            current_attempts = int(current_stage.get("attempts") or 0)
+            if incoming_attempts >= current_attempts:
+                merged_stages[stage_name] = dict(incoming_stage)
+        merged_performance["stages"] = merged_stages
+        reasons = dict(current_performance.get("failure_reasons") or {})
+        for reason, count in (incoming_performance.get("failure_reasons") or {}).items():
+            reasons[str(reason)] = max(int(reasons.get(str(reason)) or 0), int(count or 0))
+        merged_performance["failure_reasons"] = reasons
+        for key in ("schema_version", "last_stage", "last_status"):
+            if key in incoming_performance:
+                merged_performance[key] = incoming_performance[key]
+        value["performance"] = merged_performance
     value.setdefault("generation", 1)
     value["updated_at"] = now()
     atomic_write_json(run_path(package), value)
@@ -59,6 +86,67 @@ def save_run(package: Path, value: dict[str, Any]) -> dict[str, Any]:
     # adjacent prevents two visible phase records from drifting apart.
     atomic_write_json(Path(package) / RUN_NAME, value)
     return value
+
+
+def record_stage_metric(
+    package: Path,
+    *,
+    stage: str,
+    status: str,
+    duration_ms: int | float = 0,
+    error: str = "",
+    cached: bool = False,
+    **metadata: Any,
+) -> dict[str, Any]:
+    """Append compact performance evidence to the current materials run.
+
+    Metrics are deliberately stored beside the generation state so a resumed
+    run (or a different model/harness) can see where time was spent without
+    replaying verbose event logs.  Recording a metric is best-effort at call
+    sites, but this helper itself is deterministic and preserves all prior
+    stage counters.
+    """
+
+    stage_name = str(stage or "unknown").strip() or "unknown"
+    status_name = str(status or "unknown").strip() or "unknown"
+    run = load_run(Path(package))
+    if not run:
+        return {}
+    performance = run.get("performance") if isinstance(run.get("performance"), dict) else {}
+    performance.setdefault("schema_version", 1)
+    stages = performance.setdefault("stages", {})
+    entry = stages.get(stage_name) if isinstance(stages.get(stage_name), dict) else {}
+    duration = max(0, int(float(duration_ms or 0)))
+    entry["attempts"] = int(entry.get("attempts") or 0) + 1
+    entry["total_duration_ms"] = int(entry.get("total_duration_ms") or 0) + duration
+    entry["last_duration_ms"] = duration
+    entry["last_status"] = status_name
+    entry["last_error"] = str(error or "")
+    if status_name in {"succeeded", "passed", "completed", "cached"}:
+        entry["successes"] = int(entry.get("successes") or 0) + 1
+    if status_name in {"failed", "blocked", "error", "unavailable"}:
+        entry["failures"] = int(entry.get("failures") or 0) + 1
+    if cached:
+        entry["cached_calls"] = int(entry.get("cached_calls") or 0) + 1
+    else:
+        entry["actual_runs"] = int(entry.get("actual_runs") or 0) + 1
+    if stage_name == "render":
+        entry["rerender_count"] = max(0, int(entry.get("actual_runs") or 0) - 1)
+    if metadata:
+        entry["last_metadata"] = {
+            str(key): value
+            for key, value in metadata.items()
+            if value is not None
+        }
+    stages[stage_name] = entry
+    reasons = performance.setdefault("failure_reasons", {})
+    if error:
+        reason = str(error).strip()
+        reasons[reason] = int(reasons.get(reason) or 0) + 1
+    performance["last_stage"] = stage_name
+    performance["last_status"] = status_name
+    run["performance"] = performance
+    return save_run(Path(package), run)
 
 
 def read_lines(path: Path) -> list[dict[str, Any]]:

@@ -46,6 +46,66 @@ def test_preflight_reports_capacity_overrun_as_advisory_only(tmp_path, monkeypat
     assert "capacity_estimate" in preflight
 
 
+def test_preflight_blocks_over_budget_material_before_render(tmp_path):
+    """A known page-budget overrun must stop before any DOCX/PDF work."""
+
+    from tools.workflow.materials_vnext.preflight import run_preflight
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    bundle, _ = _bundle(ws, package)
+    canonical = json.loads((package / "materials_vnext" / "canonical.json").read_text(encoding="utf-8"))
+    target = next(
+        item for item in canonical["cv"]["blocks"]
+        if item.get("type") in {"paragraph", "bullet"} and not item.get("host_managed")
+    )
+    target["text"] = str(target["text"]) + " " + ("JD-aligned evidence " * 160)
+    preflight = run_preflight(
+        bundle=bundle,
+        canonical=canonical,
+        effective_transform={
+            "original": {"operations": [{"material": "cv", "jd_anchor_ids": ["JD-001"]}]},
+            "repair_patches": [],
+        },
+    )
+    capacity = preflight["capacity_estimate"]["cv"]
+    assert capacity["over_master_lines"] >= 4 or capacity["ratio"] > 1.08
+    assert preflight["status"] == "blocked"
+    finding = next(item for item in preflight["findings"] if item["code"] == "capacity_budget_exceeded")
+    assert finding["severity"] == "P1"
+    assert preflight["capacity_gate"]["status"] == "blocked"
+    assert preflight["capacity_gate"]["materials"] == ["cv"]
+
+
+def test_preflight_blocks_when_capacity_estimate_is_unavailable(tmp_path, monkeypatch):
+    from tools.workflow.materials_vnext import preflight as preflight_module
+    from tools.workflow.materials_vnext.preflight import run_preflight
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    bundle, _ = _bundle(ws, package)
+    monkeypatch.setattr(preflight_module, "evaluate_capacity", lambda **_kwargs: (_ for _ in ()).throw(ValueError("no master")))
+    result = run_preflight(
+        bundle=bundle,
+        canonical=json.loads((package / "materials_vnext" / "canonical.json").read_text(encoding="utf-8")),
+        effective_transform={"original": {"operations": [{"material": "cv", "jd_anchor_ids": ["JD-001"]}]}, "repair_patches": []},
+    )
+    assert result["status"] == "blocked"
+    assert any(item["code"] == "capacity_gate_unavailable" for item in result["blocking"])
+
+
+def test_capacity_gate_fails_closed_for_empty_lane_baseline():
+    from tools.workflow.materials_vnext.preflight import evaluate_capacity
+
+    canonical = {"cv": {"blocks": [{"text": "content"}]}, "cover_letter": {"blocks": [{"text": "content"}]}}
+    try:
+        evaluate_capacity(canonical=canonical, baseline={"cv": {"blocks": []}, "cover_letter": {"blocks": []}})
+    except ValueError as exc:
+        assert "capacity_baseline_empty" in str(exc)
+    else:  # pragma: no cover - the gate must never treat a missing budget as zero
+        raise AssertionError("empty lane baseline must fail closed")
+
+
 def test_soffice_lock_serializes_conversions():
     from tools.fresh_24h.docx_to_pdf import soffice_lock
 
@@ -72,6 +132,40 @@ def test_soffice_lock_serializes_conversions():
     # After release the lock is available again.
     with soffice_lock(timeout=5) as again:
         assert again is True
+
+
+def test_materials_run_keeps_stage_timing_and_rerender_metrics(tmp_path):
+    """Performance evidence lives with the generation, not in ad-hoc logs."""
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    _bundle(ws, package)
+    from tools.workflow.materials_vnext.store import record_stage_metric
+
+    record_stage_metric(package, stage="render", status="succeeded", duration_ms=1200, cached=False)
+    record_stage_metric(package, stage="render", status="failed", duration_ms=40, error="capacity_budget_exceeded", cached=False)
+    record_stage_metric(package, stage="render", status="succeeded", duration_ms=0, cached=True)
+    run = load_run(package)
+    performance = run["performance"]
+    render = performance["stages"]["render"]
+    assert render["attempts"] == 3
+    assert render["actual_runs"] == 2
+    assert render["rerender_count"] == 1
+    assert render["failures"] == 1
+    assert render["last_error"] == ""
+    assert performance["failure_reasons"]["capacity_budget_exceeded"] == 1
+
+
+def test_materials_engine_records_preflight_metric(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    bundle, _ = _bundle(ws, package)
+    result = MaterialsEngine().handle({"job_id": "C0-001", "transform": _transform(bundle)}, workspace=ws)
+    assert result["status"] == "succeeded"
+    run = load_run(package)
+    assert run["performance"]["stages"]["preflight"]["attempts"] == 1
+    assert run["performance"]["stages"]["preflight"]["last_status"] == "passed"
+    assert run["performance"]["stages"]["transform"]["actual_runs"] == 1
 
 
 def test_apply_strict_audit_refuses_user_accepted_package(tmp_path):

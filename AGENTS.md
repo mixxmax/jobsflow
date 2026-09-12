@@ -181,19 +181,22 @@ See `docs/tracker_defaults.md` for:
 5. 项目何以至此：见下节；全量编年 `sopctl chronicle`。
 
 ## 何以至此（换模型/换会话）
-- 编年 28 条（完整性 OK）；下列为最近 5 条治理动作：
-- [2026-09-08T14:21] JF-APPLY-001 proposed→accepted
-- [2026-09-08T14:21] JF-ARCH-001 登记为 proposed
-- [2026-09-08T14:21] JF-ARCH-001 proposed→accepted
-- [2026-09-08T14:21] JF-SYNC-001 登记为 proposed
-- [2026-09-08T14:21] JF-SYNC-001 proposed→accepted
+- 编年 58 条（完整性 OK）；下列为最近 5 条治理动作：
+- [2026-09-10T07:36] JF-MAT-107 proposed→accepted
+- [2026-09-10T07:36] JF-MAT-004 → superseded
+- [2026-09-10T07:36] JF-MAT-005 → superseded
+- [2026-09-10T07:36] JF-MAT-006 → superseded
+- [2026-09-10T07:36] JF-MAT-007 → superseded
 - 全量：`sopctl chronicle`；核对：`sopctl chronicle check`。
 
 ## 空间生长（无感观察；定型需人）
-- 空间生长（无感）：观察 8；待人定型候选 0（删入口 0 / 改善入口 0 / 登记规则 0）
+- 空间生长（无感）：观察 49；待人定型候选 7（删入口 0 / 改善入口 0 / 登记规则 0）
 - 发现已自动；写入权威或删代码仍需人确认——不是要你「推进发现」。
 - 最近空间快照：ambiguity_index=0 （旁路开 0 / 平行状态 0）
 - 相对上一帧：歧义指数未变：ambiguity_index=0（`sopctl growth diff`）
+- [investigate_finding] CAND-bd124b514f205867: 重复发现 state_marker_absent（规则 JF-MAT-104）；应调查并登记稳定修复
+- [investigate_finding] CAND-8c48b339ba18be36: 重复发现 state_marker_absent（规则 JF-MAT-105）；应调查并登记稳定修复
+- [investigate_finding] CAND-be2eaab212332738: 重复发现 state_marker_absent（规则 JF-MAT-106）；应调查并登记稳定修复
 - 明细：`sopctl growth status|measure|diff`；全量候选：`sopctl candidate list`；中途接入看 `sopctl doctor`（默认轻量，全量加 `--full`）。
 
 ## 控制成熟度：L2 Validate：schema/test 不通过则不宣称完成
@@ -214,6 +217,9 @@ See `docs/tracker_defaults.md` for:
 - [JF-APPLY-001][MUST] apply 只验证准备，禁止自动提交 （生产消费者标记: require_apply_validation_only）
 - [JF-ARCH-001][MUST] 归档写入必须先有确认提案 （生产消费者标记: require_archive_confirmation）
 - [JF-SYNC-001][MUST] 同步与晋升必须走统一 gateway，禁止旁路写表 （生产消费者标记: require_sync_gateway）
+- [JF-MAT-104][MUST] CV 与 Cover Letter 在任何 DOCX/PDF 渲染前都必须分别通过主机容量估算；超预算只阻断对应材料并返回定向修订，不得先生成必然超页的 PDF；估算不可用时必须失败关闭。 （生产消费者标记: require_pre_render_capacity）
+- [JF-MAT-105][MUST] 多个独立岗位可以批量准备或运行确定性下游阶段，但最多三个 worker、单岗位步骤严格串行且状态隔离；没有独立审计提供方时必须生成一个人工复核队列，不得为每个岗位重复启动完整调度链或伪造通过。 （生产消费者标记: require_material_batch_isolation）
+- [JF-MAT-106][MUST] 每个材料 generation 必须保留阶段耗时、尝试次数、实际执行与缓存命中、重渲染次数和失败原因；这些指标只能用于观测，不能替代内容或格式门禁。 （生产消费者标记: require_material_run_telemetry）
 
 ## 当前链头（可执行切片）
 - 上限 5 条明细；verified 折叠；摘要 `5d5587750d2a1f6c`

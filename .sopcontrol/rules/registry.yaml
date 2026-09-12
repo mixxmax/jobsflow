@@ -454,3 +454,299 @@ rules:
   tags: []
   created_at: '2026-09-08T14:21:15.341721Z'
   accepted_at: '2026-09-08T14:21:15.714811Z'
+- rule_id: JF-MAT-004
+  statement: CV 与 Cover Letter 在任何 DOCX/PDF 渲染前都必须分别通过主机容量估算；超预算只阻断对应材料并返回定向修订，不得先生成必然超页的
+    PDF；估算不可用时必须失败关闭。
+  modality: MUST
+  status: superseded
+  scope: project
+  scope_paths: []
+  lifecycle_revision: 0
+  effective_since: null
+  suspended_until: null
+  lifecycle_events: []
+  attested_revision: null
+  owner: jobsflow-materials
+  risk: high
+  source:
+    type: document
+    ref: docs/materials_vnext.md#deterministic-preflight-before-any-audit
+    observed_at: null
+  consumer_markers:
+  - require_pre_render_capacity
+  legacy_markers: []
+  state_markers:
+  - materials_run.performance.stages.render
+  guard_ids: []
+  source_hash: ''
+  bypass_note: ''
+  attested_by: ''
+  attested_at: null
+  supersedes: []
+  superseded_by: JF-MAT-104
+  retirement_reason: 修正规则出处为可验证的仓内文件；章节位置保留在 source_section 标签
+  retired_by: user
+  retired_at: '2026-09-10T07:36:42.361333Z'
+  retirement_id: 5855e0e22fd064f5
+  tags: []
+  created_at: '2026-09-10T07:25:27.023234Z'
+  accepted_at: '2026-09-10T07:25:33.776939Z'
+- rule_id: JF-MAT-005
+  statement: 多个独立岗位可以批量准备或运行确定性下游阶段，但最多三个 worker、单岗位步骤严格串行且状态隔离；没有独立审计提供方时必须生成一个人工复核队列，不得为每个岗位重复启动完整调度链或伪造通过。
+  modality: MUST
+  status: superseded
+  scope: project
+  scope_paths: []
+  lifecycle_revision: 0
+  effective_since: null
+  suspended_until: null
+  lifecycle_events: []
+  attested_revision: null
+  owner: jobsflow-materials
+  risk: medium
+  source:
+    type: document
+    ref: docs/materials_vnext.md#batch-preparation-research-cost-and-telemetry
+    observed_at: null
+  consumer_markers:
+  - require_material_batch_isolation
+  legacy_markers: []
+  state_markers:
+  - materials_batch_contexts
+  guard_ids: []
+  source_hash: ''
+  bypass_note: ''
+  attested_by: ''
+  attested_at: null
+  supersedes: []
+  superseded_by: JF-MAT-105
+  retirement_reason: 修正规则出处为可验证的仓内文件；章节位置保留在 source_section 标签
+  retired_by: user
+  retired_at: '2026-09-10T07:36:43.507106Z'
+  retirement_id: e2fbf2bd766600fb
+  tags: []
+  created_at: '2026-09-10T07:25:27.573354Z'
+  accepted_at: '2026-09-10T07:25:34.343207Z'
+- rule_id: JF-MAT-006
+  statement: 每个材料 generation 必须保留阶段耗时、尝试次数、实际执行与缓存命中、重渲染次数和失败原因；这些指标只能用于观测，不能替代内容或格式门禁。
+  modality: MUST
+  status: superseded
+  scope: project
+  scope_paths: []
+  lifecycle_revision: 0
+  effective_since: null
+  suspended_until: null
+  lifecycle_events: []
+  attested_revision: null
+  owner: jobsflow-materials
+  risk: medium
+  source:
+    type: document
+    ref: docs/materials_vnext.md#batch-preparation-research-cost-and-telemetry
+    observed_at: null
+  consumer_markers:
+  - require_material_run_telemetry
+  legacy_markers: []
+  state_markers:
+  - materials_vnext.materials_run.performance
+  guard_ids: []
+  source_hash: ''
+  bypass_note: ''
+  attested_by: ''
+  attested_at: null
+  supersedes: []
+  superseded_by: JF-MAT-106
+  retirement_reason: 修正规则出处为可验证的仓内文件；章节位置保留在 source_section 标签
+  retired_by: user
+  retired_at: '2026-09-10T07:36:44.668482Z'
+  retirement_id: cd1685a846f5ad44
+  tags: []
+  created_at: '2026-09-10T07:25:28.118439Z'
+  accepted_at: '2026-09-10T07:25:34.920706Z'
+- rule_id: JF-MAT-007
+  statement: 公司研究必须按成本分级：优先复用已核实 brief，明确请求时才做定向研究；雇主已确定且 JD 完整时只用雇主身份和 JD，不默认启动完整联网调研，也不得编造公司事实。
+  modality: SHOULD
+  status: superseded
+  scope: project
+  scope_paths: []
+  lifecycle_revision: 0
+  effective_since: null
+  suspended_until: null
+  lifecycle_events: []
+  attested_revision: null
+  owner: jobsflow-materials
+  risk: medium
+  source:
+    type: document
+    ref: docs/materials_vnext.md#batch-preparation-research-cost-and-telemetry
+    observed_at: null
+  consumer_markers:
+  - tiered_company_research
+  legacy_markers: []
+  state_markers: []
+  guard_ids: []
+  source_hash: ''
+  bypass_note: ''
+  attested_by: ''
+  attested_at: null
+  supersedes: []
+  superseded_by: JF-MAT-107
+  retirement_reason: 修正规则出处为可验证的仓内文件；章节位置保留在 source_section 标签
+  retired_by: user
+  retired_at: '2026-09-10T07:36:45.828320Z'
+  retirement_id: 8b81f616f865b736
+  tags: []
+  created_at: '2026-09-10T07:25:28.673291Z'
+  accepted_at: '2026-09-10T07:25:35.474270Z'
+- rule_id: JF-MAT-104
+  statement: CV 与 Cover Letter 在任何 DOCX/PDF 渲染前都必须分别通过主机容量估算；超预算只阻断对应材料并返回定向修订，不得先生成必然超页的
+    PDF；估算不可用时必须失败关闭。
+  modality: MUST
+  status: accepted
+  scope: project
+  scope_paths: []
+  lifecycle_revision: 0
+  effective_since: null
+  suspended_until: null
+  lifecycle_events: []
+  attested_revision: null
+  owner: jobsflow-materials
+  risk: high
+  source:
+    type: document
+    ref: docs/materials_vnext.md
+    observed_at: null
+  consumer_markers:
+  - require_pre_render_capacity
+  legacy_markers: []
+  state_markers:
+  - materials_run.performance.stages.render
+  guard_ids: []
+  source_hash: ''
+  bypass_note: ''
+  attested_by: ''
+  attested_at: null
+  supersedes:
+  - JF-MAT-004
+  superseded_by: ''
+  retirement_reason: ''
+  retired_by: ''
+  retired_at: null
+  retirement_id: ''
+  tags:
+  - source_section=deterministic-preflight-before-any-audit
+  created_at: '2026-09-10T07:36:28.211974Z'
+  accepted_at: '2026-09-10T07:36:28.757672Z'
+- rule_id: JF-MAT-105
+  statement: 多个独立岗位可以批量准备或运行确定性下游阶段，但最多三个 worker、单岗位步骤严格串行且状态隔离；没有独立审计提供方时必须生成一个人工复核队列，不得为每个岗位重复启动完整调度链或伪造通过。
+  modality: MUST
+  status: accepted
+  scope: project
+  scope_paths: []
+  lifecycle_revision: 0
+  effective_since: null
+  suspended_until: null
+  lifecycle_events: []
+  attested_revision: null
+  owner: jobsflow-materials
+  risk: medium
+  source:
+    type: document
+    ref: docs/materials_vnext.md
+    observed_at: null
+  consumer_markers:
+  - require_material_batch_isolation
+  legacy_markers: []
+  state_markers:
+  - materials_batch_contexts
+  guard_ids: []
+  source_hash: ''
+  bypass_note: ''
+  attested_by: ''
+  attested_at: null
+  supersedes:
+  - JF-MAT-005
+  superseded_by: ''
+  retirement_reason: ''
+  retired_by: ''
+  retired_at: null
+  retirement_id: ''
+  tags:
+  - source_section=batch-preparation-research-cost-and-telemetry
+  created_at: '2026-09-10T07:36:29.201059Z'
+  accepted_at: '2026-09-10T07:36:29.768505Z'
+- rule_id: JF-MAT-106
+  statement: 每个材料 generation 必须保留阶段耗时、尝试次数、实际执行与缓存命中、重渲染次数和失败原因；这些指标只能用于观测，不能替代内容或格式门禁。
+  modality: MUST
+  status: accepted
+  scope: project
+  scope_paths: []
+  lifecycle_revision: 0
+  effective_since: null
+  suspended_until: null
+  lifecycle_events: []
+  attested_revision: null
+  owner: jobsflow-materials
+  risk: medium
+  source:
+    type: document
+    ref: docs/materials_vnext.md
+    observed_at: null
+  consumer_markers:
+  - require_material_run_telemetry
+  legacy_markers: []
+  state_markers:
+  - materials_vnext.materials_run.performance
+  guard_ids: []
+  source_hash: ''
+  bypass_note: ''
+  attested_by: ''
+  attested_at: null
+  supersedes:
+  - JF-MAT-006
+  superseded_by: ''
+  retirement_reason: ''
+  retired_by: ''
+  retired_at: null
+  retirement_id: ''
+  tags:
+  - source_section=batch-preparation-research-cost-and-telemetry
+  created_at: '2026-09-10T07:36:30.235819Z'
+  accepted_at: '2026-09-10T07:36:30.795067Z'
+- rule_id: JF-MAT-107
+  statement: 公司研究必须按成本分级：优先复用已核实 brief，明确请求时才做定向研究；雇主已确定且 JD 完整时只用雇主身份和 JD，不默认启动完整联网调研，也不得编造公司事实。
+  modality: SHOULD
+  status: accepted
+  scope: project
+  scope_paths: []
+  lifecycle_revision: 0
+  effective_since: null
+  suspended_until: null
+  lifecycle_events: []
+  attested_revision: null
+  owner: jobsflow-materials
+  risk: medium
+  source:
+    type: document
+    ref: docs/materials_vnext.md
+    observed_at: null
+  consumer_markers:
+  - tiered_company_research
+  legacy_markers: []
+  state_markers: []
+  guard_ids: []
+  source_hash: ''
+  bypass_note: ''
+  attested_by: ''
+  attested_at: null
+  supersedes:
+  - JF-MAT-007
+  superseded_by: ''
+  retirement_reason: ''
+  retired_by: ''
+  retired_at: null
+  retirement_id: ''
+  tags:
+  - source_section=batch-preparation-research-cost-and-telemetry
+  created_at: '2026-09-10T07:36:31.261137Z'
+  accepted_at: '2026-09-10T07:36:31.821747Z'

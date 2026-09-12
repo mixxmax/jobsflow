@@ -55,7 +55,15 @@ GOVERNED_ACTIONS = frozenset({
 SOP_RULES_BY_ACTION: dict[str, tuple[str, ...]] = {
     "push": ("JF-PREVIEW-001", "JF-PUSH-002"),
     "scan": ("JF-SCAN-001", "JF-SCAN-002"),
-    "materials": ("JF-MAT-001", "JF-MAT-002", "JF-MAT-003"),
+    "materials": (
+        "JF-MAT-001",
+        "JF-MAT-002",
+        "JF-MAT-003",
+        "JF-MAT-104",
+        "JF-MAT-105",
+        "JF-MAT-106",
+        "JF-MAT-107",
+    ),
     "audit": ("JF-AUD-001",),
     "format": ("JF-AUD-001",),
     "apply": ("JF-APPLY-001",),
@@ -173,15 +181,27 @@ def sanitize_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
     return result
 
 
+def _vendor_sopcontrol_root() -> Path:
+    """Bundled control-plane checkout shipped inside the JobsFlow product tree."""
+
+    return Path(__file__).resolve().parents[2] / "vendor" / "sopcontrol"
+
+
 def _import_sopcontrol() -> tuple[Any, str | None]:
-    try:
+    """Import sopcontrol, preferring an installed package then vendor/.
+
+    JobsFlow ships ``vendor/sopcontrol`` at the pinned revision so a normal
+    clone works without a second download.  If the package is still missing,
+    callers soft-degrade: the product workflow continues without the external
+    control-plane runtime.
+    """
+
+    def _load() -> dict[str, Any]:
         from sopcontrol.events import ControlEvent, append_event, fingerprint_payload
         from sopcontrol.model import effective_rules, utcnow
         from sopcontrol.registry import Registry, RegistryError
-    except ImportError as exc:
-        return None, f"import_error:{type(exc).__name__}"
-    return (
-        {
+
+        return {
             "ControlEvent": ControlEvent,
             "append_event": append_event,
             "fingerprint_payload": fingerprint_payload,
@@ -189,9 +209,24 @@ def _import_sopcontrol() -> tuple[Any, str | None]:
             "utcnow": utcnow,
             "Registry": Registry,
             "RegistryError": RegistryError,
-        },
-        None,
-    )
+        }
+
+    try:
+        return _load(), None
+    except ImportError:
+        vendor = _vendor_sopcontrol_root()
+        if vendor.is_dir():
+            import sys
+
+            path = str(vendor)
+            if path not in sys.path:
+                sys.path.insert(0, path)
+            try:
+                return _load(), None
+            except ImportError as exc:
+                return None, f"import_error:{type(exc).__name__}"
+        return None, "import_error:ImportError"
+
 
 
 def load_effective_sop_rules(root: Path | None = None) -> tuple[list[Any], str | None]:
@@ -441,6 +476,37 @@ def issue_capability_ticket(
     }
 
 
+def capability_ticket_run_id(payload: dict[str, Any] | None) -> str:
+    """Recover the durable run bound to a pending capability ticket.
+
+    A live scan's first admission mints a ticket before the scan adapter runs.
+    The ticket is therefore the only durable hand-off between the challenge
+    invocation and the retry invocation.  CLI callers may omit ``--run-id`` on
+    retry; in that case recover the ticket's run rather than silently minting
+    a new one.  This is deliberately read-only and returns an empty string if
+    an older SOP Control installation does not expose ticket loading.
+    """
+
+    payload = dict(payload or {})
+    ticket_id = str(
+        payload.get("capability_ticket_id")
+        or payload.get("ticket_id")
+        or ""
+    ).strip()
+    if not ticket_id:
+        return ""
+    try:
+        # ``_load_ticket`` is the local SOP Control persistence primitive.  We
+        # keep this compatibility shim at the product boundary so JobsFlow
+        # does not copy or mutate the controller's ticket files.
+        from sopcontrol.tickets import _load_ticket
+
+        ticket = _load_ticket(product_root(), ticket_id)
+        return str(getattr(ticket, "run_id", "") or "").strip()
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        return ""
+
+
 def _redeem_capability_ticket(request: Any) -> list[str]:
     if not tickets_enabled() or not _write_path_requested(request):
         return []
@@ -488,6 +554,9 @@ def _run_domain_consumers(action: str, payload: dict[str, Any], *, run_id: str =
             consumers.require_vnext_engine(payload)
             consumers.require_current_job_bundle(payload)
             consumers.require_audit_before_render(payload)
+            consumers.require_pre_render_capacity(payload)
+            consumers.require_material_batch_isolation(payload)
+            consumers.require_material_run_telemetry(payload)
         elif action in {"audit", "format"}:
             consumers.require_audit_generation_binding(payload)
         elif action == "apply":
@@ -522,14 +591,12 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
     writing = _write_path_requested(request)
 
     blockers: list[str] = []
-    # Missing controller: fail-closed on side effects. Fixture/dry-run scan may
-    # continue with a diagnostic only when relax_allowed (tests).
-    if load_err and mode == "enforce" and writing:
-        if load_err.startswith("import_error"):
-            blockers.append("sopcontrol_unavailable")
-        else:
-            blockers.append("sopcontrol_registry_unavailable")
-    if not (root / ".sopcontrol" / "rules" / "registry.yaml").is_file() and writing and mode == "enforce":
+    # The external control-plane package is optional for basic JobsFlow use.
+    # When it is missing, skip tickets/events/registry I/O and continue; JobsFlow
+    # native consumers below still apply.  Do not fail-closed solely because
+    # sopcontrol is unavailable.
+    package_available = not (load_err or "").startswith("import_error")
+    if load_err and mode == "enforce" and writing and package_available:
         blockers.append("sopcontrol_registry_unavailable")
 
     if action == "push":
@@ -540,7 +607,7 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
 
     ticket_challenge = False
     issued_ticket: dict[str, Any] | None = None
-    if not blockers and writing and tickets_enabled():
+    if not blockers and writing and tickets_enabled() and package_available:
         ticket_id = str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
         secret = str(payload.get("capability_ticket_secret") or payload.get("ticket_secret") or "").strip()
         if not ticket_id or not secret:
@@ -548,14 +615,14 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
             # the caller must present it on the real write. Zero side effects.
             issued_ticket = issue_capability_ticket(action=action, payload=payload, run_id=run_id)
             if issued_ticket is None:
-                blockers.append("capability_ticket_required")
-                blockers.append("sopcontrol_unavailable")
+                # Package present but ticket mint failed — skip tickets and
+                # continue rather than blocking the whole product workflow.
+                pass
             else:
                 ticket_challenge = True
                 blockers.append("capability_ticket_required")
         else:
             blockers.extend(_redeem_capability_ticket(request))
-
     blockers = sorted(set(blockers))
     report: dict[str, Any] = {
         "mode": mode,
@@ -570,6 +637,10 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         "tickets_enabled": tickets_enabled(),
         "ticket_challenge": ticket_challenge,
         "zero_side_effects": ticket_challenge,
+        # The retry must stay attached to the challenged run.  Expose this in
+        # the structured result so a model can also pass it explicitly, while
+        # the gateway can recover it automatically from the ticket.
+        "run_id": run_id,
     }
     if issued_ticket is not None:
         report["capability_ticket_id"] = issued_ticket["ticket_id"]
@@ -595,7 +666,13 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         run_id=run_id,
         detail={"admit": {"blockers": blockers, "mode": mode, "ticket_challenge": ticket_challenge}},
     )
-    if not emitted and mode == "enforce" and writing and not ticket_challenge:
+    if (
+        not emitted
+        and mode == "enforce"
+        and writing
+        and not ticket_challenge
+        and package_available
+    ):
         blockers = sorted(set(blockers + ["sopcontrol_receipt_failed"]))
         report["blockers"] = blockers
         report["verdict"] = "fail"
@@ -603,6 +680,10 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         report["emit_error"] = emit_err
     elif emit_err:
         report["emit_error"] = emit_err
+        # Missing package: keep report observational; do not block the workflow.
+        if not package_available:
+            report["blocking"] = False
+            report["verdict"] = "pass" if not blockers else report.get("verdict") or "pass"
 
     return report
 

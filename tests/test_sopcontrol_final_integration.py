@@ -18,13 +18,21 @@ from tools.workflow.sop_consumers import (
     require_audit_before_render,
     require_audit_generation_binding,
     require_current_job_bundle,
+    require_material_batch_isolation,
+    require_material_run_telemetry,
+    require_pre_render_capacity,
     require_scan_review_only,
     require_scored_hash_binding,
     require_sync_gateway,
     require_system_id_allocation,
     require_vnext_engine,
 )
-from tools.workflow.sopcontrol_adapter import current_mode, relax_allowed, tickets_enabled
+from tools.workflow.sopcontrol_adapter import (
+    capability_ticket_run_id,
+    current_mode,
+    relax_allowed,
+    tickets_enabled,
+)
 from tools.workflow.testing_packages import build_package, build_workspace, prepare_package_for_apply
 
 
@@ -103,6 +111,13 @@ def test_consumers_reject_forbidden_payloads():
     assert require_current_job_bundle({"job_id": "C0-001"}) == "C0-001"
     with pytest.raises(ValueError, match="audit_required_before_render"):
         require_audit_before_render({"stage": "render", "skip_audit": True})
+    require_pre_render_capacity({"stage": "render"})
+    with pytest.raises(ValueError, match="pre_render_capacity_blocked"):
+        require_pre_render_capacity({"stage": "pdf", "capacity_gate": {"status": "blocked"}})
+    with pytest.raises(ValueError, match="worker_limit"):
+        require_material_batch_isolation({"max_workers": 4})
+    require_material_batch_isolation({"max_workers": 3})
+    require_material_run_telemetry({"stage": "render"})
     with pytest.raises(ValueError, match="stale_audit"):
         require_audit_generation_binding({"reuse_stale_audit": True})
     with pytest.raises(ValueError, match="apply_auto_submit"):
@@ -157,6 +172,44 @@ def test_ticket_challenge_has_zero_side_effects(enforce_root, tmp_path):
     assert challenged.get("side_effects") == []
     after = list(store.rows) if hasattr(store, "rows") else []
     assert after == before
+
+
+def test_scan_ticket_retry_recovers_bound_run_without_cli_run_id(enforce_root, tmp_path):
+    """A ticket-only retry must not create a new run and invalidate itself."""
+
+    ws = build_workspace(tmp_path)
+
+    def fake_runner(payload, workspace):
+        return {
+            "status": "succeeded",
+            "after_state": "scan_completed",
+            "run_id": payload["run_id"],
+            "side_effects": [],
+            "advance_refresh_cursor": False,
+        }
+
+    challenged = dispatch(
+        "scan",
+        workspace=ws,
+        runner=fake_runner,
+        payload={"mode": "temp"},
+    )
+    assert challenged["status"] == "planned"
+    assert challenged["run_id"].startswith("scan-")
+    ticket_payload = {
+        "mode": "temp",
+        "capability_ticket_id": challenged["capability_ticket_id"],
+        "capability_ticket_secret": challenged["capability_ticket_secret"],
+    }
+    assert capability_ticket_run_id(ticket_payload) == challenged["run_id"]
+    retried = dispatch(
+        "scan",
+        workspace=ws,
+        runner=fake_runner,
+        payload=ticket_payload,
+    )
+    assert retried["status"] == "succeeded"
+    assert retried["run_id"] == challenged["run_id"]
 
 
 def test_ticket_redeem_allows_confirmed_push(enforce_root, tmp_path):

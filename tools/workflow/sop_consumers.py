@@ -77,6 +77,47 @@ def require_audit_before_render(payload: dict[str, Any]) -> None:
         raise ValueError("audit_required_before_render")
 
 
+def require_pre_render_capacity(payload: dict[str, Any]) -> dict[str, Any]:
+    """JF-MAT-104: capacity is a host gate before DOCX/PDF work.
+
+    The MaterialsEngine computes the authoritative estimate.  This named
+    consumer keeps the SOP Control marker on the gateway path and rejects a
+    caller that tries to carry a known blocked/unavailable capacity decision
+    into a renderer.
+    """
+
+    stage = str(payload.get("stage") or payload.get("materials_cmd") or "").casefold()
+    if stage in {"render", "docx", "pdf", "convert", "format", "mechanical_format"}:
+        gate = payload.get("capacity_gate")
+        if isinstance(gate, dict) and str(gate.get("status") or "").casefold() in {"blocked", "unavailable"}:
+            raise ValueError("pre_render_capacity_blocked")
+    return payload
+
+
+def require_material_batch_isolation(payload: dict[str, Any]) -> dict[str, Any]:
+    """JF-MAT-105: a batch may not exceed the bounded worker count."""
+
+    workers = payload.get("max_workers")
+    if workers is not None:
+        try:
+            value = int(workers)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("material_batch_worker_count_invalid") from exc
+        if value > 3:
+            raise ValueError("material_batch_worker_limit_exceeded")
+    return payload
+
+
+def require_material_run_telemetry(payload: dict[str, Any]) -> dict[str, Any]:
+    """JF-MAT-106: keep the telemetry consumer on every materials gateway path.
+
+    Telemetry itself is recorded by the vNext engine as best-effort evidence;
+    this consumer intentionally never turns observational data into a gate.
+    """
+
+    return payload
+
+
 def require_audit_generation_binding(payload: dict[str, Any]) -> None:
     """JF-AUD-001: audit/format results bind to the current generation."""
 

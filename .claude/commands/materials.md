@@ -124,6 +124,10 @@ python3 -m tools.workflow apply --job-id C0-005
   `intentionally_omitted`；该状态只供编排器和独立审计读取，不进入 CV/CL。审计不得把内部
   omission 重新解释为“必须公开说明缺口”，`HYG-001` 优先于 `MAP-001`。
 - 不同岗位最多三个并行；同一岗位严格串行。CV 与 CL 的 PDF 可并行转换。
+- 在任何 DOCX/PDF 进程前，宿主分别对 CV 和 CL 做 `estimate_canonical_capacity`。
+  任一材料超过自己的 lane 基础版预算即返回 P1 `capacity_budget_exceeded`，只要求主模型
+  修改该材料；不得先导出一个必然超页的 PDF，也不得为修一份材料重做另一份。估算不可用时
+  以 `capacity_gate_unavailable` 失败关闭。最终 PDF 页数仍由机械格式门确认。
 - Email 不是第三份模型写作任务，也不进入子 Agent：CV/CL 内容通过后，宿主根据当前岗位的
   已验证职位/雇主边界和候选人姓名固定生成 `application_email.txt`；未披露客户时不会写猎头名。
 
@@ -133,7 +137,21 @@ python3 -m tools.workflow materials reset --job-id C0-005 --scope render
 python3 -m tools.workflow materials reset --job-id C0-005 --scope render --confirm-reset
 python3 -m tools.workflow materials reset --job-id C0-005 --scope all --confirm-reset
 python3 -m tools.workflow materials batch --jobs C0-005 C1-006 --batch-action pdf --max-workers 3
+python3 -m tools.workflow materials batch --jobs C0-005 C1-006 --batch-action prepare --max-workers 3
+python3 -m tools.workflow materials batch --jobs C0-005 C1-006 --batch-action audit --max-workers 3
 ```
+
+批量 `prepare` 只并行冻结岗位包、基础版和规划交接，不提交模型答案，也不生成成品；批量
+`render`/`pdf`/`format` 最多三个岗位并行、单岗位步骤仍严格串行。每次批量都会生成只含路径
+和哈希的紧凑 context index，不复制完整 JD 或用户事实。没有配置独立审计 provider 时，
+`batch --batch-action audit` 只生成一个 `materials_audit_batches/<batch-id>.json` 人工复核队列，
+不虚构通过结果，也不为每个岗位启动重复调度链；有 provider 时才按岗位并行调用。
+
+每个包的 `materials_vnext/materials_run.json` 会记录阶段耗时、实际执行次数、缓存命中、重渲染
+次数和失败原因。这是观测数据，不改变任何门禁。
+
+公司研究按成本分级：已核实 brief 直接复用；明确提出研究请求时做定向研究；雇主已确定且 JD
+完整时只使用雇主身份和 JD，不为普通岗位默认发起完整联网调研，也不允许模型编造公司事实。
 
 `audit` 只归档旧审计/修复交接，保留 canonical；`render` 只归档本轮已登记的
 DOCX/PDF、email 和机械回执；`draft` 归档 canonical、transform、修复和下游产物，

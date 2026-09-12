@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sopcontrol"
+version = "0.2.0"
+description = "SOP Control: model-neutral project control plane for coding agents (experimental but real)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "SOP Control contributors" }]
+keywords = [
+    "agent",
+    "sop",
+    "guardrail",
+    "policy",
+    "coding-agent",
+    "verification",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "pydantic>=2.5",
+    "PyYAML>=6",
+    # 2026-08-30 用户授权越过「仅 pydantic/PyYAML/pytest」边界：Go 表面结构化
+    # 证据（go_ast_scan）依赖 tree-sitter 语法树解析；缺失时运行时退回词法代理
+    # 并在 grounding 自曝 lexical，不静默丢视力。
+    "tree-sitter>=0.26,<0.27",
+    "tree-sitter-go>=0.25,<0.26",
+    "tree-sitter-typescript>=0.23,<0.24",
+    "tree-sitter-rust>=0.23,<0.25",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-cov>=5,<7",
+    "ruff>=0.8,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/mixxmax/sopcontrol"
+Documentation = "https://github.com/mixxmax/sopcontrol#readme"
+Issues = "https://github.com/mixxmax/sopcontrol/issues"
+
+[project.scripts]
+sopctl = "sopcontrol.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sopcontrol*", "plugins*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["sopcontrol", "plugins"]
+
+[tool.coverage.report]
+# fail_under applies to the combined statement+branch metric; branch execution
+# is measured and shown separately in the report.
+fail_under = 85
+precision = 1
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# 先阻断会改变运行语义的错误；其余历史风格债务按批次收紧，避免一次机械改写全仓。
+select = ["E9", "F63", "F7", "F82"]

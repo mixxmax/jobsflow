@@ -32,10 +32,9 @@ TEMPLATE_STYLES: dict[str, tuple[str, ...]] = {
 }
 
 # Calibrated wrapped-line widths (characters per line) of the lane masters.
-# These feed the pre-render capacity estimate.  The estimate is advisory: the
-# LibreOffice PDF page count stays the only authoritative one-page fact, but
-# comparing the canonical against the same master's estimate catches gross
-# overruns before any DOCX/PDF cycle starts.
+# These feed the pre-render capacity estimate.  The estimate is a conservative
+# early budget; the LibreOffice PDF page count remains the authoritative
+# one-page fact, while crossing the budget is stopped before any conversion.
 CAPACITY_CHARS_PER_LINE: dict[str, int] = {
     "Normal": 92,
     "Compact Line": 104,
@@ -719,6 +718,22 @@ def render_canonical_docx(package: Path, workspace: Path, *, force: bool = False
             raise ValueError("baseline_content_floor_invalid:" + ",".join(floor_errors))
     if not _audit_current(package):
         raise ValueError("content_audit_not_current")
+    # Defend the renderer itself as well as the workflow engine.  A direct
+    # caller or a late retry must not start a DOCX/PDF cycle when the current
+    # canonical already exceeds its lane master's cheap one-page budget.
+    try:
+        from tools.workflow.materials_baseline import load_content_baseline
+        from tools.workflow.materials_vnext.preflight import evaluate_capacity
+
+        capacity_gate = evaluate_capacity(
+            canonical=draft,
+            baseline=load_content_baseline(package),
+        )
+    except (ImportError, OSError, ValueError, TypeError, KeyError) as exc:
+        raise ValueError("capacity_gate_unavailable") from exc
+    if capacity_gate.get("status") == "blocked":
+        materials = ",".join(str(item) for item in capacity_gate.get("materials") or [])
+        raise ValueError(f"capacity_budget_exceeded:{materials}")
     names = expected_filenames(package, workspace)
     templates = _template_paths(package, workspace)
     digest = str(draft.get("canonical_sha256") or canonical_digest(draft))

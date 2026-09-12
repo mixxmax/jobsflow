@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.sopcontrol-local/
+corpus/fixtures/**/.sopcontrol/evidence/
+corpus/fixtures/**/.sopcontrol/tasks/
+corpus/fixtures/**/.sopcontrol/rules/candidates.yaml
+
+.sopcontrol/worktrees/
+
+# 运行时 trace 是本机噪音（每次工具调用都追加），证据由判定器每轮重算
+.sopcontrol/evidence/trace.jsonl
+corpus/fixtures/**/.sopcontrol/evidence/trace.jsonl
+
+# coverage 运行产物
+.coverage

@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import re
+from time import perf_counter
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -25,7 +26,7 @@ from tools.workflow.materials_vnext.audit import (
 )
 from tools.workflow.materials_vnext.bundle import build_bundle, bundle_current, load_json, state_dir
 from tools.workflow.materials_vnext.contracts import MATERIALS, digest, text
-from tools.workflow.materials_vnext.preflight import run_preflight
+from tools.workflow.materials_vnext.preflight import evaluate_capacity, run_preflight
 from tools.workflow.materials_vnext.migration import migration_blocker
 from tools.workflow.materials_vnext.store import (
     EFFECTIVE_NAME,
@@ -48,6 +49,7 @@ from tools.workflow.materials_vnext.store import (
     save_plan,
     save_run,
     save_transform,
+    record_stage_metric,
     package_lock,
     write_event,
 )
@@ -67,6 +69,34 @@ _DISPATCH_FAILURES = {
     "invalid_auditor_command",
     "empty_auditor_command",
 }
+
+
+def _metric(
+    package: Path,
+    *,
+    stage: str,
+    status: str,
+    started: float,
+    error: str = "",
+    cached: bool = False,
+    **metadata: Any,
+) -> None:
+    """Best-effort run telemetry; metrics must never change a gate result."""
+
+    try:
+        record_stage_metric(
+            package,
+            stage=stage,
+            status=status,
+            duration_ms=int((perf_counter() - started) * 1000),
+            error=error,
+            cached=cached,
+            **metadata,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        # A broken telemetry projection cannot make a valid materials run
+        # fail.  The state machine and artifact gates remain authoritative.
+        return
 
 
 def _write_email(package: Path, bundle: dict[str, Any]) -> Path:
@@ -156,6 +186,38 @@ def _format_artifacts_current(package: Path, workspace: Path, run: dict[str, Any
         )
     except (OSError, ValueError, RuntimeError, TypeError):
         return False
+
+
+def _capacity_blocker(
+    *,
+    bundle: dict[str, Any],
+    package: Path,
+) -> dict[str, Any] | None:
+    """Return a precise render blocker for a canonical over the page budget.
+
+    This second, cheap check protects late render/PDF retries from a canonical
+    edit that happened after content preflight.  It deliberately reports only
+    the material(s) over budget so the producer can revise a narrow scope.
+    """
+
+    canonical = load_canonical(package)
+    if not canonical:
+        return {"blockers": ["canonical_missing"], "next_action": "submit_bounded_baseline_transform"}
+    try:
+        gate = evaluate_capacity(canonical=canonical, baseline=bundle.get("baseline") or {})
+    except (ImportError, OSError, ValueError, TypeError, KeyError) as exc:
+        return {
+            "blockers": ["capacity_gate_unavailable"],
+            "error": str(exc) or "capacity_estimate_unavailable",
+            "next_action": "stop_and_check_lane_master",
+        }
+    if gate.get("status") != "blocked":
+        return None
+    return {
+        "blockers": ["capacity_budget_exceeded"],
+        "capacity_gate": gate,
+        "next_action": "revise_only_over_budget_materials",
+    }
 
 
 def _package(workspace: Path, job_id: str) -> Path:
@@ -375,9 +437,19 @@ def _dispatch_audit_task(task: dict[str, Any], *, package: Path, payload: dict[s
     audit the user explicitly stopped.
     """
 
+    started = perf_counter()
     if run.get("audit_dispatch_suspended"):
+        _metric(package, stage="audit_dispatch", status="suspended", started=started, cached=True)
         return None
-    return dispatch(task, package=package, timeout=int(payload.get("audit_timeout") or 600))
+    try:
+        out = dispatch(task, package=package, timeout=int(payload.get("audit_timeout") or 600))
+    except Exception as exc:
+        _metric(package, stage="audit_dispatch", status="failed", started=started, error=type(exc).__name__)
+        raise
+    status = text(out.get("status") or "unknown")
+    metric_status = "succeeded" if status in {"completed", "delegation_required"} else ("failed" if status in _DISPATCH_FAILURES or status in {"failed", "error"} else status)
+    _metric(package, stage="audit_dispatch", status=metric_status, started=started, error=text(out.get("reason") or out.get("error")), provider_status=status)
+    return out
 
 
 def _plan_packet(
@@ -421,6 +493,28 @@ def _plan_packet(
                 "model_action": "use the host-supplied title; do not reorder or inspect another package",
             },
         }
+    research = bundle.get("company_research") if isinstance(bundle.get("company_research"), dict) else {}
+    research_quality = research.get("quality") if isinstance(research.get("quality"), dict) else {}
+    research_ready = bool(research_quality.get("ready_for_tailoring"))
+    research_available = bool(
+        research.get("sources")
+        or research.get("verified_facts")
+        or research.get("verified_signals")
+        or research_quality
+    )
+    research_request = str(bundle.get("company_research_request") or "").strip()
+    if research_ready:
+        company_research_depth = "verified_brief"
+        company_research_action = "reuse_verified_brief"
+    elif research_request:
+        company_research_depth = "targeted_research_required"
+        company_research_action = "complete_only_the_requested_company_identity_and_business_brief"
+    elif research_available:
+        company_research_depth = "available_brief_not_verified_for_tailoring"
+        company_research_action = "use_only_verified_fields_and_rely_on_jd_for_role_mapping"
+    else:
+        company_research_depth = "jd_and_identity_only"
+        company_research_action = "do_not_start_full_company_research; use_employer_identity_and_frozen_jd"
     return {
         "schema_version": 1,
         "task_type": "materials_plan_and_bounded_tailoring",
@@ -433,13 +527,21 @@ def _plan_packet(
         "company_research_request": str(bundle.get("company_research_request") or ""),
         "company_research_status": (
             "verified"
-            if (bundle.get("company_research") or {}).get("quality", {}).get("ready_for_tailoring")
+            if research_ready
             else (
                 "required"
-                if str(bundle.get("company_research_request") or "").strip()
+                if research_request
                 else "jd_only_or_generic"
             )
         ),
+        "company_research_depth": company_research_depth,
+        "company_context_policy": {
+            "purpose": "support JD-specific tailoring without making research a default cost",
+            "action": company_research_action,
+            "minimum": ["employer identity", "business nature/main business when verified", "frozen JD duties and requirements"],
+            "skip_full_research_when": "the employer is identified and the JD is complete, unless the user or package explicitly requests a verified brief",
+            "no_invention": "never claim company knowledge that is not present in the frozen bundle",
+        },
         "candidate_profile": candidate_profile,
         "forbidden_claims": list(
             bundle.get("forbidden_claims")
@@ -1023,7 +1125,9 @@ class MaterialsEngine:
             return {"status": "planned", "after_state": run.get("phase"), "engine": "materials-vnext", "plan_task": plan_packet, "task_packet": plan_packet, "draft_schema": plan_packet.get("draft_seed_schema")}
 
         if stage in {"render", "docx", "docx_generated"}:
+            render_started = perf_counter()
             if not audit_current(package, run):
+                _metric(package, stage="render", status="blocked", started=render_started, error="content_audit_not_current")
                 return {"status": "blocked", "blockers": ["content_audit_not_current"], "next_action": "record_independent_audit_result_or_reset_audit_scope", "engine": "materials-vnext", "after_state": run.get("phase")}
             current_phase = str(run.get("phase") or "")
             if current_phase in {"pdf_generated", "format_passed", "apply_ready"}:
@@ -1033,6 +1137,7 @@ class MaterialsEngine:
                 from tools.workflow.materials_renderer import render_artifacts_current
 
                 if not render_artifacts_current(package, Path(workspace)):
+                    _metric(package, stage="render", status="blocked", started=render_started, error="render_rebuild_requires_reset")
                     return {
                         "status": "blocked",
                         "after_state": current_phase,
@@ -1040,6 +1145,7 @@ class MaterialsEngine:
                         "next_action": "materials reset --scope render --confirm-reset",
                         "engine": "materials-vnext",
                     }
+                _metric(package, stage="render", status="cached", started=render_started, cached=True)
                 return {
                     "status": "succeeded",
                     "after_state": current_phase,
@@ -1047,12 +1153,30 @@ class MaterialsEngine:
                     "idempotent": True,
                     "engine": "materials-vnext",
                 }
+            capacity_blocker = _capacity_blocker(bundle=bundle, package=package)
+            if capacity_blocker is not None:
+                _metric(
+                    package,
+                    stage="render",
+                    status="blocked",
+                    started=render_started,
+                    error=",".join(str(item) for item in capacity_blocker.get("blockers") or []),
+                    over_budget_materials=list((capacity_blocker.get("capacity_gate") or {}).get("materials") or []),
+                )
+                return {
+                    "status": "blocked",
+                    "after_state": current_phase,
+                    **capacity_blocker,
+                    "engine": "materials-vnext",
+                }
             try:
                 from tools.workflow.materials_renderer import render_canonical_docx
 
                 rendered = render_canonical_docx(package, Path(workspace), force=bool(payload.get("force")))
             except (OSError, ValueError, RuntimeError) as exc:
+                _metric(package, stage="render", status="failed", started=render_started, error=str(exc)[:160])
                 return {"status": "blocked", "blockers": ["docx_render_failed"], "error": str(exc), "engine": "materials-vnext"}
+            _metric(package, stage="render", status="succeeded", started=render_started, cached=False)
             run.update({"phase": current_phase if current_phase == "docx_generated" else "docx_generated"})
             save_run(package, run)
             _write_email(package, bundle)
@@ -1065,7 +1189,9 @@ class MaterialsEngine:
             }
 
         if stage in {"pdf", "convert", "pdf_generated"}:
+            pdf_started = perf_counter()
             if not audit_current(package, run):
+                _metric(package, stage="pdf", status="blocked", started=pdf_started, error="content_audit_not_current")
                 return {"status": "blocked", "blockers": ["content_audit_not_current"], "next_action": "record_independent_audit_result_or_reset_audit_scope", "engine": "materials-vnext", "after_state": run.get("phase")}
             current_phase = str(run.get("phase") or "")
             if current_phase in {"pdf_generated", "format_passed", "apply_ready"} and not bool(payload.get("force")):
@@ -1083,6 +1209,7 @@ class MaterialsEngine:
                     if not (package / names[key]).is_file()
                 ]
                 if missing:
+                    _metric(package, stage="pdf", status="blocked", started=pdf_started, error="pdf_artifact_missing")
                     return {
                         "status": "blocked",
                         "after_state": current_phase,
@@ -1090,6 +1217,7 @@ class MaterialsEngine:
                         "missing": missing,
                         "engine": "materials-vnext",
                     }
+                _metric(package, stage="pdf", status="cached", started=pdf_started, cached=True)
                 return {
                     "status": "succeeded",
                     "after_state": current_phase,
@@ -1098,10 +1226,27 @@ class MaterialsEngine:
                     "engine": "materials-vnext",
                 }
             if current_phase in {"format_passed", "apply_ready"} and bool(payload.get("force")):
+                _metric(package, stage="pdf", status="blocked", started=pdf_started, error="pdf_rebuild_requires_reset")
                 return {
                     "status": "blocked",
                     "after_state": current_phase,
                     "blockers": ["pdf_rebuild_requires_reset"],
+                    "engine": "materials-vnext",
+                }
+            capacity_blocker = _capacity_blocker(bundle=bundle, package=package)
+            if capacity_blocker is not None:
+                _metric(
+                    package,
+                    stage="pdf",
+                    status="blocked",
+                    started=pdf_started,
+                    error=",".join(str(item) for item in capacity_blocker.get("blockers") or []),
+                    over_budget_materials=list((capacity_blocker.get("capacity_gate") or {}).get("materials") or []),
+                )
+                return {
+                    "status": "blocked",
+                    "after_state": current_phase,
+                    **capacity_blocker,
                     "engine": "materials-vnext",
                 }
             try:
@@ -1115,16 +1260,20 @@ class MaterialsEngine:
                     parallel=bool(payload.get("parallel", True)),
                 )
             except (OSError, ValueError, RuntimeError) as exc:
+                _metric(package, stage="pdf", status="failed", started=pdf_started, error=str(exc)[:160])
                 return {"status": "failed", "blockers": ["pdf_conversion_failed"], "error": str(exc), "engine": "materials-vnext"}
+            _metric(package, stage="pdf", status="succeeded", started=pdf_started, cached=False, parallel=bool(payload.get("parallel", True)))
             run.update({"phase": "pdf_generated"})
             save_run(package, run)
             _write_email(package, bundle)
             return {"status": "succeeded", "after_state": "pdf_generated", "conversion": converted, "engine": "materials-vnext"}
 
         if stage in {"format", "mechanical_format"}:
+            format_started = perf_counter()
             current_phase = str(run.get("phase") or "")
             if current_phase in {"format_passed", "apply_ready"}:
                 if not _format_artifacts_current(package, Path(workspace), run):
+                    _metric(package, stage="format", status="blocked", started=format_started, error="format_recheck_requires_render_reset")
                     return {
                         "status": "blocked",
                         "after_state": current_phase,
@@ -1132,6 +1281,7 @@ class MaterialsEngine:
                         "next_action": "materials reset --scope render --confirm-reset",
                         "engine": "materials-vnext",
                     }
+                _metric(package, stage="format", status="cached", started=format_started, cached=True)
                 return {
                     "status": "succeeded",
                     "after_state": current_phase,
@@ -1141,15 +1291,24 @@ class MaterialsEngine:
                     "engine": "materials-vnext",
                 }
             if current_phase not in {"pdf_generated"}:
+                _metric(package, stage="format", status="blocked", started=format_started, error="pdf_not_generated")
                 return {"status": "blocked", "blockers": ["pdf_not_generated"], "engine": "materials-vnext", "after_state": run.get("phase")}
             try:
                 from tools.workflow.materials_renderer import mechanical_format_gate
 
                 report = mechanical_format_gate(package, Path(workspace))
             except (OSError, ValueError, RuntimeError) as exc:
+                _metric(package, stage="format", status="failed", started=format_started, error=str(exc)[:160])
                 return {"status": "failed", "blockers": ["format_gate_failed"], "error": str(exc), "engine": "materials-vnext"}
             atomic_write_json(state_dir(package) / "format_report.json", report)
             if not report.get("format_passed"):
+                _metric(
+                    package,
+                    stage="format",
+                    status="blocked",
+                    started=format_started,
+                    error=",".join(str(item.get("code")) for item in report.get("findings") or [] if isinstance(item, dict)),
+                )
                 run.update({"phase": "pdf_generated", "last_error": "mechanical_format_gate_failed"})
                 save_run(package, run)
                 return {"status": "blocked", "after_state": "pdf_generated", "blockers": [item.get("code") for item in report.get("findings") or []], "format": report, "engine": "materials-vnext"}
@@ -1167,6 +1326,7 @@ class MaterialsEngine:
                 # pdf_generated so a retry can finish the same format gate.
                 run.update({"phase": "pdf_generated", "last_error": "tracker_material_status_sync_failed"})
                 save_run(package, run)
+                _metric(package, stage="format", status="blocked", started=format_started, error="tracker_material_status_sync_failed")
                 return {
                     "status": "blocked",
                     "after_state": "pdf_generated",
@@ -1186,6 +1346,7 @@ class MaterialsEngine:
             })
             run.update({"phase": "format_passed", "last_error": ""})
             save_run(package, run)
+            _metric(package, stage="format", status="succeeded", started=format_started, cached=False)
             return {"status": "succeeded", "after_state": "format_passed", "format": report, "engine": "materials-vnext"}
 
         if stage in {"apply", "ready"}:
@@ -1285,10 +1446,12 @@ class MaterialsEngine:
             return {"status": "succeeded" if ready else "blocked", "after_state": "apply_ready" if ready else run.get("phase"), "apply_ready": ready, "validation": report, "submitted": False, "next_action": "wait_for_user_submission_decision", "engine": "materials-vnext"}
 
         if stage in {"plan", "run", "planning"} and not incoming_transform and payload.get("repair_patch") is None:
+            plan_started = perf_counter()
             plan = payload.get("model_plan") or payload.get("plan")
             if isinstance(plan, dict):
                 errors = _plan_errors(plan)
                 if errors:
+                    _metric(package, stage="plan", status="blocked", started=plan_started, error=",".join(errors))
                     return {"status": "blocked", "after_state": run.get("phase"), "blockers": ["plan_invalid"], "errors": errors, "engine": "materials-vnext"}
                 frozen_plan = dict(plan)
                 frozen_plan.setdefault("schema_version", 1)
@@ -1314,6 +1477,13 @@ class MaterialsEngine:
                     phase="tailoring",
                     plan=load_plan(package),
                 )
+            _metric(
+                package,
+                stage="plan",
+                status="succeeded",
+                started=plan_started,
+                response="model_plan" if isinstance(plan, dict) else "task_packet",
+            )
             return {
                 "status": "succeeded",
                 "after_state": run.get("phase"),
@@ -1406,6 +1576,7 @@ class MaterialsEngine:
         if not transform:
             plan_packet = _plan_packet(bundle, run, plan=load_plan(package))
             return {"status": "succeeded", "after_state": run.get("phase"), "engine": "materials-vnext", "plan_task": plan_packet, "task_packet": plan_packet, "draft_schema": plan_packet.get("draft_seed_schema"), "next_action": "submit_bounded_transform"}
+        transform_started = perf_counter()
         if patch is None and incoming_transform is not None:
             from tools.workflow.materials_drafting_context import load_drafting_scope, validate_submission_binding
 
@@ -1530,6 +1701,7 @@ class MaterialsEngine:
                 bundle_sha256=str(bundle.get("bundle_sha256")),
             )
         except ValueError as exc:
+            _metric(package, stage="transform", status="failed", started=transform_started, error=str(exc)[:160])
             return {"status": "blocked", "blockers": ["canonical_compile_failed"], "error": str(exc), "engine": "materials-vnext"}
         frozen_plan = load_plan(package) or {}
         canonical["coverage_dispositions"] = dict(frozen_plan.get("coverage_dispositions") or {})
@@ -1539,9 +1711,25 @@ class MaterialsEngine:
         canonical["canonical_sha256"] = digest({key: value for key, value in canonical.items() if key != "canonical_sha256"})
         save_canonical(package, canonical)
         save_effective(package, effective)
+        _metric(
+            package,
+            stage="transform",
+            status="succeeded",
+            started=transform_started,
+            changed_blocks=int((effective.get("changed_block_count") or effective.get("changed_blocks") or 0)),
+        )
         run.update({"phase": "transformed", "effective_transform_sha256": effective.get("effective_transform_sha256"), "canonical_sha256": canonical.get("canonical_sha256")})
         save_run(package, run)
+        preflight_started = perf_counter()
         preflight = run_preflight(bundle=bundle, canonical=canonical, effective_transform=effective, plan=load_plan(package) or {})
+        _metric(
+            package,
+            stage="preflight",
+            status=str(preflight.get("status") or "unknown"),
+            started=preflight_started,
+            error=",".join(str(item.get("code")) for item in preflight.get("blocking") or [] if isinstance(item, dict)),
+            over_budget_materials=list((preflight.get("capacity_gate") or {}).get("materials") or []),
+        )
         if preflight.get("status") != "passed":
             run.update({"phase": "blocked", "last_error": "content_preflight_failed"})
             save_run(package, run)

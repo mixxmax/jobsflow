@@ -91,9 +91,13 @@ recruiter leakage and internal markers (severity tags, rule IDs, prompts) are
 blocked; acronym slash order (for example, ECM/IPO versus IPO/ECM) is treated
 as equivalent and never produces a finding; and every planned JD duty/requirement must be
 answered somewhere or carry an internal coverage disposition. A wrapped-line
-capacity estimate (`estimate_canonical_capacity`) compares the canonical
-against the lane master and reports overruns as an advisory P2 so content can
-be trimmed before any DOCX/PDF cycle.
+capacity estimate (`estimate_canonical_capacity`) compares each canonical
+material with its own lane master before any DOCX/PDF process. An over-budget
+CV or Cover Letter is a deterministic P1 pre-render block: the host names only
+the affected material and returns `revise_only_over_budget_materials`. The
+model revises that material and does not reset or regenerate the other one. If
+the estimate cannot be computed, the host fails closed with
+`capacity_gate_unavailable` rather than starting a blind render loop.
 
 None of these checks compares wording similarity; they check fact and
 semantic boundaries only.
@@ -225,12 +229,51 @@ file extension. Every confirmed reset archives rather than silently deletes the
 previous generation, and never touches the JD, profile or lane masters. A new
 generation cannot mix an old bundle with a new JD, role or master.
 
+## Batch preparation, research cost and telemetry
+
+Independent job packages may be prepared in one bounded batch. Preparation
+freezes the bundle, baseline and planning handoff for each job; it does not
+submit a plan, write canonical content or create outbound files. The host may
+run at most three independent jobs concurrently, while steps inside one job
+remain serial. A compact batch context index stores only package paths and
+digests (`jd_sha256`, profile, baseline, rules and lessons), so a model or a
+different harness can reuse the same read-only context without copying full
+JDs or private facts into every prompt:
+
+```bash
+python3 -m tools.workflow materials batch --jobs C0-005 C1-006 \
+  --batch-action prepare --max-workers 3
+```
+
+When no auditor command is configured, a batch audit does not fabricate a pass
+or launch one full dispatch chain per job. It writes one
+`materials_audit_batches/<batch-id>.json` manual-review queue containing the
+hash-bound per-job task paths. One independent reviewer context may process
+that queue, then submit each result through the normal gateway; every package
+still retains its own generation, three-attempt limit and audit fingerprint.
+With a configured auditor command, `--batch-action audit` runs the independent
+per-job calls concurrently (bounded by the same worker limit).
+
+Each package's `materials_vnext/materials_run.json` (and compatibility mirror)
+records compact stage telemetry: attempts, actual runs, cache hits, duration,
+rerender count and failure reasons. Telemetry is observational and can never
+open or close a gate; it replaces reconstructing elapsed time from verbose
+event logs.
+
+Company research is tiered. A verified brief is reused when present; an
+explicit research request receives a targeted brief; otherwise a known
+employer with a complete JD uses employer identity plus the frozen JD only.
+The last path does not start an unnecessary network research task and never
+permits the model to invent company facts.
+
 ## Rendering throughput
 
 The DOCX→PDF conversion takes a machine-wide LibreOffice run lock, so
 parallel CV/CL or multi-job conversions serialize instead of pre-empting each
-other (the historical random `exit 2`). The pre-render capacity estimate
-above removes the render-loop blind spot: trim content when the estimate says
-the page is over budget instead of discovering it through repeated
-LibreOffice conversions. The PDF page count remains the only authoritative
-one-page fact; the estimate is advisory.
+other (the historical random `exit 2`). The pre-render capacity gate removes
+the render-loop blind spot: revise content when the estimate says a material is
+over budget instead of discovering it through repeated LibreOffice
+conversions. CV and Cover Letter estimates are independent, so a compliant
+file is not regenerated when only the other file is too long. The PDF page
+count remains the authoritative one-page fact; the estimate is a conservative
+release gate, not a replacement for the final PDF check.

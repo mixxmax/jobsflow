@@ -146,6 +146,7 @@ PYTHON_BIN="$(command -v python3.12 || command -v python3.11 || command -v pytho
 "$PYTHON_BIN" -m venv .venv
 source .venv/bin/activate
 python3 -m pip install --require-hashes -r requirements.lock
+python3 -m pip install -e vendor/sopcontrol
 python3 setup.py --doctor
 ```
 

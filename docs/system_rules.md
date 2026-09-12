@@ -117,6 +117,29 @@ existing application materials are not rewritten by an intent update.
 
 ## 4. Search and two-pass scoring
 
+### 4.0 SOP Control capability tickets
+
+When the product is running in SOP Control `enforce` mode, a real scan or
+other governed side effect may first return `capability_ticket_required`. This
+is an intentional two-step authorization: the first request is side-effect
+free and issues a one-shot ticket. The ticket carries the challenged scan's
+run identity; on retry the gateway restores that identity before recomputing
+the fingerprint, so a new CLI process cannot invalidate its own ticket by
+generating a new UUID. The caller repeats the same workflow command with both
+values from the response:
+
+```bash
+python3 -m tools.workflow scan --mode temp \
+  --capability-ticket-id '<ticket id>' \
+  --capability-ticket-secret '<one-shot secret>'
+```
+
+All workflow subcommands inherit these transport options. The gateway, not the
+CLI or model, validates the ticket's action, input fingerprint, scope and
+single-use state. Never place the secret in source control or durable logs,
+and never switch to a legacy script to avoid the challenge. Fixture and
+`--dry-run` scans remain review-only and do not require a ticket.
+
 The private setup configuration must contain at least three intent buckets:
 
 1. core target roles;
@@ -590,11 +613,28 @@ runs deterministic semantic checks: invented numbers, number-object drift,
 scope narrowing near a retained number, verb escalation, cross-employer
 attribution, employer-heading attribution loss, cross-material language-level
 conflicts, internal marker/prompt leakage, and JD duty coverage (themes are
-exempt; coverage dispositions are honoured). An advisory wrapped-line
-capacity estimate (`estimate_canonical_capacity`) reports page-budget
-overruns before any DOCX/PDF cycle; the LibreOffice PDF page count stays the
-only authoritative one-page fact, and a machine-wide soffice run lock
-serializes conversions.
+exempt; coverage dispositions are honoured). The host runs a per-material
+wrapped-line capacity estimate (`estimate_canonical_capacity`) before any
+DOCX/PDF cycle. An over-budget CV or Cover Letter is a deterministic P1
+`capacity_budget_exceeded` block naming only the affected material; the model
+revises that material instead of entering a blind render loop. If the estimate
+is unavailable, `capacity_gate_unavailable` fails closed. The LibreOffice PDF
+page count remains the authoritative one-page fact, and a machine-wide soffice
+run lock serializes conversions.
+
+For multiple independent jobs, preparation and deterministic downstream
+stages may run in a bounded batch of at most three workers while each job's
+state remains serial and isolated. The batch context index contains only
+paths and input digests, not full JD or profile text. When no independent
+auditor provider is configured, a batch audit produces one manual-review queue
+of hash-bound per-job task packets rather than repeatedly launching a full
+dispatch chain or fabricating an audit pass. Company research is likewise
+tiered: reuse a verified brief, perform explicit targeted research, or use
+only employer identity plus the complete JD when no research is needed.
+
+Each materials run records compact stage telemetry (duration, attempts,
+actual/cache runs, rerenders and failure reasons) as observational evidence;
+telemetry cannot open or close a gate.
 
 The content gate opens only through (1) a real independent audit bound to the
 task-packet digest, delegation id, canonical semantic hashes and a distinct

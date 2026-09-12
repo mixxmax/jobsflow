@@ -8,6 +8,29 @@ python3 -m tools.workflow scan --mode daily
 python3 -m tools.workflow scan --mode temp --dry-run
 ```
 
+如果返回 `capability_ticket_required`，这是 SOP Control 对真实扫描写入
+运行记录/评分产物的二阶段授权。使用同一条命令重试，并把首次响应中的一次性
+票据透传给网关；网关会从票据恢复首次挑战绑定的 `run_id`，所以不带
+`--run-id` 也能安全续接。若手动指定，则必须使用首次响应返回的同一个 `run_id`。
+不要关闭 enforce，也不要改用旧扫描脚本：
+
+```bash
+python3 -m tools.workflow scan --mode temp \
+  --capability-ticket-id '<ticket id>' \
+  --capability-ticket-secret '<one-shot secret>'
+```
+
+也可以显式携带首次响应的运行号：
+
+```bash
+python3 -m tools.workflow scan --mode temp --run-id '<challenge run_id>' \
+  --capability-ticket-id '<ticket id>' \
+  --capability-ticket-secret '<one-shot secret>'
+```
+
+票据只绑定当前动作、挑战运行和输入指纹，不能跨岗位、运行或动作复用；secret 不得写入
+仓库、日志或提交记录。`--dry-run`/fixture 扫描不需要票据。
+
 临时模式是默认。网关执行经批准的 scan adapter：写 run state 和评分产物。扫描不生成材料，不归档，不改未授权的 refresh cursor。
 
 向用户报告 adapter 返回的机器结果：职位列表、lane、层级、分数、URL、JD 状态、

@@ -24,10 +24,12 @@ _PLACEHOLDER = re.compile("|".join(PLACEHOLDER_PATTERNS), re.I)
 _TRAILING_FRAGMENT = re.compile(r"(?:\s|^)(?:and|or|with|for|to|of|the|a|an|in|on)\s*[.,;:]?$", re.I)
 
 # Wrapped-line growth against the lane master that makes a second page
-# likely.  Advisory only: the LibreOffice PDF stays the one-page authority,
-# but this estimate removes the render-loop blind spot at zero cost.
+# likely.  This is a cheap pre-render budget, not a replacement for the
+# LibreOffice page-count authority.  Crossing it is a deterministic blocker
+# so a model can revise only the offending material before any DOCX/PDF work.
 _CAPACITY_OVER_LINES = 4
 _CAPACITY_OVER_RATIO = 1.08
+_CAPACITY_RATIO_MIN_MASTER_LINES = 20
 
 
 def _texts(canonical: dict[str, Any]) -> dict[str, str]:
@@ -43,6 +45,62 @@ def _texts(canonical: dict[str, Any]) -> dict[str, str]:
 
 def _finding(code: str, material: str, evidence: str, *, severity: str = "P0") -> dict[str, Any]:
     return {"code": code, "severity": severity, "material": material, "evidence": evidence[:300]}
+
+
+def evaluate_capacity(*, canonical: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+    """Return the bounded, per-material pre-render page-budget decision.
+
+    The estimate is intentionally conservative: it compares each tailored
+    material with its own lane master and never mixes CV and Cover Letter
+    budgets.  A caller may use the result without running semantic checks,
+    which lets the render/PDF adapters defend themselves if a canonical file
+    was changed after the original preflight.
+    """
+
+    from tools.workflow.materials_renderer import estimate_canonical_capacity
+
+    if not isinstance(canonical, dict) or not isinstance(baseline, dict):
+        raise ValueError("capacity_inputs_invalid")
+    # A missing/empty lane baseline is not a zero-cost document; it is an
+    # unavailable budget.  Failing closed here prevents a malformed package
+    # from silently bypassing the pre-render one-page guard.
+    for material in MATERIALS:
+        base = baseline.get(material)
+        current = canonical.get(material)
+        if not isinstance(base, dict) or not isinstance(current, dict):
+            raise ValueError(f"capacity_material_missing:{material}")
+        if not isinstance(base.get("blocks"), list) or not base.get("blocks"):
+            raise ValueError(f"capacity_baseline_empty:{material}")
+
+    estimate = estimate_canonical_capacity(canonical, baseline)
+    if not isinstance(estimate, dict):
+        raise ValueError("capacity_estimate_invalid")
+    for material in MATERIALS:
+        item = estimate.get(material)
+        if not isinstance(item, dict) or int(item.get("master_lines") or 0) <= 0:
+            raise ValueError(f"capacity_estimate_unavailable:{material}")
+    over = [
+        material
+        for material in MATERIALS
+        if (
+            int((estimate.get(material) or {}).get("over_master_lines") or 0) >= _CAPACITY_OVER_LINES
+            or (
+                int((estimate.get(material) or {}).get("master_lines") or 0) >= _CAPACITY_RATIO_MIN_MASTER_LINES
+                and float((estimate.get(material) or {}).get("ratio") or 0) > _CAPACITY_OVER_RATIO
+            )
+        )
+    ]
+    return {
+        "status": "blocked" if over else "passed",
+        "materials": over,
+        "estimate": estimate,
+        "thresholds": {
+            "over_master_lines": _CAPACITY_OVER_LINES,
+            "ratio_exclusive": _CAPACITY_OVER_RATIO,
+            "ratio_min_master_lines": _CAPACITY_RATIO_MIN_MASTER_LINES,
+        },
+        "next_action": "revise_only_over_budget_materials" if over else "continue_to_content_audit",
+    }
 
 
 def run_preflight(
@@ -116,30 +174,41 @@ def run_preflight(
     # checks compare semantic anchors, never wording similarity.
     findings.extend(semantic_lint.run_semantic_lint(bundle=bundle, canonical=canonical, plan=plan))
 
-    # Pre-render capacity estimate (advisory): how far the tailored canonical
-    # has grown past the lane master's estimated one-page budget.
+    # Pre-render capacity gate: how far the tailored canonical has grown past
+    # the lane master's estimated one-page budget.  This runs before the
+    # independent child audit and before any renderer/PDF process.
     try:
-        from tools.workflow.materials_renderer import estimate_canonical_capacity
-
-        capacity = estimate_canonical_capacity(canonical, baseline)
-        for material in MATERIALS:
+        capacity_gate = evaluate_capacity(canonical=canonical, baseline=baseline)
+        capacity = capacity_gate.get("estimate") or {}
+        for material in capacity_gate.get("materials") or []:
             item = capacity.get(material) or {}
-            if (
-                item.get("over_master_lines", 0) >= _CAPACITY_OVER_LINES
-                or item.get("ratio", 0) > _CAPACITY_OVER_RATIO
-            ):
-                findings.append(_finding(
-                    "capacity_estimate_over_master",
-                    material,
-                    (
-                        f"estimated {item.get('estimated_lines')} wrapped lines vs master "
-                        f"{item.get('master_lines')} (+{item.get('over_master_lines')}); "
-                        "trim before rendering instead of looping PDF conversions"
-                    ),
-                    severity="P2",
-                ))
+            findings.append(_finding(
+                "capacity_budget_exceeded",
+                material,
+                (
+                    f"estimated {item.get('estimated_lines')} wrapped lines vs master "
+                    f"{item.get('master_lines')} (+{item.get('over_master_lines')}); "
+                    "revise this material before rendering"
+                ),
+                severity="P1",
+            ))
     except (ImportError, OSError, ValueError, TypeError, KeyError):
         capacity = {}
+        capacity_gate = {
+            "status": "unavailable",
+            "materials": [],
+            "estimate": {},
+            "error": "capacity_estimate_unavailable",
+            "next_action": "stop_and_check_lane_master",
+        }
+        findings.append(
+            _finding(
+                "capacity_gate_unavailable",
+                "cv",
+                "the host could not estimate the lane-master page budget; rendering is not safe",
+                severity="P1",
+            )
+        )
 
     # A tailored run must carry at least one explicit JD anchor.  This keeps a
     # weak model from silently returning the unmodified master while still
@@ -165,4 +234,5 @@ def run_preflight(
         "counts": counts,
         "blocking": blocking,
         "capacity_estimate": capacity,
+        "capacity_gate": capacity_gate,
     }

@@ -7,8 +7,6 @@ import json
 import os
 from pathlib import Path
 
-from uuid import uuid4
-
 from tools.workflow.adapters.scan import default_scan_runner
 from tools.workflow.engine import dispatch
 from tools.workflow.fresh_store import FileFreshStore, default_fresh_store
@@ -103,6 +101,16 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument("--workspace", type=Path, default=None)
     common.add_argument("--dry-run", action="store_true")
     common.add_argument("--json", action="store_true")
+    common.add_argument(
+        "--capability-ticket-id",
+        default="",
+        help="One-shot SOP Control capability ticket ID returned by a prior challenge",
+    )
+    common.add_argument(
+        "--capability-ticket-secret",
+        default="",
+        help="One-shot SOP Control capability ticket secret; never commit or log it",
+    )
 
     ap = argparse.ArgumentParser(prog="tools.workflow", description="JobsFlow command gateway", parents=[common])
     sub = ap.add_subparsers(dest="action", required=True)
@@ -114,6 +122,11 @@ def main(argv: list[str] | None = None) -> int:
         "--gate",
         default="",
         help="Optional pass-1 score gate forwarded to the canonical scorer",
+    )
+    scan.add_argument(
+        "--run-id",
+        default="",
+        help="Reuse the run_id returned by a prior capability-ticket challenge",
     )
     scan.add_argument("--fixture", type=Path)
 
@@ -203,7 +216,12 @@ def main(argv: list[str] | None = None) -> int:
     materials.add_argument("--force", action="store_true")
     materials.add_argument("--no-parallel", action="store_true", help="Convert CV/CL sequentially")
     materials.add_argument("--jobs", nargs="*", default=[], help="Job IDs for the batch action")
-    materials.add_argument("--batch-action", choices=["status", "render", "pdf", "format"], default="status")
+    materials.add_argument(
+        "--batch-action",
+        choices=["status", "prepare", "audit", "render", "pdf", "format"],
+        default="status",
+        help="Batch stage: prepare freezes job inputs; audit groups no-provider review; other stages run per-job in parallel",
+    )
     materials.add_argument("--max-workers", type=int, default=3)
 
     apply_p = sub.add_parser("apply", parents=[common], help="Validate a package; never submits")
@@ -256,6 +274,15 @@ def main(argv: list[str] | None = None) -> int:
     store = None
     action = args.action
     payload: dict = {"dry_run": bool(getattr(args, "dry_run", False))}
+    # Capability tickets are transport credentials issued by the SOP Control
+    # admission response.  Keep the CLI as a thin transport layer: every
+    # subcommand inherits these two options from ``common`` and the gateway
+    # remains the only component that validates scope, fingerprint and
+    # one-shot redemption.  Do not persist or reinterpret the secret here.
+    if getattr(args, "capability_ticket_id", ""):
+        payload["capability_ticket_id"] = args.capability_ticket_id
+    if getattr(args, "capability_ticket_secret", ""):
+        payload["capability_ticket_secret"] = args.capability_ticket_secret
 
     if action == "doctor":
         import setup as setup_module
@@ -333,14 +360,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif action == "scan":
         payload["mode"] = args.mode
+        if args.run_id:
+            payload["run_id"] = args.run_id
         if args.hours:
             payload["hours"] = args.hours
         if args.gate:
             payload["gate"] = args.gate
         if args.fixture:
             payload["fixture"] = json.loads(Path(args.fixture).read_text(encoding="utf-8"))
-        elif not payload.get("run_id"):
-            payload["run_id"] = f"scan-{uuid4().hex[:8]}"
     elif action == "push":
         payload.update(
             {

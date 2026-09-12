@@ -256,6 +256,33 @@ def test_unknown_publisher_creates_one_research_request_before_material_bundle(t
     assert request.read_bytes() == request_bytes
 
 
+def test_plan_packet_selects_verified_research_depth_without_forcing_research(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False, publisher_type="employer", publisher_name="Acme")
+    (package / "company_research.json").write_text(
+        json.dumps(
+            {
+                "publisher_type": "employer",
+                "publisher_name": "Acme",
+                "employer_name": "Acme",
+                "company_out": "Acme",
+                "nature": "Technology company",
+                "business": "Workflow software",
+                "role_priorities": ["contract operations"],
+                "verified_signals": [{"claim": "Acme provides workflow software.", "source_url": "https://acme.example/about", "source_type": "official"}],
+                "interest_angles": ["workflow operations"],
+                "verified_facts": ["Acme provides workflow software."],
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan = json.loads((package / "materials_plan.validated.json").read_text(encoding="utf-8"))
+    out = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "model_plan": plan})
+    assert out["status"] == "succeeded"
+    assert out["plan_task"]["company_research_depth"] == "verified_brief"
+    assert out["plan_task"]["company_context_policy"]["action"] == "reuse_verified_brief"
+
+
 def test_audit_host_binds_job_id_when_child_omits_routing_field(tmp_path):
     ws, package = _planned(tmp_path)
     drafted = dispatch(
@@ -292,3 +319,60 @@ def test_batch_clamps_parallelism_and_isolates_job_failures(tmp_path, monkeypatc
     assert out["max_workers"] == 3
     assert out["failed_job_ids"] == ["C0-002"]
     assert [item["job_id"] for item in out["results"]] == ["C0-001", "C0-002", "C0-003", "C0-004"]
+
+
+def test_batch_prepare_uses_gateway_and_writes_compact_context(tmp_path, monkeypatch):
+    """Preparation is parallel across jobs but shares only bounded digests."""
+
+    ws = build_workspace(tmp_path)
+    calls = []
+
+    def fake_one(_workspace, job_id, action, engine):
+        calls.append((job_id, action, engine))
+        return {"job_id": job_id, "status": "succeeded", "action": action, "engine": engine}
+
+    monkeypatch.setattr(materials_batch, "_one", fake_one)
+    out = materials_batch.run_batch(ws, ["C0-001", "C0-002"], action="prepare", max_workers=2)
+
+    assert out["status"] == "succeeded"
+    assert out["parallel"] is True
+    assert out["batch_context_id"].startswith("batch-")
+    assert out["batch_context_path"]
+    assert (Path(out["batch_context_path"])).is_file()
+    assert {item[1] for item in calls} == {"prepare"}
+    context = json.loads(Path(out["batch_context_path"]).read_text(encoding="utf-8"))
+    assert context["batch_context_id"] == out["batch_context_id"]
+    assert len(context["jobs"]) == 2
+    assert all("jd_text" not in item and "profile_facts" not in item for item in context["jobs"])
+
+
+def test_batch_audit_without_provider_creates_one_manual_review_queue(tmp_path, monkeypatch):
+    """A no-provider batch creates one queue, never fake-passes per-job audits."""
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    state = package / "materials_vnext"
+    state.mkdir(exist_ok=True)
+    (state / "audit_task.json").write_text(
+        json.dumps(
+            {
+                "job_id": "C0-001",
+                "generation_id": "gen-test",
+                "audit_task_sha256": "task-digest",
+                "audit_input_fingerprint": "input-digest",
+                "model_routing": {"preferred_tier": "fast"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JOBSFLOW_AUDITOR_PROVIDER", "none")
+    out = materials_batch.run_batch(ws, ["C0-001"], action="audit", max_workers=3)
+
+    assert out["status"] == "succeeded"
+    assert out["manual_review_required"] is True
+    assert out["max_workers"] == 1
+    queue = json.loads(Path(out["audit_batch_path"]).read_text(encoding="utf-8"))
+    assert queue["status"] == "manual_review_required"
+    assert queue["scope"] == "cv_and_cover_letter"
+    assert queue["jobs"][0]["task_sha256"] == "task-digest"
+    assert not (state / "audit_result.json").exists()

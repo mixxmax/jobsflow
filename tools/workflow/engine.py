@@ -72,6 +72,19 @@ class WorkflowEngine:
         # alternate engine name.
         if request.action in _MATERIALS_ACTIONS:
             payload["materials_engine"] = "vnext"
+        # A live scan challenge binds its one-shot ticket to the generated
+        # run_id.  If a retry carries the ticket but omits --run-id, recover
+        # the original run before entity lookup/admission; otherwise a fresh
+        # UUID would make the ticket fingerprint impossible to redeem.
+        if request.action == "scan" and not str(payload.get("run_id") or "").strip():
+            try:
+                from tools.workflow.sopcontrol_adapter import capability_ticket_run_id
+
+                recovered = capability_ticket_run_id(payload)
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+                recovered = ""
+            if recovered:
+                payload["run_id"] = recovered
         # A confirmation proposal is bound to the scan run that produced its
         # scored artifact.  Requiring a model to repeat that run ID creates a
         # dangerous ambiguity: ``push --confirm`` can otherwise resolve the
@@ -264,6 +277,7 @@ class WorkflowEngine:
                 requires_capability_ticket=ticket_challenge,
                 capability_ticket_id=sop_admit_report.get("capability_ticket_id"),
                 capability_ticket_secret=sop_admit_report.get("capability_ticket_secret"),
+                run_id=sop_admit_report.get("run_id") or payload.get("run_id"),
                 side_effects=[],
             )
             _audit(workspace, request, out, entity, event_id, duration_ms=_elapsed_ms(started))
@@ -356,9 +370,16 @@ def dispatch(
         payload["materials_engine"] = "vnext"
     if action == "scan":
         fixture = payload.get("fixture") if isinstance(payload.get("fixture"), dict) else {}
-        payload["run_id"] = str(
-            payload.get("run_id") or fixture.get("run_id") or f"scan-{uuid4().hex[:8]}"
-        )
+        if not str(payload.get("run_id") or "").strip():
+            try:
+                from tools.workflow.sopcontrol_adapter import capability_ticket_run_id
+
+                recovered = capability_ticket_run_id(payload)
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+                recovered = ""
+            payload["run_id"] = str(
+                recovered or fixture.get("run_id") or f"scan-{uuid4().hex[:8]}"
+            )
     if runner is not None:
         payload["_runner"] = runner
     confirmation_id = confirmation_id or payload.get("proposal_id") or payload.get("confirmation_id")
