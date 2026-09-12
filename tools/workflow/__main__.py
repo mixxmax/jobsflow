@@ -10,6 +10,16 @@ from pathlib import Path
 from tools.workflow.adapters.scan import default_scan_runner
 from tools.workflow.engine import dispatch
 from tools.workflow.fresh_store import FileFreshStore, default_fresh_store
+from tools.workflow.interaction_shell import (
+    doctor_next_actions,
+    is_runtime_workspace,
+    maybe_auto_redeem_scan,
+    redact_output,
+    resolve_workspace,
+    runtime_gate,
+    wrap_result,
+)
+
 
 
 def _materials_engine_info() -> dict[str, str]:
@@ -32,25 +42,9 @@ def _materials_engine_info() -> dict[str, str]:
 
 
 def _workspace(ns: argparse.Namespace) -> Path:
-    """Resolve the runtime workspace without guessing a sibling private tree.
+    """Resolve the runtime workspace without guessing a sibling private tree."""
 
-    The product checkout and a user's ``JobSearch_2026`` instance commonly
-    live side by side.  Earlier versions silently preferred the sibling when
-    a command was started from the product root.  That made a new model (or a
-    different harness) able to operate on private data simply by omitting
-    ``--workspace``.  A runtime is now selected only by an explicit argument,
-    ``JOBSEARCH_ROOT`` (which the gateway passes to its adapters), or by
-    actually running from inside the private runtime itself.
-    """
-    if ns.workspace:
-        return Path(ns.workspace).expanduser().resolve()
-    configured = os.environ.get("JOBSEARCH_ROOT", "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    cwd = Path.cwd().resolve()
-    if cwd.name == "JobSearch_2026" and (cwd / "00_Profile").is_dir():
-        return cwd
-    return cwd
+    return resolve_workspace(explicit=getattr(ns, "workspace", None))
 
 
 def _load_store(path: Path | None, title: str, workspace: Path):
@@ -189,10 +183,31 @@ def main(argv: list[str] | None = None) -> int:
     materials.add_argument(
         "materials_cmd",
         nargs="?",
-        choices=["run", "status", "reset", "draft", "resolve", "accept", "repair", "render", "pdf", "batch"],
+        choices=[
+            "run",
+            "status",
+            "reset",
+            "draft",
+            "resolve",
+            "accept",
+            "repair",
+            "render",
+            "pdf",
+            "batch",
+            "check",
+            "produce",
+            "role-choose",
+        ],
         default="run",
     )
     materials.add_argument("--job-id", default="")
+    materials.add_argument("--title", default="", help="Selected role title for materials role-choose")
+    materials.add_argument(
+        "--max-steps",
+        type=int,
+        default=4,
+        help="Maximum internal stages a materials produce call may advance",
+    )
     materials.add_argument("--plan", type=Path, help="JSON planning response for the current frozen job bundle")
     materials.add_argument("--content", type=Path, help="Bounded baseline transform JSON (not a full CV/CL replacement)")
     materials.add_argument("--patch", type=Path, help="Finding-scoped canonical repair JSON")
@@ -336,7 +351,14 @@ def main(argv: list[str] | None = None) -> int:
             out = dict(out)
             out["next_action"] = "prepare_base_masters"
             out["strict_materials_blocked"] = True
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        guidance = doctor_next_actions(
+            out,
+            workspace=workspace,
+            runtime_ok=is_runtime_workspace(workspace),
+        )
+        out = dict(out)
+        out.update(guidance)
+        print(json.dumps(redact_output(out), ensure_ascii=False, indent=2))
         return 0 if out.get("ready") and (not getattr(args, "strict_materials", False) or out.get("materials_ready")) else 2
 
     if action == "base":
@@ -410,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
             }
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 2
-        if args.plan and args.materials_cmd not in {"run"}:
+        if args.plan and args.materials_cmd not in {"run", "check"}:
             out = {
                 "status": "blocked",
                 "job_id": args.job_id,
@@ -419,6 +441,48 @@ def main(argv: list[str] | None = None) -> int:
             }
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 2
+        if args.materials_cmd == "role-choose":
+            if not args.job_id or not args.title:
+                out = {
+                    "status": "blocked",
+                    "blockers": ["role_choose_requires_job_id_and_title"],
+                    "required": "python3 -m tools.workflow materials role-choose --job-id <id> --title <title>",
+                }
+                print(json.dumps(wrap_result(out, action="materials"), ensure_ascii=False, indent=2))
+                return 2
+            from tools.job_materials.role_titles import build_role_title_contract
+            from tools.workflow.package_context import PackageContextLoader
+
+            ctx = PackageContextLoader(workspace).load(args.job_id)
+            if not ctx.package:
+                out = {"status": "blocked", "blockers": ["package_missing"], "job_id": args.job_id}
+                print(json.dumps(wrap_result(out, action="materials"), ensure_ascii=False, indent=2))
+                return 2
+            manifest_path = Path(ctx.package) / "job_manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                manifest = {}
+            display = str((manifest.get("job") or {}).get("role_display") or args.title)
+            selected = build_role_title_contract(display, selected_primary=args.title)
+            job = dict(manifest.get("job") or {})
+            job["role_title_contract"] = selected
+            manifest["job"] = job
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            out = {
+                "status": "succeeded",
+                "job_id": args.job_id,
+                "role_title_contract": selected,
+                "side_effects": ["role_title_selected"],
+            }
+            print(json.dumps(wrap_result(out, action="materials"), ensure_ascii=False, indent=2))
+            return 0
+        if args.materials_cmd == "check":
+            payload["stage"] = "plan"
+            payload["materials_shell"] = "check"
+        elif args.materials_cmd == "produce":
+            payload["materials_shell"] = "produce"
+            payload["max_steps"] = max(1, int(args.max_steps or 4))
         if args.materials_cmd == "status":
             package = None
             from tools.workflow.package_context import PackageContextLoader
@@ -642,22 +706,47 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 2
 
+    gated = runtime_gate(action, workspace)
+    if gated is not None:
+        print(json.dumps(gated, ensure_ascii=False, indent=2))
+        return 2
+
     runner = None
     if action == "scan" and not payload.get("dry_run") and not payload.get("fixture"):
         runner = default_scan_runner
-    out = dispatch(action, workspace=workspace, store=store, payload=payload, runner=runner)
+
+    if action == "materials" and payload.get("materials_shell") == "produce":
+        from tools.workflow.interaction_shell import PRODUCE_STAGES, produce_should_stop
+
+        steps = []
+        out = {"status": "blocked", "blockers": ["produce_no_progress"]}
+        max_steps = max(1, int(payload.get("max_steps") or 4))
+        for stage in PRODUCE_STAGES[:max_steps]:
+            step_payload = dict(payload)
+            step_payload["stage"] = stage
+            out = dispatch(action, workspace=workspace, store=store, payload=step_payload, runner=runner)
+            steps.append({"stage": stage, "status": out.get("status"), "blockers": out.get("blockers") or []})
+            if produce_should_stop(out):
+                break
+        out = dict(out)
+        out["produce_steps"] = steps
+    else:
+        out = dispatch(action, workspace=workspace, store=store, payload=payload, runner=runner)
+        if action == "scan":
+            retry = maybe_auto_redeem_scan(out, already_retried=False)
+            if retry:
+                payload.update(retry)
+                # Secret stays in process memory for one redeem; never print it.
+                out = dispatch(action, workspace=workspace, store=store, payload=payload, runner=runner)
+                out = dict(out)
+                out["scan_ticket_auto_redeemed"] = True
+                out.pop("capability_ticket_secret", None)
+
     if action in {"materials", "audit", "format", "apply"} and isinstance(payload.get("materials_engine_info"), dict):
         out.update(payload["materials_engine_info"])
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-    ok_statuses = {
-        "succeeded",
-        "planned",
-        "initialized",
-        "drafted",
-        "preview",
-        "activated",
-    }
-    if out.get("status") in ok_statuses or out.get("ready"):
+    envelope = wrap_result(out, action=action)
+    print(json.dumps(envelope, ensure_ascii=False, indent=2))
+    if envelope.get("status") in {"succeeded", "needs_user"} or out.get("ready"):
         return 0
     return 2
 

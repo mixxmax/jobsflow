@@ -22,6 +22,7 @@ def test_scan_cli_forwards_capability_ticket_to_gateway(tmp_path, monkeypatch):
         return {"status": "succeeded", "run_id": "scan-test"}
 
     monkeypatch.setattr(workflow_cli, "dispatch", fake_dispatch)
+    (tmp_path / "00_Profile").mkdir()
     exit_code = workflow_cli.main(
         [
             "scan",

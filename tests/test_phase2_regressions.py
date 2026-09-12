@@ -117,6 +117,7 @@ def test_cli_scan_without_fixture_injects_real_runner(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(wf_main, "default_scan_runner", fake_runner)
+    (tmp_path / "00_Profile").mkdir()
     rc = wf_main.main(["scan", "--mode", "temp", "--workspace", str(tmp_path)])
     assert rc == 0
     assert called["mode"] == "temp"
