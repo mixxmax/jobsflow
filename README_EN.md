@@ -29,20 +29,6 @@ and how to tailor the application without giving up final control.
 - **Faster materials, less rework:** pre-render capacity checks, rewrite only over-budget CV/CL, at most three parallel jobs, a shared human-audit queue when no auditor model is configured, plus timing/cache/re-render/failure telemetry; company research is cost-tiered.
 - **Portable identity:** `.sopcontrol/identity.yaml` uses portable `root: .`; CI SOP Control gate and python-tests both install the same vendor pin.
 
-## 🆕 Latest update · 2026-09-08 · SOP Control control plane
-
-- **One governed entry boundary:** `scan / push / materials / audit / format / apply / base / intent / archive / sync` now pass through the unified workflow gateway before calling their business adapters. A model cannot switch to a legacy route or bypass the state machine.
-- **Rules are runtime-enforced:** SOP rules are registered in `.sopcontrol/`, not merely written in `AGENTS.md` or the README. The JobsFlow adapter checks them before an action and records a receipt afterward; missing confirmation, capability tickets, current inputs or required artifacts fail closed.
-- **Materials are fixed to one chain:** material generation is bound to `materials-vnext-1`; legacy material entrypoints are rejected. The controlled order is baseline → bounded JD delta → independent CV/CL content audit → DOCX/PDF format gates.
-- **Safe model handoff:** project identity, rule summaries, task state and evidence can be reused across models, harnesses and worktrees, so switching models does not recreate the workflow from memory.
-- **Release boundary:** the SOP rules, test command, fixed CI revision and pre-push gate are wired into the product. Control-plane evidence remains separate from private job-search runtime data; resumes, JDs, cookies, Google credentials and runtime ledgers are not published to GitHub.
-
-## 🆕 Latest update · 2026-08-23 · workflow reliability patch
-
-- **One canonical scan boundary:** `temp_two_pass.sh` is now a compatibility wrapper around the workflow gateway. Each run writes an official `run.json` binding the scan window, scored-artifact hash, semantic status, and cursor commit. When `run_id` is omitted, `/push` resolves only the newest official run—not a legacy `temp`/`daily` sentinel.
-- **Ledger identity is separate from projections:** the local workflow ledger is authoritative for row identity and IDs. A confirmed batch can be projected to CSV and Google Sheets without renumbering when one projection is empty. Push responses expose backend resolution and explicitly warn when `auto → local CSV` because Google configuration is incomplete.
-- **JobsDB recovery is actionable and bounded:** if daily Chrome does not expose CDP, the system does not pretend verification succeeded or retry forever. It writes a cookie-free manual-recovery handoff and a resumable command, deduplicates identical portal requests while preserving page/query aliases, and reports planned/deduplicated/error/filter diagnostics.
-
 ### Why JobsFlow?
 
 | Generic AI job tool | JobsFlow |
@@ -54,6 +40,8 @@ and how to tailor the application without giving up final control.
 | Uses a fixed industry template | Generates industry-aware directions from your CV and intent |
 
 ## Product structure: standards, inputs, outputs and hand-offs
+
+JobsFlow does not let a model freestyle a pile of scripts. Business SOP is a bounded pipeline: `scan / push / materials / audit / format / apply / base / intent / archive / sync` all enter the unified workflow gateway before their business adapters; a model cannot switch to a legacy route or bypass the state machine. Rules live in `.sopcontrol/` and are checked by the JobsFlow adapter before an action, with a receipt afterward; missing confirmation, capability tickets, current inputs or required artifacts fail closed. Materials are bound to the single chain `materials-vnext-1` (baseline → bounded JD delta → CV/CL content audit → DOCX/PDF format gates).
 
 | Stage | Non-negotiable standard | User action | Main output | Downstream hand-off |
 |---|---|---|---|---|
@@ -507,9 +495,14 @@ JobsFlow has one product implementation, rule set and state machine. `JobSearch_
 is not a separate private code or policy line; it is one local runtime instance of the
 product, holding a user's résumé, queries, job descriptions, scores, tracker and generated
 artifacts. Runtime data is Git-ignored, while GitHub publishes the same product code and
-empty templates without personal data. `/setup` generates industry-aware directions,
-tracker headers, scoring weights, and material priorities from that user's intent;
-legal/compliance is not a built-in default.
+empty templates without personal data. Control-plane evidence (`.sopcontrol/` / vendor)
+stays separate from private job-search runtime data; SOP rules, the test command, the
+fixed CI revision and the pre-push gate are wired into the product. Resumes, JDs,
+cookies, Google credentials and runtime ledgers are not published to GitHub. Project
+identity, rule summaries, task state and evidence can be reused across models, harnesses
+and worktrees, so switching models does not recreate the workflow from scratch.
+`/setup` generates industry-aware directions, tracker headers, scoring weights, and
+material priorities from that user's intent; legal/compliance is not a built-in default.
 
 Deterministic preflight, schema validation, scoring gates, source checks, evidence
 mapping, coverage checks, and PDF checks remain in force even with a model of limited

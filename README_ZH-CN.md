@@ -43,20 +43,6 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 - **材料制作提速与防返工**：渲染前容量预检、只改超预算的 CV/CL、同批最多三个并行、无审计模型时统一人工审计队列，并记录耗时 / 缓存 / 重渲染与失败原因；公司调研按成本分级。
 - **身份可携**：`.sopcontrol/identity.yaml` 改为可移植 `root: .`；CI 的 SOP Control gate 与 python-tests 均安装同一 vendor pin。
 
-## 🆕 最新更新 · 2026-09-08 · SOP Control 控制面接入
-
-- **统一控制入口**：`scan / push / materials / audit / format / apply / base / intent / archive / sync` 现在都先经过统一 workflow gateway，再调用原有业务适配器；模型不能自行切换旧入口或绕过状态机。
-- **规则真正进入运行时**：SOP 规则不只写在 `AGENTS.md` 或 README，而是登记在 `.sopcontrol/`，由 JobsFlow adapter 在动作前检查、动作后写入 receipt；缺少确认、能力凭证、当前输入或必要产物时会 fail-closed。
-- **材料链固定**：材料制作绑定 `materials-vnext-1`，旧材料入口拒绝继续；基础版 → 有界 JD 定制 → CV/CL 内容审计 → DOCX/PDF 格式门的顺序由系统控制。
-- **跨模型可接手**：项目身份、规则摘要、任务状态和证据记录可在不同模型、Harness 和 Worktree 间复用；模型切换不会重新发明一套流程。
-- **发布门**：SOP Control 的规则、测试命令、CI 固定版本和 pre-push gate 已接入；控制面证据与私人求职运行数据分离，不把简历、JD、cookie、Google 凭据或运行台账发布到 GitHub。
-
-## 🆕 最新更新 · 2026-08-23 · workflow reliability patch
-
-- **扫描入口已收敛**：`temp_two_pass.sh` 现在只是兼容入口，统一转到 workflow gateway；每轮生成绑定窗口、评分产物哈希、语义状态和游标提交的官方 `run.json`。省略 `run_id` 时只解析最新官方运行，不再误用旧的 `temp`/`daily` 状态哨兵。
-- **台账身份与投影已分离**：本地 workflow ledger 是岗位行身份和编号的权威来源；同一批已确认岗位可以安全投影到 CSV 和 Google Sheets，不会因为另一投影为空而重新编号。每次 push 都返回后端解析结果，配置缺失时明确警告 `auto → local CSV`。
-- **JobsDB 受控恢复更可操作**：日常 Chrome 未暴露 CDP 时，系统不会假装完成验证或无限重试，而是生成不含 cookie 的人工恢复交接记录和可重跑提示；同时对重复门户请求去重，保留页码与查询别名，并输出计划/去重/错误/过滤诊断。
-
 ## 🎯 解决什么问题？
 
 求职难，往往不是「找不到链接」，而是**整条链路运营不起来**：
@@ -92,7 +78,7 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 
 ## 🧭 产品结构总览：每一步的标准、输入、输出和关系
 
-JobsFlow 不是让模型自由串联一堆脚本，而是把业务 SOP 固定为一条有边界的流水线：
+JobsFlow 不是让模型自由串联一堆脚本，而是把业务 SOP 固定为一条有边界的流水线：`scan / push / materials / audit / format / apply / base / intent / archive / sync` 都先经过统一 workflow gateway，再调用原有业务适配器；模型不能自行切换旧入口或绕过状态机。规则登记在 `.sopcontrol/`，由 JobsFlow adapter 在动作前检查、动作后写入 receipt；缺少确认、能力凭证、当前输入或必要产物时 fail-closed。材料制作绑定唯一链 `materials-vnext-1`（基础版 → 有界 JD 定制 → CV/CL 内容审计 → DOCX/PDF 格式门）。
 
 | 环节 | 固定标准 | 用户如何使用 | 主要输出 | 与下一环节的关系 |
 |------|----------|--------------|----------|------------------|
@@ -642,7 +628,7 @@ PDF 导出用 LibreOffice headless（不弹窗，不干扰你正在做的事）�
 
 ## 🌍 隐私、安全与发布说明
 
-JobsFlow 只有一套产品代码、规则和状态机。`JobSearch_2026/` 不是另一条代码或规则线，而是直接运行这套产品的一个本地实例，用来保存你的简历、搜索词、JD、评分、台账和产物。这些运行数据默认被 Git 忽略；GitHub 发布的是同一套产品代码和空模板，不包含个人资料。
+JobsFlow 只有一套产品代码、规则和状态机。`JobSearch_2026/` 不是另一条代码或规则线，而是直接运行这套产品的一个本地实例，用来保存你的简历、搜索词、JD、评分、台账和产物。这些运行数据默认被 Git 忽略；GitHub 发布的是同一套产品代码和空模板，不包含个人资料。控制面证据（`.sopcontrol/` / vendor）与私人求职运行数据分离；SOP 规则、测试命令、固定 CI 版本与 pre-push gate 已接入产品，不把简历、JD、cookie、Google 凭据或运行台账发布到 GitHub。项目身份、规则摘要、任务状态与证据可在不同模型 / harness / worktree 间复用，切换模型不必重发明流程。
 
 首次使用由 `/setup` 根据用户的简历、求职意向、行业和限制条件生成搜索词、评分权重、方向表头与材料策略。模型可以提出公司/行业研究摘要和更贴近岗位的表头，但必须经过结构校验；缺少研究来源或模型能力不足时，系统使用可审计的通用回退，不会把法律/合规当成默认行业，也不会编造经历、数字或公司事实。
 

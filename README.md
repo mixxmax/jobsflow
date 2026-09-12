@@ -43,14 +43,6 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
 - **材料製作提速與防返工**：渲染前容量預檢、只改超預算的 CV/CL、同批最多三個並行、無審計模型時統一人工審計隊列，並記錄耗時 / 緩存 / 重渲染與失敗原因；公司調研按成本分級。
 - **身份可攜**：`.sopcontrol/identity.yaml` 改為可移植 `root: .`；CI 的 SOP Control gate 與 python-tests 均安裝同一 vendor pin。
 
-## 🆕 最新更新 · 2026-09-08 · SOP Control 控制面接入
-
-- **统一控制入口**：`scan / push / materials / audit / format / apply / base / intent / archive / sync` 现在都先经过统一 workflow gateway，再调用原有业务适配器；模型不能自行切换旧入口或绕过状态机。
-- **规则真正进入运行时**：SOP 规则不只写在 `AGENTS.md` 或 README，而是登记在 `.sopcontrol/`，由 JobsFlow adapter 在动作前检查、动作后写入 receipt；缺少确认、能力凭证、当前输入或必要产物时会 fail-closed。
-- **材料链固定**：材料制作绑定 `materials-vnext-1`，旧材料入口拒绝继续；基础版 → 有界 JD 定制 → CV/CL 内容审计 → DOCX/PDF 格式门的顺序由系统控制。
-- **跨模型可接手**：项目身份、规则摘要、任务状态和证据记录可在不同模型、Harness 和 Worktree 间复用；模型切换不会重新发明一套流程。
-- **发布门**：SOP Control 的规则、测试命令、CI 固定版本和 pre-push gate 已接入；控制面证据与私人求职运行数据分离，不把简历、JD、cookie、Google 凭据或运行台账发布到 GitHub。
-
 ## 🎯 解決什麼問題？
 
 求職難，往往不是「找不到連結」，而是**整條鏈路運營不起來**：
@@ -86,7 +78,7 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
 
 ## 🧭 產品結構總覽：每一步的標準、輸入、輸出和關係
 
-JobsFlow 不是讓模型自由串聯一堆腳本，而是把業務 SOP 固定為一條有邊界的流水線：
+JobsFlow 不是讓模型自由串聯一堆腳本，而是把業務 SOP 固定為一條有邊界的流水線：`scan / push / materials / audit / format / apply / base / intent / archive / sync` 都先經過統一 workflow gateway，再調用原有業務適配器；模型不能自行切換舊入口或繞過狀態機。規則登記在 `.sopcontrol/`，由 JobsFlow adapter 在動作前檢查、動作後寫入 receipt；缺少確認、能力憑證、當前輸入或必要產物時 fail-closed。材料製作綁定唯一鏈 `materials-vnext-1`（基礎版 → 有界 JD 定製 → CV/CL 內容審計 → DOCX/PDF 格式門）。
 
 | 環節 | 固定標準 | 用戶如何使用 | 主要輸出 | 與下一環節的關係 |
 |------|----------|--------------|----------|------------------|
@@ -649,7 +641,7 @@ PDF 導出用 LibreOffice headless（不彈窗，不干擾你正在做的事）�
 
 ## 🌍 隱私、安全與發佈說明
 
-JobsFlow 只有一套產品代碼、規則和狀態機。`JobSearch_2026/` 不是另一條代碼或規則線，而是直接運行這套產品的一個本地實例，用來保存你的簡歷、搜尋詞、JD、評分、臺帳和產物。這些運行數據默認被 Git 忽略；GitHub 發佈的是同一套產品代碼和空模板，不包含個人資料。
+JobsFlow 只有一套產品代碼、規則和狀態機。`JobSearch_2026/` 不是另一條代碼或規則線，而是直接運行這套產品的一個本地實例，用來保存你的簡歷、搜尋詞、JD、評分、臺帳和產物。這些運行數據默認被 Git 忽略；GitHub 發佈的是同一套產品代碼和空模板，不包含個人資料。控制面證據（`.sopcontrol/` / vendor）與私人求職運行數據分離；SOP 規則、測試命令、固定 CI 版本與 pre-push gate 已接入產品，不把簡歷、JD、cookie、Google 憑據或運行台賬發佈到 GitHub。項目身份、規則摘要、任務狀態與證據可在不同模型 / harness / worktree 間複用，切換模型不必重發明流程。
 
 首次使用由 `/setup` 根據用戶的簡歷、求職意向、行業和限制條件生成搜尋詞、評分權重、方向表頭與材料策略。模型可以提出公司/行業研究摘要和更貼近崗位的表頭，但必須經過結構校驗；缺少研究來源或模型能力不足時，系統使用可審計的通用回退，不會把法律/合規當成默認行業，也不會編造經歷、數字或公司事實。
 
