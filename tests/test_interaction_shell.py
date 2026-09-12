@@ -196,7 +196,36 @@ def test_role_confirmation_becomes_choose_role_title_card():
     )
     assert wrapped["status"] == "needs_user"
     assert wrapped["user_prompt"]["kind"] == "choose_role_title"
-    assert wrapped["user_prompt"]["options"]
+    assert wrapped["user_prompt"]["options"][1]["id"] == "Associate"
+    assert wrapped["user_prompt"]["reply_contract"].get("title_from_option_id") is True
+    assert "title" not in wrapped["user_prompt"]["reply_contract"]
+
+
+def test_materials_ticket_challenge_includes_prompt_and_retry():
+    wrapped = wrap_result(
+        {
+            "status": "planned",
+            "requires_capability_ticket": True,
+            "capability_ticket_id": "t-mat",
+            "capability_ticket_secret": "s-mat",
+            "run_id": "mat-1",
+            "job_id": "C0-001",
+            "blockers": ["capability_ticket_required"],
+        },
+        action="materials",
+    )
+    assert wrapped["status"] == "needs_user"
+    assert wrapped["user_prompt"]["kind"] == "ask_preflight"
+    assert wrapped["retry"]["capability_ticket_secret"] == "s-mat"
+    assert "s-mat" not in json.dumps(wrapped["result"])
+
+
+def test_next_produce_stages_for_transformed_and_complete():
+    from tools.workflow.interaction_shell import next_produce_stages
+
+    assert next_produce_stages("transformed")[0] == "audit"
+    assert next_produce_stages("format_passed") == []
+    assert next_produce_stages("apply_ready") == []
 
 
 def test_redact_marks_list_truncation():

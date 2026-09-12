@@ -404,7 +404,13 @@ def _write_path_requested(request: Any) -> bool:
     if action == "scan":
         # Fixture/dry-run scans are review-only for ticket purposes; live scans write.
         return not bool(payload.get("fixture"))
-    if action in {"materials", "audit", "format", "apply", "promote", "sync_retry"}:
+    if action == "materials":
+        stage = str(payload.get("stage") or payload.get("materials_cmd") or "").casefold()
+        # Read-only status must not demand a capability ticket.
+        if stage in {"status"}:
+            return False
+        return True
+    if action in {"audit", "format", "apply", "promote", "sync_retry"}:
         return True
     if action in {"archive_fresh", "archive_confirm"}:
         return bool(payload.get("confirmation_id") or payload.get("proposal_id") or True)
@@ -556,11 +562,16 @@ def _run_domain_consumers(action: str, payload: dict[str, Any], *, run_id: str =
             consumers.require_system_id_allocation(payload)
         elif action == "materials":
             consumers.require_vnext_engine(payload)
-            consumers.require_current_job_bundle(payload)
-            consumers.require_audit_before_render(payload)
-            consumers.require_pre_render_capacity(payload)
-            consumers.require_material_batch_isolation(payload)
-            consumers.require_material_run_telemetry(payload)
+            stage = str(payload.get("stage") or payload.get("materials_cmd") or "").casefold()
+            is_batch = stage == "batch" or str(payload.get("materials_cmd") or "").casefold() == "batch"
+            if is_batch:
+                consumers.require_material_batch_isolation(payload)
+            elif stage not in {"status"}:
+                consumers.require_current_job_bundle(payload)
+                consumers.require_audit_before_render(payload)
+                consumers.require_pre_render_capacity(payload)
+                consumers.require_material_run_telemetry(payload)
+
         elif action in {"audit", "format"}:
             consumers.require_audit_generation_binding(payload)
         elif action == "apply":

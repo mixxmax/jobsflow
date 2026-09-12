@@ -251,16 +251,22 @@ def _prompt_for_action(action: str, internal: dict[str, Any]) -> dict[str, Any] 
         if not options and contract.get("primary"):
             options.append({"id": "title_0", "label": str(contract.get("primary")), "recommended": True})
         if options:
+            # Option id is the title string itself so the selected choice binds
+            # correctly regardless of which entry the user picks.
+            bound_options = [
+                {"id": str(item["label"]), "label": str(item["label"]), "recommended": bool(item.get("recommended"))}
+                for item in options
+            ]
             return build_user_prompt(
                 "choose_role_title",
                 question="请选择该岗位的正式职位名称",
-                options=options,
-                reply_hint="回复选项对应的职位名",
+                options=bound_options,
+                reply_hint="将所选 option.id 作为 materials role-choose --title 回传",
                 reply_contract={
                     "action": "materials",
                     "materials_cmd": "role-choose",
                     "job_id": str(internal.get("job_id") or ""),
-                    "title": options[0]["label"],
+                    "title_from_option_id": True,
                 },
             )
     if action == "push" and str(internal.get("status") or "") in {"planned", "preview"}:
@@ -323,19 +329,45 @@ def wrap_result(
     if isinstance(sop, dict):
         sop.pop("capability_ticket_secret", None)
     status = map_external_status(internal, action=action)
+    blockers = [str(item) for item in (internal.get("blockers") or [])]
     prompt = None
-    if status == "needs_user":
+    retry = None
+    if internal.get("requires_capability_ticket") or "capability_ticket_required" in blockers:
+        status = "needs_user"
+        ticket_id = str(internal.get("capability_ticket_id") or "").strip()
+        secret = str(internal.get("capability_ticket_secret") or "").strip()
+        prompt = build_user_prompt(
+            "ask_preflight",
+            question="需要一次性能力票据后才能继续此动作。请用 gateway 重试，勿把 secret 写入长期日志。",
+            options=[{"id": "retry_with_ticket", "label": "携带票据重试", "recommended": True}],
+            reply_hint="使用返回的 retry 字段原样回传 capability_ticket_id/secret",
+            reply_contract={
+                "action": action,
+                "capability_ticket_id": ticket_id,
+                "run_id": str(internal.get("run_id") or ""),
+                "job_id": str(internal.get("job_id") or ""),
+            },
+        )
+        if ticket_id and secret:
+            retry = {
+                "capability_ticket_id": ticket_id,
+                "capability_ticket_secret": secret,
+                "run_id": str(internal.get("run_id") or ""),
+                "job_id": str(internal.get("job_id") or ""),
+                "action": action,
+            }
+    elif status == "needs_user":
         prompt = _prompt_for_action(action, internal)
-        if prompt is None and "runtime_workspace_invalid" in (internal.get("blockers") or []):
+        if prompt is None and "runtime_workspace_invalid" in blockers:
             prompt = build_user_prompt(
                 "setup_required",
                 question="尚未绑定求职运行实例。",
                 options=[{"id": "run_setup", "label": "运行 setup", "recommended": True}],
                 reply_contract={"action": "setup"},
             )
-        if prompt is not None:
-            validate_user_prompt(prompt)
-            status = "needs_user"
+    if prompt is not None:
+        validate_user_prompt(prompt)
+        status = "needs_user"
 
     message = str(internal.get("message") or "")
     if not message:
@@ -363,6 +395,8 @@ def wrap_result(
     }
     if prompt is not None:
         out["user_prompt"] = prompt
+    if retry is not None:
+        out["retry"] = retry
     return out
 
 
@@ -472,16 +506,18 @@ def next_produce_stages(phase: str | None) -> list[str]:
         "idle": list(PRODUCE_STAGES),
         "inputs_frozen": list(PRODUCE_STAGES),
         "plan_ready": ["canonical", "audit", "render", "pdf", "format"],
+        "transformed": ["audit", "render", "pdf", "format"],
         "drafting": ["audit", "render", "pdf", "format"],
         "content_audit_pending": ["audit", "render", "pdf", "format"],
         "repair_required": ["audit", "render", "pdf", "format"],
         "content_passed": ["render", "pdf", "format"],
         "docx_generated": ["pdf", "format"],
         "pdf_generated": ["format"],
-        "format_passed": ["format"],
-        "apply_ready": ["format"],
+        # Already past format — produce has nothing left to advance.
+        "format_passed": [],
+        "apply_ready": [],
     }
-    return list(mapping.get(current) or PRODUCE_STAGES)
+    return list(mapping.get(current, PRODUCE_STAGES))
 
 
 def produce_should_stop(internal: dict[str, Any]) -> bool:

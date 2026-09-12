@@ -287,8 +287,9 @@ def test_cli_allows_scoped_reset_only_for_existing_vnext_runs(tmp_path, capsys):
         ]
     ) == 0
     preview = json.loads(capsys.readouterr().out)
-    assert preview["status"] == "preview"
-    assert preview["scope"] == "render"
+    assert preview["status"] == "needs_user"
+    assert preview["result"]["status"] == "preview"
+    assert preview["result"]["scope"] == "render"
 
     assert main(
         [
@@ -304,8 +305,9 @@ def test_cli_allows_scoped_reset_only_for_existing_vnext_runs(tmp_path, capsys):
         ]
     ) == 0
     confirmed = json.loads(capsys.readouterr().out)
-    assert confirmed["status"] == "reset"
-    assert confirmed["scope"] == "render"
+    assert confirmed["status"] == "succeeded"
+    assert confirmed["result"]["status"] == "reset"
+    assert confirmed["result"]["scope"] == "render"
 
 
 def test_cli_all_reset_is_preview_first_and_requires_confirmation(tmp_path, capsys):
@@ -323,8 +325,9 @@ def test_cli_all_reset_is_preview_first_and_requires_confirmation(tmp_path, caps
         ]
     ) == 0
     preview = json.loads(capsys.readouterr().out)
-    assert preview["status"] == "preview"
-    assert preview["requires_confirmation"] is True
+    assert preview["status"] == "needs_user"
+    assert preview["result"]["status"] == "preview"
+    assert preview["result"]["requires_confirmation"] is True
     assert (package / "materials_vnext").is_dir()
 
     assert main(
@@ -334,7 +337,8 @@ def test_cli_all_reset_is_preview_first_and_requires_confirmation(tmp_path, caps
         ]
     ) == 0
     confirmed = json.loads(capsys.readouterr().out)
-    assert confirmed["status"] == "reset"
+    assert confirmed["status"] == "succeeded"
+    assert confirmed["result"]["status"] == "reset"
     assert not (package / "materials_vnext").exists()
 
 
@@ -360,7 +364,7 @@ def test_cli_rejects_materials_files_on_commands_that_would_ignore_them(tmp_path
     ) == 2
     blocked = json.loads(capsys.readouterr().out)
     assert blocked["blockers"] == ["materials_content_requires_draft"]
-    assert blocked["required"] == "materials draft --content <current response file>"
+    assert blocked["required"] == "materials draft|produce --content <current response file>"
 
     assert main(
         [

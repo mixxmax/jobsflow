@@ -174,10 +174,12 @@ def test_ticket_challenge_has_zero_side_effects(enforce_root, tmp_path):
     assert after == before
 
 
-def test_scan_ticket_retry_recovers_bound_run_without_cli_run_id(enforce_root, tmp_path):
+def test_scan_ticket_retry_recovers_bound_run_without_cli_run_id(enforce_root, tmp_path, monkeypatch):
     """A ticket-only retry must not create a new run and invalidate itself."""
 
     ws = build_workspace(tmp_path)
+    # Disable shell auto-redeem so this test exercises an explicit ticket retry.
+    monkeypatch.setenv("JOBSFLOW_SCAN_AUTO_TICKET", "off")
 
     def fake_runner(payload, workspace):
         return {

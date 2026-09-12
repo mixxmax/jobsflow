@@ -424,12 +424,12 @@ def main(argv: list[str] | None = None) -> int:
         store = _load_store(args.fixture, args.fresh_title, workspace)
     elif action == "materials":
         payload["job_id"] = args.job_id
-        if args.content and args.materials_cmd != "draft":
+        if args.content and args.materials_cmd not in {"draft", "produce"}:
             out = {
                 "status": "blocked",
                 "job_id": args.job_id,
                 "blockers": ["materials_content_requires_draft"],
-                "required": "materials draft --content <current response file>",
+                "required": "materials draft|produce --content <current response file>",
             }
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 2
@@ -442,12 +442,12 @@ def main(argv: list[str] | None = None) -> int:
             }
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 2
-        if args.plan and args.materials_cmd not in {"run", "check"}:
+        if args.plan and args.materials_cmd not in {"run", "check", "produce"}:
             out = {
                 "status": "blocked",
                 "job_id": args.job_id,
                 "blockers": ["materials_plan_requires_run"],
-                "required": "materials run --plan <current response file>",
+                "required": "materials run|check|produce --plan <current response file>",
             }
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 2
@@ -457,12 +457,23 @@ def main(argv: list[str] | None = None) -> int:
         elif args.materials_cmd == "check":
             payload["stage"] = "plan"
             payload["materials_shell"] = "check"
+            if args.plan:
+                payload["model_plan"] = json.loads(Path(args.plan).read_text(encoding="utf-8"))
         elif args.materials_cmd == "produce":
             payload["materials_shell"] = "produce"
             payload["max_steps"] = max(1, int(args.max_steps or 4))
             if args.plan:
                 payload["model_plan"] = json.loads(Path(args.plan).read_text(encoding="utf-8"))
             if args.content:
+                blocker = _materials_submission_blocker(
+                    workspace,
+                    args.job_id,
+                    args.content,
+                    phase="tailoring",
+                )
+                if blocker:
+                    print(json.dumps(wrap_result(blocker, action="materials"), ensure_ascii=False, indent=2))
+                    return 2
                 payload["model_transform"] = json.loads(Path(args.content).read_text(encoding="utf-8"))
         elif args.materials_cmd == "status":
             payload["stage"] = "status"
@@ -623,29 +634,37 @@ def main(argv: list[str] | None = None) -> int:
         if ctx.package:
             phase = str((load_run(Path(ctx.package)) or {}).get("phase") or "")
         stages = next_produce_stages(phase)[:max_steps]
-        for stage in stages:
-            step_payload = dict(payload)
-            step_payload["stage"] = stage
-            # Carry host-owned model responses into the matching stage only.
-            if stage == "plan" and payload.get("model_plan") is not None:
-                step_payload["model_plan"] = payload.get("model_plan")
-            if stage == "canonical" and payload.get("model_transform") is not None:
-                step_payload["model_transform"] = payload.get("model_transform")
-            out = dispatch(action, workspace=workspace, store=store, payload=step_payload, runner=runner)
-            steps.append(
-                {
-                    "stage": stage,
-                    "status": out.get("status"),
-                    "blockers": out.get("blockers") or [],
-                    "after_state": out.get("after_state"),
-                }
-            )
-            if produce_should_stop(out):
-                break
-            phase = str(out.get("after_state") or phase)
-        out = dict(out)
-        out["produce_steps"] = steps
-        out["produce_from_phase"] = phase
+        if not stages:
+            out = {
+                "status": "succeeded",
+                "job_id": payload.get("job_id"),
+                "after_state": phase,
+                "produce_steps": [],
+                "message": "materials_already_complete",
+            }
+        else:
+            for stage in stages:
+                step_payload = dict(payload)
+                step_payload["stage"] = stage
+                if stage == "plan" and payload.get("model_plan") is not None:
+                    step_payload["model_plan"] = payload.get("model_plan")
+                if stage == "canonical" and payload.get("model_transform") is not None:
+                    step_payload["model_transform"] = payload.get("model_transform")
+                out = dispatch(action, workspace=workspace, store=store, payload=step_payload, runner=runner)
+                steps.append(
+                    {
+                        "stage": stage,
+                        "status": out.get("status"),
+                        "blockers": out.get("blockers") or [],
+                        "after_state": out.get("after_state"),
+                    }
+                )
+                if produce_should_stop(out):
+                    break
+                phase = str(out.get("after_state") or phase)
+            out = dict(out)
+            out["produce_steps"] = steps
+            out["produce_from_phase"] = phase
     else:
         out = dispatch(action, workspace=workspace, store=store, payload=payload, runner=runner)
 
