@@ -34,6 +34,15 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
 
 ---
 
+## 🆕 最新更新 · 2026-09-12 · 控制面隨倉發佈 · 一鍵升級 · 材料提速
+
+- **控制面打進產品倉**：SOP Control 以固定 pin 放在 `vendor/sopcontrol/`（含 `plugins/`），公開 clone 即可用；不必再另下私有上游倉。
+- **老用戶只須更新**：已安裝用戶 `git pull origin main` 後，工作流會自動載入倉內 vendor；日常使用不必再單獨 `pip install` 控制面（可選裝僅為把 `sopctl` 放進 PATH）。
+- **缺包 fail-closed**：enforce 下控制面不可用時會阻斷副作用，不再軟降級假裝通過；與 README 承諾一致。
+- **Capability Ticket 掃描閉環**：scan/push 等寫路徑支援 challenge → 帶回 ticket / 保留 `run_id` 重試，避免票據對不上或重試換 id 失效。
+- **材料製作提速與防返工**：渲染前容量預檢、只改超預算的 CV/CL、同批最多三個並行、無審計模型時統一人工審計隊列，並記錄耗時 / 緩存 / 重渲染與失敗原因；公司調研按成本分級。
+- **身份可攜**：`.sopcontrol/identity.yaml` 改為可移植 `root: .`；CI 的 SOP Control gate 與 python-tests 均安裝同一 vendor pin。
+
 ## 🆕 最新更新 · 2026-09-08 · SOP Control 控制面接入
 
 - **统一控制入口**：`scan / push / materials / audit / format / apply / base / intent / archive / sync` 现在都先经过统一 workflow gateway，再调用原有业务适配器；模型不能自行切换旧入口或绕过状态机。

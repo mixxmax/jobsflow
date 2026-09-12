@@ -20,11 +20,14 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-08-23 · workflow reliability patch
+## 🆕 Latest update · 2026-09-12 · bundled control plane · pull-only upgrade · faster materials
 
-- **One canonical scan boundary:** `temp_two_pass.sh` is now a compatibility wrapper around the workflow gateway. Each run writes an official `run.json` binding the scan window, scored-artifact hash, semantic status, and cursor commit. When `run_id` is omitted, `/push` resolves only the newest official run—not a legacy `temp`/`daily` sentinel.
-- **Ledger identity is separate from projections:** the local workflow ledger is authoritative for row identity and IDs. A confirmed batch can be projected to CSV and Google Sheets without renumbering when one projection is empty. Push responses expose backend resolution and explicitly warn when `auto → local CSV` because Google configuration is incomplete.
-- **JobsDB recovery is actionable and bounded:** if daily Chrome does not expose CDP, the system does not pretend verification succeeded or retry forever. It writes a cookie-free manual-recovery handoff and a resumable command, deduplicates identical portal requests while preserving page/query aliases, and reports planned/deduplicated/error/filter diagnostics.
+- **Control plane ships in-repo:** SOP Control is vendored at a fixed pin under `vendor/sopcontrol/` (including `plugins/`). A public clone is enough — no second private upstream checkout.
+- **Existing installs just update:** after `git pull origin main`, the workflow loads the in-repo vendor automatically. Day-to-day use needs no separate control-plane `pip install` (`pip install -e vendor/sopcontrol` is optional, only to put `sopctl` on PATH).
+- **Missing package fail-closes:** under enforce, an unavailable control plane blocks side effects instead of soft-degrading to a fake pass — matching the README promise.
+- **Capability-ticket scan loop:** write paths such as scan/push support challenge → return the ticket / keep `run_id` on retry, so tickets no longer mismatch or die when the run id changes.
+- **Faster materials, less rework:** pre-render capacity checks, rewrite only over-budget CV/CL, at most three parallel jobs, a shared human-audit queue when no auditor model is configured, plus timing/cache/re-render/failure telemetry; company research is cost-tiered.
+- **Portable identity:** `.sopcontrol/identity.yaml` uses portable `root: .`; CI SOP Control gate and python-tests both install the same vendor pin.
 
 ## 🆕 Latest update · 2026-09-08 · SOP Control control plane
 
@@ -33,6 +36,12 @@ and how to tailor the application without giving up final control.
 - **Materials are fixed to one chain:** material generation is bound to `materials-vnext-1`; legacy material entrypoints are rejected. The controlled order is baseline → bounded JD delta → independent CV/CL content audit → DOCX/PDF format gates.
 - **Safe model handoff:** project identity, rule summaries, task state and evidence can be reused across models, harnesses and worktrees, so switching models does not recreate the workflow from memory.
 - **Release boundary:** the SOP rules, test command, fixed CI revision and pre-push gate are wired into the product. Control-plane evidence remains separate from private job-search runtime data; resumes, JDs, cookies, Google credentials and runtime ledgers are not published to GitHub.
+
+## 🆕 Latest update · 2026-08-23 · workflow reliability patch
+
+- **One canonical scan boundary:** `temp_two_pass.sh` is now a compatibility wrapper around the workflow gateway. Each run writes an official `run.json` binding the scan window, scored-artifact hash, semantic status, and cursor commit. When `run_id` is omitted, `/push` resolves only the newest official run—not a legacy `temp`/`daily` sentinel.
+- **Ledger identity is separate from projections:** the local workflow ledger is authoritative for row identity and IDs. A confirmed batch can be projected to CSV and Google Sheets without renumbering when one projection is empty. Push responses expose backend resolution and explicitly warn when `auto → local CSV` because Google configuration is incomplete.
+- **JobsDB recovery is actionable and bounded:** if daily Chrome does not expose CDP, the system does not pretend verification succeeded or retry forever. It writes a cookie-free manual-recovery handoff and a resumable command, deduplicates identical portal requests while preserving page/query aliases, and reports planned/deduplicated/error/filter diagnostics.
 
 ### Why JobsFlow?
 

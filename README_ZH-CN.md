@@ -34,11 +34,14 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 
 ---
 
-## 🆕 最新更新 · 2026-08-23 · workflow reliability patch
+## 🆕 最新更新 · 2026-09-12 · 控制面随仓发布 · 一键升级 · 材料提速
 
-- **扫描入口已收敛**：`temp_two_pass.sh` 现在只是兼容入口，统一转到 workflow gateway；每轮生成绑定窗口、评分产物哈希、语义状态和游标提交的官方 `run.json`。省略 `run_id` 时只解析最新官方运行，不再误用旧的 `temp`/`daily` 状态哨兵。
-- **台账身份与投影已分离**：本地 workflow ledger 是岗位行身份和编号的权威来源；同一批已确认岗位可以安全投影到 CSV 和 Google Sheets，不会因为另一投影为空而重新编号。每次 push 都返回后端解析结果，配置缺失时明确警告 `auto → local CSV`。
-- **JobsDB 受控恢复更可操作**：日常 Chrome 未暴露 CDP 时，系统不会假装完成验证或无限重试，而是生成不含 cookie 的人工恢复交接记录和可重跑提示；同时对重复门户请求去重，保留页码与查询别名，并输出计划/去重/错误/过滤诊断。
+- **控制面打进产品仓**：SOP Control 以固定 pin 放在 `vendor/sopcontrol/`（含 `plugins/`），公开 clone 即可用；不必再另下私有上游仓。
+- **老用户只需更新**：已安装用户 `git pull origin main` 后，工作流会自动加载仓内 vendor；日常使用不必再单独 `pip install` 控制面（可选安装仅为把 `sopctl` 放进 PATH）。
+- **缺包 fail-closed**：enforce 下控制面不可用时会阻断副作用，不再软降级假装通过；与 README 承诺一致。
+- **Capability Ticket 扫描闭环**：scan/push 等写路径支持 challenge → 带回 ticket / 保留 `run_id` 重试，避免票据对不上或重试换 id 失效。
+- **材料制作提速与防返工**：渲染前容量预检、只改超预算的 CV/CL、同批最多三个并行、无审计模型时统一人工审计队列，并记录耗时 / 缓存 / 重渲染与失败原因；公司调研按成本分级。
+- **身份可携**：`.sopcontrol/identity.yaml` 改为可移植 `root: .`；CI 的 SOP Control gate 与 python-tests 均安装同一 vendor pin。
 
 ## 🆕 最新更新 · 2026-09-08 · SOP Control 控制面接入
 
@@ -47,6 +50,12 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 - **材料链固定**：材料制作绑定 `materials-vnext-1`，旧材料入口拒绝继续；基础版 → 有界 JD 定制 → CV/CL 内容审计 → DOCX/PDF 格式门的顺序由系统控制。
 - **跨模型可接手**：项目身份、规则摘要、任务状态和证据记录可在不同模型、Harness 和 Worktree 间复用；模型切换不会重新发明一套流程。
 - **发布门**：SOP Control 的规则、测试命令、CI 固定版本和 pre-push gate 已接入；控制面证据与私人求职运行数据分离，不把简历、JD、cookie、Google 凭据或运行台账发布到 GitHub。
+
+## 🆕 最新更新 · 2026-08-23 · workflow reliability patch
+
+- **扫描入口已收敛**：`temp_two_pass.sh` 现在只是兼容入口，统一转到 workflow gateway；每轮生成绑定窗口、评分产物哈希、语义状态和游标提交的官方 `run.json`。省略 `run_id` 时只解析最新官方运行，不再误用旧的 `temp`/`daily` 状态哨兵。
+- **台账身份与投影已分离**：本地 workflow ledger 是岗位行身份和编号的权威来源；同一批已确认岗位可以安全投影到 CSV 和 Google Sheets，不会因为另一投影为空而重新编号。每次 push 都返回后端解析结果，配置缺失时明确警告 `auto → local CSV`。
+- **JobsDB 受控恢复更可操作**：日常 Chrome 未暴露 CDP 时，系统不会假装完成验证或无限重试，而是生成不含 cookie 的人工恢复交接记录和可重跑提示；同时对重复门户请求去重，保留页码与查询别名，并输出计划/去重/错误/过滤诊断。
 
 ## 🎯 解决什么问题？
 
