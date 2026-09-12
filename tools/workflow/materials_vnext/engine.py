@@ -969,11 +969,15 @@ class MaterialsEngine:
             scope = text(payload.get("scope") or "all").casefold()
             if scope not in {"audit", "draft", "render", "all"}:
                 scope = "all"
-            # CLI/shell always pass confirm_reset/confirmed. Direct engine tests
-            # and recovery tools that omit the keys keep the previous behavior.
-            if ("confirm_reset" in payload or "confirmed" in payload) and not bool(
-                payload.get("confirm_reset") or payload.get("confirmed")
-            ):
+            # Default fail-closed: any harness (including direct engine imports)
+            # must confirm. Tests may pass allow_unconfirmed_reset=True.
+            import os as _os
+
+            allow_unconfirmed = bool(payload.get("allow_unconfirmed_reset")) or str(
+                _os.environ.get("JOBSFLOW_MATERIALS_ALLOW_UNCONFIRMED_RESET", "") or ""
+            ).strip() in {"1", "true", "yes", "on"}
+            confirmed = bool(payload.get("confirm_reset") or payload.get("confirmed"))
+            if not confirmed and not allow_unconfirmed:
                 return {
                     "status": "preview",
                     "job_id": job_id,

@@ -201,6 +201,23 @@ def test_role_confirmation_becomes_choose_role_title_card():
     assert "title" not in wrapped["user_prompt"]["reply_contract"]
 
 
+def test_reset_preview_includes_confirm_reset_card():
+    wrapped = wrap_result(
+        {
+            "status": "preview",
+            "scope": "render",
+            "job_id": "C0-001",
+            "requires_confirmation": True,
+            "next_action": "repeat_with_--confirm-reset",
+        },
+        action="materials",
+    )
+    assert wrapped["status"] == "needs_user"
+    assert wrapped["user_prompt"]["kind"] == "confirm_reset"
+    assert wrapped["user_prompt"]["reply_contract"]["confirm_reset"] is True
+    assert wrapped["user_prompt"]["reply_contract"]["scope"] == "render"
+
+
 def test_materials_ticket_challenge_includes_prompt_and_retry():
     wrapped = wrap_result(
         {

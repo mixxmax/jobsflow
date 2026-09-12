@@ -488,7 +488,7 @@ def test_reset_audit_scope_archives_user_acceptance(tmp_path):
         workspace=ws,
     )
     assert (package / "materials_vnext" / "audit_acceptance.json").is_file()
-    reset = MaterialsEngine().handle({"job_id": "C0-001", "stage": "reset", "scope": "audit"}, workspace=ws)
+    reset = MaterialsEngine().handle({"job_id": "C0-001", "stage": "reset", "scope": "audit", "allow_unconfirmed_reset": True}, workspace=ws)
     assert reset["status"] == "reset"
     assert not (package / "materials_vnext" / "audit_acceptance.json").exists()
     assert load_run(package)["phase"] == "content_audit_pending"
@@ -658,7 +658,7 @@ def test_legacy_material_state_returns_explicit_vnext_reset_action(tmp_path):
     assert out["next_action"] == "preview_vnext_reset"
 
     reset = MaterialsEngine().handle(
-        {"job_id": "C0-001", "stage": "reset"}, workspace=ws
+        {"job_id": "C0-001", "stage": "reset", "allow_unconfirmed_reset": True}, workspace=ws
     )
     assert reset["status"] == "reset"
     assert not (package / "materials_run.json").exists()
@@ -683,7 +683,7 @@ def test_vnext_render_reset_preserves_canonical_and_audit_then_allows_rerender(t
     assert any(path.suffix == ".pdf" for path in package.iterdir())
 
     reset = MaterialsEngine().handle(
-        {"job_id": "C0-001", "stage": "reset", "scope": "render"},
+        {"job_id": "C0-001", "stage": "reset", "scope": "render", "allow_unconfirmed_reset": True},
         workspace=ws,
     )
 
@@ -720,7 +720,7 @@ def test_vnext_reset_archives_generation_and_rewinds_projection(tmp_path):
     from tools.workflow.entity_state import commit_entity_state
 
     commit_entity_state(ws, state, expected_revision=state.revision, dest_phase="inputs_frozen", event_id="test")
-    out = MaterialsEngine().handle({"job_id": "C0-001", "stage": "reset"}, workspace=ws)
+    out = MaterialsEngine().handle({"job_id": "C0-001", "stage": "reset", "allow_unconfirmed_reset": True}, workspace=ws)
     assert out["status"] == "reset"
     assert out["projected_entity_phase"] == "idle"
     assert not (package / "materials_vnext").exists()

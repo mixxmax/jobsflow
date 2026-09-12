@@ -11,6 +11,7 @@ PROMPT_KINDS = (
     "confirm_push",
     "confirm_intent",
     "confirm_base",
+    "confirm_reset",
     "ask_preflight",
     "confirm_archive",
 )

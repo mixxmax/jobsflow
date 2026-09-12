@@ -288,6 +288,9 @@ def test_cli_allows_scoped_reset_only_for_existing_vnext_runs(tmp_path, capsys):
     ) == 0
     preview = json.loads(capsys.readouterr().out)
     assert preview["status"] == "needs_user"
+    assert preview["user_prompt"]["kind"] == "confirm_reset"
+    assert preview["user_prompt"]["reply_contract"]["confirm_reset"] is True
+    assert preview["user_prompt"]["reply_contract"]["scope"] == "render"
     assert preview["result"]["status"] == "preview"
     assert preview["result"]["scope"] == "render"
 
@@ -326,6 +329,8 @@ def test_cli_all_reset_is_preview_first_and_requires_confirmation(tmp_path, caps
     ) == 0
     preview = json.loads(capsys.readouterr().out)
     assert preview["status"] == "needs_user"
+    assert preview["user_prompt"]["kind"] == "confirm_reset"
+    assert preview["user_prompt"]["reply_contract"]["scope"] == "all"
     assert preview["result"]["status"] == "preview"
     assert preview["result"]["requires_confirmation"] is True
     assert (package / "materials_vnext").is_dir()

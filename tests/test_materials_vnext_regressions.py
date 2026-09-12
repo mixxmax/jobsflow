@@ -306,7 +306,7 @@ def test_scoped_audit_reset_archives_repair_handoff_state(tmp_path):
     assert (package / "materials_vnext" / "repair_patches.jsonl").is_file()
 
     reset = MaterialsEngine().handle(
-        {"job_id": "C0-001", "stage": "reset", "scope": "audit"},
+        {"job_id": "C0-001", "stage": "reset", "scope": "audit", "allow_unconfirmed_reset": True},
         workspace=ws,
     )
     assert reset["status"] == "reset"
@@ -323,7 +323,7 @@ def test_draft_reset_archives_external_staging_contexts(tmp_path):
     assert staging.is_dir()
 
     reset = MaterialsEngine().handle(
-        {"job_id": "C0-001", "stage": "reset", "scope": "draft"},
+        {"job_id": "C0-001", "stage": "reset", "scope": "draft", "allow_unconfirmed_reset": True},
         workspace=ws,
     )
     assert reset["status"] == "reset"

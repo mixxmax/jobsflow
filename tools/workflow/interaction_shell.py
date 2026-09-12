@@ -302,6 +302,32 @@ def _prompt_for_action(action: str, internal: dict[str, Any]) -> dict[str, Any] 
             reply_hint="回复「确认激活」或「取消」",
             reply_contract={"action": "base", "base_cmd": "confirm", "confirmed": True},
         )
+    if action == "materials" and (
+        str(internal.get("next_action") or "") == "repeat_with_--confirm-reset"
+        or (
+            str(internal.get("status") or "") in {"planned", "preview"}
+            and bool(internal.get("requires_confirmation"))
+            and str(internal.get("scope") or "") in {"audit", "draft", "render", "all"}
+        )
+    ):
+        scope = str(internal.get("scope") or "all")
+        job_id = str(internal.get("job_id") or "")
+        return build_user_prompt(
+            "confirm_reset",
+            question=f"是否确认重置材料生成（scope={scope}）？此操作会丢弃当前范围内的生成物。",
+            options=[
+                {"id": "confirm", "label": "确认重置", "recommended": False},
+                {"id": "cancel", "label": "取消", "recommended": False},
+            ],
+            reply_hint="确认后请带 --confirm-reset 重试同一 scope",
+            reply_contract={
+                "action": "materials",
+                "materials_cmd": "reset",
+                "job_id": job_id,
+                "scope": scope,
+                "confirm_reset": True,
+            },
+        )
     if action.startswith("archive") and str(internal.get("status") or "") in {"planned", "preview"}:
         return build_user_prompt(
             "confirm_archive",
