@@ -155,12 +155,14 @@ def test_doctor_next_is_read_only(tmp_path):
     assert len(out["queue"]) <= 3
 
 
-def test_scan_cli_auto_redeems_once(tmp_path, monkeypatch):
+def test_dispatch_scan_auto_redeems_once(tmp_path, monkeypatch):
     (tmp_path / "00_Profile").mkdir()
     calls: list[dict] = []
+    from tools.workflow import engine as eng
 
-    def fake_dispatch(action, *, workspace, store, payload, runner):
-        calls.append(dict(payload))
+    def fake_execute(self, request, *, workspace, store=None, now=None):
+        payload = dict(request.payload or {})
+        calls.append(payload)
         if not payload.get("capability_ticket_id"):
             return {
                 "status": "planned",
@@ -171,15 +173,38 @@ def test_scan_cli_auto_redeems_once(tmp_path, monkeypatch):
             }
         return {"status": "succeeded", "run_id": payload.get("run_id")}
 
-    monkeypatch.setattr(workflow_cli, "dispatch", fake_dispatch)
+    monkeypatch.setattr(eng.WorkflowEngine, "execute", fake_execute)
     monkeypatch.setenv("JOBSFLOW_SCAN_AUTO_TICKET", "on")
-    code = workflow_cli.main(
-        ["scan", "--workspace", str(tmp_path), "--mode", "temp", "--run-id", "scan-auto-1"]
-    )
-    assert code == 0
+    out = eng.dispatch("scan", workspace=tmp_path, payload={"mode": "temp", "run_id": "scan-auto-1"})
+    assert out["status"] == "succeeded"
+    assert out.get("scan_ticket_auto_redeemed") is True
+    assert "capability_ticket_secret" not in out
     assert len(calls) == 2
     assert calls[1]["run_id"] == "scan-auto-1"
     assert calls[1]["capability_ticket_id"] == "t-auto"
+
+
+def test_role_confirmation_becomes_choose_role_title_card():
+    wrapped = wrap_result(
+        {
+            "status": "blocked",
+            "blockers": ["role_confirmation_required"],
+            "job_id": "C0-001",
+            "role_title_contract": {"alternates": ["Analyst", "Associate"]},
+        },
+        action="materials",
+    )
+    assert wrapped["status"] == "needs_user"
+    assert wrapped["user_prompt"]["kind"] == "choose_role_title"
+    assert wrapped["user_prompt"]["options"]
+
+
+def test_redact_marks_list_truncation():
+    safe = redact_output({"jobs": [{"id": i, "text": "SECRET"} for i in range(45)]})
+    assert len(safe["jobs"]) == 40
+    assert safe["jobs_total_count"] == 45
+    assert safe["jobs_truncated"] is True
+    assert safe["jobs"][0]["text"]["redacted"] is True
 
 
 def test_cli_ticket_secret_not_in_stdout(tmp_path, monkeypatch, capsys):

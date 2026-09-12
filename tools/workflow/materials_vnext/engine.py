@@ -909,10 +909,79 @@ class MaterialsEngine:
             legacy = migration_blocker(Path(workspace), package, job_id)
             if legacy is not None:
                 return {**legacy, "engine": "materials-vnext", "engine_version": "materials-vnext-1"}
+        if stage == "status":
+            from tools.workflow.materials_vnext.migration import migration_blocker as _migration_blocker
+            from tools.workflow.materials_vnext.store import load_run as _load_run
+
+            vnext_run = _load_run(package)
+            if vnext_run:
+                return {
+                    "status": "succeeded",
+                    "job_id": job_id,
+                    "materials_run": vnext_run,
+                    "engine": "materials-vnext",
+                    "side_effects": [],
+                }
+            legacy = _migration_blocker(Path(workspace), package, job_id)
+            if legacy is not None:
+                return {**legacy, "job_id": job_id, "materials_run": None, "engine": "materials-vnext"}
+            return {
+                "status": "succeeded",
+                "job_id": job_id,
+                "phase": "idle",
+                "materials_run": None,
+                "engine": "materials-vnext",
+                "side_effects": [],
+            }
+        if stage in {"role_choose", "role-choose"}:
+            from tools.job_materials.role_titles import build_role_title_contract
+
+            title = text(payload.get("title") or "")
+            if not title:
+                return {
+                    "status": "blocked",
+                    "blockers": ["role_choose_requires_title"],
+                    "engine": "materials-vnext",
+                    "job_id": job_id,
+                }
+            manifest_path = package / "job_manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                manifest = {}
+            job = dict(manifest.get("job") or {})
+            display = text(job.get("role_display") or title)
+            selected = build_role_title_contract(display, selected_primary=title)
+            job["role_title_contract"] = selected
+            job["role_display"] = text(selected.get("primary") or title)
+            manifest["job"] = job
+            atomic_write_json(manifest_path, manifest)
+            # Keep the materials entity phase unchanged; role selection is a
+            # package-manifest write, not a generation-phase advance.
+            return {
+                "status": "succeeded",
+                "job_id": job_id,
+                "role_title_contract": selected,
+                "side_effects": ["role_title_selected"],
+                "engine": "materials-vnext",
+            }
         if stage in {"reset", "restart"}:
             scope = text(payload.get("scope") or "all").casefold()
             if scope not in {"audit", "draft", "render", "all"}:
                 scope = "all"
+            # CLI/shell always pass confirm_reset/confirmed. Direct engine tests
+            # and recovery tools that omit the keys keep the previous behavior.
+            if ("confirm_reset" in payload or "confirmed" in payload) and not bool(
+                payload.get("confirm_reset") or payload.get("confirmed")
+            ):
+                return {
+                    "status": "preview",
+                    "job_id": job_id,
+                    "scope": scope,
+                    "requires_confirmation": True,
+                    "next_action": "repeat_with_--confirm-reset",
+                    "engine": "materials-vnext",
+                }
             out = reset(package, scope=scope, workspace=Path(workspace), job_id=job_id)
             target_phase = {
                 "audit": "content_audit_pending",

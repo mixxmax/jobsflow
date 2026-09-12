@@ -29,6 +29,8 @@ RUNTIME_WRITE_ACTIONS = frozenset(
         "archive_fresh",
         "archive_confirm",
         "promote",
+        "sync_pull",
+        "sync_retry",
     }
 )
 RUNTIME_POINTER_NAME = ".jobsflow-runtime.json"
@@ -48,12 +50,17 @@ _TEXT_KEYS = {
     "jd_text",
     "resume",
     "resume_text",
+    "cv",
     "cv_text",
+    "cl",
     "cl_text",
     "cover_letter",
     "body",
     "content",
+    "text",
+    "blocks",
 }
+_LIST_CAP = 40
 
 
 def is_runtime_workspace(path: Path) -> bool:
@@ -167,15 +174,31 @@ def _redact_value(key: str, value: Any) -> Any:
 def redact_output(payload: dict[str, Any] | None) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in dict(payload or {}).items():
+        name = str(key)
+        lowered = name.casefold()
         if isinstance(value, dict):
-            result[str(key)] = redact_output(value)
+            if lowered in {"cv", "cl", "cover_letter"} or lowered.endswith("_text"):
+                result[name] = {"redacted": True, "reason": "private_material", "keys": sorted(value.keys())[:20]}
+            else:
+                result[name] = redact_output(value)
         elif isinstance(value, list):
-            result[str(key)] = [
-                redact_output(item) if isinstance(item, dict) else _redact_value(str(key), item)
-                for item in value[:40]
-            ]
+            total = len(value)
+            clipped = value[:_LIST_CAP]
+            mapped = []
+            for item in clipped:
+                if isinstance(item, dict):
+                    cleaned = redact_output(item)
+                    if "text" in item:
+                        cleaned["text"] = {"redacted": True, "reason": "block_text"}
+                    mapped.append(cleaned)
+                else:
+                    mapped.append(_redact_value(name, item))
+            result[name] = mapped
+            if total > _LIST_CAP:
+                result[f"{name}_total_count"] = total
+                result[f"{name}_truncated"] = True
         else:
-            result[str(key)] = _redact_value(str(key), value)
+            result[name] = _redact_value(name, value)
     return result
 
 
@@ -186,6 +209,8 @@ def map_external_status(internal: dict[str, Any], *, action: str) -> str:
         return "blocked"
     if status in {"failed", "error"}:
         return "failed"
+    if "role_confirmation_required" in blockers or internal.get("needs_role_confirmation"):
+        return "needs_user"
     if status == "blocked":
         return "blocked"
     if status in {"planned", "preview", "drafted"} or internal.get("requires_confirmation"):
@@ -206,6 +231,38 @@ def _prompt_for_action(action: str, internal: dict[str, Any]) -> dict[str, Any] 
         or (internal.get("reply_contract") or {}).get("confirmation_id")
         or ""
     )
+    blockers = {str(item) for item in (internal.get("blockers") or [])}
+    contract = internal.get("role_title_contract") if isinstance(internal.get("role_title_contract"), dict) else {}
+    if (
+        action == "materials"
+        and (
+            "role_confirmation_required" in blockers
+            or internal.get("needs_role_confirmation")
+            or (contract and not contract.get("primary") and contract.get("alternates"))
+        )
+    ):
+        alternates = list(contract.get("alternates") or contract.get("variants") or [])
+        options = []
+        for idx, title in enumerate(alternates[:8]):
+            label = str(title.get("primary") if isinstance(title, dict) else title).strip()
+            if not label:
+                continue
+            options.append({"id": f"title_{idx}", "label": label, "recommended": idx == 0})
+        if not options and contract.get("primary"):
+            options.append({"id": "title_0", "label": str(contract.get("primary")), "recommended": True})
+        if options:
+            return build_user_prompt(
+                "choose_role_title",
+                question="请选择该岗位的正式职位名称",
+                options=options,
+                reply_hint="回复选项对应的职位名",
+                reply_contract={
+                    "action": "materials",
+                    "materials_cmd": "role-choose",
+                    "job_id": str(internal.get("job_id") or ""),
+                    "title": options[0]["label"],
+                },
+            )
     if action == "push" and str(internal.get("status") or "") in {"planned", "preview"}:
         return build_user_prompt(
             "confirm_push",
@@ -278,6 +335,8 @@ def wrap_result(
             )
         if prompt is not None:
             validate_user_prompt(prompt)
+            status = "needs_user"
+
     message = str(internal.get("message") or "")
     if not message:
         if status == "needs_user":
@@ -400,7 +459,29 @@ PRODUCE_STOP_BLOCKERS = {
     "capacity_over_budget",
     "stale_generation",
     "illegal_transition",
+    "plan_required",
+    "canonical_missing",
 }
+
+
+def next_produce_stages(phase: str | None) -> list[str]:
+    """Pick legal produce stages from the persisted materials phase."""
+
+    current = str(phase or "idle").casefold()
+    mapping = {
+        "idle": list(PRODUCE_STAGES),
+        "inputs_frozen": list(PRODUCE_STAGES),
+        "plan_ready": ["canonical", "audit", "render", "pdf", "format"],
+        "drafting": ["audit", "render", "pdf", "format"],
+        "content_audit_pending": ["audit", "render", "pdf", "format"],
+        "repair_required": ["audit", "render", "pdf", "format"],
+        "content_passed": ["render", "pdf", "format"],
+        "docx_generated": ["pdf", "format"],
+        "pdf_generated": ["format"],
+        "format_passed": ["format"],
+        "apply_ready": ["format"],
+    }
+    return list(mapping.get(current) or PRODUCE_STAGES)
 
 
 def produce_should_stop(internal: dict[str, Any]) -> bool:

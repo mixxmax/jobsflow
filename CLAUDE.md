@@ -98,7 +98,7 @@ machine-readable blocker instead of guessing.
 5. 项目何以至此：见下节；全量编年 `sopctl chronicle`。
 
 ## 何以至此（换模型/换会话）
-- 编年 58 条（完整性 OK）；下列为最近 5 条治理动作：
+- 编年 71 条（完整性 OK）；下列为最近 5 条治理动作：
 - [2026-09-10T07:36] JF-MAT-107 proposed→accepted
 - [2026-09-10T07:36] JF-MAT-004 → superseded
 - [2026-09-10T07:36] JF-MAT-005 → superseded
@@ -107,7 +107,7 @@ machine-readable blocker instead of guessing.
 - 全量：`sopctl chronicle`；核对：`sopctl chronicle check`。
 
 ## 空间生长（无感观察；定型需人）
-- 空间生长（无感）：观察 49；待人定型候选 7（删入口 0 / 改善入口 0 / 登记规则 0）
+- 空间生长（无感）：观察 88；待人定型候选 7（删入口 0 / 改善入口 0 / 登记规则 0）
 - 发现已自动；写入权威或删代码仍需人确认——不是要你「推进发现」。
 - 最近空间快照：ambiguity_index=0 （旁路开 0 / 平行状态 0）
 - 相对上一帧：歧义指数未变：ambiguity_index=0（`sopctl growth diff`）

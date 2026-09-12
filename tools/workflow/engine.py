@@ -392,8 +392,36 @@ def dispatch(
         payload=payload,
         requested_at=iso(now) if now else None,
     )
-    return WorkflowEngine().execute(request, workspace=workspace, store=store, now=now)
+    out = WorkflowEngine().execute(request, workspace=workspace, store=store, now=now)
+    # Low-risk scan may complete one challenge→redeem inside the gateway so
+    # every harness (CLI, Python API, slash) shares the same behavior.  Secret
+    # stays in-process and is stripped before return.
+    if action == "scan" and not payload.get("_scan_ticket_retried"):
+        try:
+            from tools.workflow.interaction_shell import maybe_auto_redeem_scan
 
+            retry = maybe_auto_redeem_scan(out, already_retried=False)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+            retry = None
+        if retry:
+            payload.update(retry)
+            payload["_scan_ticket_retried"] = True
+            if runner is not None:
+                payload["_runner"] = runner
+            retry_request = ActionRequest(
+                action=action,
+                autonomy_level="A0",
+                actor=actor,
+                target=payload.get("target") or (getattr(store, "title", None)),
+                confirmation_id=confirmation_id,
+                payload=payload,
+                requested_at=iso(now) if now else None,
+            )
+            out = WorkflowEngine().execute(retry_request, workspace=workspace, store=store, now=now)
+            out = dict(out)
+            out["scan_ticket_auto_redeemed"] = True
+            out.pop("capability_ticket_secret", None)
+    return out
 
 def _run_adapter(action, payload, workspace, store, dry_run, now):
     if action == "scan":

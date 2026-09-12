@@ -61,6 +61,21 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
 
         if workspace is None:
             return result(status="blocked", rule_ids=["MAT-VNEXT-001"], blockers=["workspace_required"])
+        stage = str(payload.get("stage") or payload.get("materials_cmd") or "").casefold()
+        if stage == "batch" or payload.get("materials_cmd") == "batch":
+            from tools.workflow.materials_batch import run_batch
+
+            out = run_batch(
+                Path(workspace),
+                list(payload.get("jobs") or []),
+                action=str(payload.get("batch_action") or "prepare"),
+                max_workers=int(payload.get("max_workers") or 3),
+                engine=str(payload.get("engine") or "libreoffice"),
+            )
+            out.setdefault("rule_ids", ["MAT-VNEXT-001", "JF-MAT-105"])
+            out.setdefault("engine", "materials-vnext")
+            out.setdefault("engine_version", "materials-vnext-1")
+            return out
         out = MaterialsEngine().handle(payload, workspace=workspace, dry_run=dry_run)
         out.setdefault("rule_ids", ["MAT-VNEXT-001"])
         out.setdefault("engine", "materials-vnext")

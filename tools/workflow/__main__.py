@@ -13,7 +13,6 @@ from tools.workflow.fresh_store import FileFreshStore, default_fresh_store
 from tools.workflow.interaction_shell import (
     doctor_next_actions,
     is_runtime_workspace,
-    maybe_auto_redeem_scan,
     redact_output,
     resolve_workspace,
     runtime_gate,
@@ -312,8 +311,19 @@ def main(argv: list[str] | None = None) -> int:
         runtime_base = base_status(workspace)
         out = dict(out)
         checks = dict(out.get("checks") or {})
-        checks["tracker"] = bool(list((workspace / "02_Tracker").glob("hk_apply_list_*.csv")))
+        tracker_root = workspace / "02_Tracker"
+        ledger_dir = tracker_root / "workflow" / "ledger"
+        fresh_dir = tracker_root / "workflow" / "fresh"
+        has_ledger = ledger_dir.is_dir() and any(ledger_dir.glob("*.json"))
+        has_fresh = fresh_dir.is_dir() and any(fresh_dir.glob("*/active.csv"))
+        has_csv = any(tracker_root.glob("*.csv")) if tracker_root.is_dir() else False
+        checks["tracker"] = bool(has_ledger or has_fresh or has_csv)
         out["checks"] = checks
+        out["tracker_projections"] = {
+            "ledger": has_ledger,
+            "fresh_csv": has_fresh,
+            "tracker_csv": has_csv,
+        }
         out["failed"] = [name for name, ready in checks.items() if not ready]
         out["ready"] = not out["failed"]
         out["workflow_ready"] = out["ready"]
@@ -442,148 +452,33 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 2
         if args.materials_cmd == "role-choose":
-            if not args.job_id or not args.title:
-                out = {
-                    "status": "blocked",
-                    "blockers": ["role_choose_requires_job_id_and_title"],
-                    "required": "python3 -m tools.workflow materials role-choose --job-id <id> --title <title>",
-                }
-                print(json.dumps(wrap_result(out, action="materials"), ensure_ascii=False, indent=2))
-                return 2
-            from tools.job_materials.role_titles import build_role_title_contract
-            from tools.workflow.package_context import PackageContextLoader
-
-            ctx = PackageContextLoader(workspace).load(args.job_id)
-            if not ctx.package:
-                out = {"status": "blocked", "blockers": ["package_missing"], "job_id": args.job_id}
-                print(json.dumps(wrap_result(out, action="materials"), ensure_ascii=False, indent=2))
-                return 2
-            manifest_path = Path(ctx.package) / "job_manifest.json"
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                manifest = {}
-            display = str((manifest.get("job") or {}).get("role_display") or args.title)
-            selected = build_role_title_contract(display, selected_primary=args.title)
-            job = dict(manifest.get("job") or {})
-            job["role_title_contract"] = selected
-            manifest["job"] = job
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            out = {
-                "status": "succeeded",
-                "job_id": args.job_id,
-                "role_title_contract": selected,
-                "side_effects": ["role_title_selected"],
-            }
-            print(json.dumps(wrap_result(out, action="materials"), ensure_ascii=False, indent=2))
-            return 0
-        if args.materials_cmd == "check":
+            payload["stage"] = "role_choose"
+            payload["title"] = args.title
+        elif args.materials_cmd == "check":
             payload["stage"] = "plan"
             payload["materials_shell"] = "check"
         elif args.materials_cmd == "produce":
             payload["materials_shell"] = "produce"
             payload["max_steps"] = max(1, int(args.max_steps or 4))
-        if args.materials_cmd == "status":
-            package = None
-            from tools.workflow.package_context import PackageContextLoader
-
-            package = PackageContextLoader(workspace).load(args.job_id).package
-            if not package:
-                out = {"status": "blocked", "blockers": ["package_missing"], "job_id": args.job_id}
-            else:
-                from tools.workflow.materials_vnext.store import load_run
-                from tools.workflow.materials_vnext.migration import migration_blocker
-
-                vnext_run = load_run(Path(package))
-                legacy = None if vnext_run else migration_blocker(workspace, Path(package), args.job_id)
-                out = (
-                    {"status": "succeeded", "job_id": args.job_id, "materials_run": vnext_run}
-                    if vnext_run
-                    else (
-                        {**legacy, "job_id": args.job_id, "materials_run": None}
-                        if legacy
-                        else {"status": "succeeded", "job_id": args.job_id, "phase": "idle", "materials_run": None}
-                    )
-                )
-                try:
-                    out.update(_materials_engine_info())
-                except (ImportError, RuntimeError) as exc:
-                    out = {"status": "blocked", "job_id": args.job_id, "blockers": ["materials_engine_unavailable"], "error": str(exc)}
-            print(json.dumps(out, ensure_ascii=False, indent=2))
-            return 0 if out.get("status") not in {"blocked", "failed"} else 2
-        if args.materials_cmd == "reset":
-            from tools.workflow.package_context import PackageContextLoader
-
-            package = PackageContextLoader(workspace).load(args.job_id).package
-            if not package:
-                out = {"status": "blocked", "blockers": ["package_missing"], "job_id": args.job_id}
-            elif args.scope != "all":
-                from tools.workflow.materials_vnext.store import load_run
-
-                vnext_run = load_run(Path(package))
-                if not vnext_run:
-                    out = {
-                        "status": "blocked",
-                        "job_id": args.job_id,
-                        "blockers": ["materials_reset_scope_requires_vnext_run"],
-                        "required": "materials reset --scope all --confirm-reset",
-                    }
-                elif not args.confirm_reset:
-                    out = {
-                        "status": "preview",
-                        "job_id": args.job_id,
-                        "scope": args.scope,
-                        "next_action": "repeat_with_--confirm-reset",
-                    }
-                else:
-                    from tools.workflow.materials_vnext import MaterialsEngine
-
-                    out = MaterialsEngine().handle(
-                        {"job_id": args.job_id, "stage": "reset", "scope": args.scope},
-                        workspace=workspace,
-                    )
-                    try:
-                        out.update(_materials_engine_info())
-                    except (ImportError, RuntimeError) as exc:
-                        out = {"status": "blocked", "job_id": args.job_id, "blockers": ["materials_engine_unavailable"], "error": str(exc)}
-            elif not args.confirm_reset:
-                # Every reset scope, including the destructive full-generation
-                # reset, is preview-first.  The old ``all`` branch invoked the
-                # engine immediately and therefore allowed a model or copied
-                # command to archive a live generation without confirmation.
-                out = {
-                    "status": "preview",
-                    "job_id": args.job_id,
-                    "scope": args.scope,
-                    "next_action": "repeat_with_--confirm-reset",
-                    "requires_confirmation": True,
-                }
-            else:
-                from tools.workflow.materials_vnext import MaterialsEngine
-
-                out = MaterialsEngine().handle(
-                    {"job_id": args.job_id, "stage": "reset", "scope": args.scope},
-                    workspace=workspace,
-                )
-                try:
-                    out.update(_materials_engine_info())
-                except (ImportError, RuntimeError) as exc:
-                    out = {"status": "blocked", "job_id": args.job_id, "blockers": ["materials_engine_unavailable"], "error": str(exc)}
-            print(json.dumps(out, ensure_ascii=False, indent=2))
-            return 0 if out.get("status") in {"preview", "reset"} else 2
-        if args.materials_cmd == "batch":
-            from tools.workflow.materials_batch import run_batch
-
-            out = run_batch(
-                workspace,
-                list(args.jobs),
-                action=args.batch_action,
-                max_workers=args.max_workers,
-                engine=args.engine,
-            )
-            print(json.dumps(out, ensure_ascii=False, indent=2))
-            return 0 if out.get("status") == "succeeded" else 2
-        if args.materials_cmd == "draft":
+            if args.plan:
+                payload["model_plan"] = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+            if args.content:
+                payload["model_transform"] = json.loads(Path(args.content).read_text(encoding="utf-8"))
+        elif args.materials_cmd == "status":
+            payload["stage"] = "status"
+        elif args.materials_cmd == "reset":
+            payload["stage"] = "reset"
+            payload["scope"] = args.scope
+            payload["confirm_reset"] = bool(args.confirm_reset)
+            payload["confirmed"] = bool(args.confirm_reset)
+        elif args.materials_cmd == "batch":
+            payload["stage"] = "batch"
+            payload["materials_cmd"] = "batch"
+            payload["jobs"] = list(args.jobs)
+            payload["batch_action"] = args.batch_action
+            payload["max_workers"] = args.max_workers
+            payload["engine"] = args.engine
+        elif args.materials_cmd == "draft":
             payload["stage"] = "canonical"
             if args.content:
                 blocker = _materials_submission_blocker(
@@ -716,31 +611,43 @@ def main(argv: list[str] | None = None) -> int:
         runner = default_scan_runner
 
     if action == "materials" and payload.get("materials_shell") == "produce":
-        from tools.workflow.interaction_shell import PRODUCE_STAGES, produce_should_stop
+        from tools.workflow.interaction_shell import next_produce_stages, produce_should_stop
+        from tools.workflow.package_context import PackageContextLoader
+        from tools.workflow.materials_vnext.store import load_run
 
         steps = []
         out = {"status": "blocked", "blockers": ["produce_no_progress"]}
         max_steps = max(1, int(payload.get("max_steps") or 4))
-        for stage in PRODUCE_STAGES[:max_steps]:
+        phase = ""
+        ctx = PackageContextLoader(workspace).load(str(payload.get("job_id") or ""))
+        if ctx.package:
+            phase = str((load_run(Path(ctx.package)) or {}).get("phase") or "")
+        stages = next_produce_stages(phase)[:max_steps]
+        for stage in stages:
             step_payload = dict(payload)
             step_payload["stage"] = stage
+            # Carry host-owned model responses into the matching stage only.
+            if stage == "plan" and payload.get("model_plan") is not None:
+                step_payload["model_plan"] = payload.get("model_plan")
+            if stage == "canonical" and payload.get("model_transform") is not None:
+                step_payload["model_transform"] = payload.get("model_transform")
             out = dispatch(action, workspace=workspace, store=store, payload=step_payload, runner=runner)
-            steps.append({"stage": stage, "status": out.get("status"), "blockers": out.get("blockers") or []})
+            steps.append(
+                {
+                    "stage": stage,
+                    "status": out.get("status"),
+                    "blockers": out.get("blockers") or [],
+                    "after_state": out.get("after_state"),
+                }
+            )
             if produce_should_stop(out):
                 break
+            phase = str(out.get("after_state") or phase)
         out = dict(out)
         out["produce_steps"] = steps
+        out["produce_from_phase"] = phase
     else:
         out = dispatch(action, workspace=workspace, store=store, payload=payload, runner=runner)
-        if action == "scan":
-            retry = maybe_auto_redeem_scan(out, already_retried=False)
-            if retry:
-                payload.update(retry)
-                # Secret stays in process memory for one redeem; never print it.
-                out = dispatch(action, workspace=workspace, store=store, payload=payload, runner=runner)
-                out = dict(out)
-                out["scan_ticket_auto_redeemed"] = True
-                out.pop("capability_ticket_secret", None)
 
     if action in {"materials", "audit", "format", "apply"} and isinstance(payload.get("materials_engine_info"), dict):
         out.update(payload["materials_engine_info"])
