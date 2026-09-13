@@ -65,6 +65,11 @@ ENTITY_TRANSITIONS: dict[str, dict[str, set[str]]] = {
         "sync_imported": {"sync_imported"},
         "sync_replayed": {"sync_replayed"},
     },
+    "intake": {
+        "idle": {"proposal_created", "intake_written"},
+        "proposal_created": {"intake_written", "proposal_created"},
+        "intake_written": {"intake_written"},
+    },
 }
 
 
@@ -254,6 +259,7 @@ ACTION_DESTINATIONS: dict[str, set[str]] = {
     "archive_confirm": {"archived"},
     "sync_pull": {"sync_imported"},
     "sync_retry": {"sync_replayed"},
+    "intake": {"proposal_created", "intake_written"},
 }
 
 
@@ -270,6 +276,7 @@ def action_is_mutating(action: str) -> bool:
         "format",
         "sync_pull",
         "sync_retry",
+        "intake",
     }
 
 

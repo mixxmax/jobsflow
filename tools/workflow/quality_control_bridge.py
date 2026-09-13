@@ -188,7 +188,7 @@ def preflight(request: Any, entity: Any) -> dict[str, Any] | None:
             )
         )
 
-    if action in {"scan", "push"}:
+    if action in {"scan", "push", "intake"}:
         # A model may request the business action, but may not smuggle a
         # materials-generation instruction into a scan/entry request.  The
         # confirmed push adapter is allowed to create only the bound,
@@ -206,7 +206,7 @@ def preflight(request: Any, entity: Any) -> dict[str, Any] | None:
                 "QC-SCOPE-001",
                 status="fail" if forbidden_material_request else "pass",
                 severity="P0",
-                message="Scan/push may not generate or write application materials",
+                message="Scan/push/intake may not generate or write application materials",
                 evidence=[f"action={action}"],
                 remediation="Finish scan/push at their declared boundary; call /materials separately for a selected job.",
                 blocking=forbidden_material_request,
@@ -260,7 +260,7 @@ def evaluate_result(request: Any, entity: Any, out: dict[str, Any], *, event_id:
             )
         )
 
-    if action in {"scan", "push"}:
+    if action in {"scan", "push", "intake"}:
         side_effects = out.get("side_effects") or []
         material_output = _has_material_side_effect(side_effects) or any(
             key in out for key in ("cv", "cl", "cover_letter", "application_email", "docx", "pdf", "render")
@@ -270,7 +270,7 @@ def evaluate_result(request: Any, entity: Any, out: dict[str, Any], *, event_id:
                 "QC-SCOPE-002",
                 status="fail" if material_output else "pass",
                 severity="P0",
-                message="Scan/push result contains no CV/CL/Email or rendered material output",
+                message="Scan/push/intake result contains no CV/CL/Email or rendered material output",
                 evidence=[f"action={action}", f"status={status}"],
                 remediation="Do not let the model continue into materials from a scan or push response.",
                 blocking=material_output,
@@ -287,6 +287,25 @@ def evaluate_result(request: Any, entity: Any, out: dict[str, Any], *, event_id:
                 message="A successful tracker write has a bound confirmation proposal",
                 evidence=[f"confirmed={bool(confirmation)}"],
                 remediation="Run the write-free push preview and confirm its proposal ID before writing.",
+                blocking=not bool(confirmation),
+            )
+        )
+
+    if action == "intake" and status == "succeeded":
+        confirmation = str(
+            getattr(request, "confirmation_id", "")
+            or payload.get("confirmation_id")
+            or payload.get("proposal_id")
+            or ""
+        )
+        assertions.append(
+            _assertion(
+                "QC-INTAKE-001",
+                status="pass" if confirmation else "fail",
+                severity="P0",
+                message="A successful manual intake write has a bound confirmation proposal",
+                evidence=[f"confirmed={bool(confirmation)}"],
+                remediation="Preview the URLs first and confirm the returned manual-intake proposal.",
                 blocking=not bool(confirmation),
             )
         )

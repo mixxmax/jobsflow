@@ -1,4 +1,4 @@
-"""python3 -m tools.workflow <doctor|base|intent|scan|push|materials|apply|promote|archive>"""
+"""python3 -m tools.workflow <doctor|base|intent|scan|push|intake|materials|apply|promote|archive>"""
 
 from __future__ import annotations
 
@@ -184,6 +184,29 @@ def main(argv: list[str] | None = None) -> int:
         "--local-only",
         action="store_true",
         help="Compatibility alias for --backend csv; never contacts Google Sheets",
+    )
+
+    intake = sub.add_parser(
+        "intake",
+        parents=[common],
+        help="Preview user-specified job URLs, then confirm to allocate IDs and write",
+    )
+    intake.add_argument("urls", nargs="*", help="One or more job-posting URLs")
+    intake.add_argument("--url", dest="url_options", action="append", default=[], help="Additional URL (repeatable)")
+    intake.add_argument("--metadata-file", type=Path, help="JSON list/object with per-URL page metadata")
+    intake.add_argument("--title", default="", help="Role title when it is not supplied in metadata")
+    intake.add_argument("--employer", default="", help="Hiring employer when it is not supplied in metadata")
+    intake.add_argument("--platform", default="", help="Portal/source; otherwise derived from the URL")
+    intake.add_argument("--lane", default="", help="Lane letter for a JD-incomplete posting")
+    intake.add_argument("--jd-file", type=Path, help="Full JD text for a single URL")
+    intake.add_argument("--page-file", type=Path, help="Page text/metadata file for a single URL")
+    intake.add_argument("--fresh-title", default="", help="Fresh tracker projection title")
+    intake.add_argument("--backend", choices=["auto", "csv", "gsheet", "file"], default="auto")
+    intake.add_argument(
+        "--confirm",
+        dest="confirmation_id",
+        default="",
+        help="Proposal ID returned by the prior write-free intake preview",
     )
 
     promote = sub.add_parser("promote", parents=[common], help="Merge into main; always keeps fresh")
@@ -449,6 +472,33 @@ def main(argv: list[str] | None = None) -> int:
                 "confirmation_id": args.confirmation_id,
             }
         )
+    elif action == "intake":
+        urls = [str(value).strip() for value in [*args.urls, *args.url_options] if str(value).strip()]
+        payload.update(
+            {
+                "urls": urls,
+                "title": args.title,
+                "employer": args.employer,
+                "platform": args.platform,
+                "lane": args.lane,
+                "fresh_title": args.fresh_title,
+                "backend": args.backend,
+                "confirmation_id": args.confirmation_id,
+            }
+        )
+        if args.metadata_file:
+            payload["items"] = json.loads(Path(args.metadata_file).read_text(encoding="utf-8"))
+        if args.jd_file:
+            payload["jd_text"] = Path(args.jd_file).read_text(encoding="utf-8")
+        if args.page_file:
+            page_path = Path(args.page_file)
+            page_text = page_path.read_text(encoding="utf-8")
+            try:
+                payload["page"] = json.loads(page_text)
+            except json.JSONDecodeError:
+                payload["page_text"] = page_text
+        if args.confirmation_id:
+            payload["proposal_id"] = args.confirmation_id
     elif action == "promote":
         payload.update(
             {

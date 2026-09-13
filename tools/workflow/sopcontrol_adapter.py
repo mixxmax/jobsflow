@@ -34,6 +34,7 @@ _SENSITIVE_KEYS = {
 GOVERNED_ACTIONS = frozenset({
     "scan",
     "push",
+    "intake",
     "materials",
     "audit",
     "format",
@@ -54,6 +55,7 @@ GOVERNED_ACTIONS = frozenset({
 # in the project's registry. Unknown / unregistered ids are simply omitted.
 SOP_RULES_BY_ACTION: dict[str, tuple[str, ...]] = {
     "push": ("JF-PREVIEW-001", "JF-PUSH-002"),
+    "intake": ("JF-PREVIEW-001", "JF-PUSH-002"),
     "scan": ("JF-SCAN-001", "JF-SCAN-002"),
     "materials": (
         "JF-MAT-001",
@@ -81,6 +83,7 @@ SOP_RULES_BY_ACTION: dict[str, tuple[str, ...]] = {
 
 SIDE_EFFECT_ACTIONS = frozenset({
     "push",
+    "intake",
     "materials",
     "audit",
     "format",
@@ -375,6 +378,7 @@ def tickets_enabled() -> bool:
 def _side_effect_for_write(action: str) -> str:
     return {
         "push": "tracker_write",
+        "intake": "tracker_write",
         "intent": "profile_write",
         "base": "base_activation",
         "apply": "apply_prepare",
@@ -396,6 +400,8 @@ def _write_path_requested(request: Any) -> bool:
     if bool(payload.get("dry_run")):
         return False
     if action == "push":
+        return _push_write_requested(request)
+    if action == "intake":
         return _push_write_requested(request)
     if action == "intent":
         return _intent_is_confirm(payload)
@@ -558,7 +564,7 @@ def _run_domain_consumers(action: str, payload: dict[str, Any], *, run_id: str =
         if action == "scan":
             consumers.require_scan_review_only(payload)
             consumers.require_scored_hash_binding(payload, run_id=run_id)
-        elif action == "push":
+        elif action in {"push", "intake"}:
             consumers.require_system_id_allocation(payload)
         elif action == "materials":
             consumers.require_vnext_engine(payload)
@@ -617,7 +623,7 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         elif not (root / ".sopcontrol" / "rules" / "registry.yaml").is_file():
             blockers.append("sopcontrol_registry_unavailable")
 
-    if action == "push":
+    if action in {"push", "intake"}:
         blockers.extend(_check_push_preview(request, Path(workspace)))
     elif action == "intent":
         blockers.extend(_check_intent_confirm(payload, Path(workspace)))
@@ -732,7 +738,7 @@ def record_receipt(
         outcome = "planned"
         side_effect_class = "none"
     elif status in {"succeeded", "activated", "ok"} or status.startswith("set_"):
-        if action == "push" and _push_write_requested(request):
+        if action in {"push", "intake"} and _push_write_requested(request):
             event_type = "side_effect_committed"
             side_effect_class = "tracker_write"
         elif action == "intent" and _intent_is_confirm(payload):
@@ -750,7 +756,7 @@ def record_receipt(
         outcome = status or "ok"
         side_effect_class = "none"
 
-    if status in {"succeeded", "activated"} and action == "push" and _push_write_requested(request):
+    if status in {"succeeded", "activated"} and action in {"push", "intake"} and _push_write_requested(request):
         # Explicit confirm receipt alongside the commit event.
         _emit(
             root,

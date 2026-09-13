@@ -13,6 +13,7 @@ from tools.workflow.adapters import archive as archive_adapter
 from tools.workflow.adapters import audit as audit_adapter
 from tools.workflow.adapters import base as base_adapter
 from tools.workflow.adapters import intent as intent_adapter
+from tools.workflow.adapters import intake as intake_adapter
 from tools.workflow.adapters import materials as materials_adapter
 from tools.workflow.adapters import promote as promote_adapter
 from tools.workflow.adapters import push as push_adapter
@@ -104,6 +105,18 @@ class WorkflowEngine:
             # latest official run is only a convenience default; the adapter
             # still verifies its scored hash and semantic status.
             payload["run_id"] = _latest_scan_run_id(Path(workspace)) or "latest"
+        if request.action == "intake":
+            # A confirmation must resume the same logical URL set that
+            # created the proposal.  Do not make the state machine depend on
+            # a fresh random operation id or on whatever URLs a harness may
+            # repeat on the second call.
+            confirmation_id = request.confirmation_id or payload.get("proposal_id") or payload.get("confirmation_id")
+            if confirmation_id and not str(payload.get("intake_id") or "").strip():
+                proposal = ConfirmationStore(Path(workspace)).load(str(confirmation_id))
+                if isinstance(proposal, dict) and str(proposal.get("intake_id") or "").strip():
+                    payload["intake_id"] = str(proposal["intake_id"])
+            if not str(payload.get("intake_id") or "").strip():
+                payload["intake_id"] = intake_adapter.intake_binding(payload)
         # Keep the request object and the normalized adapter payload aligned
         # for the optional QC bridge and audit record.  Direct
         # ``WorkflowEngine.execute`` callers must receive the same forced
@@ -433,6 +446,8 @@ def _run_adapter(action, payload, workspace, store, dry_run, now):
         )
     if action == "push":
         return push_adapter.handle(payload, workspace=workspace, dry_run=dry_run, store=store)
+    if action == "intake":
+        return intake_adapter.handle(payload, workspace=workspace, dry_run=dry_run, store=store)
     if action == "promote":
         if store is None:
             from tools.workflow.fresh_store import MemoryFreshStore
@@ -486,6 +501,8 @@ def _entity_for(action: str, payload: dict[str, Any], store) -> tuple[str, str]:
         return "scan", str(
             payload.get("run_id") or fixture.get("run_id") or payload.get("mode") or "latest"
         )
+    if action == "intake":
+        return "intake", str(payload.get("intake_id") or payload.get("proposal_id") or "manual-intake")
     if action in {"archive_preview", "archive_fresh", "archive_confirm", "promote"}:
         return "fresh", str(payload.get("target") or getattr(store, "title", None) or "fresh")
     if action in {"materials", "audit", "format", "apply"}:

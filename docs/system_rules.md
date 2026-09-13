@@ -201,6 +201,16 @@ show the same successful-portal rows again.
   digest-bound, write-free proposal; only the same run's unexpired proposal
   with explicit user confirmation may assign a persistent ID and write CSV or
   Google Sheets. A model must never infer entry permission from scan completion.
+- Manual intake is the parallel user-specified URL entry: `/intake` normalizes
+  the supplied URL(s), checks both the local ledger and the selected CSV/Sheet
+  projection for duplicates, and creates a proposal containing only the new
+  postings. Page metadata or explicit user fields must provide the title and
+  employer; the host never guesses them from an opaque URL. A complete JD is
+  scored with the normal profile; an incomplete JD is shown as
+  `待审-JD不足` with blank scores. The preview allocates no persistent ID and
+  writes no tracker row. Only `/intake --confirm <proposal-id>` rechecks the
+  identities, allocates IDs and writes the projection. A supplied full JD is
+  cached after the confirmed write for later materials work.
 - The gateway rejects model-supplied tracker rows, direct-write flags, ID
   allocation flags or archive/clear requests on `/scan` and `/push`. Selection
   is a list of stable keys from the hash-bound scored artifact; an unknown key

@@ -80,6 +80,17 @@
       "tests": ["test_scan_entry_boundary.py"]
     },
     {
+      "rule_id": "INTAKE-001",
+      "domain": "push",
+      "statement": "A user-specified posting is normalized and deduplicated into a write-free proposal; incomplete JD text is marked 待审-JD不足 without a fabricated score, and persistent IDs are allocated only after explicit confirmation.",
+      "level": "MUST",
+      "autonomy": "A0",
+      "enforcement": "code",
+      "failure_status": "blocked",
+      "override_policy": "none",
+      "tests": ["test_manual_intake.py"]
+    },
+    {
       "rule_id": "INTENT-001",
       "domain": "intent",
       "statement": "Intent changes require preview then confirm; casual chat is not authorization.",

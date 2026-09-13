@@ -38,6 +38,11 @@ ACTION_RULES: dict[str, dict[str, Any]] = {
         ],
         "requires_confirmation": True,
     },
+    "intake": {
+        "autonomy": "A0",
+        "rule_ids": ["INTAKE-001", "PUSH-002", "SYNC-001", "SYNC-004", "SYNC-005"],
+        "requires_confirmation": True,
+    },
     "promote": {
         "autonomy": "A0",
         "rule_ids": ["FRESH-001", "FRESH-002"],
@@ -154,6 +159,11 @@ def decide(request: ActionRequest) -> PolicyDecision:
             "clear_fresh", "archive", "generate_materials", "create_cv", "create_cl",
             "render_docx", "render_pdf",
         },
+        "intake": {
+            "prepared_rows", "rows", "write_rows", "direct_write", "append_tracker",
+            "assign_ids", "allocate_ids", "job_ids", "clear_fresh", "archive",
+            "generate_materials", "create_cv", "create_cl", "render_docx", "render_pdf",
+        },
         "materials": {"legacy_pipeline", "direct_docx", "direct_pdf", "direct_convert"},
     }
     forbidden = sorted(
@@ -187,7 +197,7 @@ def decide(request: ActionRequest) -> PolicyDecision:
             autonomy_level=spec["autonomy"],
             next_action="sync_pull_confirm",
         )
-    if needs_confirm and request.action == "push" and not confirmation_id:
+    if needs_confirm and request.action in {"push", "intake"} and not confirmation_id:
         # A push without a proposal is a review-only preview.  The adapter
         # creates the digest-bound proposal; only the second call can write.
         return PolicyDecision(

@@ -19,6 +19,7 @@ RUNTIME_WRITE_ACTIONS = frozenset(
     {
         "scan",
         "push",
+        "intake",
         "materials",
         "audit",
         "format",
@@ -169,7 +170,11 @@ def resolve_workspace(
     if here.name == "JobSearch_2026" and (here / "00_Profile").is_dir():
         return here
     root = product_root()
-    if allow_pointer:
+    # A pointer belongs to this product checkout.  Do not let a process
+    # started from an unrelated directory silently adopt the checkout's
+    # private runtime (which is especially dangerous for another worktree or
+    # a test fixture with its own product root).
+    if allow_pointer and (here == root or root in here.parents):
         bound = load_runtime_pointer(root)
         if bound is not None:
             return bound
@@ -364,6 +369,17 @@ def _prompt_for_action(action: str, internal: dict[str, Any]) -> dict[str, Any] 
             ],
             reply_hint="回复「确认入表」或「取消」",
             reply_contract={"action": "push", "confirmation_id": confirmation_id},
+        )
+    if action == "intake" and str(internal.get("status") or "") in {"planned", "preview"}:
+        return build_user_prompt(
+            "confirm_manual_intake",
+            question="是否确认将这些用户指定岗位分配永久编号并写入 fresh 台账？",
+            options=[
+                {"id": "confirm", "label": "确认入表", "recommended": False},
+                {"id": "cancel", "label": "取消", "recommended": False},
+            ],
+            reply_hint="回复「确认入表」后，按 reply_contract 传回 proposal_id",
+            reply_contract={"action": "intake", "confirmation_id": confirmation_id},
         )
     if action == "intent" and str(internal.get("status") or "") in {"planned", "preview"}:
         return build_user_prompt(

@@ -39,7 +39,7 @@ or push that private runtime.
 
 ## Workflow
 
-`/setup` → `/scan` → `/push` → `/materials` → `/apply`
+`/setup` → `/scan` or `/intake` → `/push`/confirmation → `/materials` → `/apply`
 
 Agents call `python3 -m tools.workflow <action>` before the underlying
 scripts. Promote keeps the fresh tab. Archive/clear requires preview then
