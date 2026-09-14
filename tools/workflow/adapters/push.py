@@ -5,6 +5,8 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
+from contextlib import contextmanager
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,30 @@ from tools.fresh_24h.policy import (
 )
 
 ENTRY_RULE_IDS = ["PUSH-001", "FRESH-001", "SYNC-001", "SYNC-004", "SYNC-005"]
+
+
+@contextmanager
+def _jobsdb_gateway_context():
+    """Authorize the selected-push deep-review child as gateway-owned.
+
+    ``scan`` already sets this marker before launching the scorer.  In the
+    review-first path, however, ``push --select`` calls the same deep-review
+    scorer in-process.  Without the marker, the JobsDB recovery seam correctly
+    fails closed even though the caller is the official workflow gateway.  The
+    marker is scoped to this one deep-review call and is restored immediately;
+    it is never persisted or exposed as user configuration.
+    """
+
+    key = "JOBSFLOW_GATEWAY_ACTIVE"
+    previous = os.environ.get(key)
+    os.environ[key] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
 
 
 def _retire_proposal(
@@ -440,11 +466,17 @@ def handle(
             try:
                 from tools.fresh_24h.two_pass_score import deepen_scored_rows
 
-                deep_rows, deep_review_meta = deepen_scored_rows(
-                    rows,
-                    repo=_repo_for_workspace(workspace),
-                    min_final=float(preferences["final_gate"]),
-                )
+                # This is still an official gateway action, but unlike the
+                # subprocess-based scan it invokes the scorer in-process.  Set
+                # the same narrowly scoped attestation marker for the duration
+                # of the selected deep review so JobsDB can use the approved
+                # primary-Chrome handoff without opening a compatibility path.
+                with _jobsdb_gateway_context():
+                    deep_rows, deep_review_meta = deepen_scored_rows(
+                        rows,
+                        repo=_repo_for_workspace(workspace),
+                        min_final=float(preferences["final_gate"]),
+                    )
             except Exception as exc:
                 return result(
                     status="failed",
