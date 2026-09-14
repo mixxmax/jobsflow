@@ -62,7 +62,12 @@ jobs:
         run: |
           test -f vendor/sopcontrol/plugins/__init__.py
           test -f vendor/sopcontrol/sopcontrol/__init__.py
+          test -f vendor/sopcontrol/VENDOR_MANIFEST.json
           pip install -e vendor/sopcontrol
+      - name: Verify vendor pin/manifest/import
+        run: |
+          python tools/vendorize_sopcontrol.py --verify
+          python -c "import sopcontrol,importlib.metadata as m; assert sopcontrol.__version__==m.version('sopcontrol')"
       - run: python -m pytest -q
       - run: python tools/fresh_24h/validate_queries.py
 
@@ -85,9 +90,12 @@ jobs:
           test -f vendor/sopcontrol/sopcontrol/__init__.py
           test -f vendor/sopcontrol/plugins/__init__.py
           test -f vendor/sopcontrol/pyproject.toml
+          test -f vendor/sopcontrol/VENDOR_MANIFEST.json
           test "$(cat vendor/sopcontrol/PIN.txt)" = "${{ steps.pin.outputs.ref }}"
+          python tools/vendorize_sopcontrol.py --verify
           pip install -e vendor/sopcontrol
           python -c "from plugins import DETECTORS, SENSORS; assert SENSORS and DETECTORS"
+          python -c "import sopcontrol, json; m=json.load(open('vendor/sopcontrol/VENDOR_MANIFEST.json')); assert sopcontrol.__version__==m['version']"
       - name: Require portable control-plane files
         run: |
           test -f .sopcontrol/rules/registry.yaml

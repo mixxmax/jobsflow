@@ -757,6 +757,31 @@ def challenge_admission(
         mse=mse,
     )
     handoff_path, _ = _write_ticket_handoff(root, ticket, op_id, mse=mse)
+    try:
+        from .activity_log import record_activity
+
+        record_activity(
+            root,
+            "ticket_challenged",
+            action=action,
+            run_id=r_id,
+            operation_id=op_id,
+            task_id=task_id,
+            phase=phase,
+            source="runtime",
+            confidence="verified",
+            outcome="challenged",
+            input_fingerprint=fingerprint,
+            plan_digest=effective_plan_digest,
+            side_effect_class=side_effect,
+            cost={"challenge_count": 1, "llm_calls": 0},
+            detail={
+                "ticket_id": ticket.ticket_id,
+                "integration_id": integration_id,
+            },
+        )
+    except Exception:  # noqa: BLE001 — activity log is degradable
+        pass
     return {
         "ticket_id": ticket.ticket_id,
         "handoff": handoff_path,
@@ -884,11 +909,38 @@ def admit_ticket(
         Path(ticket_file).unlink()
     except OSError:
         pass
+    op_out = str(payload.get("operation_id") or expected_op)
+    run_out = stable_run_id(str(payload.get("operation_id") or ticket.ticket_id))
+    try:
+        from .activity_log import record_activity
+
+        record_activity(
+            root,
+            "ticket_redeemed",
+            action=action,
+            run_id=run_out,
+            operation_id=op_out,
+            task_id=ctx_task_id,
+            phase=ctx_phase,
+            source="runtime",
+            confidence="verified",
+            outcome="passed",
+            input_fingerprint=fingerprint,
+            plan_digest=ctx_plan_digest,
+            side_effect_class=side_effect,
+            cost={"admit_count": 1, "llm_calls": 0},
+            detail={
+                "ticket_id": ticket.ticket_id,
+                "integration_id": integration_id,
+            },
+        )
+    except Exception:  # noqa: BLE001 — activity log is degradable
+        pass
     return {
         "admitted": True,
         "ticket_id": ticket.ticket_id,
-        "operation_id": str(payload.get("operation_id") or expected_op),
-        "run_id": stable_run_id(str(payload.get("operation_id") or ticket.ticket_id)),
+        "operation_id": op_out,
+        "run_id": run_out,
     }
 
 

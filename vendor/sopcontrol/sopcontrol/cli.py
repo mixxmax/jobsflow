@@ -26,6 +26,7 @@ from .cli_learn import cmd_learn
 from .cli_enter import *
 from .cli_effect import *
 from .cli_product import *
+from .cli_log import cmd_log
 from .registry import RegistryError
 from .repair import RepairError
 
@@ -1104,6 +1105,42 @@ def build_parser() -> argparse.ArgumentParser:
     p = event_sub.add_parser("validate", help="校验 stdin JSON 事件 schema")
     p.add_argument("path", nargs="?", default=".")
     p.set_defaults(func=cmd_event, sub="validate")
+
+    log = sub.add_parser(
+        "log",
+        help="运行活动日志：list/show/report/health/benchmark（.sopcontrol-local，非权威）",
+    )
+    log_sub = log.add_subparsers(dest="log_sub")
+    p = log_sub.add_parser("list", help="短表列出最近活动事件")
+    p.add_argument("path", nargs="?", default=".")
+    p.add_argument("--run-id", default="")
+    p.add_argument("--task-id", default="")
+    p.add_argument("--operation-id", default="")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_log, log_sub="list")
+    p = log_sub.add_parser("show", help="按 run_id 展示时间线")
+    p.add_argument("path", nargs="?", default=".")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--limit", type=int, default=5000)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_log, log_sub="show")
+    p = log_sub.add_parser("report", help="生成控制效果报告（text/json/markdown）")
+    p.add_argument("path", nargs="?", default=".")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--format", choices=["text", "json", "markdown"], default="markdown")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--limit", type=int, default=5000)
+    p.set_defaults(func=cmd_log, log_sub="report")
+    p = log_sub.add_parser("health", help="活动日志完整性/健康状态")
+    p.add_argument("path", nargs="?", default=".")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_log, log_sub="health")
+    p = log_sub.add_parser("benchmark", help="测量单事件 append 延迟（无 LLM）")
+    p.add_argument("path", nargs="?", default=".")
+    p.add_argument("--count", type=int, default=100)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_log, log_sub="benchmark")
 
     return parser
 

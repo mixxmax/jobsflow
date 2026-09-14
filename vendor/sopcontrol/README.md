@@ -9,7 +9,8 @@
 <p align="center">
   <a href="https://github.com/mixxmax/sopcontrol"><img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.10+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Version-v0.2.0-blue.svg" alt="Version"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Version-v0.4.0-blue.svg" alt="Version"></a>
+  <a href="LIMITATIONS.md"><img src="https://img.shields.io/badge/Status-Beta-orange.svg" alt="Beta"></a>
 </p>
 
 **Keep coding agents faithful to decisions already made.**
@@ -18,7 +19,20 @@
 >
 > It is not another coding agent or an always-on review bot. The fast path is local and deterministic: constrain the task, intercept unauthorized actions, and run only the checks needed for the current change. Stronger semantic review is an escalation for high-risk work, not a ceremony required for every edit.
 
-**Status:** v0.2.0 · Living-project loop · [LIMITATIONS](LIMITATIONS.md) · [CHANGELOG](CHANGELOG.md) · [PLAYBOOK](PLAYBOOK.md)
+**Status:** v0.4.0 · **Beta / early public** · Living-project loop · [LIMITATIONS](LIMITATIONS.md) · [CHANGELOG](CHANGELOG.md) · [PLAYBOOK](PLAYBOOK.md)
+
+### Run visibility (activity log)
+
+After a controlled run you can inspect what was gated, admitted, blocked, or only declared:
+
+```bash
+sopctl log list .
+sopctl log show . --run-id <run-id>
+sopctl log report . --run-id <run-id> --format markdown
+sopctl log health .
+```
+
+Activity logs live under `.sopcontrol-local/` (not git). They never store ticket secrets or full prompts. Logging cannot approve actions or write permanent rules; learning still requires the existing confirmation chain.
 
 ---
 

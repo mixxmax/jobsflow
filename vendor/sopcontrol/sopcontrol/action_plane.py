@@ -336,55 +336,127 @@ def commit_action_result(
     *,
     result_status: str = "success",
 ) -> ActionResult:
-    """Persist a digest-only ControlEvent for the decision (I/O allowed here)."""
-    from .events import ControlEvent, append_event
+    """Persist digest-only activity events for the decision (I/O allowed here).
+
+    Gate purity stays in ``evaluate_action``; this call layer records the timeline.
+    Logging failures degrade and never forge verified success.
+    """
+    from .activity_log import record_activity
 
     root = Path(root)
     envelope = decision.envelope
     action_id = envelope.action_id if envelope else f"act-{uuid4().hex[:12]}"
-    detail = {
+    action = decision.operation or (envelope.raw_tool_name if envelope else "tool")
+    run_id = envelope.run_id if envelope else ""
+    task_id = envelope.task_id if envelope else ""
+    operation_id = action_id
+    harness = envelope.actor.harness if envelope else ""
+    fingerprint = envelope.input_fingerprint if envelope else ""
+    side_effect = ",".join(envelope.requested_side_effects) if envelope else ""
+    base_detail = {
         "surface": decision.surface,
         "operation": decision.operation,
         "decision": decision.decision,
         "rule_ids": list(decision.rule_ids),
         "raw_event_digest": envelope.raw_event_digest if envelope else "",
-        "input_fingerprint": envelope.input_fingerprint if envelope else "",
+        "input_fingerprint": fingerprint,
         "target_digest": _digest(envelope.target) if envelope and envelope.target else "",
     }
     if decision.gap:
-        detail["gap"] = decision.gap
-    # Never persist file bodies / secrets — summary already scrubbed.
+        base_detail["gap"] = decision.gap
     if envelope and envelope.summary:
-        detail["summary_keys"] = envelope.summary.get("keys", [])
+        base_detail["summary_keys"] = envelope.summary.get("keys", [])
 
-    event_type = "action_blocked" if decision.decision == "deny" else "action_completed"
-    if decision.decision == "observe":
-        event_type = "action_started"
-    path = append_event(
-        root,
-        ControlEvent(
-            event_type=event_type,  # type: ignore[arg-type]
-            action=decision.operation or (envelope.raw_tool_name if envelope else "tool"),
-            outcome=decision.decision,
-            blocker=decision.gap or ("denied" if decision.decision == "deny" else ""),
-            next_action="continue" if decision.decision in {"allow", "observe"} else "review",
-            rule_ids=list(decision.rule_ids),
-            detail=detail,
-            task_id=envelope.task_id if envelope else "",
-            run_id=envelope.run_id if envelope else "",
-            project_id=envelope.project_id if envelope else "",
-            worktree_id=envelope.worktree_id if envelope else "",
-            harness=envelope.actor.harness if envelope else "",
-            input_fingerprint=envelope.input_fingerprint if envelope else "",
-            side_effect_class=",".join(envelope.requested_side_effects) if envelope else "",
-        ),
+    common = dict(
+        action=action,
+        run_id=run_id or action_id,
+        operation_id=operation_id,
+        task_id=task_id,
+        project_id=envelope.project_id if envelope else "",
+        worktree_id=envelope.worktree_id if envelope else "",
+        harness=harness,
+        input_fingerprint=fingerprint,
+        side_effect_class=side_effect,
+        actor="agent",
+        source="runtime",
     )
+
+    # 1) request received
+    record_activity(
+        root,
+        "request_received",
+        confidence="observed",
+        outcome="received",
+        sequence=1,
+        detail={k: base_detail[k] for k in ("surface", "operation", "summary_keys") if k in base_detail},
+        **common,
+    )
+    # 2) rules selected (summary only)
+    record_activity(
+        root,
+        "rules_selected",
+        confidence="observed",
+        outcome="selected",
+        rule_ids=list(decision.rule_ids),
+        sequence=2,
+        detail={"selected_rule_count": len(decision.rule_ids), "rule_ids": list(decision.rule_ids)},
+        **common,
+    )
+    # 3) real gate verdict
+    gate_decision = decision.decision
+    record_activity(
+        root,
+        "gate_evaluated",
+        confidence="verified",
+        decision=gate_decision,
+        outcome=gate_decision,
+        rule_ids=list(decision.rule_ids),
+        sequence=3,
+        blocker=decision.gap or ("denied" if gate_decision == "deny" else ""),
+        next_action="continue" if gate_decision in {"allow", "observe"} else "review",
+        detail=base_detail,
+        **common,
+    )
+
+    if gate_decision == "deny":
+        final_type = "action_blocked"
+        confidence = "verified"
+        outcome = "blocked"
+        next_action = "review"
+    elif gate_decision == "observe":
+        # Observe is recorded, not a verified completion of a side effect.
+        final_type = "action_started"
+        confidence = "observed"
+        outcome = "observe"
+        next_action = "continue"
+    else:
+        final_type = "action_completed"
+        confidence = "verified"
+        outcome = "passed"
+        next_action = "continue"
+
+    result = record_activity(
+        root,
+        final_type,  # type: ignore[arg-type]
+        confidence=confidence,
+        decision=gate_decision,
+        outcome=outcome,
+        rule_ids=list(decision.rule_ids),
+        sequence=4,
+        blocker=decision.gap or ("denied" if gate_decision == "deny" else ""),
+        next_action=next_action,
+        detail=base_detail,
+        **common,
+    )
+    path = result.path
     return ActionResult(
         action_id=action_id,
         status=result_status,  # type: ignore[arg-type]
         decision=decision.decision,
-        event_path=str(path),
-        detail={"gap": decision.gap} if decision.gap else {},
+        event_path=str(path) if path else "",
+        detail={"gap": decision.gap, "logging_status": "degraded" if result.degraded else "ok"}
+        if decision.gap or result.degraded
+        else ({"logging_status": "degraded"} if result.degraded else {}),
     )
 
 

@@ -515,10 +515,36 @@ def _proposals_path(root: Path) -> Path:
 
 def save_proposals(root: Path | str, proposals: list[LearningProposal]) -> int:
     import json
-    path = _proposals_path(Path(root))
+    root = Path(root)
+    path = _proposals_path(root)
     with open(path, "a", encoding="utf-8") as fh:
         for p in proposals:
             fh.write(p.model_dump_json() + "\n")
+    try:
+        from .activity_log import record_activity
+
+        for p in proposals:
+            record_activity(
+                root,
+                "proposal_created",
+                action="learning.propose",
+                run_id=str(getattr(p, "window_id", "") or ""),
+                source="runtime",
+                confidence="observed",
+                outcome="proposed",
+                learning={
+                    "eligible": True,
+                    "kind": str(getattr(p, "rule_class", "") or "dynamic_sop"),
+                    "fingerprint": str(getattr(p, "proposal_id", "") or ""),
+                },
+                detail={
+                    "proposal_id": p.proposal_id,
+                    "window_id": str(getattr(p, "window_id", "") or ""),
+                    "route": "",
+                },
+            )
+    except Exception:  # noqa: BLE001
+        pass
     return len(proposals)
 
 
@@ -597,6 +623,25 @@ def issue_learning_confirmation(root: Path | str, proposal_id: str) -> dict[str,
     try:
         handoff.chmod(0o600)
     except OSError:
+        pass
+    try:
+        from .activity_log import record_activity
+
+        record_activity(
+            root,
+            "user_confirmation_requested",
+            action="learning.confirm",
+            source="runtime",
+            confidence="observed",
+            outcome="needs_user",
+            next_action="retry_with_user_confirmation",
+            learning={"eligible": True, "kind": "confirmation", "fingerprint": proposal_id},
+            detail={
+                "proposal_id": proposal_id,
+                "confirmation_id": confirmation_id,
+            },
+        )
+    except Exception:  # noqa: BLE001
         pass
     return {
         "status": "needs_user",
@@ -721,6 +766,33 @@ def decide_proposal(root: Path | str, proposal: LearningProposal,
         result["rule_status"] = compiled["rule_status"]
         result["compile_digest"] = compiled["compile_digest"]
         result["confirmation_id"] = decision.confirmation_id
+        try:
+            from .activity_log import record_activity
+
+            record_activity(
+                root,
+                "rule_promoted",
+                action="learning.promote",
+                source="runtime",
+                confidence="verified",
+                outcome="promoted",
+                rule_ids=[str(confirmed["rule_id"])],
+                learning={
+                    "eligible": False,
+                    "kind": "promoted",
+                    "fingerprint": proposal.proposal_id,
+                },
+                detail={
+                    "proposal_id": proposal.proposal_id,
+                    "rule_id": confirmed["rule_id"],
+                    "compile_digest": compiled.get("compile_digest", ""),
+                    "candidate_id": result.get("candidate_id", ""),
+                    "confirmation_id": decision.confirmation_id,
+                    "route": decision.route,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
     if decision.route in ("document", "both"):
         result["doc_payload"] = {
             "statement": proposal.statement,

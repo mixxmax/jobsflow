@@ -277,28 +277,111 @@ def _emit(
     side_effect_class: str = "none",
     run_id: str = "",
     detail: dict[str, Any] | None = None,
+    operation_id: str = "",
+    phase: str = "",
+    decision: str = "",
+    source: str = "adapter",
+    confidence: str = "observed",
+    cost: dict[str, Any] | None = None,
 ) -> tuple[bool, str | None]:
     api, err = _import_sopcontrol()
     if api is None:
         return False, err
     try:
         safe = sanitize_payload(payload)
-        event = api["ControlEvent"](
-            event_type=event_type,
-            action=action,
-            actor=actor or "agent",
-            harness="jobsflow.workflow",
-            rule_ids=list(rule_ids),
-            input_fingerprint=api["fingerprint_payload"](safe),
-            state_before=state_before,
-            state_after=state_after,
-            side_effect_class=side_effect_class,
-            outcome=outcome,
-            blocker=blocker,
-            next_action=next_action,
-            run_id=run_id,
-            detail=dict(detail or {}),
-        )
+        fingerprint = api["fingerprint_payload"](safe)
+        safe_detail = sanitize_payload(dict(detail or {}))
+        # Prefer activity_log writer when the vendored control plane exposes it.
+        record_activity = None
+        try:
+            from sopcontrol.activity_log import record_activity as _record_activity
+
+            record_activity = _record_activity
+        except ImportError:
+            record_activity = None
+        legacy_types = {
+            "action_started", "preview_created", "user_confirmed",
+            "state_transition_requested", "state_transitioned",
+            "side_effect_requested", "side_effect_committed",
+            "artifact_created", "validation_passed", "validation_failed",
+            "action_completed", "action_blocked",
+        }
+
+        def _legacy_type(name: str) -> str:
+            if name in legacy_types:
+                return name
+            if name in {"action_blocked", "gate_evaluated"} and outcome in {
+                "blocked", "deny", "fail",
+            }:
+                return "action_blocked"
+            if name in {"ticket_challenged", "request_received", "rules_selected",
+                        "gate_evaluated", "ticket_redeemed"}:
+                return "action_started"
+            return "action_completed" if name.endswith("completed") else "action_started"
+
+        if record_activity is not None:
+            try:
+                result = record_activity(
+                    root,
+                    event_type,  # type: ignore[arg-type]
+                    action=action,
+                    actor=actor or "agent",
+                    harness="jobsflow.workflow",
+                    rule_ids=list(rule_ids),
+                    input_fingerprint=fingerprint,
+                    state_before=state_before,
+                    state_after=state_after,
+                    side_effect_class=side_effect_class,
+                    outcome=outcome,
+                    blocker=blocker,
+                    next_action=next_action,
+                    run_id=run_id,
+                    operation_id=operation_id or run_id or action,
+                    phase=phase,
+                    decision=decision,
+                    source=source,
+                    confidence=confidence,
+                    cost=cost or {},
+                    detail=safe_detail,
+                )
+            except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                return False, f"event_error:{type(exc).__name__}"
+            if result.degraded and not result.ok:
+                # Activity log degraded: do not fail closed on receipt path.
+                return True, f"event_degraded:{result.error or 'degraded'}"
+            return True, None
+        event_kwargs = {
+            "event_type": event_type if event_type in legacy_types else _legacy_type(event_type),
+            "action": action,
+            "actor": actor or "agent",
+            "harness": "jobsflow.workflow",
+            "rule_ids": list(rule_ids),
+            "input_fingerprint": fingerprint,
+            "state_before": state_before,
+            "state_after": state_after,
+            "side_effect_class": side_effect_class,
+            "outcome": outcome,
+            "blocker": blocker,
+            "next_action": next_action,
+            "run_id": run_id,
+            "detail": safe_detail,
+        }
+        # Optional v2 fields — older vendor builds ignore unknown kwargs via try.
+        try:
+            event = api["ControlEvent"](
+                **event_kwargs,
+                operation_id=operation_id or run_id or action,
+                phase=phase,
+                decision=decision,
+                source=source,
+                confidence=confidence,
+            )
+        except (TypeError, ValueError):
+            try:
+                event = api["ControlEvent"](**event_kwargs)
+            except (TypeError, ValueError):
+                event_kwargs["event_type"] = _legacy_type(str(event_kwargs.get("event_type") or ""))
+                event = api["ControlEvent"](**event_kwargs)
         api["append_event"](root, event)
         return True, None
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
@@ -783,6 +866,96 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         report["blocking"] = False
         report["verdict"] = "warn"
 
+    # Activity timeline (degradable): request → rules → gate → blocked/started.
+    # Failures must not change admit business semantics except existing receipt fail-closed.
+    op_id = str(run_id or action)
+    _emit(
+        root,
+        event_type="request_received",
+        action=action,
+        actor=actor,
+        rule_ids=sop_rule_ids,
+        payload=payload,
+        state_before=phase,
+        phase=phase,
+        outcome="received",
+        run_id=run_id,
+        operation_id=op_id,
+        source="adapter",
+        confidence="observed",
+        detail={"mode": mode, "status": "admit"},
+    )
+    _emit(
+        root,
+        event_type="rules_selected",
+        action=action,
+        actor=actor,
+        rule_ids=sop_rule_ids,
+        payload={},
+        phase=phase,
+        outcome="selected",
+        run_id=run_id,
+        operation_id=op_id,
+        source="adapter",
+        confidence="observed",
+        detail={"selected_rule_count": len(sop_rule_ids), "rule_ids": sop_rule_ids},
+    )
+    gate_decision = "deny" if blockers and not ticket_challenge else ("ask" if ticket_challenge else "allow")
+    _emit(
+        root,
+        event_type="gate_evaluated",
+        action=action,
+        actor=actor,
+        rule_ids=sop_rule_ids,
+        payload={},
+        phase=phase,
+        decision=gate_decision,
+        outcome=gate_decision,
+        blocker=",".join(blockers),
+        run_id=run_id,
+        operation_id=op_id,
+        source="adapter",
+        confidence="observed",
+        detail={"admit": {"blockers": blockers, "mode": mode, "ticket_challenge": ticket_challenge}},
+    )
+    if ticket_challenge and issued_ticket is not None:
+        _emit(
+            root,
+            event_type="ticket_challenged",
+            action=action,
+            actor=actor,
+            rule_ids=sop_rule_ids,
+            payload={},
+            phase=phase,
+            outcome="challenged",
+            run_id=run_id,
+            operation_id=op_id,
+            source="adapter",
+            confidence="observed",
+            cost={"challenge_count": 1},
+            detail={"ticket_id": issued_ticket["ticket_id"]},
+        )
+    elif writing and tickets_enabled() and package_available and not blockers:
+        # Redeem path already succeeded above; record id only.
+        ticket_id = str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
+        if ticket_id:
+            _emit(
+                root,
+                event_type="ticket_redeemed",
+                action=action,
+                actor=actor,
+                rule_ids=sop_rule_ids,
+                payload={},
+                phase=phase,
+                outcome="passed",
+                run_id=run_id,
+                operation_id=op_id,
+                source="adapter",
+                confidence="observed",
+                cost={"admit_count": 1},
+                detail={"ticket_id": ticket_id},
+            )
+
     emitted, emit_err = _emit(
         root,
         event_type="action_started" if not blockers else "action_blocked",
@@ -791,11 +964,16 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         rule_ids=sop_rule_ids,
         payload=payload,
         state_before=phase,
+        phase=phase,
+        decision=gate_decision,
         outcome="ticket_required" if ticket_challenge else ("blocked" if blockers else "admitted"),
         blocker=",".join(blockers),
         next_action=str(report.get("next_action") or report.get("verdict") or ""),
         side_effect_class="none",
         run_id=run_id,
+        operation_id=op_id,
+        source="adapter",
+        confidence="observed",
         detail={"admit": {"blockers": blockers, "mode": mode, "ticket_challenge": ticket_challenge}},
     )
     if not emitted and mode == "enforce" and writing and not ticket_challenge:
@@ -881,6 +1059,13 @@ def record_receipt(
             detail={"workflow_event_id": event_id},
         )
 
+    conf = "declared" if status in {"", "unknown"} else "observed"
+    if event_type in {"action_blocked", "validation_failed"}:
+        conf = "observed"
+    elif event_type in {"side_effect_committed", "action_completed"} and status in {
+        "succeeded", "activated", "ok",
+    }:
+        conf = "observed"
     emitted, emit_err = _emit(
         root,
         event_type=event_type,
@@ -890,17 +1075,22 @@ def record_receipt(
         payload=payload,
         state_before=str(out.get("before_state") or getattr(entity, "phase", "") or ""),
         state_after=str(out.get("after_state") or ""),
+        phase=str(getattr(entity, "phase", "") or ""),
         outcome=outcome,
         blocker=",".join(blockers),
         next_action=str(out.get("next_action") or ""),
         side_effect_class=side_effect_class,
         run_id=run_id,
+        operation_id=str(run_id or action),
+        source="adapter",
+        confidence=conf,
         detail={
             "workflow_event_id": event_id,
             "status": status,
             "workspace_fingerprint": _digest(str(Path(workspace).resolve())),
         },
     )
+    # Degraded logging must not flip business receipt semantics.
     report = {
         "mode": mode,
         "phase": "receipt",
@@ -911,6 +1101,7 @@ def record_receipt(
         "blocking": False,
         "emitted": emitted,
         "emit_error": emit_err,
+        "logging_status": "degraded" if emit_err else "ok",
         "product_root": str(root),
         "tickets_enabled": tickets_enabled(),
     }
