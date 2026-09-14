@@ -13,7 +13,7 @@ from .capability_events import load_capability_events_checked
 from .ledger import Ledger
 from .model import content_hash, utcnow
 
-CandidateKind = Literal["policy", "guard_pattern", "finding_pattern", "correction", "deprecation"]
+CandidateKind = Literal["policy", "guard_pattern", "finding_pattern", "correction", "deprecation", "dynamic_sop"]
 CandidateStatus = Literal["observed", "triaged", "rejected", "expired"]
 CandidateAction = Literal[
     "register_rule",
@@ -72,6 +72,9 @@ class CandidateRecord(BaseModel):
     last_seen_at: datetime = Field(default_factory=utcnow)
     status: CandidateStatus = "observed"
     note: str = "候选只供审查；晋升仍须显式 sopctl rule add"
+    # WP-C 三级捕获：low=低打扰待确认，high=明确长期/重复纠正。
+    priority: str = "low"
+    explicit_once_only: bool = False
 
 
 class CorrectionObservation(BaseModel):
@@ -132,6 +135,8 @@ class CandidateStore:
             last_seen_at=data.get("last_seen_at") or last,
             status=str(data.get("status") or "observed"),
             note=str(data.get("note") or "候选只供审查；晋升仍须显式 sopctl rule add"),
+            priority=str(data.get("priority") or "low"),
+            explicit_once_only=bool(data.get("explicit_once_only", False)),
         )
 
     def load(self) -> list[CandidateRecord]:
@@ -168,6 +173,8 @@ class CandidateStore:
         suggested_modality: str,
         source: CandidateSource,
         note: Optional[str] = None,
+        priority: str = "low",
+        explicit_once_only: bool = False,
     ) -> tuple[CandidateRecord, bool]:
         normalized = _normalize(statement)
         fingerprint = candidate_fingerprint(
@@ -189,6 +196,8 @@ class CandidateStore:
                 suggested_action=suggested_action,
                 suggested_modality=suggested_modality,
                 note=note or "候选只供审查；晋升仍须显式 sopctl rule add",
+                priority=priority if priority in ("low", "high") else "low",
+                explicit_once_only=bool(explicit_once_only),
             )
             records.append(record)
         occurrence_ids = {item.occurrence_id for item in record.sources}

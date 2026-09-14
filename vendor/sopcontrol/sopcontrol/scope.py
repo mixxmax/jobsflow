@@ -4,9 +4,23 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import PurePosixPath
 
 from .model import Evidence, Rule
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def validate_identifier(value: str, *, kind: str = "identifier") -> str:
+    """文件名/任务名/入口名校验：禁路径分隔与逃逸（..、/、空、超长）。
+
+    凡把外部输入拼入文件路径的调用方必须先过此门。
+    """
+    text = str(value or "")
+    if not _IDENTIFIER_RE.match(text):
+        raise ValueError(f"非法{kind}: {text!r}（仅允许字母数字._-，64 字符内，非空开头）")
+    return text
 
 
 # Only these evidence kinds interpret ``subject`` as a repository path. Unknown

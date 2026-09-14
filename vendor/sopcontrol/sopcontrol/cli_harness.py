@@ -204,19 +204,22 @@ def cmd_capability_events(args) -> int:
 def cmd_harness_check(args) -> int:
     """harness 工具调用决策：stdin JSON 或 --payload；stdout 出决策 JSON。
 
-    落 trace 在这一层而不在 check_tool_call 里：决策函数是纯的（宪法测试守卫），
-    写盘只能由调用方做。这条 I/O 换来手册 6.5 条件6 的运行时证据。
+    落 trace / Action Plane receipt 在这一层：决策函数是纯的（宪法测试守卫），
+    写盘只能由调用方做。未知工具也必须留下事件，不得静默消失（Phase B）。
     """
-    from .harness import check_tool_call, gate_status_for_push
+    from .action_plane import commit_action_result, evaluate_payload
+    from .harness import extract_claimed_model, gate_status_for_push
     from .intent import load_session_intent
     from .trace import append_event
 
     root = _project(args.path)
     raw = args.payload if args.payload else (sys.stdin.read() or "{}")
     tool = "unparsed"
+    action_decision = None
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
+        # harness-check is the control channel itself → parse failure fail-closed
         decision = HookDecision(
             permissionDecision="deny",
             reason=f"harness check 无法解析输入（{exc}）：解析失败 fail-closed",
@@ -235,14 +238,23 @@ def cmd_harness_check(args) -> int:
             bound_executor = active_bound_executor(TaskStore(root).list_all())
         except Exception:
             bound_executor = ""
-        from .harness import extract_claimed_model
 
-        decision = check_tool_call(
+        action_decision = evaluate_payload(
             payload,
-            gate_status,
+            gate_status=gate_status,
             session_intent=session.intent,
             bound_executor=bound_executor or None,
             claimed_model=extract_claimed_model(payload) or None,
+        )
+        # Wire protocol: observe maps to allow (visible, not blocking)
+        wire = (
+            "allow" if action_decision.decision == "observe"
+            else action_decision.decision
+        )
+        decision = HookDecision(
+            permissionDecision=wire,  # type: ignore[arg-type]
+            reason=action_decision.reason,
+            rule_ids=list(action_decision.rule_ids),
         )
 
     append_event(
@@ -252,6 +264,11 @@ def cmd_harness_check(args) -> int:
         rule_ids=decision.rule_ids,
         detail=decision.reason,
     )
+    if action_decision is not None:
+        try:
+            commit_action_result(root, action_decision)
+        except Exception:
+            pass
     from .capability_events import CapabilityEvent, append_capability_event
 
     append_capability_event(
@@ -329,7 +346,8 @@ def cmd_hook_claude(args) -> int:
     # 于是这个坏掉的安装器一直「看起来装好了」。tests/harness 现在拿真 parser 校验它。
     command = f'"{sys.executable}" -m sopcontrol.cli harness-check'
     pre = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
-    entry = {"matcher": "Bash|Write|Edit|MultiEdit", "hooks": [{"type": "command", "command": command}]}
+    # Match all tools so Read/Search/Browser/MCP/unknown enter Action Plane (Phase B).
+    entry = {"matcher": ".*", "hooks": [{"type": "command", "command": command}]}
 
     replaced = False
     for existing in pre:

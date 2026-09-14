@@ -140,6 +140,17 @@ single-use state. Never place the secret in source control or durable logs,
 and never switch to a legacy script to avoid the challenge. Fixture and
 `--dry-run` scans remain review-only and do not require a ticket.
 
+### 4.1 Bounded learning and `/learn`
+
+JobsFlow may submit a short, sanitised correction or workflow marker to the
+vendored SOP Control learning surface. Ordinary actions do not call an LLM,
+request a capability ticket, or block delivery for learning. At a task or
+phase boundary, a bounded window may be aggregated into a pending proposal.
+The proposal is not a rule: it becomes control, documentation, both, or
+session-only behavior only after an explicit user route through `/learn` (or
+`python3 -m tools.workflow learn ...`). JD/resume/CV/CL/email bodies,
+credentials, cookies and tokens are never learning-event inputs.
+
 The private setup configuration must contain at least three intent buckets:
 
 1. core target roles;

@@ -532,6 +532,19 @@ def wrap_result(
         }
     if retry is not None:
         out["retry"] = retry
+    # Learning proposals are informational and must not turn a completed
+    # workflow into a blocked business action.  They still carry the same
+    # host-owned prompt contract so every harness can display and route the
+    # user's choice without inventing a second confirmation protocol.
+    learning_notice = redacted.get("learning_notification")
+    if isinstance(learning_notice, dict) and isinstance(learning_notice.get("prompt"), dict):
+        out["learning_notification"] = learning_notice
+        out["learning_protocol"] = {
+            "must_display_prompt": True,
+            "must_not_apply_without_user_route": True,
+            "reply_contract": learning_notice["prompt"].get("reply_contract") or {},
+            "instruction": "学习提案尚未生效；仅在用户明确选择 route 后调用 learn decide。",
+        }
     return out
 
 

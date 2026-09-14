@@ -214,6 +214,47 @@ def apply_behavior_ceiling(knobs: ControlKnobs, behavior) -> ControlKnobs:
     return knobs
 
 
+def actor_snapshot(profile: Optional[ModelProfile], *,
+                   current_model: Optional[str] = None,
+                   now: Optional[datetime] = None) -> dict:
+    """Actor capability 规范化快照（§6.6/§4.1）：只含控制能力上限，不含业务审计。
+
+    未获批准/过期/无法验证 → 保守 unknown 画像（tier/max_repairs 最小），
+    并如实标记 approved=false；调用方不得当作无限能力。
+    """
+    approved = profile_approval_is_current(profile, current_model=current_model, now=now)
+    knobs = control_knobs("unknown") if not approved else None
+    if approved:
+        assert profile is not None
+        knobs = effective_control_knobs(profile, current_model=current_model, now=now)
+    snapshot = {
+        "tier": knobs.tier,
+        "max_repairs": knobs.max_repairs,
+        "write_granularity": knobs.write_granularity,
+        "strict_schema": knobs.strict_schema,
+        "source": profile.source if profile else "none",
+        "evaluation_id": profile.evaluation_id if profile else "",
+        "approved": bool(approved),
+        "approved_by": profile.approved_by if (profile and approved) else "",
+        "model": current_model or "",
+    }
+    snapshot["digest"] = "actor-" + hashlib.sha256(
+        json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return snapshot
+
+
+def actor_snapshot_for_task(root: Path, model_identity: str,
+                            now: Optional[datetime] = None) -> dict | None:
+    """任务绑定的 actor 快照：无执行者身份即无上下文（返回 None，不伪造层）。
+
+    有身份即快照（含未批准→保守），调用方据此进入分层 digest。
+    """
+    if not (model_identity or "").strip():
+        return None
+    return actor_snapshot(load_profile(Path(root)),
+                          current_model=model_identity, now=now)
+
+
 def profile_path(root: Path) -> Path:
     return Path(root) / ".sopcontrol" / "model-profile.yaml"
 

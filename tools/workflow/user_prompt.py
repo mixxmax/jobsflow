@@ -14,6 +14,7 @@ PROMPT_KINDS = (
     "confirm_reset",
     "ask_preflight",
     "confirm_archive",
+    "learning_proposal",
 )
 
 

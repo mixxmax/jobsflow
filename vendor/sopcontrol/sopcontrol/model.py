@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 
 
 def utcnow() -> datetime:
@@ -120,6 +120,32 @@ class SourceRef(BaseModel):
     observed_at: Optional[datetime] = None
 
 
+RuleClass = Literal["constitution", "dynamic_sop", "natural_logic"]
+
+
+class ActivationSelector(BaseModel):
+    """上下文选择器（手册 §2.2/§4.4）：空维度=不限；不匹配→not_applicable（可解释）。"""
+    model_config = ConfigDict(extra="forbid")
+
+    products: list[str] = Field(default_factory=list)
+    actions: list[str] = Field(default_factory=list)
+    phases: list[str] = Field(default_factory=list)
+    artifact_kinds: list[str] = Field(default_factory=list)
+    actors: list[str] = Field(default_factory=list)
+
+
+class Flexibility(BaseModel):
+    """动态 SOP 的弹性表达（手册 §4.3）：不是开关，是容忍区间与修正策略。"""
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_variance: str = ""          # 允许的自由判断范围说明
+    lower_bound: str = ""               # 下界（必须做到）
+    upper_bound: str = ""               # 上界（不得越过）
+    correction_policy: Literal["keep", "minimal_fix", "redo", "escalate_human"] = "minimal_fix"
+    max_correction_rounds: int = 1
+    forbid_scope_expansion: bool = True  # 不得扩大审查目标
+
+
 class RuleLifecycleEvent(BaseModel):
     action: Literal["suspend", "reinstate", "narrow"]
     actor: str
@@ -155,6 +181,9 @@ class Rule(BaseModel):
     statement: str
     modality: Modality
     status: RuleStatus = RuleStatus.proposed
+    rule_class: RuleClass = "constitution"
+    activation: ActivationSelector = Field(default_factory=ActivationSelector)
+    flexibility: Flexibility = Field(default_factory=Flexibility)
     scope: str = "project"
     scope_paths: list[str] = Field(default_factory=list)
     lifecycle_revision: int = 0
@@ -188,6 +217,10 @@ class Rule(BaseModel):
     tags: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)
     accepted_at: Optional[datetime] = None
+    # 编译证据（§6.1）：compiled 必须有编译成功证据，不能由确认直接冒充。
+    compiled_at: Optional[datetime] = None
+    compile_digest: str = ""
+    compile_tool: str = ""
 
     @field_validator("rule_id")
     @classmethod

@@ -39,7 +39,7 @@ or push that private runtime.
 
 ## Workflow
 
-`/setup` → `/scan` or `/intake` → `/push`/confirmation → `/materials` → `/apply`
+`/setup` → `/scan` or `/intake` → `/push`/confirmation → `/materials` → `/apply`; `/learn` is the bounded, explicit learning review path.
 
 Agents call `python3 -m tools.workflow <action>` before the underlying
 scripts. Promote keeps the fresh tab. Archive/clear requires preview then
@@ -55,6 +55,10 @@ confirm. `/apply` never submits.
   and a privacy-preserving lessons ledger. No Codex/Claude vendor is mandatory.
 - `/apply` verifies the package and asks for confirmation; it never
   automatically submits an application.
+- Learning is observational and bounded: ordinary workflow actions do not call
+  an LLM or block delivery. Explicit corrections are sanitised into a scoped
+  event, reviewed at a task/phase boundary, and shown as a pending proposal;
+  only an explicit user route can send it to control or documentation.
 - CV and cover-letter PDFs use the one-page DOCX → LibreOffice headless path.
 
 Role-title handling is host-owned: acronym compounds such as `ECM/IPO` and
@@ -98,7 +102,7 @@ machine-readable blocker instead of guessing.
 5. 项目何以至此：见下节；全量编年 `sopctl chronicle`。
 
 ## 何以至此（换模型/换会话）
-- 编年 77 条（完整性 OK）；下列为最近 5 条治理动作：
+- 编年 86 条（完整性 OK）；下列为最近 5 条治理动作：
 - [2026-09-10T07:36] JF-MAT-107 proposed→accepted
 - [2026-09-10T07:36] JF-MAT-004 → superseded
 - [2026-09-10T07:36] JF-MAT-005 → superseded
@@ -107,7 +111,7 @@ machine-readable blocker instead of guessing.
 - 全量：`sopctl chronicle`；核对：`sopctl chronicle check`。
 
 ## 空间生长（无感观察；定型需人）
-- 空间生长（无感）：观察 106；待人定型候选 7（删入口 0 / 改善入口 0 / 登记规则 0）
+- 空间生长（无感）：观察 133；待人定型候选 7（删入口 0 / 改善入口 0 / 登记规则 0）
 - 发现已自动；写入权威或删代码仍需人确认——不是要你「推进发现」。
 - 最近空间快照：ambiguity_index=0 （旁路开 0 / 平行状态 0）
 - 相对上一帧：歧义指数未变：ambiguity_index=0（`sopctl growth diff`）

@@ -61,13 +61,25 @@ const PROJECT = {project_json};
 export const SopControl = async () => {{
   return {{
     "tool.execute.before": async (input, output) => {{
-      let payload = null;
+      // All tools enter Action Plane via harness-check (Phase B full ingest).
+      // Unknown / read / search / browser / mcp → observe (allow on wire, event recorded).
+      const args = output.args ?? {{}};
+      let payload;
       if (input.tool === "bash") {{
-        payload = {{ tool_name: "Bash", tool_input: {{ command: output.args.command }} }};
+        payload = {{ tool_name: "Bash", tool_input: {{ command: args.command }} }};
       }} else if (input.tool === "edit" || input.tool === "write") {{
-        payload = {{ tool_name: "Write", tool_input: {{ file_path: output.args.filePath ?? output.args.file_path }} }};
+        payload = {{
+          tool_name: input.tool === "edit" ? "Edit" : "Write",
+          tool_input: {{
+            file_path: args.filePath ?? args.file_path ?? args.path,
+            content: args.content,
+            old_string: args.oldString ?? args.old_string,
+            new_string: args.newString ?? args.new_string,
+          }},
+        }};
+      }} else {{
+        payload = {{ tool_name: String(input.tool || "unknown"), tool_input: args }};
       }}
-      if (!payload) return; // 非受控工具：观察，不阻断
       const model =
         input.model ??
         input.session?.model ??
@@ -80,7 +92,14 @@ export const SopControl = async () => {{
       try {{
         const out = execFileSync(PY, ["-m", "sopcontrol.cli", "harness-check", "--payload",
           JSON.stringify(payload), PROJECT], {{ encoding: "utf8" }});
-        decision = JSON.parse(out);
+        // harness-check may print banners; take last JSON object line
+        const lines = String(out).trim().split(/\\n/);
+        let parsed = null;
+        for (let i = lines.length - 1; i >= 0; i--) {{
+          const line = lines[i].trim();
+          if (line.startsWith("{{")) {{ try {{ parsed = JSON.parse(line); break; }} catch (_) {{}} }}
+        }}
+        decision = parsed ?? JSON.parse(out);
       }} catch (e) {{
         throw new Error("[sopcontrol] harness-check 不可用，fail-closed: " + e.message);
       }}

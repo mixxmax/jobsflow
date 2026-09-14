@@ -168,115 +168,34 @@ def check_tool_call(
     bound_executor: Optional[str] = None,
     claimed_model: Optional[str] = None,
 ) -> HookDecision:
-    """gate_status: None=与终点门无关 / "block" / "warn" / "clean"。纯函数。
+    """Compatibility wrapper over Action Plane (Phase B).
 
-    session_intent: 由调用方注入（CLI 读 session-intent.yaml）；discuss_only 时拒绝写工具。
-    bound_executor / claimed_model: 由调用方注入；任务已绑定执行者且载荷声明了当前模型时，
-    不一致则拒绝写/bash（中途换模型须先 task rebind）。
-    工具名大小写归一（Claude 用 Bash/Write，OpenCode 用 bash/edit/write）。
+    Still a pure function (no I/O). Claude/OpenCode protocol only speaks
+    allow/deny/ask — ActionDecision.observe maps to allow for the wire format
+    while commit_action_result (CLI layer) records the observe event.
     """
-    tool = str(payload.get("tool_name") or "").lower()
-    tool_input = payload.get("tool_input") or {}
+    from .action_plane import evaluate_payload
+
     intent = session_intent or str(payload.get("session_intent") or "")
-    claimed = (claimed_model if claimed_model is not None else extract_claimed_model(payload)).strip()
-    bound = (bound_executor or "").strip()
-
-    # 写工具与 bash：有绑定执行者且载荷声明了模型时，强制身份一致
-    if bound and claimed and tool in {"write", "edit", "multiedit", "bash"}:
-        if claimed != bound:
-            return _deny(
-                f"当前模型 {claimed} 与进行中任务的执行者 {bound} 不一致："
-                f"对话中途换模型不得继承旧放宽；请先 "
-                f"sopctl task rebind <TASK-ID> --model {claimed}",
-                GUARD_EXECUTOR_IDENTITY,
-            )
-
-    if tool in {"write", "edit", "multiedit"}:
-        if intent == "discuss_only":
-            return _deny(
-                "当前会话意图为 discuss_only（用户明确只讨论不修改）：拒绝写文件。"
-                "讨论不是实施授权（14.1 场景1）；若要改代码请先解除讨论锁定"
-                "（说出实施意图或 sopctl intent clear）",
-                GUARD_INTENT,
-            )
-        file_path = str(
-            tool_input.get("file_path") or tool_input.get("filePath")
-            or tool_input.get("path") or ""
+    decision = evaluate_payload(
+        payload,
+        gate_status=gate_status,
+        session_intent=intent,
+        bound_executor=bound_executor,
+        claimed_model=claimed_model,
+    )
+    # Protocol mapping: observe is visible-but-not-blocking on the wire.
+    if decision.decision == "observe":
+        return _allow(decision.reason, *decision.rule_ids)
+    if decision.decision == "deny":
+        return _deny(decision.reason, *decision.rule_ids)
+    if decision.decision == "ask":
+        return HookDecision(
+            permissionDecision="ask",
+            reason=decision.reason,
+            rule_ids=list(decision.rule_ids),
         )
-        if file_path and touches_protected_path(file_path):
-            return _deny(
-                f"控制器文件 {file_path} 不允许经普通写入口修改：规则/账本/任务只能通过 "
-                f"sopctl 命令变更（信任根，手册 9.3）；规则变更请走 sopctl rule 流程",
-                GUARD_CONTROLLER_WRITE,
-            )
-        if file_path and touches_protected_install(file_path):
-            return _deny(
-                f"{file_path} 是 sopctl 安装的拦截组件：移除自身项圈属于提权动作，"
-                f"需要人工执行（手册 12.2）",
-                GUARD_SELF_UNINSTALL,
-            )
-        # 放行也带 guard：这几条 guard 每次写入都真的过了一遍，trace 记的是「被咨询」
-        consulted = [GUARD_INTENT, GUARD_CONTROLLER_WRITE, GUARD_SELF_UNINSTALL]
-        if bound and claimed:
-            consulted.append(GUARD_EXECUTOR_IDENTITY)
-        return _allow("普通文件写入，不在受控清单", *consulted)
-
-    if tool == "bash":
-        command = str(tool_input.get("command") or "")
-
-        if "--no-verify" in command:
-            return _deny(
-                "拒绝 --no-verify：绕过验证钩子属于已登记绕过家族 R6，一律阻断",
-                GUARD_NO_VERIFY,
-            )
-
-        if command_touches_controller(command):
-            return _deny(
-                f"命令直接触碰控制器状态或拦截组件（{PROTECTED_DIR}/、opencode 插件、claude 钩子配置）"
-                f"但不是单一 sopctl 调用：一切经单一 sopctl 子命令；移除拦截组件需人工执行",
-                GUARD_CONTROLLER_BASH,
-            )
-
-        normalized_command = command.casefold()
-        capability_live = "capability-eval" in normalized_command and "--live" in normalized_command
-        capability_approve = "capability-approve" in normalized_command
-        if capability_live or capability_approve:
-            action = "真实模型能力评测" if capability_live else "模型能力画像批准"
-            return HookDecision(
-                permissionDecision="ask",
-                reason=f"{action}可能扩大后续任务权限，必须由人工在交互终端确认；agent 不得自评自批",
-                rule_ids=[GUARD_CAPABILITY_APPROVAL],
-            )
-
-        if PUSH_RE.search(command):
-            if gate_status is None:
-                return _deny(
-                    "git push 未经过终点门评估（上下文缺失）：fail-closed 拒绝；请经 sopctl hook 安装的入口执行",
-                    GUARD_PUSH_GATE,
-                )
-            if gate_status == "block":
-                return _deny(
-                    "终点门阻断：存在 fail 判定或账本损坏，禁止推送。运行 sopctl gate 查看具体规则与理由",
-                    GUARD_PUSH_GATE,
-                )
-            if gate_status == "warn":
-                return HookDecision(
-                    permissionDecision="ask",
-                    reason="终点门警告：存在 gap（规则未接线或未测试）。建议先 sopctl gate 复核；确要推送请人工确认",
-                    rule_ids=[GUARD_PUSH_GATE],
-                )
-            if gate_status == "clean":
-                return _allow("终点门通过：无 fail 判定，账本完整", GUARD_PUSH_GATE)
-
-        # 走到这里说明命令过了 no-verify 与控制器两道 guard，两者都该记入 trace
-        return _allow(
-            "不在受控动作清单（观察模式）",
-            GUARD_NO_VERIFY,
-            GUARD_CONTROLLER_BASH,
-        )
-
-    # 非写、非 bash：没有任何 guard 参与判断，rule_ids 为空（不虚报咨询过）
-    return _allow(f"工具 {tool or '未知'} 不在受控范围（观察模式）")
+    return _allow(decision.reason, *decision.rule_ids)
 
 
 def gate_status_for_push(root) -> Optional[str]:

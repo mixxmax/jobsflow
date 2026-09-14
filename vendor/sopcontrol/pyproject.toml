@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sopcontrol"
-version = "0.2.0"
-description = "SOP Control: model-neutral project control plane for coding agents (experimental but real)"
+version = "0.3.0"
+description = "SOP Control: model-neutral project control plane for coding agents (beta)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -19,7 +19,7 @@ keywords = [
     "verification",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
@@ -65,6 +65,11 @@ testpaths = ["tests"]
 [tool.coverage.run]
 branch = true
 source = ["sopcontrol", "plugins"]
+# staged runtime 复制品是构建产物（WP-E §9.5），不是被测源码——omit 后
+# fail_under 才度量真实源码；否则副本 0% 会淹没真实覆盖率。
+omit = ["*/.sopcontrol-local/runtimes/*"]
+# 子进程并行数据：pytest-cov 在报告前自动合并（防 statement/branch 混合 DataError）
+parallel = true
 
 [tool.coverage.report]
 # fail_under applies to the combined statement+branch metric; branch execution

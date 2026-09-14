@@ -308,6 +308,27 @@ def cmd_doctor(args) -> int:
             problems.append("垂直役用要求已安装 pre-push 终态门（sopctl hook install）")
     print(f"pre-push 终态门: {state}")
 
+    try:
+        from .control_profile import list_frozen
+        from .control_result import control_costs
+
+        frozen = list_frozen(root)
+        costs = control_costs(root)
+        if frozen or costs["audits"]:
+            packs = ", ".join(f"{p.profile_id} r{p.revision} {p.digest[:13]}…" for p in frozen)
+            print(
+                f"动态控制: profile {len(frozen)} 个"
+                + (f"（{packs}）" if packs else "")
+                + f"；审计 {costs['audits']} 次/复用 {costs['reuses']} 次/"
+                + f"阻断 {costs['outcomes'].get('block', 0)}"
+            )
+            if costs["profile_conflict_blocks"]:
+                print(f"动态控制风险: profile 冲突阻断 {costs['profile_conflict_blocks']} 次")
+        else:
+            print("动态控制: 未使用（profile create/freeze 起配）")
+    except Exception as exc:
+        print(f"动态控制: 跳过（{type(exc).__name__}: {exc}）")
+
     inv = None
     snaps = []
     try:
@@ -383,6 +404,65 @@ def cmd_doctor(args) -> int:
             )
     except Exception as exc:
         print(f"空间生长: 跳过（{type(exc).__name__}: {exc}）")
+
+    try:
+        # B8：MSE 诊断节（只读横切，不改判定）。
+        from pathlib import Path as _P
+        _mse_root = _P(root)
+        _mse_lines: list[str] = []
+        try:
+            from .surface_inventory import SurfaceStore
+            _inv = SurfaceStore(_mse_root).load()
+            _missing = [r for r in _inv.surfaces
+                        if r.kind in ("cli", "script", "adapter")
+                        and r.status in ("observed", "candidate", "ambiguous", "gap", "blocked")]
+            _mse_lines.append(f"MSE 缺算子 surface: {len(_missing)}（下一步: sopctl logic operator candidates）")
+        except Exception as _e:
+            _mse_lines.append(f"MSE 缺算子 surface: 跳过（{type(_e).__name__}）")
+        try:
+            import yaml as _yaml
+            _ops_f = _mse_root / ".sopcontrol-local" / "logic" / "operators.yaml"
+            _unk = 0
+            if _ops_f.is_file():
+                from .operator_contract import load_product_declaration
+                _decl = _yaml.safe_load(_ops_f.read_text(encoding="utf-8")) or {}
+                _ops, _, _ = load_product_declaration(_decl)
+                _unk = sum(1 for _o in _ops if _o.cardinality.effect == "unknown")
+            _mse_lines.append(f"MSE 高成本未知依赖 operator: {_unk}（下一步: 补 cardinality.effect 声明）")
+        except Exception as _e:
+            _mse_lines.append(f"MSE 高成本未知依赖 operator: 跳过（{type(_e).__name__}）")
+        try:
+            from .goal_contract import validate_goal_contract
+            import yaml as _yaml2
+            _gfails = 0
+            for _gf in sorted((_mse_root / ".sopcontrol-local" / "logic").glob("goal-*.yaml")):
+                try:
+                    validate_goal_contract(_yaml2.safe_load(_gf.read_text(encoding="utf-8")) or {})
+                except Exception:
+                    _gfails += 1
+            _mse_lines.append(f"MSE goal 编译失败: {_gfails}（下一步: sopctl logic goal --help 核对）")
+        except Exception as _e:
+            _mse_lines.append(f"MSE goal 编译失败: 跳过（{type(_e).__name__}）")
+        try:
+            _ldir = _mse_root / ".sopcontrol-local" / "logic"
+            _plans = len(list((_ldir / "plans").glob("*.json"))) if (_ldir / "plans").is_dir() else 0
+            _rc = _ldir / "receipts.jsonl"
+            _rn = _sn = 0
+            if _rc.is_file():
+                for _line in _rc.read_text(encoding="utf-8").splitlines():
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    _rn += 1
+                    if '"strategy"' in _line or "'strategy'" in _line:
+                        _sn += 1
+            _mse_lines.append(f"MSE 冻结计划 {_plans} / 回执 {_rn} / strategy {_sn}（下一步: sopctl logic costs）")
+        except Exception as _e:
+            _mse_lines.append(f"MSE 冻结/回执: 跳过（{type(_e).__name__}）")
+        for _ml in _mse_lines:
+            print(_ml)
+    except Exception as exc:
+        print(f"MSE 诊断: 跳过（{type(exc).__name__}: {exc}）")
 
     try:
         from .next_moves import adoption_next_moves, format_next_moves
@@ -637,6 +717,13 @@ def cmd_event(args) -> int:
 
 
 def cmd_hook(args) -> int:
+    from .resolve_cli import hook_shell_available
+
+    shell_ok, shell_why = hook_shell_available()
+    if not shell_ok:
+        # P2 Windows 矩阵：无 shell 时拒绝写入必坏的 sh hook。
+        print(f"拒绝安装: {shell_why}", file=sys.stderr)
+        return 2
     root = _project(args.path)
     git_dir = root / ".git"
     if not git_dir.exists():

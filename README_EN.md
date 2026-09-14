@@ -91,6 +91,16 @@ Artifacts, state and traceable evidence
 
 SOP Control therefore reduces cross-model drift and rework without adding a daily control conversation. Most users only need the normal `/setup`, `/scan`, `/push`, `/materials` and `/apply` commands.
 
+### Bounded automatic learning: remember experience without changing rules silently
+
+At workflow boundaries, JobsFlow can record short, sanitised corrections and execution markers,
+then aggregate them by task or phase into a pending learning proposal. This surface does not read
+or retain JDs, résumés, CV/CL files, email, cookies, tokens or long material bodies. Ordinary
+actions do not make an extra model call and a learning outage never blocks scanning, entry or
+material delivery. A proposal is routed to SOP Control, product documentation, both, or the current
+task only after the user explicitly chooses; the model cannot approve it on the user's behalf. Use
+`/learn` to inspect, defer or reject proposals while keeping the product boundary under user control.
+
 ## Quick start
 
 ```bash

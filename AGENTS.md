@@ -24,6 +24,7 @@ All agents (Claude, Cursor, Codex, etc.) must read and obey:
 | `/setup` | 首次安装向导：检查环境、读简历、问意向、生成配置 | 新用户首次使用 |
 | `/scan` | 扫描新职位 + 两段评分 | 日常扫岗 |
 | `/intake` | 接收用户指定 URL，预览去重并在确认后入表 | 用户已在外部看到具体岗位时 |
+| `/learn` | 回顾有界任务/会话窗口，查看并路由学习提案 | 用户明确纠正流程或阶段完成后复盘时 |
 | `/push` | 先预览、再经用户确认写入 fresh | 用户看过职位后入表 |
 | `/materials` | 为选定岗位生成投递材料 | 用户点名要投某岗 |
 | `/apply` | 验证材料并进入投递确认（不自动提交） | 材料完成后 |
@@ -182,7 +183,7 @@ See `docs/tracker_defaults.md` for:
 5. 项目何以至此：见下节；全量编年 `sopctl chronicle`。
 
 ## 何以至此（换模型/换会话）
-- 编年 77 条（完整性 OK）；下列为最近 5 条治理动作：
+- 编年 86 条（完整性 OK）；下列为最近 5 条治理动作：
 - [2026-09-10T07:36] JF-MAT-107 proposed→accepted
 - [2026-09-10T07:36] JF-MAT-004 → superseded
 - [2026-09-10T07:36] JF-MAT-005 → superseded
@@ -191,7 +192,7 @@ See `docs/tracker_defaults.md` for:
 - 全量：`sopctl chronicle`；核对：`sopctl chronicle check`。
 
 ## 空间生长（无感观察；定型需人）
-- 空间生长（无感）：观察 106；待人定型候选 7（删入口 0 / 改善入口 0 / 登记规则 0）
+- 空间生长（无感）：观察 133；待人定型候选 7（删入口 0 / 改善入口 0 / 登记规则 0）
 - 发现已自动；写入权威或删代码仍需人确认——不是要你「推进发现」。
 - 最近空间快照：ambiguity_index=0 （旁路开 0 / 平行状态 0）
 - 相对上一帧：歧义指数未变：ambiguity_index=0（`sopctl growth diff`）

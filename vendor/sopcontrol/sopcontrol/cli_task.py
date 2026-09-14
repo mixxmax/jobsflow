@@ -246,6 +246,14 @@ def cmd_task(args) -> int:
             except (KeyError, ValueError) as exc:
                 print(f"错误: {exc}", file=sys.stderr)
                 return 2
+            bind_profile = getattr(args, "control_profile", "") or ""
+            bind_rev = getattr(args, "control_profile_revision", 0) or 0
+            bind_digest = getattr(args, "plan_digest", "") or ""
+            if (bind_profile or bind_rev or bind_digest) and not (
+                    bind_profile and bind_rev > 0 and bind_digest):
+                print("错误: 绑定动态 profile 需同时给 --control-profile/--control-profile-revision/--plan-digest",
+                      file=sys.stderr)
+                return 2
             task = TaskRecord(
                 task_id=task_id,
                 contract=Contract(
@@ -258,6 +266,11 @@ def cmd_task(args) -> int:
                     strict_schema=strict,
                     capability_note=note,
                     model_identity=current_model or "",
+                    control_profile_id=bind_profile,
+                    control_profile_revision=bind_rev,
+                    effective_plan_digest=bind_digest,
+                    goal_digest=getattr(args, "goal_digest", "") or "",
+                    execution_plan_digest=getattr(args, "execution_plan_digest", "") or "",
                 ),
                 resolution_of=list(resolves),
             )
@@ -296,6 +309,8 @@ def cmd_task(args) -> int:
         print(f"已创建任务 {task_id} [contract_proposed]：{args.objective}")
         print(f"  写入范围: {', '.join(writes)}")
         print(f"  完成定义: 规则 {', '.join(args.require_rule or [])} 全部判定 pass")
+        if bind_profile:
+            print(f"  动态绑定: {bind_profile}.r{bind_rev} digest={bind_digest}")
         if resolves:
             print(f"  接替: {', '.join(resolves)}")
         if fields:
@@ -519,6 +534,36 @@ def cmd_task(args) -> int:
             provided_fields=fields or None,
         )
     if sub == "verify":
+        from .control_result import check_task_profile_gate
+        from .task import profile_gate_denial
+
+        store = TaskStore(root)
+        gate_task = store.load(args.task_id)
+        gate_ok, gate_reason = check_task_profile_gate(
+            root, gate_task,
+            expected_input_digest=gate_task.submit_input_digest or "")
+        if not gate_ok and gate_task.status.value == "verification_pending":
+            from_status = gate_task.status.value
+            decision = profile_gate_denial(gate_task, f"动态 profile 门未过：{gate_reason}")
+            gate_task = store.apply(gate_task, decision, "verify")
+            from .capability_events import CapabilityEvent, append_capability_event
+
+            append_capability_event(
+                root,
+                CapabilityEvent(
+                    kind="task.transition",
+                    subject=args.task_id,
+                    outcome="denied",
+                    model=gate_task.contract.model_identity,
+                    detail={"action": "verify", "from_status": from_status,
+                            "to_status": decision.to_status.value if decision.to_status else "",
+                            "gate": "control_profile"},
+                ),
+            )
+            print(f"拒绝: {args.task_id} {gate_task.status.value} (r{gate_task.revision})")
+            print(f"  理由: {decision.reason}")
+            print(f"  下一步: {decision.next_action}")
+            return 0
         return _task_decide(root, args.task_id, "verify")
     if sub == "deliver":
         return _task_decide(root, args.task_id, "deliver")

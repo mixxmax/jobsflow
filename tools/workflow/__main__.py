@@ -1,4 +1,4 @@
-"""python3 -m tools.workflow <doctor|base|intent|scan|push|intake|materials|apply|promote|archive>"""
+"""python3 -m tools.workflow <doctor|base|intent|scan|push|intake|materials|apply|learn|promote|archive>"""
 
 from __future__ import annotations
 
@@ -144,6 +144,32 @@ def main(argv: list[str] | None = None) -> int:
 
     doctor = sub.add_parser("doctor", parents=[common], help="Read-only environment and base readiness check")
     doctor.add_argument("--strict-materials", action="store_true", help="Return non-zero until every configured lane has an active base pair")
+
+    learn = sub.add_parser("learn", parents=[common], help="Review bounded learning observations and route proposals")
+    learn_sub = learn.add_subparsers(dest="learn_cmd", required=True)
+    learn_event = learn_sub.add_parser("event", parents=[common], help="Record one explicit correction/learning observation")
+    learn_event.add_argument("--text", required=True)
+    learn_event.add_argument("--kind", choices=["utterance", "correction", "tool_call", "task_boundary", "decay"], default="correction")
+    learn_event.add_argument("--task-id", default="")
+    learn_event.add_argument("--session-id", default="")
+    learn_event.add_argument("--phase", default="")
+    learn_event.add_argument("--scope-json", default="{}")
+    learn_review = learn_sub.add_parser("review", parents=[common], help="Review one explicit task/session window")
+    learn_review.add_argument("--task-id", default="")
+    learn_review.add_argument("--session-id", default="")
+    learn_review.add_argument("--phase", default="")
+    learn_review.add_argument("--force", action="store_true")
+    learn_list = learn_sub.add_parser("list", parents=[common], help="List pending learning proposals")
+    learn_list.add_argument("--status", default="")
+    learn_show = learn_sub.add_parser("show", parents=[common], help="Show one learning proposal")
+    learn_show.add_argument("--proposal-id", required=True)
+    learn_decide = learn_sub.add_parser("decide", parents=[common], help="Route a proposal after explicit user choice")
+    learn_decide.add_argument("--proposal-id", required=True)
+    learn_decide.add_argument("--route", choices=["control", "document", "both", "once_only", "defer", "reject"], required=True)
+    learn_decide.add_argument("--note", default="")
+    learn_notify = learn_sub.add_parser("notify", parents=[common], help="Render a proposal as a host-owned prompt card")
+    learn_notify.add_argument("--proposal-id", required=True)
+    learn_diag = learn_sub.add_parser("diagnose", parents=[common], help="Read learning queue and budget diagnostics")
 
     bind = sub.add_parser(
         "bind-runtime",
@@ -334,6 +360,79 @@ def main(argv: list[str] | None = None) -> int:
         payload["capability_ticket_id"] = args.capability_ticket_id
     if getattr(args, "capability_ticket_secret", ""):
         payload["capability_ticket_secret"] = args.capability_ticket_secret
+
+    if action == "learn":
+        from tools.workflow import learning_adapter
+        from tools.workflow.user_prompt import validate_user_prompt
+
+        command = args.learn_cmd
+        if command == "event":
+            try:
+                scope = json.loads(args.scope_json or "{}")
+                if not isinstance(scope, dict):
+                    raise ValueError("scope-json 必须是 JSON 对象")
+            except (TypeError, ValueError) as exc:
+                print(json.dumps({"status": "blocked", "blockers": ["learning_scope_invalid"], "error": str(exc)}, ensure_ascii=False, indent=2))
+                return 2
+            out = learning_adapter.record_learning_event(
+                workspace=workspace,
+                kind=args.kind,
+                text=args.text,
+                task_id=args.task_id,
+                session_id=args.session_id,
+                phase=args.phase,
+                scope=scope,
+            )
+            print(json.dumps({"status": "succeeded" if out.get("status") == "recorded" else "blocked", "action": "learn", "learning": out}, ensure_ascii=False, indent=2))
+            return 0 if out.get("status") in {"recorded", "ignored"} else 2
+        if command == "review":
+            if not (args.task_id or args.session_id):
+                print(json.dumps({"status": "blocked", "action": "learn", "blockers": ["learning_scope_required"], "next_action": "provide --task-id or --session-id"}, ensure_ascii=False, indent=2))
+                return 2
+            out = learning_adapter.review_learning_window(
+                task_id=args.task_id,
+                session_id=args.session_id,
+                phase=args.phase,
+                force=bool(args.force),
+            )
+            envelope = {"status": "needs_user" if out.get("notifications") else ("succeeded" if out.get("status") not in {"blocked", "unavailable"} else "blocked"), "action": "learn", "learning": out}
+            notifications = list(out.get("notifications") or [])
+            if notifications:
+                prompt = notifications[0].get("prompt") or {}
+                validate_user_prompt(prompt)
+                envelope["user_prompt"] = prompt
+                envelope["assistant_protocol"] = {"must_display_user_prompt": True, "must_not_confirm_for_user": True, "must_echo_reply_contract": True, "instruction": "学习提案尚未生效；仅在用户明确选择后调用 learn decide。"}
+            print(json.dumps(envelope, ensure_ascii=False, indent=2, default=str))
+            return 0 if envelope["status"] != "blocked" else 2
+        if command == "list":
+            items = learning_adapter.list_learning_proposals(status=args.status)
+            print(json.dumps(items, ensure_ascii=False, indent=2, default=str))
+            return 0
+        if command == "show":
+            items = [item for item in learning_adapter.list_learning_proposals() if item.get("proposal_id") == args.proposal_id]
+            if not items:
+                print(json.dumps({"status": "blocked", "blockers": ["learning_proposal_not_found"]}, ensure_ascii=False, indent=2))
+                return 2
+            print(json.dumps(items[0], ensure_ascii=False, indent=2, default=str))
+            return 0
+        if command == "decide":
+            out = learning_adapter.decide_learning_proposal(args.proposal_id, args.route, note=args.note)
+            print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+            return 0 if out.get("status") == "succeeded" else 2
+        if command == "notify":
+            items = [item for item in learning_adapter.list_learning_proposals() if item.get("proposal_id") == args.proposal_id]
+            if not items:
+                print(json.dumps({"status": "blocked", "blockers": ["learning_proposal_not_found"]}, ensure_ascii=False, indent=2))
+                return 2
+            from tools.workflow.learning_adapter import _proposal_prompt
+
+            prompt = _proposal_prompt(type("Proposal", (), items[0])())
+            validate_user_prompt(prompt)
+            print(json.dumps({"status": "needs_user", "action": "learn", "user_prompt": prompt, "assistant_protocol": {"must_display_user_prompt": True, "must_not_confirm_for_user": True, "must_echo_reply_contract": True}}, ensure_ascii=False, indent=2))
+            return 0
+        if command == "diagnose":
+            print(json.dumps(learning_adapter.learning_diagnose(), ensure_ascii=False, indent=2, default=str))
+            return 0
 
     if action == "bind-runtime":
         target = Path(getattr(args, "target", None) or workspace).expanduser().resolve()

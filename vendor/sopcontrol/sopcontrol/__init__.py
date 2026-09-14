@@ -1,4 +1,4 @@
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Schema / API pins for reproducible installs (see docs/verification/REPRODUCIBLE_VERSION.md).
 API_SERIES = "0.2"

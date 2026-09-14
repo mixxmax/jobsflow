@@ -1,5 +1,4 @@
 # Fixed SOP Control revision for JobsFlow CI and local installs.
-# Includes Prompt A stabilization plus ledger compact evidence-id dedupe
-# (required so sopctl audit --compact leaves a gate-passable ledger).
-# Do not float on main/master.
-f568a29f50abdd3722ff16e25c0e17348de50e16
+# Version 0.3.0: automatic learning observation/proposal pipeline and the
+# unified /learn control surface. Do not float on main/master.
+2eab4a2586e382bfbb4d577fb48c12dec2d3acf8

@@ -73,6 +73,11 @@ class Contract(BaseModel):
     strict_schema: bool = False                                # 弱/不稳画像：accept 时强制 required_fields
     capability_note: Optional[str] = None                      # 握手说明（只读审计）
     model_identity: str = ""                                  # task open 时固化，供事件归属使用
+    control_profile_id: str = ""                              # §9.2：绑定的动态 profile
+    control_profile_revision: int = 0                         # 冻结 revision（0=未绑定）
+    effective_plan_digest: str = ""                           # 冻结计划 digest（验收一致性）
+    goal_digest: str = ""                                        # B4：绑定的 GoalContract digest（空=未绑定）
+    execution_plan_digest: str = ""                              # B4：绑定的初始 ExecutionPlan digest（空=未绑定）
 
 
 class EnvelopeRecord(BaseModel):
@@ -92,6 +97,7 @@ class TaskRecord(BaseModel):
     status: TaskStatus = TaskStatus.contract_proposed
     repair_count: int = 0
     changed_paths: list[str] = Field(default_factory=list)
+    submit_input_digest: str = ""  # submit 时改动内容摘要；动态门比对输入是否变化
     revision: int = 1
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -338,6 +344,8 @@ def takeover_pack(
         "rule_verdicts": {r: rule_verdicts.get(r) for r in required},
         "open_findings": open_findings,
         "executor": task.contract.model_identity or "（未绑定）",
+        "goal_digest": task.contract.goal_digest,
+        "execution_plan_digest": task.contract.execution_plan_digest,
         "write_granularity": task.contract.write_granularity,
         "strict_schema": task.contract.strict_schema,
         "next_legal_actions": LEGAL_ACTIONS[task.status] + (
@@ -791,6 +799,135 @@ def _reject(reason: str) -> TransitionDecision:
     return TransitionDecision(allowed=False, to_status=None, reason=reason, next_action="sopctl task show 查看当前状态与契约")
 
 
+INPUT_DIGEST_SCHEMA = "input-digest/v1"
+
+
+def _hash_file_chunks(path: Path, digest) -> None:
+    """分块读入（大文件不一次性进内存，§9.2.8）。"""
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+
+
+def _normalize_input_path(raw_path: str) -> str:
+    """§11.1 路径规范化：拒绝 NUL、绝对路径、父遍历；规范化分隔符并去重。"""
+    if "\0" in raw_path:
+        raise ValueError(f"路径包含非法 NUL 字符: {raw_path!r}")
+    s = raw_path.strip().replace("\\", "/")
+    p = Path(s)
+    if p.is_absolute() or s.startswith("/"):
+        raise ValueError(f"拒绝绝对路径输入: {raw_path!r}")
+    parts = p.parts
+    if any(part == ".." for part in parts):
+        raise ValueError(f"拒绝包含 '..' 的相对路径: {raw_path!r}")
+    norm_parts = [part for part in parts if part not in ("", ".")]
+    if not norm_parts:
+        return "."
+    return "/".join(norm_parts)
+
+
+def _digest_walk(root: Path, rel: Path, parts: list[str], seen: set[str]) -> None:
+    """递归摘要：排序/POSIX 路径/类型/大小/内容；失败一律 fail-closed。
+
+    §12.1（WP-6）默认安全策略：lstat 先行，符号链接一律拒绝——不因目标
+    位于任务目录内就自动跟随（跟随策略未来必须独立、显式、可绑定、可
+    测试，不能悄悄改变默认语义）；目录/socket/设备等特殊文件拒绝；
+    逃逸 root 与遍历循环直接失败。
+    """
+    import hashlib as _hashlib
+    import stat as _stat
+
+    target = root / rel
+    key = str(rel.as_posix())
+    # lstat 判定目录项类型本身：symlink 在此原样拒绝（不 resolve、不 readlink）
+    if target.is_symlink():
+        raise ValueError(f"输入路径是符号链接（默认拒绝，不跟随）: {key}")
+    try:
+        st = target.lstat()
+    except FileNotFoundError:
+        parts.append(f"{key}:missing")
+        return
+    except OSError as exc:
+        raise ValueError(f"无法访问文件状态: {key} ({exc})")
+    if _stat.S_ISFIFO(st.st_mode) or _stat.S_ISSOCK(st.st_mode) \
+            or _stat.S_ISCHR(st.st_mode) or _stat.S_ISBLK(st.st_mode):
+        raise ValueError(f"不支持的特殊文件类型: {key}")
+    if key in seen:
+        raise ValueError(f"检测到遍历循环: {key}")
+    seen.add(key)
+    if _stat.S_ISDIR(st.st_mode):
+        try:
+            children = sorted(p.name for p in target.iterdir())
+        except OSError as exc:
+            raise ValueError(f"无法读取目录: {key} ({exc})")
+        if not children:
+            parts.append(f"{key}:empty-dir")
+            return
+        parts.append(f"{key}:dir:{len(children)}")
+        for name in children:
+            _digest_walk(root, rel / name, parts, seen)
+        return
+    if _stat.S_ISREG(st.st_mode):
+        try:
+            size = st.st_size
+            digest = _hashlib.sha256()
+            _hash_file_chunks(target, digest)
+        except OSError as exc:
+            raise ValueError(f"无法读取文件内容: {key} ({exc})")
+        parts.append(f"{key}:file:{size}:{digest.hexdigest()}")
+        return
+    raise ValueError(f"不支持的特殊文件类型: {key}")
+
+
+def submit_input_digest_for(root: Path, changed_paths: list[str]) -> str:
+    """submit 改动内容摘要（§7.3/§9 输入绑定）：固定 schema、稳定排序稳定编码。
+
+    文件记内容 hash（分块流式）；目录递归记全部条目；空目录与缺失可区分；
+    符号链接默认拒绝（不跟随，§12.1）；绝对路径/逃逸/特殊文件/循环即失败；
+    mtime/inode/权限不入摘要。
+    """
+    import hashlib as _hashlib
+
+    from .worktree import resolves_inside
+
+    root = Path(root)
+    # 路径验证、规范化与去重（§11.1）
+    normalized_set: set[str] = set()
+    for raw in changed_paths or []:
+        norm = _normalize_input_path(str(raw))
+        normalized_set.add(norm)
+
+    parts: list[str] = [f"schema:{INPUT_DIGEST_SCHEMA}"]
+    for rel in sorted(normalized_set):
+        try:
+            inside = resolves_inside(root, rel)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"输入路径解析异常: {rel} ({exc})")
+        if not inside:
+            raise ValueError(f"输入路径逃逸 root：{rel}")
+        _digest_walk(root, Path(rel), parts, set())
+    return "in-" + _hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def profile_gate_denial(task: TaskRecord, reason: str) -> TransitionDecision:
+    """动态 profile 门失败 → repair_required（预算耗尽则 failed_unverified 熔断）。
+
+    与 E4 测试失败同制：给修复机会，不直接 blocked（手册 14.1 场景 11 预算语义）。
+    """
+    new_count = task.repair_count + 1
+    if new_count > task.contract.max_repairs:
+        return TransitionDecision(
+            allowed=True, to_status=TaskStatus.failed_unverified, repair_count=new_count,
+            reason=f"{reason}；修复预算耗尽（{task.repair_count} 轮未收敛）——转终态",
+            next_action="人工介入分析动态门失败根因后另开任务",
+        )
+    return TransitionDecision(
+        allowed=True, to_status=TaskStatus.repair_required, repair_count=new_count,
+        reason=f"第 {new_count} 轮修复：{reason}",
+        next_action="产生通过的动态结果后 task submit 重新提交",
+    )
+
+
 class TaskStore:
     """任务文件存储：.sopcontrol/tasks/TASK-xxxx.yaml；revision 冲突即拒绝写。"""
 
@@ -896,6 +1033,7 @@ class TaskStore:
             task.repair_count = decision.repair_count if action == "verify" else task.repair_count
             if action == "submit":
                 task.changed_paths = list(changed_paths or [])
+                task.submit_input_digest = submit_input_digest_for(self.root, task.changed_paths)
             if (
                 decision.to_status in TERMINAL_FAILED
                 and not task.blocked_reason_code

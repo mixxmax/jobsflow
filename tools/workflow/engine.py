@@ -623,4 +623,29 @@ def _audit(
     except (ImportError, OSError, RuntimeError, TypeError, ValueError):
         # Receipts are observability.  Admit already fail-closed in enforce.
         pass
+    # Learning is an observational side-channel.  It receives only the
+    # bounded/sanitised correction or workflow marker and can never alter the
+    # business result or request another capability ticket.
+    try:
+        from tools.workflow.learning_adapter import record_workflow_learning
+
+        learning = record_workflow_learning(
+            request=request,
+            out=out,
+            entity=entity,
+            workspace=Path(workspace),
+        )
+        if learning:
+            out["learning"] = learning
+            review = learning.get("review") if isinstance(learning, dict) else None
+            if isinstance(review, dict):
+                from tools.workflow.learning_adapter import learning_notification
+
+                notification = learning_notification(review)
+                if notification:
+                    out["learning_notification"] = notification
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        # A learning adapter outage must never hide or block the canonical
+        # workflow result.  The next explicit /learn review can retry.
+        pass
     return recorded

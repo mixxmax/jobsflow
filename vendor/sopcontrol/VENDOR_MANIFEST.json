@@ -1,0 +1,11 @@
+{
+  "schema_version": "1",
+  "package": "sopcontrol",
+  "version": "0.3.0",
+  "commit": "2eab4a2586e382bfbb4d577fb48c12dec2d3acf8",
+  "source_file_count": 113,
+  "source_tree_sha256": "ee003e155b6f989954080361092ae09da5640c87721f19f9b4a22772e6d6ea15",
+  "file_count": 117,
+  "tree_sha256": "c013a87ce913c331db1f32d3b95fb9e8c7697aa17973b5f1f8054811b725c16c",
+  "digest_scope": "all files below vendor/sopcontrol except VENDOR_MANIFEST.json, .git metadata, sopcontrol.egg-info, __pycache__ and *.pyc"
+}
