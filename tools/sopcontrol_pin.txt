@@ -1,3 +1,3 @@
 # Fixed SOP Control revision for JobsFlow CI and local installs.
 # Version 0.4.0: do not float on main/master.
-e308ee205e18e6a90473caffb60b84bcc27d30a6
+d168354ee0657b5bcb70e897b196f4cd8a14cd08
