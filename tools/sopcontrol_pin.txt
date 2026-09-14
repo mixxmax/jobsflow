@@ -1,4 +1,4 @@
 # Fixed SOP Control revision for JobsFlow CI and local installs.
-# Version 0.3.1: DS-05 control→confirm+compile; LR noise filter; DeterministicRuleExtractor.
+# Version 0.3.2: user confirmation for learn control; review task isolation; durability.
 # Do not float on main/master.
-58cfa4258ad386e6d34d8505530455fa14cff7f0
+66b880b5716d759bf18f7883f945d74e752aac23

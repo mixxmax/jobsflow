@@ -390,18 +390,55 @@ def list_learning_proposals(*, status: str = "") -> list[dict[str, Any]]:
     return [p.model_dump(mode="json") for p in api["list_proposals"](_product_root(), status=status)]
 
 
-def decide_learning_proposal(proposal_id: str, route: str, *, note: str = "") -> dict[str, Any]:
+def decide_learning_proposal(
+    proposal_id: str,
+    route: str,
+    *,
+    note: str = "",
+    confirmation_id: str = "",
+    confirmation_secret: str = "",
+    actor: str = "agent",
+) -> dict[str, Any]:
+    """Decide a learning proposal.
+
+    control/both require a host-issued user confirmation envelope. Calling this
+    without credentials returns ``needs_user`` — it must not invent actor=user.
+    """
     api = _load_learning_api()
     if api is None:
         return {"status": "unavailable", "reason": "learning_api_unavailable"}
-    for item in api["list_proposals"](_product_root()):
+    root = _product_root()
+    for item in api["list_proposals"](root):
         if item.proposal_id == proposal_id:
             try:
-                decision = api["ProposalDecision"](proposal_id=proposal_id, route=route, note=note)
-                routed = api["decide_proposal"](_product_root(), item, decision)
-                # Preserve proposal route status under proposal_status; adapter OK → succeeded.
+                conf_id = str(confirmation_id or "").strip()
+                conf_secret = str(confirmation_secret or "").strip()
+                if route in {"control", "both"} and conf_id and not conf_secret:
+                    try:
+                        from sopcontrol.learning import read_learning_confirmation_secret
+
+                        conf_secret = read_learning_confirmation_secret(root, conf_id)
+                    except (OSError, ValueError, TypeError, RuntimeError):
+                        conf_secret = ""
+                decision = api["ProposalDecision"](
+                    proposal_id=proposal_id,
+                    route=route,
+                    note=note,
+                    actor=str(actor or "agent"),
+                    confirmation_id=conf_id,
+                    confirmation_secret=conf_secret,
+                )
+                routed = api["decide_proposal"](root, item, decision)
+                if str(routed.get("status") or "") == "needs_user":
+                    # Do not claim succeeded; surface confirmation challenge.
+                    public = {k: v for k, v in routed.items() if "secret" not in str(k).lower()}
+                    return {
+                        **public,
+                        "status": "needs_user",
+                        "proposal_status": "proposed",
+                    }
                 return {
-                    **routed,
+                    **{k: v for k, v in routed.items() if "secret" not in str(k).lower()},
                     "proposal_status": routed.get("status"),
                     "status": "succeeded",
                 }

@@ -175,13 +175,18 @@ def observe_utterance(
     suggested = suggested or {}
     explicit_once = any(marker in quote.lower() or marker in quote
                         for marker in _ONCE_ONLY_MARKERS)
+    ctx = {str(k): str(v) for k, v in context.items()}
     obs = UtteranceObservation(exact_quote=quote, source_ref=source_ref,
-                               context={str(k): str(v) for k, v in context.items()},
+                               context=ctx,
                                suggested=suggested, explicit_once_only=explicit_once)
-    # 观察留痕（append 语义：原话记录不可变）
+    # 观察留痕（append 语义：原话记录不可变）。
+    # 顶层 task_id/session_id 供 learn review 严格过滤，避免串窗。
     path = _observations_path(root)
     records = _load_jsonl(path)
-    records.append(obs.model_dump(mode="json"))
+    payload = obs.model_dump(mode="json")
+    payload["task_id"] = str(ctx.get("task_id") or "")
+    payload["session_id"] = str(ctx.get("session_id") or "")
+    records.append(payload)
     _atomic_write_jsonl(path, records)
     tier = classify_utterance(quote)
     if tier == "observation_only":

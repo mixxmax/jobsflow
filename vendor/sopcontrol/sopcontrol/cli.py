@@ -742,6 +742,12 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["control", "document", "both", "once_only",
                             "defer", "reject"])
     p.add_argument("--note", default="")
+    p.add_argument("--actor", default="agent",
+                   help="调用方身份；默认 agent。control 仍需用户确认凭据")
+    p.add_argument("--confirmation-id", default="",
+                   help="用户确认凭据 ID（control/both 必填）")
+    p.add_argument("--confirmation-secret", default="",
+                   help="用户确认 secret；可省略并由本地 handoff 读取")
     p.add_argument("path", nargs="?", default=".")
     p.set_defaults(func=cmd_learn)
     p = learn_sub.add_parser("ingest", help="外部提案导入（只成提案）")

@@ -168,6 +168,16 @@ def main(argv: list[str] | None = None) -> int:
     learn_decide.add_argument("--proposal-id", required=True)
     learn_decide.add_argument("--route", choices=["control", "document", "both", "once_only", "defer", "reject"], required=True)
     learn_decide.add_argument("--note", default="")
+    learn_decide.add_argument(
+        "--confirmation-id",
+        default="",
+        help="User confirmation id required for control/both (host-issued)",
+    )
+    learn_decide.add_argument(
+        "--confirmation-secret",
+        default="",
+        help="User confirmation secret; omit to read local handoff after user confirms",
+    )
     learn_notify = learn_sub.add_parser("notify", parents=[common], help="Render a proposal as a host-owned prompt card")
     learn_notify.add_argument("--proposal-id", required=True)
     learn_diag = learn_sub.add_parser("diagnose", parents=[common], help="Read learning queue and budget diagnostics")
@@ -417,8 +427,23 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(items[0], ensure_ascii=False, indent=2, default=str))
             return 0
         if command == "decide":
-            out = learning_adapter.decide_learning_proposal(args.proposal_id, args.route, note=args.note)
-            print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+            out = learning_adapter.decide_learning_proposal(
+                args.proposal_id,
+                args.route,
+                note=args.note,
+                confirmation_id=getattr(args, "confirmation_id", "") or "",
+                confirmation_secret=getattr(args, "confirmation_secret", "") or "",
+                actor="agent",
+            )
+            public = {k: v for k, v in out.items() if "secret" not in str(k).lower()}
+            if out.get("status") == "needs_user":
+                public["assistant_protocol"] = {
+                    "must_display_user_prompt": True,
+                    "must_not_confirm_for_user": True,
+                    "must_echo_reply_contract": True,
+                    "instruction": "control/both 需要用户确认后携带 confirmation_id 重试；禁止模型自行确认。",
+                }
+            print(json.dumps(public, ensure_ascii=False, indent=2, default=str))
             return 0 if out.get("status") == "succeeded" else 2
         if command == "notify":
             items = [item for item in learning_adapter.list_learning_proposals() if item.get("proposal_id") == args.proposal_id]
