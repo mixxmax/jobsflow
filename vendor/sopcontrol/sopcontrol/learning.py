@@ -707,13 +707,17 @@ def decide_proposal(root: Path | str, proposal: LearningProposal,
             note="学习提案转候选；用户确认凭据核销后 confirm/compile",
             priority="low", explicit_once_only=False)
         result["candidate_id"] = record.candidate_id
-        actor = "user"  # 仅在凭据核销后记为用户确认
+        # 学习确认 envelope 已核销：允许 confirm_candidate 在同一次用户确认内晋升。
         confirmed = confirm_candidate(
-            root, record.candidate_id, "keep_longterm", actor=actor)
+            root, record.candidate_id, "keep_longterm",
+            actor="user", user_attested=True)
+        if confirmed.get("status") == "needs_user":
+            # 防御：不应再挑战；若出现则原样返回，勿假装成功。
+            return confirmed
         result["rule_id"] = confirmed["rule_id"]
         result["rule_status"] = confirmed["rule_status"]
         result["permanent"] = True
-        compiled = compile_rule(root, confirmed["rule_id"], actor=actor)
+        compiled = compile_rule(root, confirmed["rule_id"], actor="user")
         result["rule_status"] = compiled["rule_status"]
         result["compile_digest"] = compiled["compile_digest"]
         result["confirmation_id"] = decision.confirmation_id
