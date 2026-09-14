@@ -4,7 +4,7 @@
   <img src="claude_animation.gif" alt="JobsFlow" width="200">
 </p>
 
-# JobsFlow（求職全流程）
+# JobsFlow（求職全流程）(for HK)
 
 [繁體中文](README.md) · [简体中文](README_ZH-CN.md) · [English](README_EN.md)
 
