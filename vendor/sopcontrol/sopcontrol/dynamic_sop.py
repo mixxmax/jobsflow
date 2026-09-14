@@ -188,6 +188,32 @@ def observe_utterance(
     payload["session_id"] = str(ctx.get("session_id") or "")
     records.append(payload)
     _atomic_write_jsonl(path, records)
+    try:
+        from .activity_log import record_activity
+
+        record_activity(
+            root,
+            "learning_observed",
+            action=str(ctx.get("action") or "learning.observe"),
+            run_id=str(ctx.get("task_id") or ctx.get("session_id") or ""),
+            task_id=str(ctx.get("task_id") or ""),
+            source="runtime",
+            confidence="observed",
+            outcome="recorded",
+            phase=str(ctx.get("phase") or ""),
+            learning={
+                "eligible": True,
+                "kind": "utterance",
+                "fingerprint": str(getattr(obs, "observation_id", "") or ""),
+            },
+            detail={
+                "kind": "utterance",
+                "status": "recorded",
+                "window_id": str(ctx.get("session_id") or ""),
+            },
+        )
+    except Exception:  # noqa: BLE001 — observation must not fail on log degrade
+        pass
     tier = classify_utterance(quote)
     if tier == "observation_only":
         return obs, None, False

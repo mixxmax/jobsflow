@@ -194,6 +194,32 @@ def record_learning_event(
             }
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            try:
+                from sopcontrol.activity_log import record_activity
+
+                record_activity(
+                    _product_root(),
+                    "learning_observed",
+                    action=_safe_text(action) or "learning.observe",
+                    run_id=_safe_text(task_id or session_id)[:100],
+                    task_id=_safe_text(task_id)[:100],
+                    source="adapter",
+                    confidence="observed",
+                    outcome="recorded",
+                    phase=_safe_text(phase)[:80],
+                    learning={
+                        "eligible": True,
+                        "kind": str(event.kind or "observation"),
+                        "fingerprint": str(event.event_id or ""),
+                    },
+                    detail={
+                        "kind": str(event.kind or "observation"),
+                        "status": "recorded",
+                        "window_id": _safe_text(session_id)[:100],
+                    },
+                )
+            except (OSError, TypeError, ValueError, RuntimeError, ImportError):
+                pass
         return {"status": "recorded", "event_id": event.event_id, "path": str(path)}
     except (OSError, TypeError, ValueError, RuntimeError) as exc:
         return {"status": "unavailable", "reason": f"learning_record_{type(exc).__name__}"}
@@ -413,13 +439,8 @@ def decide_learning_proposal(
             try:
                 conf_id = str(confirmation_id or "").strip()
                 conf_secret = str(confirmation_secret or "").strip()
-                if route in {"control", "both"} and conf_id and not conf_secret:
-                    try:
-                        from sopcontrol.learning import read_learning_confirmation_secret
-
-                        conf_secret = read_learning_confirmation_secret(root, conf_id)
-                    except (OSError, ValueError, TypeError, RuntimeError):
-                        conf_secret = ""
+                # Host must read handoff itself and pass confirmation_secret.
+                # Never auto-read secret from confirmation_id (Agents would promote).
                 decision = api["ProposalDecision"](
                     proposal_id=proposal_id,
                     route=route,

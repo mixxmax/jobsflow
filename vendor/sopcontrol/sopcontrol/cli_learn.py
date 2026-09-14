@@ -52,7 +52,6 @@ def cmd_learn(args) -> int:
             ProposalDecision,
             decide_proposal,
             list_proposals,
-            read_learning_confirmation_secret,
         )
         target = None
         for i in list_proposals(root):
@@ -64,12 +63,14 @@ def cmd_learn(args) -> int:
             return 2
         conf_id = str(getattr(args, "confirmation_id", "") or "").strip()
         conf_secret = str(getattr(args, "confirmation_secret", "") or "").strip()
-        # 宿主可只传 confirmation_id，由本地 handoff 取 secret（不打印到 stdout）。
+        # Never auto-read handoff from confirmation_id alone (Agents would promote).
+        # Explicit --confirmation-secret, or interactive TTY prompt only.
         if conf_id and not conf_secret and args.route in {"control", "both"}:
-            try:
-                conf_secret = read_learning_confirmation_secret(root, conf_id)
-            except ValueError:
-                conf_secret = ""
+            from .learning import resolve_confirmation_secret
+
+            conf_secret = resolve_confirmation_secret(
+                conf_secret, confirmation_id=conf_id, allow_tty_prompt=True,
+            )
         try:
             out = decide_proposal(
                 root, target,

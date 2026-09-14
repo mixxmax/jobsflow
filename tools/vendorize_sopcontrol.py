@@ -32,11 +32,21 @@ COPY_DIRS = ("sopcontrol", "plugins")
 COPY_FILES = ("pyproject.toml", "README.md", "README_ZH-CN.md", "LICENSE", "LIMITATIONS.md")
 EXCLUDE_DIR_NAMES = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", "sopcontrol.egg-info", ".venv"}
 EXCLUDE_SUFFIXES = {".pyc", ".pyo"}
+EXCLUDE_FILE_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini", ".gitignore"}
 
 
 def _run(cmd: list[str], *, cwd: Path | None = None) -> str:
     out = subprocess.check_output(cmd, cwd=str(cwd) if cwd else None, text=True)
     return out.strip()
+
+
+def _is_junk_name(name: str) -> bool:
+    if name in EXCLUDE_FILE_NAMES:
+        return True
+    # AppleDouble / resource-fork sidecars and editor swap files.
+    if name.startswith("._") or name.endswith("~") or name.startswith(".#"):
+        return True
+    return False
 
 
 def _iter_vendor_files(root: Path) -> list[Path]:
@@ -46,6 +56,8 @@ def _iter_vendor_files(root: Path) -> list[Path]:
             continue
         rel_parts = path.relative_to(root).parts
         if any(part in EXCLUDE_DIR_NAMES for part in rel_parts):
+            continue
+        if any(_is_junk_name(part) for part in rel_parts):
             continue
         if path.name == "VENDOR_MANIFEST.json":
             continue
@@ -134,14 +146,23 @@ def sync_from_source(source: Path, commit: str) -> None:
     else:
         VENDOR.mkdir(parents=True)
 
+    def _copy_ignore(directory: str, names: list[str]) -> set[str]:
+        ignored: set[str] = set()
+        for name in names:
+            if name in EXCLUDE_DIR_NAMES or name.endswith(".egg-info"):
+                ignored.add(name)
+                continue
+            if _is_junk_name(name):
+                ignored.add(name)
+                continue
+            if Path(name).suffix in EXCLUDE_SUFFIXES:
+                ignored.add(name)
+        return ignored
+
     for name in COPY_DIRS:
         src = source / name
         if src.is_dir():
-            shutil.copytree(
-                src,
-                VENDOR / name,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "*.egg-info", ".pytest_cache"),
-            )
+            shutil.copytree(src, VENDOR / name, ignore=_copy_ignore)
     for name in COPY_FILES:
         src = source / name
         if src.is_file():

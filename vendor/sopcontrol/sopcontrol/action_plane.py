@@ -418,22 +418,19 @@ def commit_action_result(
         **common,
     )
 
+    # Gate allow/observe is NOT tool execution. Never emit verified
+    # action_completed here (PreToolUse / pre-admission). Real completion
+    # must come from receipt / subprocess / validator evidence later.
     if gate_decision == "deny":
         final_type = "action_blocked"
         confidence = "verified"
         outcome = "blocked"
         next_action = "review"
-    elif gate_decision == "observe":
-        # Observe is recorded, not a verified completion of a side effect.
+    else:
         final_type = "action_started"
         confidence = "observed"
-        outcome = "observe"
-        next_action = "continue"
-    else:
-        final_type = "action_completed"
-        confidence = "verified"
-        outcome = "passed"
-        next_action = "continue"
+        outcome = "observe" if gate_decision == "observe" else "admitted"
+        next_action = "execute" if gate_decision == "allow" else "continue"
 
     result = record_activity(
         root,

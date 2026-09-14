@@ -654,11 +654,47 @@ def issue_learning_confirmation(root: Path | str, proposal_id: str) -> dict[str,
 
 
 def read_learning_confirmation_secret(root: Path | str, confirmation_id: str) -> str:
-    """宿主在用户确认后读取 handoff secret（测试与 JobsFlow gateway 用）。"""
+    """Read handoff secret after an explicit user confirmation.
+
+    Intended for the *host* (or tests) that already obtained user consent and
+    will pass the secret into decide/confirm. Public CLI / Agents must NOT call
+    this to auto-promote; they must take ``--confirmation-secret`` or a TTY prompt.
+    """
     path = _confirmations_dir(Path(root)) / f"{confirmation_id}.secret"
     if not path.is_file():
         raise ValueError("learning_confirmation_secret_missing")
     return path.read_text(encoding="utf-8").strip()
+
+
+def prompt_confirmation_secret(*, confirmation_id: str = "") -> str:
+    """Interactively read confirmation secret from a TTY; never auto-read handoff."""
+    import getpass
+    import sys
+
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return ""
+    label = "confirmation secret"
+    if confirmation_id:
+        label = f"confirmation secret for {confirmation_id}"
+    try:
+        return str(getpass.getpass(f"{label}: ") or "").strip()
+    except (EOFError, KeyboardInterrupt, OSError):
+        return ""
+
+
+def resolve_confirmation_secret(
+    explicit: str,
+    *,
+    confirmation_id: str = "",
+    allow_tty_prompt: bool = True,
+) -> str:
+    """Resolve secret from explicit flag or TTY prompt — never from handoff alone."""
+    secret = str(explicit or "").strip()
+    if secret:
+        return secret
+    if allow_tty_prompt:
+        return prompt_confirmation_secret(confirmation_id=confirmation_id)
+    return ""
 
 
 def redeem_learning_confirmation(

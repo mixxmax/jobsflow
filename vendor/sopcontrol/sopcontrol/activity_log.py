@@ -5,11 +5,13 @@ forge verified success. Control evidence remains in ledger/trace/receipts.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -32,6 +34,37 @@ MAX_EVENTS_KEEP = 20_000
 MAX_DETAIL_KEYS = 32
 MAX_DETAIL_STR = 160
 MAX_TAIL = 240
+MAX_FREE_TEXT = 160
+
+# Top-level free-text fields that must be redacted before digest/persist.
+_FREE_TEXT_FIELDS = (
+    "action",
+    "actor",
+    "harness",
+    "phase",
+    "state_before",
+    "state_after",
+    "decision",
+    "outcome",
+    "blocker",
+    "next_action",
+    "side_effect_class",
+)
+
+_VERIFIED_COMPLETION_TYPES = frozenset({
+    "ticket_redeemed",
+    "validation_finished",
+    "action_completed",
+    "operation_finished",
+    "side_effect_committed",
+    "validation_passed",
+})
+
+_EXECUTED_TYPES = frozenset({
+    "operation_finished",
+    "side_effect_committed",
+    "action_completed",
+})
 
 # Detail keys allowed into the durable log (values still redacted).
 DETAIL_ALLOWLIST = frozenset({
@@ -81,6 +114,8 @@ class LoadResult:
     truncated: int = 0
     path: Optional[Path] = None
     logging_status: str = "healthy"  # healthy | degraded | unknown
+    untrusted_event_ids: set[str] = field(default_factory=set)
+    write_degraded_count: int = 0
 
 
 @dataclass
@@ -93,6 +128,8 @@ class HealthReport:
     duplicates: int = 0
     truncated: int = 0
     file_bytes: int = 0
+    write_degraded_count: int = 0
+    log_degraded_events: int = 0
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -105,6 +142,8 @@ class HealthReport:
             "duplicates": self.duplicates,
             "truncated": self.truncated,
             "file_bytes": self.file_bytes,
+            "write_degraded_count": self.write_degraded_count,
+            "log_degraded_events": self.log_degraded_events,
             "notes": list(self.notes),
         }
 
@@ -117,6 +156,16 @@ def redact_text(value: str) -> str:
     text = _PHONE_RE.sub("<redacted-phone>", text)
     text = _ABS_HOME_RE.sub("<redacted-home>", text)
     return text
+
+
+def _redact_free_text(value: str) -> str:
+    """Redact secrets/PII in top-level free-string fields (not only detail)."""
+    if not value:
+        return ""
+    scrubbed = redact_text(str(value))
+    if len(scrubbed) > MAX_FREE_TEXT:
+        return scrubbed[:MAX_FREE_TEXT]
+    return scrubbed
 
 
 def _redact_any(key: str, value: Any, *, depth: int = 0) -> Any:
@@ -236,10 +285,24 @@ def build_event(
 ) -> ControlEvent:
     cost_model = cost if isinstance(cost, EventCost) else EventCost(**(cost or {}))
     learn_model = learning if isinstance(learning, EventLearning) else EventLearning(**(learning or {}))
+    # Redact free-string fields before digest so secrets never enter the durable row.
+    free = {
+        "action": _redact_free_text(action),
+        "actor": _redact_free_text(actor),
+        "harness": _redact_free_text(harness),
+        "phase": _redact_free_text(phase),
+        "state_before": _redact_free_text(state_before),
+        "state_after": _redact_free_text(state_after),
+        "decision": _redact_free_text(decision),
+        "outcome": _redact_free_text(outcome),
+        "blocker": _redact_free_text(blocker),
+        "next_action": _redact_free_text(next_action),
+        "side_effect_class": _redact_free_text(side_effect_class),
+    }
     event = ControlEvent(
         schema_version=SCHEMA_VERSION,
         event_type=event_type,
-        action=action,
+        action=free["action"],
         run_id=run_id,
         operation_id=operation_id,
         task_id=task_id,
@@ -249,22 +312,22 @@ def build_event(
         sequence=int(sequence or 0),
         source=source,  # type: ignore[arg-type]
         confidence=confidence,  # type: ignore[arg-type]
-        actor=actor,
-        harness=harness,
-        phase=phase,
+        actor=free["actor"],
+        harness=free["harness"],
+        phase=free["phase"],
         duration_ms=max(0, int(duration_ms or 0)),
-        state_before=state_before,
-        state_after=state_after,
-        decision=decision,
-        outcome=outcome,
+        state_before=free["state_before"],
+        state_after=free["state_after"],
+        decision=free["decision"],
+        outcome=free["outcome"],
         rule_ids=list(rule_ids or []),
         evidence_ids=list(evidence_ids or []),
         input_fingerprint=input_fingerprint,
         plan_digest=plan_digest,
         artifact_digests=list(artifact_digests or []),
-        side_effect_class=side_effect_class,
-        blocker=blocker,
-        next_action=next_action,
+        side_effect_class=free["side_effect_class"],
+        blocker=free["blocker"],
+        next_action=free["next_action"],
         cost=cost_model,
         learning=learn_model,
         detail=sanitize_detail(detail),
@@ -287,6 +350,12 @@ def _inject_identity(root: Path, event: ControlEvent) -> None:
 
 
 def _ensure_digests(event: ControlEvent) -> ControlEvent:
+    # Re-scrub free-text on the rare path that constructs ControlEvent directly.
+    for name in _FREE_TEXT_FIELDS:
+        raw = getattr(event, name, "") or ""
+        scrubbed = _redact_free_text(str(raw))
+        if scrubbed != raw:
+            setattr(event, name, scrubbed)
     event.detail = sanitize_detail(event.detail)
     if event.duration_ms < 0:
         event.duration_ms = 0
@@ -303,6 +372,56 @@ def _ensure_digests(event: ControlEvent) -> ControlEvent:
     return event
 
 
+def _lock_path_for(events_file: Path) -> Path:
+    return events_file.parent / ".events.lock"
+
+
+def _write_degraded_path(events_file: Path) -> Path:
+    return events_file.parent / "write_degraded.count"
+
+
+def _bump_write_degraded(events_file: Path) -> int:
+    path = _write_degraded_path(events_file)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current = 0
+        if path.exists():
+            try:
+                current = int((path.read_text(encoding="utf-8") or "0").strip() or "0")
+            except ValueError:
+                current = 0
+        current += 1
+        path.write_text(str(current) + "\n", encoding="utf-8")
+        return current
+    except OSError:
+        return 0
+
+
+def _read_write_degraded(events_file: Path | None) -> int:
+    if events_file is None:
+        return 0
+    path = _write_degraded_path(events_file)
+    if not path.exists():
+        return 0
+    try:
+        return int((path.read_text(encoding="utf-8") or "0").strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+
+@contextmanager
+def _events_lock(events_file: Path):
+    """Exclusive flock covering append + rotate so concurrent writers never drop lines."""
+    lock_path = _lock_path_for(events_file)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _atomic_append_line(path: Path, line: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = (line.rstrip("\n") + "\n").encode("utf-8")
@@ -316,7 +435,10 @@ def _atomic_append_line(path: Path, line: str) -> None:
 
 
 def _maybe_rotate(path: Path) -> int:
-    """Trim oversized logs; return number of dropped lines (0 if untouched)."""
+    """Trim oversized logs; return number of dropped lines (0 if untouched).
+
+    Caller must hold ``_events_lock(path)``.
+    """
     if not path.exists():
         return 0
     try:
@@ -355,6 +477,7 @@ def append_activity(root: Path | str, event: ControlEvent | dict[str, Any], *,
                     rotate: bool = True) -> AppendResult:
     """Sanitize, digest, and append one event. Failures degrade (ok=False)."""
     root = Path(root)
+    path: Optional[Path] = None
     try:
         if isinstance(event, dict):
             event = ControlEvent.model_validate(event)
@@ -364,15 +487,18 @@ def append_activity(root: Path | str, event: ControlEvent | dict[str, Any], *,
             event.worktree_id = "default"
         event = _ensure_digests(event)
         path = events_path(root, event.worktree_id)
-        _atomic_append_line(path, event.model_dump_json())
-        if rotate:
-            _maybe_rotate(path)
+        with _events_lock(path):
+            _atomic_append_line(path, event.model_dump_json())
+            if rotate:
+                _maybe_rotate(path)
         return AppendResult(ok=True, path=path, event=event, degraded=False)
     except Exception as exc:  # noqa: BLE001 — logging must never crash callers
         try:
             # Best-effort degraded marker (may also fail).
             scope = ProjectScope(root, mode="discovery")
             wt = getattr(event, "worktree_id", "") or scope.worktree_id
+            path = events_path(root, wt)
+            _bump_write_degraded(path)
             marker = build_event(
                 "log_degraded",
                 action="activity_log.append",
@@ -382,10 +508,12 @@ def append_activity(root: Path | str, event: ControlEvent | dict[str, Any], *,
                 worktree_id=wt,
                 detail={"error_class": type(exc).__name__, "logging_status": "degraded"},
             )
-            path = events_path(root, wt)
-            _atomic_append_line(path, marker.model_dump_json())
+            with _events_lock(path):
+                _atomic_append_line(path, marker.model_dump_json())
         except Exception:  # noqa: BLE001
-            path = None
+            if path is not None:
+                _bump_write_degraded(path)
+            path = path
         return AppendResult(
             ok=False,
             path=path,
@@ -422,6 +550,15 @@ def _parse_line(line: str) -> tuple[Optional[ControlEvent], str]:
     return event, ""
 
 
+def event_integrity_ok(event: ControlEvent) -> bool:
+    """False when a v2 row's stored digest does not match canonical recompute."""
+    if not event.record_digest:
+        return True
+    if event.schema_version != SCHEMA_VERSION:
+        return True
+    return event.record_digest == compute_record_digest(event)
+
+
 def load_activity(
     root: Path | str,
     *,
@@ -436,9 +573,11 @@ def load_activity(
     if not worktree_id:
         worktree_id = ProjectScope(root, mode="discovery").worktree_id
     path = events_path(root, worktree_id)
-    result = LoadResult(path=path)
+    result = LoadResult(path=path, write_degraded_count=_read_write_degraded(path))
     if not path.exists():
         result.logging_status = "unknown"
+        if result.write_degraded_count:
+            result.logging_status = "degraded"
         return result
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -452,6 +591,7 @@ def load_activity(
     digest_mismatch = 0
     invalid = 0
     duplicates = 0
+    untrusted: set[str] = set()
     for line in lines:
         if not line.strip():
             continue
@@ -459,12 +599,14 @@ def load_activity(
         if event is None:
             invalid += 1
             continue
-        if event.record_digest:
-            expected = compute_record_digest(event)
-            # Legacy rows may lack digest fields used in v2 canonicalization;
-            # only count mismatch when stored digest is non-empty and differs.
-            if event.record_digest != expected and event.schema_version == SCHEMA_VERSION:
-                digest_mismatch += 1
+        if event.record_digest and not event_integrity_ok(event):
+            # Tampered / mismatched rows stay visible but never enter verified stats.
+            digest_mismatch += 1
+            untrusted.add(event.event_id)
+            detail = dict(event.detail or {})
+            detail["digest_mismatch"] = True
+            detail["logging_status"] = "degraded"
+            event.detail = detail
         if event.event_id in seen:
             duplicates += 1
             continue
@@ -486,7 +628,10 @@ def load_activity(
     result.invalid_lines = invalid
     result.digest_mismatch = digest_mismatch
     result.duplicates = duplicates
-    if invalid or digest_mismatch:
+    result.untrusted_event_ids = untrusted
+    if invalid or digest_mismatch or result.write_degraded_count:
+        result.logging_status = "degraded"
+    elif any(e.event_type == "log_degraded" for e in parsed):
         result.logging_status = "degraded"
     else:
         result.logging_status = "healthy"
@@ -503,16 +648,37 @@ def activity_health(root: Path | str, *, worktree_id: str = "") -> HealthReport:
         except OSError:
             size = 0
     notes: list[str] = []
+    log_degraded_events = sum(1 for e in loaded.events if e.event_type == "log_degraded")
+    write_degraded = loaded.write_degraded_count or _read_write_degraded(path)
     status = loaded.logging_status
     if loaded.invalid_lines:
         notes.append(f"invalid_lines={loaded.invalid_lines}")
+        status = "degraded"
     if loaded.digest_mismatch:
         notes.append(f"digest_mismatch={loaded.digest_mismatch}")
+        status = "degraded"
+    if log_degraded_events:
+        notes.append(f"log_degraded_events={log_degraded_events}")
+        status = "degraded"
+    if write_degraded:
+        notes.append(f"write_degraded_count={write_degraded}")
+        status = "degraded"
     if loaded.duplicates:
         notes.append(f"duplicates={loaded.duplicates}")
     if path is None or not path.exists():
-        status = "unknown"
+        if write_degraded or loaded.invalid_lines or loaded.digest_mismatch:
+            status = "degraded"
+        else:
+            status = "unknown"
         notes.append("no_activity_log")
+    # Never report healthy when integrity or write degradation is present.
+    if status == "healthy" and (
+        loaded.invalid_lines
+        or loaded.digest_mismatch
+        or log_degraded_events
+        or write_degraded
+    ):
+        status = "degraded"
     return HealthReport(
         status=status,
         path=str(path) if path else "",
@@ -522,6 +688,8 @@ def activity_health(root: Path | str, *, worktree_id: str = "") -> HealthReport:
         duplicates=loaded.duplicates,
         truncated=loaded.truncated,
         file_bytes=size,
+        write_degraded_count=write_degraded,
+        log_degraded_events=log_degraded_events,
         notes=notes,
     )
 
@@ -535,8 +703,59 @@ def _sum_cost(events: Iterable[ControlEvent]) -> dict[str, int]:
     return totals
 
 
-def aggregate_run_report(events: list[ControlEvent], *, run_id: str = "") -> dict[str, Any]:
-    """Aggregate control-effect metrics from real events only."""
+def _is_untrusted_event(event: ControlEvent) -> bool:
+    if event.detail.get("digest_mismatch"):
+        return True
+    if event.record_digest and event.schema_version == SCHEMA_VERSION:
+        return not event_integrity_ok(event)
+    return False
+
+
+def _counts_as_verified_completion(event: ControlEvent) -> bool:
+    """Verified completion requires runtime evidence; gate allow alone never qualifies."""
+    if _is_untrusted_event(event):
+        return False
+    if event.confidence != "verified":
+        return False
+    if event.source in {"declared", "cli"}:
+        return False
+    # Prefer runtime; allow non-runtime only when concrete evidence_ids are present.
+    if event.source != "runtime" and not event.evidence_ids:
+        return False
+    if event.event_type not in _VERIFIED_COMPLETION_TYPES:
+        return False
+    if event.outcome in {"blocked", "failed", "deny", "unknown"}:
+        return False
+    if event.decision in {"deny", "block"}:
+        return False
+    return True
+
+
+def _counts_as_executed(event: ControlEvent) -> bool:
+    if _is_untrusted_event(event):
+        return False
+    if event.source in {"declared", "cli"}:
+        return False
+    if event.confidence not in {"verified", "observed"}:
+        return False
+    if event.event_type not in _EXECUTED_TYPES:
+        return False
+    if event.outcome in {"blocked", "failed", "deny"}:
+        return False
+    return True
+
+
+def aggregate_run_report(
+    events: list[ControlEvent],
+    *,
+    run_id: str = "",
+    eligible_units: int | str | None = None,
+) -> dict[str, Any]:
+    """Aggregate control-effect metrics from real events only.
+
+    Without an independent inventory (``eligible_units``), the denominator stays
+    ``unknown`` / ``partial_observation`` — never invent 100% from the ops set.
+    """
     rows = [e for e in events if (not run_id or e.run_id == run_id)]
     if run_id:
         rows = [e for e in rows if e.run_id == run_id]
@@ -545,60 +764,57 @@ def aggregate_run_report(events: list[ControlEvent], *, run_id: str = "") -> dic
     gated = {
         e.operation_id or e.event_id
         for e in rows
-        if e.event_type == "gate_evaluated" and e.confidence in {"verified", "observed"}
+        if e.event_type == "gate_evaluated"
+        and e.confidence in {"verified", "observed"}
+        and e.source not in {"declared", "cli"}
+        and not _is_untrusted_event(e)
     }
     admitted = {
         e.operation_id or e.event_id
         for e in rows
         if e.event_type in {"ticket_redeemed", "action_completed", "operation_finished"}
         and e.confidence == "verified"
+        and e.source == "runtime"
         and e.outcome not in {"blocked", "failed", "deny"}
+        and not _is_untrusted_event(e)
     }
     blocked = {
         e.operation_id or e.event_id
         for e in rows
-        if e.event_type == "action_blocked"
-        or (e.event_type == "gate_evaluated" and e.decision in {"deny", "block"})
+        if (
+            e.event_type == "action_blocked"
+            or (e.event_type == "gate_evaluated" and e.decision in {"deny", "block"})
+        )
+        and not _is_untrusted_event(e)
     }
     executed = {
         e.operation_id or e.event_id
         for e in rows
-        if e.event_type in {"operation_finished", "side_effect_committed", "action_completed"}
-        and e.confidence in {"verified", "observed"}
-        and e.outcome not in {"blocked", "failed", "deny"}
+        if _counts_as_executed(e)
     }
     verified = {
         e.operation_id or e.event_id
         for e in rows
-        if e.confidence == "verified"
-        and e.event_type in {
-            "ticket_redeemed", "validation_finished", "action_completed",
-            "operation_finished", "gate_evaluated",
-        }
-        and e.outcome not in {"blocked", "failed", "deny", "unknown"}
-        and e.decision not in {"deny", "block"}
+        if _counts_as_verified_completion(e)
     }
     declared_only = {
         e.operation_id or e.event_id
         for e in rows
-        if e.confidence == "declared" or e.source == "declared"
+        if e.confidence == "declared" or e.source in {"declared", "cli"}
     }
     degraded = {
         e.operation_id or e.event_id
         for e in rows
-        if e.event_type == "log_degraded" or e.outcome == "degraded"
+        if e.event_type == "log_degraded" or e.outcome == "degraded" or _is_untrusted_event(e)
     }
 
-    eligible_units: int | str
-    if ops:
-        eligible_units = len(ops)
-        eligible_status = "observed"
-    elif rows:
-        eligible_units = "unknown"
-        eligible_status = "partial_observation"
+    # No independent inventory → never use ops as a fake full denominator.
+    if eligible_units is None:
+        eligible_value: int | str = "unknown"
+        eligible_status = "partial_observation" if rows else "unknown"
     else:
-        eligible_units = "unknown"
-        eligible_status = "unknown"
+        eligible_value = eligible_units
+        eligible_status = "inventory" if isinstance(eligible_units, int) else str(eligible_units)
 
     timeline = []
     for e in rows:
@@ -615,6 +831,7 @@ def aggregate_run_report(events: list[ControlEvent], *, run_id: str = "") -> dic
             "blocker": e.blocker,
             "next_action": e.next_action,
             "rule_ids": list(e.rule_ids),
+            "digest_mismatch": bool(e.detail.get("digest_mismatch")),
         })
 
     unproven = set()
@@ -622,7 +839,9 @@ def aggregate_run_report(events: list[ControlEvent], *, run_id: str = "") -> dic
         key = e.operation_id or e.event_id
         if e.confidence in {"declared", "unknown"}:
             unproven.add(key)
-        if e.source == "declared" and e.event_type == "action_completed":
+        if e.source in {"declared", "cli"} and e.event_type == "action_completed":
+            unproven.add(key)
+        if _is_untrusted_event(e):
             unproven.add(key)
 
     status = "unknown"
@@ -630,7 +849,13 @@ def aggregate_run_report(events: list[ControlEvent], *, run_id: str = "") -> dic
         status = "blocked"
     elif any(e.outcome in {"failed", "fail"} for e in rows):
         status = "failed"
-    elif any(e.event_type in {"action_completed", "run_finished"} and e.confidence != "declared" for e in rows):
+    elif any(
+        e.event_type in {"action_completed", "run_finished"}
+        and e.confidence != "declared"
+        and e.source not in {"declared", "cli"}
+        and not _is_untrusted_event(e)
+        for e in rows
+    ):
         status = "completed"
     elif rows:
         status = "unknown"
@@ -643,7 +868,7 @@ def aggregate_run_report(events: list[ControlEvent], *, run_id: str = "") -> dic
     finished = rows[-1].observed_at if rows else ""
 
     coverage = {
-        "eligible_units": eligible_units,
+        "eligible_units": eligible_value,
         "eligible_status": eligible_status,
         "gated_units": len(gated),
         "admitted_units": len(admitted),
@@ -654,9 +879,9 @@ def aggregate_run_report(events: list[ControlEvent], *, run_id: str = "") -> dic
         "log_degraded_units": len(degraded),
     }
     rates: dict[str, Any] = {"coverage_status": eligible_status}
-    if isinstance(eligible_units, int) and eligible_units > 0:
-        rates["gate_coverage"] = round(len(gated) / eligible_units, 4)
-        rates["evidence_completeness"] = round(len(verified) / eligible_units, 4)
+    if isinstance(eligible_value, int) and eligible_value > 0:
+        rates["gate_coverage"] = round(len(gated) / eligible_value, 4)
+        rates["evidence_completeness"] = round(len(verified) / eligible_value, 4)
     else:
         rates["gate_coverage"] = None
         rates["evidence_completeness"] = None
@@ -810,15 +1035,32 @@ def one_line_summary(report: dict[str, Any], report_path: str = "") -> str:
     )
 
 
-def benchmark_append(root: Path | str, *, count: int = 100) -> dict[str, Any]:
-    """Measure append latency (no LLM). Returns ms stats."""
+def _pct(samples: list[float], p: float) -> float:
+    if not samples:
+        return 0.0
+    idx = min(len(samples) - 1, max(0, int(round((p / 100.0) * (len(samples) - 1)))))
+    return round(samples[idx], 4)
+
+
+def benchmark_append(
+    root: Path | str,
+    *,
+    count: int = 100,
+    include_production_path: bool = True,
+) -> dict[str, Any]:
+    """Measure append latency (no LLM).
+
+    Returns both a steady-state append path (pre-built event, identity resolved)
+    and a production-path that goes through ``record_activity`` (build + identity
+    inject + digest + flock append).
+    """
     root = Path(root)
     # Resolve identity once so the hot path mirrors steady-state callers.
     scope = ProjectScope(root, mode="discovery")
     ident = load_identity(root)
     project_id = ident.project_id if ident is not None else ""
     worktree_id = scope.worktree_id or "default"
-    samples: list[float] = []
+    direct_samples: list[float] = []
     for i in range(int(count)):
         t0 = time.perf_counter()
         result = append_activity(
@@ -839,20 +1081,61 @@ def benchmark_append(root: Path | str, *, count: int = 100) -> dict[str, Any]:
         )
         t1 = time.perf_counter()
         if not result.ok:
-            return {"ok": False, "error": result.error, "count": i}
-        samples.append((t1 - t0) * 1000.0)
-    samples.sort()
-    def pct(p: float) -> float:
-        if not samples:
-            return 0.0
-        idx = min(len(samples) - 1, max(0, int(round((p / 100.0) * (len(samples) - 1)))))
-        return round(samples[idx], 4)
+            return {"ok": False, "error": result.error, "count": i, "path": "direct"}
+        direct_samples.append((t1 - t0) * 1000.0)
+    direct_samples.sort()
+
+    production_samples: list[float] = []
+    if include_production_path:
+        for i in range(int(count)):
+            t0 = time.perf_counter()
+            # Full production writer: build_event + identity + digest + flock.
+            result = record_activity(
+                root,
+                "request_received",
+                action="benchmark.production",
+                run_id="run-bench-prod",
+                operation_id=f"op-bench-prod-{i}",
+                sequence=i,
+                source="system",
+                confidence="unknown",
+                detail={"status": "bench_production"},
+            )
+            t1 = time.perf_counter()
+            if not result.ok:
+                return {
+                    "ok": False,
+                    "error": result.error,
+                    "count": i,
+                    "path": "production",
+                }
+            production_samples.append((t1 - t0) * 1000.0)
+        production_samples.sort()
+
+    direct_p95 = _pct(direct_samples, 95)
+    production_p95 = _pct(production_samples, 95) if production_samples else None
     return {
         "ok": True,
-        "count": len(samples),
-        "p50_ms": pct(50),
-        "p95_ms": pct(95),
-        "max_ms": round(samples[-1], 4) if samples else 0.0,
+        "count": len(direct_samples),
+        "p50_ms": _pct(direct_samples, 50),
+        "p95_ms": direct_p95,
+        "max_ms": round(direct_samples[-1], 4) if direct_samples else 0.0,
         "budget_p95_ms": 5.0,
-        "within_budget": pct(95) <= 5.0,
+        "within_budget": direct_p95 <= 5.0,
+        "direct": {
+            "count": len(direct_samples),
+            "p50_ms": _pct(direct_samples, 50),
+            "p95_ms": direct_p95,
+            "max_ms": round(direct_samples[-1], 4) if direct_samples else 0.0,
+        },
+        "production": {
+            "count": len(production_samples),
+            "p50_ms": _pct(production_samples, 50) if production_samples else None,
+            "p95_ms": production_p95,
+            "max_ms": round(production_samples[-1], 4) if production_samples else None,
+            "budget_p95_ms": 5.0,
+            "within_budget": (
+                production_p95 <= 5.0 if production_p95 is not None else None
+            ),
+        },
     }

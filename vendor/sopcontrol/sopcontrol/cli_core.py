@@ -692,6 +692,13 @@ def cmd_event(args) -> int:
         raw = sys.stdin.read()
         try:
             payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("event payload must be an object")
+            # Public CLI input is never runtime/verified evidence. Callers may
+            # declare intent, but cannot mint verified control success.
+            payload = dict(payload)
+            payload["source"] = "cli"
+            payload["confidence"] = "declared"
             event = validate_event_payload(payload)
         except Exception as exc:
             print(f"invalid event: {exc}", file=sys.stderr)

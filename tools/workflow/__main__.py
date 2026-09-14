@@ -176,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     learn_decide.add_argument(
         "--confirmation-secret",
         default="",
-        help="User confirmation secret; omit to read local handoff after user confirms",
+        help="User confirmation secret (required explicitly; host must read handoff itself)",
     )
     learn_notify = learn_sub.add_parser("notify", parents=[common], help="Render a proposal as a host-owned prompt card")
     learn_notify.add_argument("--proposal-id", required=True)

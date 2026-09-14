@@ -76,14 +76,14 @@ def cmd_dynamic(args) -> int:
                 return 2
         conf_id = str(getattr(args, "confirmation_id", "") or "").strip()
         conf_secret = str(getattr(args, "confirmation_secret", "") or "").strip()
+        # Never auto-read handoff; require --confirmation-secret or TTY prompt.
         if conf_id and not conf_secret and args.decision in {
             "keep_longterm", "edit_keep_longterm"
         }:
-            try:
-                from .learning import read_learning_confirmation_secret
-                conf_secret = read_learning_confirmation_secret(root, conf_id)
-            except ValueError:
-                conf_secret = ""
+            from .learning import resolve_confirmation_secret
+            conf_secret = resolve_confirmation_secret(
+                conf_secret, confirmation_id=conf_id, allow_tty_prompt=True,
+            )
         try:
             # 公开 CLI 不得 user_attested；永久决定必须带 confirmation envelope。
             result = confirm_candidate(

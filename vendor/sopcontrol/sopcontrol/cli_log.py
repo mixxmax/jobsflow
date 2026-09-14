@@ -39,18 +39,25 @@ def cmd_log(args) -> int:
 
     if sub == "benchmark":
         count = int(getattr(args, "count", 100) or 100)
-        result = benchmark_append(root, count=count)
+        result = benchmark_append(root, count=count, include_production_path=True)
         if as_json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
             if not result.get("ok"):
                 print(f"benchmark failed: {result.get('error')}", file=sys.stderr)
                 return 2
+            prod = result.get("production") or {}
             print(
                 f"append n={result['count']} p50={result['p50_ms']}ms "
                 f"p95={result['p95_ms']}ms max={result['max_ms']}ms "
                 f"budget_p95={result['budget_p95_ms']}ms "
                 f"within_budget={result['within_budget']}"
+            )
+            print(
+                f"production-path n={prod.get('count')} "
+                f"p50={prod.get('p50_ms')}ms p95={prod.get('p95_ms')}ms "
+                f"max={prod.get('max_ms')}ms "
+                f"within_budget={prod.get('within_budget')}"
             )
         return 0 if result.get("ok") else 2
 

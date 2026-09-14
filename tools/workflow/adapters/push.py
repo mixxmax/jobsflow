@@ -38,7 +38,7 @@ ENTRY_RULE_IDS = ["PUSH-001", "FRESH-001", "SYNC-001", "SYNC-004", "SYNC-005"]
 
 
 @contextmanager
-def _jobsdb_gateway_context():
+def _jobsdb_gateway_context(workspace: Path):
     """Authorize the selected-push deep-review child as gateway-owned.
 
     ``scan`` already sets this marker before launching the scorer.  In the
@@ -49,16 +49,25 @@ def _jobsdb_gateway_context():
     it is never persisted or exposed as user configuration.
     """
 
-    key = "JOBSFLOW_GATEWAY_ACTIVE"
-    previous = os.environ.get(key)
-    os.environ[key] = "1"
+    # The scorer resolves the JobsDB policy from ``JOBSEARCH_ROOT``.  The
+    # subprocess scan sets it before launch; selected push runs in-process and
+    # therefore must carry the same private runtime identity for this bounded
+    # call, otherwise it silently falls back to product policy and disables
+    # the user-Chrome handoff.
+    markers = {
+        "JOBSFLOW_GATEWAY_ACTIVE": "1",
+        "JOBSEARCH_ROOT": str(Path(workspace).expanduser().resolve()),
+    }
+    previous = {key: os.environ.get(key) for key in markers}
+    os.environ.update(markers)
     try:
         yield
     finally:
-        if previous is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = previous
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _retire_proposal(
@@ -471,7 +480,7 @@ def handle(
                 # the same narrowly scoped attestation marker for the duration
                 # of the selected deep review so JobsDB can use the approved
                 # primary-Chrome handoff without opening a compatibility path.
-                with _jobsdb_gateway_context():
+                with _jobsdb_gateway_context(workspace):
                     deep_rows, deep_review_meta = deepen_scored_rows(
                         rows,
                         repo=_repo_for_workspace(workspace),

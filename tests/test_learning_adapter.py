@@ -150,7 +150,10 @@ def test_learning_control_enters_effective_compiled_rule(monkeypatch, tmp_path):
 
 
 def test_learning_control_agent_self_call_blocked(monkeypatch, tmp_path):
-    """负向：模型直接 decide control 无用户凭据 → needs_user，Registry 不增长。"""
+    """负向：模型直接 decide control 无用户凭据 → needs_user，Registry 不增长。
+
+    Agent 两次调用（含仅 confirmation_id）也不得自动读 handoff 晋升。
+    """
     _use_root(monkeypatch, tmp_path)
     learning_adapter._LEARNING_API_ATTEMPTED = False
     learning_adapter._LEARNING_API = None
@@ -169,6 +172,14 @@ def test_learning_control_agent_self_call_blocked(monkeypatch, tmp_path):
     assert out["status"] == "needs_user"
     assert out.get("confirmation_id")
     assert "confirmation_secret" not in out
+    # Second call with confirmation_id only — adapter must not auto-read secret.
+    out2 = learning_adapter.decide_learning_proposal(
+        proposal_id,
+        "control",
+        actor="agent",
+        confirmation_id=out["confirmation_id"],
+    )
+    assert out2["status"] == "needs_user"
     reg = tmp_path / ".sopcontrol" / "rules" / "registry.yaml"
     if reg.is_file():
         from sopcontrol.registry import Registry

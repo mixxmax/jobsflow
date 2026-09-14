@@ -748,7 +748,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirmation-id", default="",
                    help="用户确认凭据 ID（control/both 必填）")
     p.add_argument("--confirmation-secret", default="",
-                   help="用户确认 secret；可省略并由本地 handoff 读取")
+                   help="用户确认 secret（必填显式传入，或在 TTY 交互输入；不自动读 handoff）")
     p.add_argument("path", nargs="?", default=".")
     p.set_defaults(func=cmd_learn)
     p = learn_sub.add_parser("ingest", help="外部提案导入（只成提案）")
@@ -790,7 +790,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirmation-id", default="",
                    help="用户确认凭据 ID（keep_longterm/edit_keep_longterm 必填）")
     p.add_argument("--confirmation-secret", default="",
-                   help="用户确认 secret；可省略并由本地 handoff 读取")
+                   help="用户确认 secret（必填显式传入，或在 TTY 交互输入；不自动读 handoff）")
     p.add_argument("path", nargs="?", default=".")
     p.set_defaults(func=cmd_dynamic)
     p = dynamic_sub.add_parser("once-only", help="查看会话级临时指令（不进永久空间）")
