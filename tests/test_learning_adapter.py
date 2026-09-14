@@ -105,6 +105,102 @@ def test_learning_decision_routes_document_without_registry_write(monkeypatch, t
     assert not (tmp_path / ".sopcontrol" / "rules" / "registry.yaml").exists()
 
 
+def test_learning_control_enters_effective_compiled_rule(monkeypatch, tmp_path):
+    """DS-05/06：control 在用户确认凭据核销后进入 Registry compiled。"""
+    _use_root(monkeypatch, tmp_path)
+    learning_adapter._LEARNING_API_ATTEMPTED = False
+    learning_adapter._LEARNING_API = None
+    learning_adapter.record_learning_event(
+        text="以后必须先台账后评分",
+        kind="correction",
+        task_id="task-ds05",
+        session_id="session-ds05",
+        action="push",
+        phase="preview",
+    )
+    reviewed = learning_adapter.review_learning_window(
+        task_id="task-ds05", session_id="session-ds05"
+    )
+    proposal_id = reviewed["proposals"][0]["proposal_id"]
+    # 无凭据：不得晋升
+    denied = learning_adapter.decide_learning_proposal(proposal_id, "control")
+    assert denied["status"] == "needs_user"
+    assert denied.get("confirmation_id")
+    from sopcontrol.learning import read_learning_confirmation_secret
+
+    secret = read_learning_confirmation_secret(tmp_path, denied["confirmation_id"])
+    decided = learning_adapter.decide_learning_proposal(
+        proposal_id,
+        "control",
+        confirmation_id=denied["confirmation_id"],
+        confirmation_secret=secret,
+    )
+    assert decided["status"] == "succeeded"
+    assert decided["route"] == "control"
+    assert decided.get("rule_id")
+    assert decided.get("rule_status") == "compiled"
+    assert decided.get("compile_digest")
+    from sopcontrol.registry import Registry
+    from sopcontrol.dynamic_sop import select_rules
+
+    rules = Registry(tmp_path / ".sopcontrol" / "rules" / "registry.yaml").load()
+    assert any(r.rule_id == decided["rule_id"] for r in rules)
+    selected, _, _ = select_rules(rules, {"action": "push"})
+    assert any(r.rule_id == decided["rule_id"] for r in selected)
+
+
+def test_learning_control_agent_self_call_blocked(monkeypatch, tmp_path):
+    """负向：模型直接 decide control 无用户凭据 → needs_user，Registry 不增长。"""
+    _use_root(monkeypatch, tmp_path)
+    learning_adapter._LEARNING_API_ATTEMPTED = False
+    learning_adapter._LEARNING_API = None
+    learning_adapter.record_learning_event(
+        text="以后必须先审计 CV 再渲染，不要跳过",
+        kind="correction",
+        task_id="task-neg",
+        session_id="session-neg",
+        action="materials",
+        phase="audit",
+    )
+    reviewed = learning_adapter.review_learning_window(task_id="task-neg", session_id="session-neg")
+    assert reviewed.get("proposals"), reviewed
+    proposal_id = reviewed["proposals"][0]["proposal_id"]
+    out = learning_adapter.decide_learning_proposal(proposal_id, "control", actor="user")
+    assert out["status"] == "needs_user"
+    assert out.get("confirmation_id")
+    assert "confirmation_secret" not in out
+    reg = tmp_path / ".sopcontrol" / "rules" / "registry.yaml"
+    if reg.is_file():
+        from sopcontrol.registry import Registry
+
+        assert Registry(reg).load() == []
+
+
+def test_learning_once_only_does_not_grow_registry(monkeypatch, tmp_path):
+    """DS-04：once_only 不进入永久 Registry。"""
+    _use_root(monkeypatch, tmp_path)
+    learning_adapter._LEARNING_API_ATTEMPTED = False
+    learning_adapter._LEARNING_API = None
+    learning_adapter.record_learning_event(
+        text="以后必须先预览再确认",
+        kind="correction",
+        task_id="task-oo",
+        session_id="session-oo",
+        action="push",
+        phase="preview",
+    )
+    reviewed = learning_adapter.review_learning_window(task_id="task-oo", session_id="session-oo")
+    proposal_id = reviewed["proposals"][0]["proposal_id"]
+    decided = learning_adapter.decide_learning_proposal(proposal_id, "once_only")
+    assert decided["status"] == "succeeded"
+    assert decided.get("permanent") is False
+    reg = tmp_path / ".sopcontrol" / "rules" / "registry.yaml"
+    if reg.is_file():
+        from sopcontrol.registry import Registry
+
+        assert Registry(reg).load() == []
+
+
 def test_workflow_observation_is_non_blocking_and_only_reviews_at_boundary(monkeypatch, tmp_path):
     _use_root(monkeypatch, tmp_path)
 

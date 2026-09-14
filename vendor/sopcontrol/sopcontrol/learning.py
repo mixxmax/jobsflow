@@ -89,6 +89,9 @@ class EvidenceBundle(BaseModel):
                  "events": [e.event_id for e in self.events]})[:20]
 
 
+ProposalDurability = Literal["permanent", "once_only"]
+
+
 class LearningProposal(BaseModel):
     """§4.3：归并后的规则建议。0 到 3 条/窗口；生效范围 + 例外 + 非目标必填。"""
     model_config = _STRICT
@@ -100,6 +103,8 @@ class LearningProposal(BaseModel):
     exceptions: list[str] = Field(default_factory=list)
     non_goals: list[str] = Field(default_factory=list)
     rule_class: str = "dynamic_sop"  # constitution/dynamic_sop/natural_logic
+    # 贯穿 distill → proposal → decide；不得只靠 evidence_refs 猜「仅本次」。
+    durability: ProposalDurability = "permanent"
     route: ProposalRoute = "defer"
     status: ProposalStatus = "proposed"
     evidence_refs: list[str] = Field(default_factory=list)
@@ -113,13 +118,19 @@ class LearningProposal(BaseModel):
 
 
 class ProposalDecision(BaseModel):
-    """§4.4：人对提案的决定。决定只改提案状态；规则生效另走正规链。"""
+    """§4.4：人对提案的决定。
+
+    actor 默认是 agent：调用 CLI/API 本身不等于用户确认。
+    control/both 必须携带宿主签发的 confirmation_id + confirmation_secret。
+    """
     model_config = _STRICT
 
     proposal_id: str
     route: ProposalRoute
-    actor: str = "user"
+    actor: str = "agent"
     note: str = ""
+    confirmation_id: str = ""
+    confirmation_secret: str = ""
     decided_at: datetime = Field(default_factory=utcnow)
 
 
@@ -352,13 +363,56 @@ class DistillerAdapter:
         raise NotImplementedError
 
 
+# 闲聊 / 系统错误：确定性提取器不得据此提案（手册 LR）。
+_CHITCHAT_MARKERS = (
+    "你好", "您好", "谢谢", "感谢", "哈哈", "hello", "hi ", "thanks",
+    "good morning", "good night", "咋样", "在吗",
+)
+_SYSTEM_ERROR_MARKERS = (
+    "traceback", "exception:", "error:", "errno", "status_code=5",
+    "connectionreset", "timeout", "workflow action ",
+    "capability_ticket", "runtimeerror", "typeerror", "valueerror",
+)
+
+
+def _is_noise_topic(topic: str, events: list[LearningEvent]) -> bool:
+    """闲聊或系统/工具错误主题不得成为规则提案。"""
+    t = (topic or "").strip()
+    if not t:
+        return True
+    low = t.casefold()
+    if any(m in low for m in _CHITCHAT_MARKERS):
+        # 短问候/寒暄：无长期意图信号
+        if _signal_level(t) == "none" and len(t) < 40:
+            return True
+    if any(m in low for m in _SYSTEM_ERROR_MARKERS):
+        return True
+    # 窗口内若全是 tool_call/系统态且无纠正类信号 → 噪声
+    if events and all(e.kind in ("tool_call", "decay", "task_boundary") for e in events):
+        if _signal_level(" ".join(e.text for e in events)) == "none":
+            return True
+    return False
+
+
 class FakeDistiller(DistillerAdapter):
-    """确定性 fake：主题→提案（≤3），离线测试唯一依赖。"""
-    name: str = "fake"
+    """确定性规则提取器（测试/离线回退用）。
+
+    诚实命名：不是 LLM，不具备泛化理解能力；仅按主题+信号阈值生成 ≤3 条提案。
+    别名 DeterministicRuleExtractor 指向同一实现。
+    """
+    name: str = "deterministic-rule-extractor"
 
     def distill(self, bundle: EvidenceBundle) -> DistillerOutput:
         proposals = []
         for topic in bundle.topics[:3]:
+            if _is_noise_topic(topic, bundle.events):
+                continue
+            # 无中高信号时不提案（与 evaluate_trigger 对齐，防闲聊穿透）
+            if _signal_level(topic) == "none" and _signal_level(
+                    " ".join(e.text for e in bundle.events)) in ("none", "low"):
+                continue
+            once = any("仅本次" in e.text or "只针对这次" in e.text
+                       or "这一次" in e.text for e in bundle.events)
             proposals.append({
                 "summary": topic,
                 "rule_class": "dynamic_sop",
@@ -366,8 +420,8 @@ class FakeDistiller(DistillerAdapter):
                 "exceptions": ["用户明确反向要求"],
                 "non_goals": ["不扩大到无关任务"],
                 "scope": {},
-                "durability": "permanent_candidate",
-                "recommended_destination": "control",
+                "durability": ("once_only" if once else "permanent_candidate"),
+                "recommended_destination": ("once_only" if once else "control"),
                 "confidence": "high" if not bundle.conflicts else "not_proven",
                 "evidence_refs": [e.event_id for e in bundle.events[:4]],
                 "unsupported_claims": [],
@@ -375,7 +429,11 @@ class FakeDistiller(DistillerAdapter):
             })
         return DistillerOutput(
             window_id=bundle.window_id, proposals=proposals,
-            no_candidate_reason="" if proposals else "证据不足")
+            no_candidate_reason=("" if proposals else "证据不足或仅噪声/闲聊/系统错误"))
+
+
+# 诚实别名：测试与文档应使用此名，避免伪装成 LLM。
+DeterministicRuleExtractor = FakeDistiller
 
 
 class UnprovenLLMAdapter(DistillerAdapter):
@@ -506,15 +564,114 @@ def _rewrite_proposal(root: Path, proposal: LearningProposal) -> None:
     path.write_text("\n".join(kept) + "\n", encoding="utf-8")
 
 
+_CONTROL_ROUTES = frozenset({"control", "both"})
+
+
+def _confirmations_dir(root: Path) -> Path:
+    return Path(root) / ".sopcontrol-local" / "learning" / "confirmations"
+
+
+def issue_learning_confirmation(root: Path | str, proposal_id: str) -> dict[str, Any]:
+    """签发一次性用户确认凭据。secret 只写入 0600 handoff，不进入公开返回值。"""
+    import hashlib
+    import json
+    import secrets
+
+    root = Path(root)
+    confirmation_id = "lconf-" + secrets.token_hex(8)
+    secret = secrets.token_urlsafe(24)
+    digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    folder = _confirmations_dir(root)
+    folder.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "confirmation_id": confirmation_id,
+        "proposal_id": proposal_id,
+        "secret_sha256": digest,
+        "consumed": False,
+        "created_at": utcnow().isoformat(),
+    }
+    (folder / f"{confirmation_id}.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    handoff = folder / f"{confirmation_id}.secret"
+    handoff.write_text(secret, encoding="utf-8")
+    try:
+        handoff.chmod(0o600)
+    except OSError:
+        pass
+    return {
+        "status": "needs_user",
+        "proposal_id": proposal_id,
+        "confirmation_id": confirmation_id,
+        "next_action": "retry_with_user_confirmation",
+        "note": "control/both 需要宿主在用户确认后提交 confirmation_id+secret；"
+                "secret 仅在本地 handoff 文件，不在公开 JSON。",
+    }
+
+
+def read_learning_confirmation_secret(root: Path | str, confirmation_id: str) -> str:
+    """宿主在用户确认后读取 handoff secret（测试与 JobsFlow gateway 用）。"""
+    path = _confirmations_dir(Path(root)) / f"{confirmation_id}.secret"
+    if not path.is_file():
+        raise ValueError("learning_confirmation_secret_missing")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def redeem_learning_confirmation(
+    root: Path | str,
+    *,
+    proposal_id: str,
+    confirmation_id: str,
+    secret: str,
+) -> None:
+    """核销用户确认凭据；失败则不得晋升永久规则。"""
+    import hashlib
+    import json
+
+    root = Path(root)
+    confirmation_id = str(confirmation_id or "").strip()
+    secret = str(secret or "").strip()
+    if not confirmation_id or not secret:
+        raise ValueError("learning_confirmation_required")
+    meta_path = _confirmations_dir(root) / f"{confirmation_id}.json"
+    if not meta_path.is_file():
+        raise ValueError("learning_confirmation_not_found")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if str(meta.get("proposal_id") or "") != proposal_id:
+        raise ValueError("learning_confirmation_proposal_mismatch")
+    if bool(meta.get("consumed")):
+        raise ValueError("learning_confirmation_consumed")
+    digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    if digest != str(meta.get("secret_sha256") or ""):
+        raise ValueError("learning_confirmation_invalid")
+    meta["consumed"] = True
+    meta["consumed_at"] = utcnow().isoformat()
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8")
+    handoff = _confirmations_dir(root) / f"{confirmation_id}.secret"
+    try:
+        handoff.unlink(missing_ok=True)
+    except TypeError:
+        if handoff.is_file():
+            handoff.unlink()
+    except OSError:
+        pass
+
+
 def decide_proposal(root: Path | str, proposal: LearningProposal,
                     decision: ProposalDecision) -> dict[str, Any]:
-    """P1-D：六选一路由。control/both 经 CandidateStore（正规链入口），
-    永不直写 Registry；once_only 证据禁 control。"""
+    """P1-D：六选一路由。
+
+    control/both：必须先有用户确认凭据，再 CandidateStore → confirm → compile。
+    调用 CLI/设 actor=user 不等于用户确认。once_only/reject/defer 不进永久空间。
+    """
     from .candidate import CandidateSource, CandidateStore
     root = Path(root)
     if decision.proposal_id != proposal.proposal_id:
         raise ValueError("决定与提案不匹配")
-    if decision.route in ("control", "both") and any(
+    durability = getattr(proposal, "durability", "permanent") or "permanent"
+    if decision.route in _CONTROL_ROUTES and durability == "once_only":
+        raise ValueError("once_only 提案不得路由 control")
+    if decision.route in _CONTROL_ROUTES and any(
             "仅本次" in ref for ref in proposal.evidence_refs):
         raise ValueError("once_only 证据不得路由 control")
     # §6/defer 语义：deferred 是 pending，可复决；confirmed/rejected 为终态。
@@ -522,7 +679,23 @@ def decide_proposal(root: Path | str, proposal: LearningProposal,
         raise ValueError(f"提案已定案（{proposal.status}），不得重复决定")
     result: dict[str, Any] = {"proposal_id": proposal.proposal_id,
                               "route": decision.route}
-    if decision.route in ("control", "both"):
+    if decision.route in _CONTROL_ROUTES:
+        if not (decision.confirmation_id and decision.confirmation_secret):
+            challenge = issue_learning_confirmation(root, proposal.proposal_id)
+            challenge["route"] = decision.route
+            return challenge
+        redeem_learning_confirmation(
+            root,
+            proposal_id=proposal.proposal_id,
+            confirmation_id=decision.confirmation_id,
+            secret=decision.confirmation_secret,
+        )
+        from .dynamic_sop import compile_rule, confirm_candidate
+        # control 晋升需要权威 Registry；宿主若尚未 sopctl init，创建空表（不发明规则）。
+        reg_path = root / ".sopcontrol" / "rules" / "registry.yaml"
+        if not reg_path.is_file():
+            reg_path.parent.mkdir(parents=True, exist_ok=True)
+            reg_path.write_text("rules: []\n", encoding="utf-8")
         store = CandidateStore(root)
         record, _ = store.upsert(
             kind="dynamic_sop", statement=proposal.statement,
@@ -531,9 +704,23 @@ def decide_proposal(root: Path | str, proposal: LearningProposal,
             source=CandidateSource(source_type="learning_proposal",
                                    ref=proposal.proposal_id,
                                    occurrence_id=proposal.proposal_id),
-            note="学习提案转候选；晋升走 confirm/compile 正规链",
+            note="学习提案转候选；用户确认凭据核销后 confirm/compile",
             priority="low", explicit_once_only=False)
         result["candidate_id"] = record.candidate_id
+        # 学习确认 envelope 已核销：允许 confirm_candidate 在同一次用户确认内晋升。
+        confirmed = confirm_candidate(
+            root, record.candidate_id, "keep_longterm",
+            actor="user", user_attested=True)
+        if confirmed.get("status") == "needs_user":
+            # 防御：不应再挑战；若出现则原样返回，勿假装成功。
+            return confirmed
+        result["rule_id"] = confirmed["rule_id"]
+        result["rule_status"] = confirmed["rule_status"]
+        result["permanent"] = True
+        compiled = compile_rule(root, confirmed["rule_id"], actor="user")
+        result["rule_status"] = compiled["rule_status"]
+        result["compile_digest"] = compiled["compile_digest"]
+        result["confirmation_id"] = decision.confirmation_id
     if decision.route in ("document", "both"):
         result["doc_payload"] = {
             "statement": proposal.statement,
@@ -541,8 +728,30 @@ def decide_proposal(root: Path | str, proposal: LearningProposal,
             "exceptions": proposal.exceptions,
             "non_goals": proposal.non_goals,
         }
-    if decision.route == "once_only":
-        result["note"] = "仅本次：记入会话级语义，不进永久空间"
+    # durability=once_only 的提案即使误选其他 route，也强制会话级记录。
+    force_once = durability == "once_only" or decision.route == "once_only"
+    if force_once and decision.route != "reject":
+        from .dynamic_sop import current_session_id
+        import json as _json
+        path = root / ".sopcontrol-local" / "dynamic" / "once_only.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "proposal_id": proposal.proposal_id,
+            "statement": proposal.statement,
+            "recorded_at": utcnow().isoformat(),
+            "actor": decision.actor or "agent",
+            "session_id": current_session_id(root),
+            "source": "learning_decide",
+            "durability": "once_only",
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+        result["note"] = "仅本次：已记入会话级语义，不进永久空间"
+        result["permanent"] = False
+        if decision.route != "once_only" and durability == "once_only":
+            # 元数据要求 once_only：改写路由结果，避免误入 confirmed/control。
+            decision = decision.model_copy(update={"route": "once_only"})
+            result["route"] = "once_only"
     status_map = {"control": "confirmed", "document": "confirmed",
                   "both": "confirmed", "once_only": "confirmed",
                   "defer": "deferred", "reject": "rejected"}
@@ -622,11 +831,17 @@ _PROJECTION_MARKERS = ("<!-- sopcontrol:", "sopcontrol:v1", "接管包", "takeov
 def review_window(root: Path | str, *, session_id: str = "",
                   task_id: str = "",
                   adapter: DistillerAdapter | None = None) -> dict[str, Any]:
-    """显式窗口回顾：用户指定会话/任务→聚合→提炼→存提案。必须二选一指定。"""
+    """显式窗口回顾：用户指定会话/任务→聚合→提炼→存提案。必须二选一指定。
+
+    必须按 observation 上保存的原始 task_id/session_id 过滤；不得把其他任务
+    的事件改写成当前 task/session 再蒸馏（防跨任务串窗）。
+    """
     if not (session_id or task_id):
         raise ValueError("必须指定 session_id 或 task_id（显式回顾范围）")
     import json as _json
     root = Path(root)
+    want_task = str(task_id or "").strip()
+    want_session = str(session_id or "").strip()
     obs_path = root / ".sopcontrol-local" / "dynamic" / "observations.jsonl"
     events: list[LearningEvent] = []
     recs: list[dict] = []
@@ -639,30 +854,61 @@ def review_window(root: Path | str, *, session_id: str = "",
                 recs.append(_json.loads(line))
             except ValueError:
                 continue
+    skipped = 0
     for rec in recs:
-        ev = LearningEvent(kind="utterance", session_id=session_id,
-                           task_id=task_id,
-                           message_ref=str(rec.get("observation_id", "")),
-                           text=str(rec.get("exact_quote", "")),
-                           scope={str(k): str(v) for k, v in
-                                  (rec.get("context", None) or {}).items()})
+        ctx = rec.get("context") if isinstance(rec.get("context"), dict) else {}
+        rec_task = str(rec.get("task_id") or ctx.get("task_id") or "").strip()
+        rec_session = str(rec.get("session_id") or ctx.get("session_id") or "").strip()
+        # 严格匹配：过滤条件存在时，记录必须带相同 id；空 id 不匹配（fail-closed）。
+        if want_task and rec_task != want_task:
+            skipped += 1
+            continue
+        if want_session and rec_session != want_session:
+            skipped += 1
+            continue
+        kind = str(rec.get("kind") or "utterance")
+        if kind not in {"utterance", "correction", "tool_call", "task_boundary", "decay"}:
+            kind = "utterance"
+        ev = LearningEvent(
+            event_id=str(rec.get("observation_id") or ""),
+            kind=kind,  # type: ignore[arg-type]
+            session_id=rec_session,
+            task_id=rec_task,
+            message_ref=str(rec.get("observation_id") or ""),
+            text=str(rec.get("exact_quote", "")),
+            scope={str(k): str(v) for k, v in ctx.items()},
+        )
         events.append(ev)
-    window = open_window(task_id=task_id, session_id=session_id)
+    window = open_window(task_id=want_task, session_id=want_session)
     bundle = aggregate_window(events, window)
     out, used = distill_with_fallback(bundle, adapter or FakeDistiller())
-    proposals = [LearningProposal(
-        window_id=window.window_id, statement=str(p.get("summary", "")),
-        scope_summary=", ".join(f"{k}={','.join(v)}"
-                                for k, v in (p.get("scope", None) or {}).items()),
-        exceptions=list(p.get("exceptions", []) or []),
-        non_goals=list(p.get("non_goals", []) or []),
-        rule_class=str(p.get("rule_class", "dynamic_sop")),
-        evidence_refs=list(p.get("evidence_refs", []) or []))
-        for p in out.proposals]
+    proposals: list[LearningProposal] = []
+    for p in out.proposals:
+        raw_dur = str(p.get("durability") or "permanent_candidate")
+        durability: ProposalDurability = (
+            "once_only" if raw_dur in {"once_only", "session", "temporary"} else "permanent"
+        )
+        proposals.append(LearningProposal(
+            window_id=window.window_id,
+            statement=str(p.get("summary", "")),
+            scope_summary=", ".join(
+                f"{k}={','.join(v)}" for k, v in (p.get("scope", None) or {}).items()
+            ),
+            exceptions=list(p.get("exceptions", []) or []),
+            non_goals=list(p.get("non_goals", []) or []),
+            rule_class=str(p.get("rule_class", "dynamic_sop")),
+            durability=durability,
+            evidence_refs=list(p.get("evidence_refs", []) or []),
+        ))
     saved = save_proposals(root, proposals)
-    return {"window_id": window.window_id, "events": len(events),
-            "proposals": saved, "adapter": used,
-            "no_candidate_reason": out.no_candidate_reason}
+    return {
+        "window_id": window.window_id,
+        "events": len(events),
+        "skipped_out_of_scope": skipped,
+        "proposals": saved,
+        "adapter": used,
+        "no_candidate_reason": out.no_candidate_reason,
+    }
 
 
 def import_external_proposal(root: Path | str, data: dict[str, Any]) -> LearningProposal:

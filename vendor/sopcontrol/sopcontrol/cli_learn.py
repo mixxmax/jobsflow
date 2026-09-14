@@ -48,7 +48,12 @@ def cmd_learn(args) -> int:
         return 2
 
     if sub == "decide":
-        from .learning import ProposalDecision, decide_proposal, list_proposals
+        from .learning import (
+            ProposalDecision,
+            decide_proposal,
+            list_proposals,
+            read_learning_confirmation_secret,
+        )
         target = None
         for i in list_proposals(root):
             if i.proposal_id == args.proposal_id:
@@ -57,17 +62,32 @@ def cmd_learn(args) -> int:
         if target is None:
             print(f"错误: 提案不存在: {args.proposal_id}", file=sys.stderr)
             return 2
+        conf_id = str(getattr(args, "confirmation_id", "") or "").strip()
+        conf_secret = str(getattr(args, "confirmation_secret", "") or "").strip()
+        # 宿主可只传 confirmation_id，由本地 handoff 取 secret（不打印到 stdout）。
+        if conf_id and not conf_secret and args.route in {"control", "both"}:
+            try:
+                conf_secret = read_learning_confirmation_secret(root, conf_id)
+            except ValueError:
+                conf_secret = ""
         try:
             out = decide_proposal(
                 root, target,
-                ProposalDecision(proposal_id=target.proposal_id,
-                                 route=args.route,
-                                 note=getattr(args, "note", "") or ""))
+                ProposalDecision(
+                    proposal_id=target.proposal_id,
+                    route=args.route,
+                    actor=str(getattr(args, "actor", "") or "agent"),
+                    note=getattr(args, "note", "") or "",
+                    confirmation_id=conf_id,
+                    confirmation_secret=conf_secret,
+                ))
         except ValueError as exc:
             print(f"错误: {exc}", file=sys.stderr)
             return 2
-        print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
-        return 0
+        # 永不把 confirmation_secret 打到 stdout。
+        public = {k: v for k, v in out.items() if "secret" not in str(k).lower()}
+        print(json.dumps(public, ensure_ascii=False, indent=2, default=str))
+        return 0 if out.get("status") != "needs_user" else 3
 
     if sub == "ingest":
         from .learning import import_external_proposal

@@ -1,4 +1,4 @@
 # Fixed SOP Control revision for JobsFlow CI and local installs.
-# Version 0.3.0: automatic learning observation/proposal pipeline and the
-# unified /learn control surface. Do not float on main/master.
-2eab4a2586e382bfbb4d577fb48c12dec2d3acf8
+# Version 0.3.3: dynamic confirm requires user confirmation envelope.
+# Do not float on main/master.
+4f79bb085fc08f6fd9f06c687d25ead7bfba792b

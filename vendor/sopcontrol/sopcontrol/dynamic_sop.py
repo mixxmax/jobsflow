@@ -175,13 +175,18 @@ def observe_utterance(
     suggested = suggested or {}
     explicit_once = any(marker in quote.lower() or marker in quote
                         for marker in _ONCE_ONLY_MARKERS)
+    ctx = {str(k): str(v) for k, v in context.items()}
     obs = UtteranceObservation(exact_quote=quote, source_ref=source_ref,
-                               context={str(k): str(v) for k, v in context.items()},
+                               context=ctx,
                                suggested=suggested, explicit_once_only=explicit_once)
-    # 观察留痕（append 语义：原话记录不可变）
+    # 观察留痕（append 语义：原话记录不可变）。
+    # 顶层 task_id/session_id 供 learn review 严格过滤，避免串窗。
     path = _observations_path(root)
     records = _load_jsonl(path)
-    records.append(obs.model_dump(mode="json"))
+    payload = obs.model_dump(mode="json")
+    payload["task_id"] = str(ctx.get("task_id") or "")
+    payload["session_id"] = str(ctx.get("session_id") or "")
+    records.append(payload)
     _atomic_write_jsonl(path, records)
     tier = classify_utterance(quote)
     if tier == "observation_only":
@@ -227,12 +232,21 @@ def list_dynamic_candidates(root: Path | str) -> list[dict[str, Any]]:
 
 def confirm_candidate(
     root: Path | str, candidate_id: str, decision: str, *,
-    edited_statement: str = "", actor: str = "user",
+    edited_statement: str = "", actor: str = "agent",
     activation: Optional[dict[str, list[str]]] = None,
     flexibility: Optional[dict[str, Any]] = None,
     rule_id: str = "",
+    confirmation_id: str = "",
+    confirmation_secret: str = "",
+    user_attested: bool = False,
 ) -> dict[str, Any]:
-    """§4.2 第 5 步确认卡片。四种决定，权威性只来自人的显式选择。"""
+    """§4.2 第 5 步确认卡片。
+
+    永久决定（keep_longterm / edit_keep_longterm）必须有用户确认凭据。
+    调用 CLI 或把 actor 设为 user 不等于用户确认。
+    ``user_attested=True`` 仅供已核销 confirmation envelope 的正式上游
+    （如 learn decide）在同一次用户确认后继续晋升，禁止公开 CLI 使用。
+    """
     root = Path(root)
     store = CandidateStore(root)
     record = store.get(candidate_id)
@@ -249,19 +263,41 @@ def confirm_candidate(
     if decision in ("keep_longterm", "edit_keep_longterm"):
         if not statement:
             raise ValueError("规则陈述不能为空")
+        subject = f"candidate:{candidate_id}"
+        if not user_attested:
+            from .learning import (
+                issue_learning_confirmation,
+                redeem_learning_confirmation,
+            )
+            if not (confirmation_id and confirmation_secret):
+                challenge = issue_learning_confirmation(root, subject)
+                challenge.update({
+                    "decision": decision,
+                    "candidate_id": candidate_id,
+                    "permanent": False,
+                    "note": "永久动态 SOP 需要宿主在用户确认后提交 confirmation_id+secret",
+                })
+                return challenge
+            redeem_learning_confirmation(
+                root,
+                proposal_id=subject,
+                confirmation_id=confirmation_id,
+                secret=confirmation_secret,
+            )
         from .registry import Registry
 
         rid = rule_id or ("DR-" + content_hash({"statement": statement})[:8].upper())
         registry = Registry(root / ".sopcontrol" / "rules" / "registry.yaml")
         rules = registry.load()
         existing = next((r for r in rules if r.rule_id == rid), None)
+        owner = "user" if (user_attested or (confirmation_id and confirmation_secret)) else (actor or "agent")
         if existing is None:
             first_quote = record.sources[0].ref if record.sources else source_ref_of(record)
             rule = Rule(
                 rule_id=rid, statement=statement,
                 modality=record.suggested_modality,  # type: ignore[arg-type]
                 status=RuleStatus.proposed, rule_class="dynamic_sop",
-                owner=actor,
+                owner=owner,
                 source=SourceRef(type="user_conversation", ref=first_quote),
                 activation=(ActivationSelector.model_validate(activation)
                             if activation else ActivationSelector()),
@@ -280,6 +316,7 @@ def confirm_candidate(
         final = next(r for r in registry.load() if r.rule_id == rid)
         return {"decision": decision, "rule_id": rid,
                 "rule_status": final.status.value, "permanent": True,
+                "status": "confirmed",
                 "note": "动态 SOP 已永久保存并接受；无 TTL，仅显式生命周期可改变。"
                         "执行前需 compile（证据见 rule.compile_digest）"}
     if decision == "once_only":
@@ -287,17 +324,16 @@ def confirm_candidate(
         path = _once_only_path(root)
         records = _load_jsonl(path)
         records.append({"candidate_id": candidate_id, "statement": statement,
-                        "recorded_at": utcnow().isoformat(), "actor": actor,
+                        "recorded_at": utcnow().isoformat(), "actor": actor or "agent",
                         "session_id": current_session_id(root)})
         _atomic_write_jsonl(path, records)
         store.triage(candidate_id, "triaged")
-        return {"decision": decision, "permanent": False,
+        return {"decision": decision, "permanent": False, "status": "confirmed",
                 "note": "仅本次：已记入会话级记录，不进入永久规则空间"}
     # not_a_rule
     store.triage(candidate_id, "rejected")
-    return {"decision": decision, "permanent": False,
+    return {"decision": decision, "permanent": False, "status": "confirmed",
             "note": "已标记为非规则；相同原话不会重复生成候选"}
-
 
 def source_ref_of(record: Any) -> str:
     return record.sources[0].ref if getattr(record, "sources", None) else "unknown"

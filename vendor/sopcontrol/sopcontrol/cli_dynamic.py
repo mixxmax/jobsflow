@@ -74,17 +74,32 @@ def cmd_dynamic(args) -> int:
             except ValueError:
                 print("错误: --flexibility 必须是合法 JSON", file=sys.stderr)
                 return 2
+        conf_id = str(getattr(args, "confirmation_id", "") or "").strip()
+        conf_secret = str(getattr(args, "confirmation_secret", "") or "").strip()
+        if conf_id and not conf_secret and args.decision in {
+            "keep_longterm", "edit_keep_longterm"
+        }:
+            try:
+                from .learning import read_learning_confirmation_secret
+                conf_secret = read_learning_confirmation_secret(root, conf_id)
+            except ValueError:
+                conf_secret = ""
         try:
+            # 公开 CLI 不得 user_attested；永久决定必须带 confirmation envelope。
             result = confirm_candidate(
                 root, args.candidate_id, args.decision,
-                edited_statement=args.statement, actor="user",
+                edited_statement=args.statement, actor="agent",
                 activation=activation, flexibility=flexibility,
-                rule_id=getattr(args, "rule_id", "") or "")
+                rule_id=getattr(args, "rule_id", "") or "",
+                confirmation_id=conf_id,
+                confirmation_secret=conf_secret,
+                user_attested=False)
         except (KeyError, ValueError) as exc:
             print(f"错误: {exc}", file=sys.stderr)
             return 2
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
+        public = {k: v for k, v in result.items() if "secret" not in str(k).lower()}
+        print(json.dumps(public, ensure_ascii=False, indent=2))
+        return 0 if result.get("status") != "needs_user" else 3
 
     if args.sub == "once-only":
         from .dynamic_sop import list_once_only as _loo

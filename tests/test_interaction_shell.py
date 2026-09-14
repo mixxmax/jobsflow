@@ -399,3 +399,46 @@ def test_cli_ticket_secret_not_in_stdout(tmp_path, monkeypatch, capsys):
     workflow_cli.main(["scan", "--workspace", str(tmp_path), "--dry-run"])
     printed = capsys.readouterr().out
     assert "must-not-print" not in printed
+
+
+def test_cli_challenge_secret_redacted_but_handoff_usable(tmp_path, monkeypatch, capsys):
+    """SEC-01/06：challenge 的 stdout 不含明文 secret；retry 仍可经 handoff 兑换。"""
+    (tmp_path / "00_Profile").mkdir()
+    secret = "one-shot-challenge-secret-xyz"
+
+    def fake_dispatch(action, *, workspace, store, payload, runner):
+        return {
+            "status": "planned",
+            "requires_capability_ticket": True,
+            "capability_ticket_id": "tkt-sec",
+            "capability_ticket_secret": secret,
+            "capability_ticket_handoff": str(tmp_path / "handoff-tkt-sec.json"),
+            "run_id": "run-sec",
+            "blockers": ["capability_ticket_required"],
+        }
+
+    monkeypatch.setattr(workflow_cli, "dispatch", fake_dispatch)
+    code = workflow_cli.main(["materials", "--workspace", str(tmp_path), "--job-id", "C0-001", "status"])
+    printed = capsys.readouterr().out
+    assert secret not in printed
+    payload = json.loads(printed)
+    assert payload["status"] == "needs_user"
+    assert payload["retry"]["capability_ticket_secret"]["redacted"] is True
+    assert payload["retry"]["capability_ticket_id"] == "tkt-sec"
+    assert code == 0
+
+
+def test_intake_dry_run_needs_user_no_traceback(tmp_path):
+    """INT-01/02：intake planned → needs_user + confirm_manual_intake，无 UserPromptError。"""
+    wrapped = wrap_result(
+        {
+            "status": "planned",
+            "requires_confirmation": True,
+            "proposal_id": "prop-intake-1",
+            "row_count": 1,
+        },
+        action="intake",
+    )
+    assert wrapped["status"] == "needs_user"
+    assert wrapped["user_prompt"]["kind"] == "confirm_manual_intake"
+    assert wrapped["assistant_protocol"]["must_not_confirm_for_user"] is True

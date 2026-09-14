@@ -742,6 +742,12 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["control", "document", "both", "once_only",
                             "defer", "reject"])
     p.add_argument("--note", default="")
+    p.add_argument("--actor", default="agent",
+                   help="调用方身份；默认 agent。control 仍需用户确认凭据")
+    p.add_argument("--confirmation-id", default="",
+                   help="用户确认凭据 ID（control/both 必填）")
+    p.add_argument("--confirmation-secret", default="",
+                   help="用户确认 secret；可省略并由本地 handoff 读取")
     p.add_argument("path", nargs="?", default=".")
     p.set_defaults(func=cmd_learn)
     p = learn_sub.add_parser("ingest", help="外部提案导入（只成提案）")
@@ -780,6 +786,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rule-id", default="", help="指定规则 id（默认 DR-<hash>）")
     p.add_argument("--activation", default="", help="激活选择器 JSON（actions/phases/...）")
     p.add_argument("--flexibility", default="", help="弹性 JSON（lower_bound/max_correction_rounds/...）")
+    p.add_argument("--confirmation-id", default="",
+                   help="用户确认凭据 ID（keep_longterm/edit_keep_longterm 必填）")
+    p.add_argument("--confirmation-secret", default="",
+                   help="用户确认 secret；可省略并由本地 handoff 读取")
     p.add_argument("path", nargs="?", default=".")
     p.set_defaults(func=cmd_dynamic)
     p = dynamic_sub.add_parser("once-only", help="查看会话级临时指令（不进永久空间）")

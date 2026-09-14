@@ -292,6 +292,27 @@ def redact_output(payload: dict[str, Any] | None) -> dict[str, Any]:
     return result
 
 
+def cli_public_envelope(envelope: dict[str, Any] | None) -> dict[str, Any]:
+    """SEC：CLI/stdout 视图——递归脱敏 capability_ticket_secret，保留 handoff 路径。"""
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            out: dict[str, Any] = {}
+            for key, value in node.items():
+                name = str(key)
+                lowered = name.casefold()
+                if lowered in _SECRET_KEYS or lowered.endswith("_secret"):
+                    out[name] = {"redacted": True, "reason": "secret"}
+                else:
+                    out[name] = _walk(value)
+            return out
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        return node
+
+    return _walk(dict(envelope or {}))
+
+
 def map_external_status(internal: dict[str, Any], *, action: str) -> str:
     status = str(internal.get("status") or "")
     blockers = [str(item) for item in (internal.get("blockers") or [])]
@@ -463,11 +484,16 @@ def wrap_result(
         status = "needs_user"
         ticket_id = str(internal.get("capability_ticket_id") or "").strip()
         secret = str(internal.get("capability_ticket_secret") or "").strip()
+        handoff = str(
+            internal.get("capability_ticket_handoff")
+            or (internal.get("sop_control") or {}).get("capability_ticket_handoff")
+            or ""
+        ).strip()
         prompt = build_user_prompt(
             "ask_preflight",
             question="需要一次性能力票据后才能继续此动作。请用 gateway 重试，勿把 secret 写入长期日志。",
             options=[{"id": "retry_with_ticket", "label": "携带票据重试", "recommended": True}],
-            reply_hint="使用返回的 retry 字段原样回传 capability_ticket_id/secret",
+            reply_hint="回传 capability_ticket_id（及 run_id）；secret 经 0600 handoff 兑换，勿写入日志",
             reply_contract={
                 "action": action,
                 "capability_ticket_id": ticket_id,
@@ -475,10 +501,12 @@ def wrap_result(
                 "job_id": str(internal.get("job_id") or ""),
             },
         )
-        if ticket_id and secret:
+        if ticket_id and (secret or handoff):
             retry = {
                 "capability_ticket_id": ticket_id,
+                # In-process callers may still read the secret; CLI print redacts it.
                 "capability_ticket_secret": secret,
+                "capability_ticket_handoff": handoff,
                 "run_id": str(internal.get("run_id") or ""),
                 "job_id": str(internal.get("job_id") or ""),
                 "action": action,

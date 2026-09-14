@@ -18,6 +18,7 @@ from tools.workflow.interaction_shell import (
     resolve_workspace,
     runtime_gate,
     save_runtime_pointer,
+    cli_public_envelope,
     wrap_result,
 )
 
@@ -167,6 +168,16 @@ def main(argv: list[str] | None = None) -> int:
     learn_decide.add_argument("--proposal-id", required=True)
     learn_decide.add_argument("--route", choices=["control", "document", "both", "once_only", "defer", "reject"], required=True)
     learn_decide.add_argument("--note", default="")
+    learn_decide.add_argument(
+        "--confirmation-id",
+        default="",
+        help="User confirmation id required for control/both (host-issued)",
+    )
+    learn_decide.add_argument(
+        "--confirmation-secret",
+        default="",
+        help="User confirmation secret; omit to read local handoff after user confirms",
+    )
     learn_notify = learn_sub.add_parser("notify", parents=[common], help="Render a proposal as a host-owned prompt card")
     learn_notify.add_argument("--proposal-id", required=True)
     learn_diag = learn_sub.add_parser("diagnose", parents=[common], help="Read learning queue and budget diagnostics")
@@ -416,8 +427,23 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(items[0], ensure_ascii=False, indent=2, default=str))
             return 0
         if command == "decide":
-            out = learning_adapter.decide_learning_proposal(args.proposal_id, args.route, note=args.note)
-            print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+            out = learning_adapter.decide_learning_proposal(
+                args.proposal_id,
+                args.route,
+                note=args.note,
+                confirmation_id=getattr(args, "confirmation_id", "") or "",
+                confirmation_secret=getattr(args, "confirmation_secret", "") or "",
+                actor="agent",
+            )
+            public = {k: v for k, v in out.items() if "secret" not in str(k).lower()}
+            if out.get("status") == "needs_user":
+                public["assistant_protocol"] = {
+                    "must_display_user_prompt": True,
+                    "must_not_confirm_for_user": True,
+                    "must_echo_reply_contract": True,
+                    "instruction": "control/both 需要用户确认后携带 confirmation_id 重试；禁止模型自行确认。",
+                }
+            print(json.dumps(public, ensure_ascii=False, indent=2, default=str))
             return 0 if out.get("status") == "succeeded" else 2
         if command == "notify":
             items = [item for item in learning_adapter.list_learning_proposals() if item.get("proposal_id") == args.proposal_id]
@@ -444,7 +470,7 @@ def main(argv: list[str] | None = None) -> int:
                 "blockers": [str(exc)],
                 "message": "目标不是合法运行实例（需要 00_Profile/）",
             }
-            print(json.dumps(wrap_result(out, action="bind-runtime"), ensure_ascii=False, indent=2))
+            print(json.dumps(cli_public_envelope(wrap_result(out, action="bind-runtime")), ensure_ascii=False, indent=2))
             return 2
         out = {
             "status": "succeeded",
@@ -453,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
             "side_effects": ["runtime_pointer_saved"],
             "message": "已绑定运行实例；之后可在产品根目录直接调用 workflow",
         }
-        print(json.dumps(wrap_result(out, action="bind-runtime"), ensure_ascii=False, indent=2))
+        print(json.dumps(cli_public_envelope(wrap_result(out, action="bind-runtime")), ensure_ascii=False, indent=2))
         return 0
 
     if action == "doctor":
@@ -657,7 +683,7 @@ def main(argv: list[str] | None = None) -> int:
                     phase="tailoring",
                 )
                 if blocker:
-                    print(json.dumps(wrap_result(blocker, action="materials"), ensure_ascii=False, indent=2))
+                    print(json.dumps(cli_public_envelope(wrap_result(blocker, action="materials")), ensure_ascii=False, indent=2))
                     return 2
                 payload["model_transform"] = json.loads(Path(args.content).read_text(encoding="utf-8"))
         elif args.materials_cmd == "status":
@@ -856,7 +882,7 @@ def main(argv: list[str] | None = None) -> int:
     if action in {"materials", "audit", "format", "apply"} and isinstance(payload.get("materials_engine_info"), dict):
         out.update(payload["materials_engine_info"])
     envelope = wrap_result(out, action=action)
-    print(json.dumps(envelope, ensure_ascii=False, indent=2))
+    print(json.dumps(cli_public_envelope(envelope), ensure_ascii=False, indent=2))
     if envelope.get("status") in {"succeeded", "needs_user"} or out.get("ready"):
         return 0
     return 2

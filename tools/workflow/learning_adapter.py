@@ -352,9 +352,19 @@ def record_workflow_learning(
         kind = "correction" if text else "tool_call"
         scope = {}
     if not text:
+        # LR-02：系统/工具状态不是用户规则信号——记录为 tool_call 供诊断，
+        # 但不构造可提炼的规则正文（避免 FakeDistiller/触发器误提案）。
         status = str(out.get("status") or "completed")
         blockers = ",".join(str(v) for v in (out.get("blockers") or [])[:4])
         text = f"workflow action {action} {status}" + (f": {blockers}" if blockers else "")
+        kind = "tool_call"
+    # 系统错误/traceback 正文强制降为 tool_call，避免进入永久规则候选。
+    lowered = str(text).casefold()
+    if any(token in lowered for token in (
+        "traceback", "exception:", "runtimeerror", "connectionreset",
+        "capability_ticket_invalid", "errno ",
+    )):
+        kind = "tool_call"
     recorded = record_learning_event(
         workspace=workspace,
         kind=kind,
@@ -380,18 +390,60 @@ def list_learning_proposals(*, status: str = "") -> list[dict[str, Any]]:
     return [p.model_dump(mode="json") for p in api["list_proposals"](_product_root(), status=status)]
 
 
-def decide_learning_proposal(proposal_id: str, route: str, *, note: str = "") -> dict[str, Any]:
+def decide_learning_proposal(
+    proposal_id: str,
+    route: str,
+    *,
+    note: str = "",
+    confirmation_id: str = "",
+    confirmation_secret: str = "",
+    actor: str = "agent",
+) -> dict[str, Any]:
+    """Decide a learning proposal.
+
+    control/both require a host-issued user confirmation envelope. Calling this
+    without credentials returns ``needs_user`` — it must not invent actor=user.
+    """
     api = _load_learning_api()
     if api is None:
         return {"status": "unavailable", "reason": "learning_api_unavailable"}
-    for item in api["list_proposals"](_product_root()):
+    root = _product_root()
+    for item in api["list_proposals"](root):
         if item.proposal_id == proposal_id:
             try:
-                decision = api["ProposalDecision"](proposal_id=proposal_id, route=route, note=note)
-                routed = api["decide_proposal"](_product_root(), item, decision)
-                return {**routed, "status": "succeeded"}
-            except (TypeError, ValueError, RuntimeError) as exc:
-                return {"status": "blocked", "reason": str(exc)}
+                conf_id = str(confirmation_id or "").strip()
+                conf_secret = str(confirmation_secret or "").strip()
+                if route in {"control", "both"} and conf_id and not conf_secret:
+                    try:
+                        from sopcontrol.learning import read_learning_confirmation_secret
+
+                        conf_secret = read_learning_confirmation_secret(root, conf_id)
+                    except (OSError, ValueError, TypeError, RuntimeError):
+                        conf_secret = ""
+                decision = api["ProposalDecision"](
+                    proposal_id=proposal_id,
+                    route=route,
+                    note=note,
+                    actor=str(actor or "agent"),
+                    confirmation_id=conf_id,
+                    confirmation_secret=conf_secret,
+                )
+                routed = api["decide_proposal"](root, item, decision)
+                if str(routed.get("status") or "") == "needs_user":
+                    # Do not claim succeeded; surface confirmation challenge.
+                    public = {k: v for k, v in routed.items() if "secret" not in str(k).lower()}
+                    return {
+                        **public,
+                        "status": "needs_user",
+                        "proposal_status": "proposed",
+                    }
+                return {
+                    **{k: v for k, v in routed.items() if "secret" not in str(k).lower()},
+                    "proposal_status": routed.get("status"),
+                    "status": "succeeded",
+                }
+            except Exception as exc:  # RegistryError and schema errors stay non-fatal
+                return {"status": "blocked", "reason": f"{type(exc).__name__}:{exc}"}
     return {"status": "blocked", "reason": "learning_proposal_not_found"}
 
 
