@@ -20,13 +20,13 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-09-12 · bundled control plane · pull-only upgrade · faster materials
+## 🆕 Latest update · 2026-09-15 · SOP Control 0.4.0 Beta vendored
 
-- **SOP Control ships with the product:** a fresh clone uses the same rules, state checks and confirmation gates; an unavailable control plane cannot silently allow side effects.
-- **The workflow stays the same across models:** scan, push, materials and apply keep one governed entry path; a model cannot choose a legacy route or skip confirmation.
-- **Faster, lower-rework materials:** capacity is checked before rendering, only the over-budget CV or cover letter is revised, and independent jobs may run in a bounded batch with timing/cache/re-render telemetry.
-- **More reliable retrieval:** JD caching, bounded retries and the JobsDB recovery hand-off are coordinated by the gateway, so an unverified result is never recorded as success.
-- **Portable hand-off:** project rules and runtime state can continue across models, harnesses and worktrees without asking the user to restate the entire SOP.
+- **Ships with [SOP Control v0.4.0](https://github.com/mixxmax/sopcontrol):** `vendor/sopcontrol` and `tools/sopcontrol_pin.txt` pin the same commit; `vendorize --verify` checks the digest.
+- **Fail-closed formal entry:** `python -m tools.workflow` keeps scan / push / materials / apply / learn on one gateway; a missing control plane cannot pretend to allow side effects.
+- **Dynamic SOP needs real user confirmation:** permanent learning/control promotion cannot be self-attested by the model; `once_only` never becomes a permanent rule.
+- **Activity logs are inspectable:** controlled runs can be reviewed with `sopctl log report` (gated / admitted / blocked / unproven).
+- **Materials and retrieval:** capacity preflight, JD cache, bounded retries and JobsDB recovery remain gateway-managed.
 
 ### Why JobsFlow?
 

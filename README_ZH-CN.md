@@ -34,13 +34,13 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 
 ---
 
-## 🆕 最新更新 · 2026-09-12 · 控制面随仓发布 · 一键升级 · 材料提速
+## 🆕 最新更新 · 2026-09-15 · SOP Control 0.4.0 Beta 随仓钉死
 
-- **SOP Control 随产品一起提供**：新 clone 直接使用同一套规则、状态和确认门；控制面不可用时不会假装放行有副作用的操作。
-- **换模型也不换流程**：scan、push、materials、apply 等入口保持一致，模型不能自行切换旧链或绕过确认。
-- **材料链更快、更少返工**：渲染前先做容量预检，只重做超预算的 CV/CL；同批岗位可受控并行，并保留耗时、缓存和重渲染记录。
-- **扫描与恢复更稳定**：JD 缓存、受控重试和 JobsDB 人工恢复交接统一由网关管理，不把未验证结果当成成功。
-- **跨环境可接手**：项目规则和运行状态可在不同模型、harness 和 worktree 间延续；日常用户不必另外维护一套规则。
+- **内嵌 [SOP Control v0.4.0](https://github.com/mixxmax/sopcontrol)**：`vendor/sopcontrol` 与 `tools/sopcontrol_pin.txt` 钉死同一 commit；`vendorize --verify` 校验 digest。
+- **正式入口 fail-closed**：`python -m tools.workflow` 的 scan / push / materials / apply / learn 走统一 gateway；缺控制面不会假装放行有副作用的写入。
+- **动态 SOP 需真实用户确认**：永久学习/控制晋升不能靠模型自报；`once_only` 不进永久规则。
+- **活动日志可复盘**：受控运行可对照 `sopctl log report`，区分 gated / admitted / blocked / unproven。
+- **材料链与扫描**：容量预检、JD 缓存、受控重试与 JobsDB 恢复交接仍由网关管理。
 
 ## 🎯 解决什么问题？
 
