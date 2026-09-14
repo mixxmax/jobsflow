@@ -1,4 +1,4 @@
 # Fixed SOP Control revision for JobsFlow CI and local installs.
-# Version 0.3.3: dynamic confirm requires user confirmation envelope.
+# Version 0.4.0: unified PROMPT-D control surface with user confirmation envelopes.
 # Do not float on main/master.
-4f79bb085fc08f6fd9f06c687d25ead7bfba792b
+852150f1efc2c8138a2c64706663b9c8a93f7186
