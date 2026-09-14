@@ -9,6 +9,7 @@ PROMPT_KINDS = (
     "choose_role_title",
     "select_jobs",
     "confirm_push",
+    "confirm_manual_intake",
     "confirm_intent",
     "confirm_base",
     "confirm_reset",

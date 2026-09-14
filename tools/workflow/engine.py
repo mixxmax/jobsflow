@@ -290,6 +290,7 @@ class WorkflowEngine:
                 requires_capability_ticket=ticket_challenge,
                 capability_ticket_id=sop_admit_report.get("capability_ticket_id"),
                 capability_ticket_secret=sop_admit_report.get("capability_ticket_secret"),
+                capability_ticket_handoff=sop_admit_report.get("capability_ticket_handoff"),
                 run_id=sop_admit_report.get("run_id") or payload.get("run_id"),
                 side_effects=[],
             )

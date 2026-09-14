@@ -1,4 +1,4 @@
 # Fixed SOP Control revision for JobsFlow CI and local installs.
-# Version 0.3.0: automatic learning observation/proposal pipeline and the
-# unified /learn control surface. Do not float on main/master.
-2eab4a2586e382bfbb4d577fb48c12dec2d3acf8
+# Version 0.3.1: DS-05 control→confirm+compile; LR noise filter; DeterministicRuleExtractor.
+# Do not float on main/master.
+58cfa4258ad386e6d34d8505530455fa14cff7f0

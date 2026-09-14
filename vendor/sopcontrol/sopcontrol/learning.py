@@ -352,13 +352,56 @@ class DistillerAdapter:
         raise NotImplementedError
 
 
+# 闲聊 / 系统错误：确定性提取器不得据此提案（手册 LR）。
+_CHITCHAT_MARKERS = (
+    "你好", "您好", "谢谢", "感谢", "哈哈", "hello", "hi ", "thanks",
+    "good morning", "good night", "咋样", "在吗",
+)
+_SYSTEM_ERROR_MARKERS = (
+    "traceback", "exception:", "error:", "errno", "status_code=5",
+    "connectionreset", "timeout", "workflow action ",
+    "capability_ticket", "runtimeerror", "typeerror", "valueerror",
+)
+
+
+def _is_noise_topic(topic: str, events: list[LearningEvent]) -> bool:
+    """闲聊或系统/工具错误主题不得成为规则提案。"""
+    t = (topic or "").strip()
+    if not t:
+        return True
+    low = t.casefold()
+    if any(m in low for m in _CHITCHAT_MARKERS):
+        # 短问候/寒暄：无长期意图信号
+        if _signal_level(t) == "none" and len(t) < 40:
+            return True
+    if any(m in low for m in _SYSTEM_ERROR_MARKERS):
+        return True
+    # 窗口内若全是 tool_call/系统态且无纠正类信号 → 噪声
+    if events and all(e.kind in ("tool_call", "decay", "task_boundary") for e in events):
+        if _signal_level(" ".join(e.text for e in events)) == "none":
+            return True
+    return False
+
+
 class FakeDistiller(DistillerAdapter):
-    """确定性 fake：主题→提案（≤3），离线测试唯一依赖。"""
-    name: str = "fake"
+    """确定性规则提取器（测试/离线回退用）。
+
+    诚实命名：不是 LLM，不具备泛化理解能力；仅按主题+信号阈值生成 ≤3 条提案。
+    别名 DeterministicRuleExtractor 指向同一实现。
+    """
+    name: str = "deterministic-rule-extractor"
 
     def distill(self, bundle: EvidenceBundle) -> DistillerOutput:
         proposals = []
         for topic in bundle.topics[:3]:
+            if _is_noise_topic(topic, bundle.events):
+                continue
+            # 无中高信号时不提案（与 evaluate_trigger 对齐，防闲聊穿透）
+            if _signal_level(topic) == "none" and _signal_level(
+                    " ".join(e.text for e in bundle.events)) in ("none", "low"):
+                continue
+            once = any("仅本次" in e.text or "只针对这次" in e.text
+                       or "这一次" in e.text for e in bundle.events)
             proposals.append({
                 "summary": topic,
                 "rule_class": "dynamic_sop",
@@ -366,8 +409,8 @@ class FakeDistiller(DistillerAdapter):
                 "exceptions": ["用户明确反向要求"],
                 "non_goals": ["不扩大到无关任务"],
                 "scope": {},
-                "durability": "permanent_candidate",
-                "recommended_destination": "control",
+                "durability": ("once_only" if once else "permanent_candidate"),
+                "recommended_destination": ("once_only" if once else "control"),
                 "confidence": "high" if not bundle.conflicts else "not_proven",
                 "evidence_refs": [e.event_id for e in bundle.events[:4]],
                 "unsupported_claims": [],
@@ -375,7 +418,11 @@ class FakeDistiller(DistillerAdapter):
             })
         return DistillerOutput(
             window_id=bundle.window_id, proposals=proposals,
-            no_candidate_reason="" if proposals else "证据不足")
+            no_candidate_reason=("" if proposals else "证据不足或仅噪声/闲聊/系统错误"))
+
+
+# 诚实别名：测试与文档应使用此名，避免伪装成 LLM。
+DeterministicRuleExtractor = FakeDistiller
 
 
 class UnprovenLLMAdapter(DistillerAdapter):
@@ -508,8 +555,12 @@ def _rewrite_proposal(root: Path, proposal: LearningProposal) -> None:
 
 def decide_proposal(root: Path | str, proposal: LearningProposal,
                     decision: ProposalDecision) -> dict[str, Any]:
-    """P1-D：六选一路由。control/both 经 CandidateStore（正规链入口），
-    永不直写 Registry；once_only 证据禁 control。"""
+    """P1-D：六选一路由。
+
+    DS-05：用户选 control/both = 显式确认 → CandidateStore.upsert 后自动
+    confirm_candidate(keep_longterm) + compile_rule，进入 effective/selectable。
+    仍走公开正规链，不直写 Registry 私有结构。once_only/reject/defer 不进永久空间。
+    """
     from .candidate import CandidateSource, CandidateStore
     root = Path(root)
     if decision.proposal_id != proposal.proposal_id:
@@ -523,6 +574,12 @@ def decide_proposal(root: Path | str, proposal: LearningProposal,
     result: dict[str, Any] = {"proposal_id": proposal.proposal_id,
                               "route": decision.route}
     if decision.route in ("control", "both"):
+        from .dynamic_sop import compile_rule, confirm_candidate
+        # control 晋升需要权威 Registry；宿主若尚未 sopctl init，创建空表（不发明规则）。
+        reg_path = root / ".sopcontrol" / "rules" / "registry.yaml"
+        if not reg_path.is_file():
+            reg_path.parent.mkdir(parents=True, exist_ok=True)
+            reg_path.write_text("rules: []\n", encoding="utf-8")
         store = CandidateStore(root)
         record, _ = store.upsert(
             kind="dynamic_sop", statement=proposal.statement,
@@ -531,9 +588,20 @@ def decide_proposal(root: Path | str, proposal: LearningProposal,
             source=CandidateSource(source_type="learning_proposal",
                                    ref=proposal.proposal_id,
                                    occurrence_id=proposal.proposal_id),
-            note="学习提案转候选；晋升走 confirm/compile 正规链",
+            note="学习提案转候选；用户选 control=显式确认，自动 confirm/compile",
             priority="low", explicit_once_only=False)
         result["candidate_id"] = record.candidate_id
+        # 用户选 control = 显式确认（DS-05），不得停在 candidate。
+        confirmed = confirm_candidate(
+            root, record.candidate_id, "keep_longterm",
+            actor=decision.actor or "user")
+        result["rule_id"] = confirmed["rule_id"]
+        result["rule_status"] = confirmed["rule_status"]
+        result["permanent"] = True
+        compiled = compile_rule(
+            root, confirmed["rule_id"], actor=decision.actor or "user")
+        result["rule_status"] = compiled["rule_status"]
+        result["compile_digest"] = compiled["compile_digest"]
     if decision.route in ("document", "both"):
         result["doc_payload"] = {
             "statement": proposal.statement,
@@ -542,7 +610,23 @@ def decide_proposal(root: Path | str, proposal: LearningProposal,
             "non_goals": proposal.non_goals,
         }
     if decision.route == "once_only":
-        result["note"] = "仅本次：记入会话级语义，不进永久空间"
+        # 会话级记录，绝不进入永久 Registry（DS-04）。
+        from .dynamic_sop import current_session_id
+        import json as _json
+        path = root / ".sopcontrol-local" / "dynamic" / "once_only.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "proposal_id": proposal.proposal_id,
+            "statement": proposal.statement,
+            "recorded_at": utcnow().isoformat(),
+            "actor": decision.actor or "user",
+            "session_id": current_session_id(root),
+            "source": "learning_decide",
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+        result["note"] = "仅本次：已记入会话级语义，不进永久空间"
+        result["permanent"] = False
     status_map = {"control": "confirmed", "document": "confirmed",
                   "both": "confirmed", "once_only": "confirmed",
                   "defer": "deferred", "reject": "rejected"}

@@ -1,11 +1,13 @@
 {
   "schema_version": "1",
   "package": "sopcontrol",
-  "version": "0.3.0",
-  "commit": "2eab4a2586e382bfbb4d577fb48c12dec2d3acf8",
-  "source_file_count": 113,
-  "source_tree_sha256": "ee003e155b6f989954080361092ae09da5640c87721f19f9b4a22772e6d6ea15",
+  "version": "0.3.1",
+  "commit": "58cfa4258ad386e6d34d8505530455fa14cff7f0",
+  "source_file_count": 117,
+  "source_tree_sha256": "fe57deeb15141b6025f0df31ba30ebe3d29d664ad2a7b5b8b53d7dc098a1988e",
   "file_count": 117,
-  "tree_sha256": "c013a87ce913c331db1f32d3b95fb9e8c7697aa17973b5f1f8054811b725c16c",
-  "digest_scope": "all files below vendor/sopcontrol except VENDOR_MANIFEST.json, .git metadata, sopcontrol.egg-info, __pycache__ and *.pyc"
+  "tree_sha256": "fe57deeb15141b6025f0df31ba30ebe3d29d664ad2a7b5b8b53d7dc098a1988e",
+  "digest_scope": "all files below vendor/sopcontrol except VENDOR_MANIFEST.json, .git metadata, sopcontrol.egg-info, __pycache__ and *.pyc",
+  "pin": "58cfa4258ad386e6d34d8505530455fa14cff7f0",
+  "source_commit": "58cfa4258ad386e6d34d8505530455fa14cff7f0"
 }

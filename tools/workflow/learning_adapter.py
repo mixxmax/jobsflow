@@ -352,9 +352,19 @@ def record_workflow_learning(
         kind = "correction" if text else "tool_call"
         scope = {}
     if not text:
+        # LR-02：系统/工具状态不是用户规则信号——记录为 tool_call 供诊断，
+        # 但不构造可提炼的规则正文（避免 FakeDistiller/触发器误提案）。
         status = str(out.get("status") or "completed")
         blockers = ",".join(str(v) for v in (out.get("blockers") or [])[:4])
         text = f"workflow action {action} {status}" + (f": {blockers}" if blockers else "")
+        kind = "tool_call"
+    # 系统错误/traceback 正文强制降为 tool_call，避免进入永久规则候选。
+    lowered = str(text).casefold()
+    if any(token in lowered for token in (
+        "traceback", "exception:", "runtimeerror", "connectionreset",
+        "capability_ticket_invalid", "errno ",
+    )):
+        kind = "tool_call"
     recorded = record_learning_event(
         workspace=workspace,
         kind=kind,
@@ -389,9 +399,14 @@ def decide_learning_proposal(proposal_id: str, route: str, *, note: str = "") ->
             try:
                 decision = api["ProposalDecision"](proposal_id=proposal_id, route=route, note=note)
                 routed = api["decide_proposal"](_product_root(), item, decision)
-                return {**routed, "status": "succeeded"}
-            except (TypeError, ValueError, RuntimeError) as exc:
-                return {"status": "blocked", "reason": str(exc)}
+                # Preserve proposal route status under proposal_status; adapter OK → succeeded.
+                return {
+                    **routed,
+                    "proposal_status": routed.get("status"),
+                    "status": "succeeded",
+                }
+            except Exception as exc:  # RegistryError and schema errors stay non-fatal
+                return {"status": "blocked", "reason": f"{type(exc).__name__}:{exc}"}
     return {"status": "blocked", "reason": "learning_proposal_not_found"}
 
 

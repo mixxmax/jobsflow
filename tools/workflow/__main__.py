@@ -18,6 +18,7 @@ from tools.workflow.interaction_shell import (
     resolve_workspace,
     runtime_gate,
     save_runtime_pointer,
+    cli_public_envelope,
     wrap_result,
 )
 
@@ -444,7 +445,7 @@ def main(argv: list[str] | None = None) -> int:
                 "blockers": [str(exc)],
                 "message": "目标不是合法运行实例（需要 00_Profile/）",
             }
-            print(json.dumps(wrap_result(out, action="bind-runtime"), ensure_ascii=False, indent=2))
+            print(json.dumps(cli_public_envelope(wrap_result(out, action="bind-runtime")), ensure_ascii=False, indent=2))
             return 2
         out = {
             "status": "succeeded",
@@ -453,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
             "side_effects": ["runtime_pointer_saved"],
             "message": "已绑定运行实例；之后可在产品根目录直接调用 workflow",
         }
-        print(json.dumps(wrap_result(out, action="bind-runtime"), ensure_ascii=False, indent=2))
+        print(json.dumps(cli_public_envelope(wrap_result(out, action="bind-runtime")), ensure_ascii=False, indent=2))
         return 0
 
     if action == "doctor":
@@ -657,7 +658,7 @@ def main(argv: list[str] | None = None) -> int:
                     phase="tailoring",
                 )
                 if blocker:
-                    print(json.dumps(wrap_result(blocker, action="materials"), ensure_ascii=False, indent=2))
+                    print(json.dumps(cli_public_envelope(wrap_result(blocker, action="materials")), ensure_ascii=False, indent=2))
                     return 2
                 payload["model_transform"] = json.loads(Path(args.content).read_text(encoding="utf-8"))
         elif args.materials_cmd == "status":
@@ -856,7 +857,7 @@ def main(argv: list[str] | None = None) -> int:
     if action in {"materials", "audit", "format", "apply"} and isinstance(payload.get("materials_engine_info"), dict):
         out.update(payload["materials_engine_info"])
     envelope = wrap_result(out, action=action)
-    print(json.dumps(envelope, ensure_ascii=False, indent=2))
+    print(json.dumps(cli_public_envelope(envelope), ensure_ascii=False, indent=2))
     if envelope.get("status") in {"succeeded", "needs_user"} or out.get("ready"):
         return 0
     return 2

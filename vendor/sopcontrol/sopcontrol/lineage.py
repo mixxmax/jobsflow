@@ -184,3 +184,4 @@ def make_set_id(operator_id: str, step_id: str, content_digest: str) -> str:
     payload = {"operator_id": operator_id, "step_id": step_id,
                "content_digest": content_digest}
     return "set-" + content_hash(payload)[:20]
+

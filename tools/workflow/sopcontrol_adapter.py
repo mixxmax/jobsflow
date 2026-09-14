@@ -455,6 +455,81 @@ def _ticket_fingerprint(action: str, payload: dict[str, Any]) -> str:
     return str(api["fingerprint_payload"](safe))
 
 
+def _capability_handoff_dir(root: Path | None = None) -> Path:
+    base = Path(root or product_root()).resolve()
+    target = base / ".sopcontrol-local" / "capability_handoff"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def write_capability_handoff(
+    ticket_id: str,
+    secret: str,
+    *,
+    root: Path | None = None,
+    run_id: str = "",
+    action: str = "",
+) -> str:
+    """Persist one-shot secret to a 0600 handoff file; return its path."""
+
+    import json
+    import os
+
+    directory = _capability_handoff_dir(root)
+    path = directory / f"{ticket_id}.json"
+    payload = {
+        "ticket_id": ticket_id,
+        "secret": secret,
+        "run_id": run_id,
+        "action": action,
+    }
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return str(path)
+
+
+def load_capability_handoff_secret(
+    ticket_id: str,
+    *,
+    root: Path | None = None,
+    consume: bool = True,
+) -> str:
+    """Load secret from handoff; optionally delete after read (one-shot)."""
+
+    import json
+
+    if not ticket_id:
+        return ""
+    path = _capability_handoff_dir(root) / f"{ticket_id}.json"
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        secret = str(data.get("secret") or "").strip()
+    except (OSError, TypeError, ValueError):
+        return ""
+    if consume:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return secret
+
+
 def issue_capability_ticket(
     *,
     action: str,
@@ -481,10 +556,19 @@ def issue_capability_ticket(
         issued_by="jobsflow.workflow",
     )
     view = ticket_public_view(ticket)
+    handoff = write_capability_handoff(
+        ticket.ticket_id,
+        ticket.secret,
+        root=root,
+        run_id=run_id,
+        action=action,
+    )
     # Secret is returned once to the caller result; never emit it in ControlEvents.
+    # CLI stdout must use the 0600 handoff instead of printing the raw secret.
     return {
         "ticket_id": ticket.ticket_id,
         "secret": ticket.secret,
+        "handoff": handoff,
         "action": action,
         "input_fingerprint": fingerprint,
         "allowed_side_effects": list(ticket.allowed_side_effects),
@@ -529,6 +613,15 @@ def _redeem_capability_ticket(request: Any) -> list[str]:
     payload = dict(getattr(request, "payload", {}) or {})
     ticket_id = str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
     secret = str(payload.get("capability_ticket_secret") or payload.get("ticket_secret") or "").strip()
+    if ticket_id and not secret:
+        # SEC：CLI 脱敏后可通过 0600 handoff 兑换，不要求 stdout 回传明文 secret。
+        secret = load_capability_handoff_secret(ticket_id, root=product_root(), consume=True)
+        if secret:
+            payload["capability_ticket_secret"] = secret
+            try:
+                request.payload = payload
+            except (AttributeError, TypeError):
+                pass
     if not ticket_id or not secret:
         return ["capability_ticket_required"]
     try:
@@ -628,6 +721,20 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
     elif action == "intent":
         blockers.extend(_check_intent_confirm(payload, Path(workspace)))
     blockers.extend(_run_domain_consumers(action, payload, run_id=run_id))
+    # PK-01：apply/materials 写路径在发票前必须先确认 package 存在，避免空票。
+    if action == "apply" and writing and not blockers:
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            blockers.append("package_missing")
+        else:
+            try:
+                from tools.workflow.package_context import PackageContextLoader
+
+                ctx = PackageContextLoader(Path(workspace)).load(job_id)
+                if not getattr(ctx, "package", None):
+                    blockers.append("package_missing")
+            except (OSError, TypeError, ValueError, RuntimeError, ImportError):
+                blockers.append("package_missing")
 
     ticket_challenge = False
     issued_ticket: dict[str, Any] | None = None
@@ -668,6 +775,8 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
     if issued_ticket is not None:
         report["capability_ticket_id"] = issued_ticket["ticket_id"]
         report["capability_ticket_secret"] = issued_ticket["secret"]
+        if issued_ticket.get("handoff"):
+            report["capability_ticket_handoff"] = issued_ticket["handoff"]
         report["next_action"] = "retry_with_capability_ticket"
 
     if mode == "warn" and blockers and not ticket_challenge:
