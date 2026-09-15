@@ -220,3 +220,144 @@ def test_high_risk_verbs_ignore_possessive_own():
 
 def test_content_words_drop_stopwords_and_fold_plurals():
     assert content_words("Contracts and Disputes") == {"contract", "dispute"}
+
+
+def _canonical_with_pillars(pillar_texts, *, coverage_dispositions=None):
+    canonical = _canonical({})
+    for index, pillar_text in enumerate(pillar_texts):
+        canonical["cover_letter"]["blocks"].append({
+            "id": f"cl-pillar-{index + 1}",
+            "type": "bullet",
+            "text": pillar_text,
+            "section": "pillar",
+            "experience_id": "",
+            "priority": 10 + index,
+            "customized": True,
+            "baseline_refs": [],
+            "jd_anchor_ids": [f"JD-{index + 1:03d}"],
+        })
+    canonical["coverage_dispositions"] = dict(coverage_dispositions or {})
+    return canonical
+
+
+def test_pillar_count_matching_plan_anchors_passes():
+    plan = {"duties": ["Draft vendor contracts", "Review service agreements"]}
+    canonical = _canonical_with_pillars([
+        "Draft vendor contracts with structured checklists.",
+        "Review service agreements with clear summaries.",
+    ])
+    findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
+    assert "pillar_anchor_count_mismatch" not in _codes(findings)
+
+
+def test_pillar_count_mismatch_is_p1():
+    plan = {"duties": ["Draft vendor contracts", "Review service agreements", "Track renewal dates"]}
+    canonical = _canonical_with_pillars([
+        "Draft vendor contracts with structured checklists.",
+        "Review service agreements with clear summaries.",
+    ])
+    findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
+    mismatches = [item for item in findings if item["code"] == "pillar_anchor_count_mismatch"]
+    assert len(mismatches) == 1
+    assert mismatches[0]["severity"] == "P1"
+    assert mismatches[0]["material"] == "cover_letter"
+    assert "2" in mismatches[0]["evidence"] and "3" in mismatches[0]["evidence"]
+
+
+def test_pillar_count_excess_over_anchors_is_p1():
+    plan = {"duties": ["Draft vendor contracts", "Review service agreements"]}
+    canonical = _canonical_with_pillars([
+        "Draft vendor contracts with structured checklists.",
+        "Review service agreements with clear summaries.",
+        "Track renewal dates with a shared register.",
+    ])
+    findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
+    mismatches = [item for item in findings if item["code"] == "pillar_anchor_count_mismatch"]
+    assert len(mismatches) == 1
+    assert mismatches[0]["severity"] == "P1"
+
+
+def test_pillar_gate_ignores_positioning_themes():
+    plan = {
+        "duties": ["Draft vendor contracts", "Review service agreements"],
+        "themes": ["evidence alignment"],
+    }
+    canonical = _canonical_with_pillars([
+        "Draft vendor contracts with structured checklists.",
+        "Review service agreements with clear summaries.",
+    ])
+    findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
+    assert "pillar_anchor_count_mismatch" not in _codes(findings)
+
+
+def test_pillar_gate_excludes_intentionally_omitted_anchors():
+    plan = {"duties": ["Draft vendor contracts", "Review service agreements", "Track renewal dates"]}
+    canonical = _canonical_with_pillars(
+        [
+            "Draft vendor contracts with structured checklists.",
+            "Review service agreements with clear summaries.",
+        ],
+        coverage_dispositions={"JD-003": "intentionally_omitted"},
+    )
+    findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
+    assert "pillar_anchor_count_mismatch" not in _codes(findings)
+
+
+def test_pillar_gate_skipped_without_explicit_plan():
+    canonical = _canonical_with_pillars(["Draft vendor contracts with structured checklists."])
+    findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=None)
+    assert "pillar_anchor_count_mismatch" not in _codes(findings)
+
+
+def _structural_bundle(transition_text):
+    bundle = _bundle()
+    bundle["baseline"]["cover_letter"]["blocks"].append({
+        "id": "cl-transition", "type": "paragraph", "text": transition_text,
+        "section": "body", "experience_id": "", "priority": 10,
+    })
+    return bundle
+
+
+def _structural_canonical(transition_text, pillar_count):
+    canonical = _canonical({})
+    canonical["cover_letter"]["blocks"].append({
+        "id": "cl-transition", "type": "paragraph", "text": transition_text,
+        "section": "body", "experience_id": "", "priority": 10,
+        "customized": True, "baseline_refs": ["cl-transition"],
+    })
+    for index in range(pillar_count):
+        canonical["cover_letter"]["blocks"].append({
+            "id": f"cl-p-{index + 1}", "type": "bullet",
+            "text": "Support vendor contract review with structured checklists.",
+            "section": "pillar", "experience_id": "", "priority": 11 + index,
+            "customized": True, "baseline_refs": [],
+            "jd_anchor_ids": [],
+        })
+    return canonical
+
+
+def test_true_structural_count_exempt_from_invented_number():
+    bundle = _structural_bundle("These three pillars show my fit.")
+    canonical = _structural_canonical("These four pillars show my fit.", 4)
+    findings = run_semantic_lint(bundle=bundle, canonical=canonical, plan=None)
+    assert [item for item in findings if item["code"] == "invented_number"] == []
+
+
+def test_false_structural_count_still_blocked():
+    bundle = _structural_bundle("These three pillars show my fit.")
+    canonical = _structural_canonical("These five pillars show my fit.", 4)
+    findings = run_semantic_lint(bundle=bundle, canonical=canonical, plan=None)
+    invented = [item for item in findings if item["code"] == "invented_number"]
+    assert len(invented) == 1
+    assert "5" in invented[0]["evidence"]
+
+
+def test_rule_pack_contains_jd_anchor_supremacy_rule():
+    from tools.workflow.materials_rules import RULES_VERSION, build_rule_pack, validate_rule_pack
+
+    assert RULES_VERSION == "materials-rules-v8"
+    pack = build_rule_pack()
+    assert validate_rule_pack(pack) == []
+    rule = next(item for item in pack["rules"] if item["rule_id"] == "MAP-002")
+    assert rule["severity"] == "P1"
+    assert rule["scope"] == ["cover_letter"]
