@@ -458,6 +458,24 @@ def tickets_enabled() -> bool:
     return raw in {"1", "true", "yes", "on", "enforce"}
 
 
+def produce_ticket_operation_id(payload: dict[str, Any] | None) -> str:
+    """Stable identity binding one produce invocation's ticket exemption.
+
+    The produce loop redeems the one-shot ticket on its first write-requiring
+    inner dispatch and stamps later steps of the same CLI invocation with this
+    identity.  It is derived only from caller-supplied durable keys
+    (operation/run/job), never from secrets.
+    """
+
+    payload = dict(payload or {})
+    return str(
+        payload.get("operation_id")
+        or payload.get("run_id")
+        or payload.get("job_id")
+        or ""
+    ).strip()
+
+
 def _side_effect_for_write(action: str) -> str:
     return {
         "push": "tracker_write",
@@ -821,9 +839,37 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
 
     ticket_challenge = False
     issued_ticket: dict[str, Any] | None = None
-    if not blockers and writing and tickets_enabled() and package_available:
+    # Produce-loop exemption (option A): the same CLI produce invocation
+    # already redeemed the one-shot ticket on its first write-requiring inner
+    # dispatch.  Later steps carry the stamped operation identity and skip
+    # re-verification.  The marker is process-local: __main__ strips it at
+    # produce entry and no CLI flag can set it, so cross-invocation one-shot
+    # semantics are preserved.
+    redeemed_op = str(payload.get("_produce_ticket_redeemed_operation") or "").strip()
+    produce_exempt = bool(redeemed_op) and redeemed_op == produce_ticket_operation_id(payload) and bool(
+        produce_ticket_operation_id(payload)
+    )
+    if not blockers and writing and tickets_enabled() and package_available and not produce_exempt:
         ticket_id = str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
         secret = str(payload.get("capability_ticket_secret") or payload.get("ticket_secret") or "").strip()
+        if ticket_id and not secret:
+            # CLI transport carries only the ticket id; the one-shot secret
+            # lives in the 0600 handoff file written at mint time.  Redeem it
+            # here (consume=True, read-once) so a bare
+            # ``--capability-ticket-id`` retry reaches redeem instead of
+            # minting a second ticket.  A missing handoff falls through to
+            # the mint path below, unchanged.  Only request.payload is
+            # mutated; the local ``payload`` copy used for ControlEvents
+            # stays secret-free.
+            loaded = load_capability_handoff_secret(ticket_id, root=root, consume=True)
+            if loaded:
+                secret = loaded
+                try:
+                    current = dict(getattr(request, "payload", {}) or {})
+                    current["capability_ticket_secret"] = loaded
+                    request.payload = current
+                except (AttributeError, TypeError):
+                    secret = ""
         if not ticket_id or not secret:
             # Two-phase: mint a ticket and stop before the business adapter so
             # the caller must present it on the real write. Zero side effects.

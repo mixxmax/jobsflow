@@ -836,6 +836,19 @@ def main(argv: list[str] | None = None) -> int:
         from tools.workflow.interaction_shell import next_produce_stages, produce_should_stop
         from tools.workflow.package_context import PackageContextLoader
         from tools.workflow.materials_vnext.store import load_run
+        from tools.workflow.sopcontrol_adapter import produce_ticket_operation_id
+
+        # The exemption marker is process-local: strip any caller-supplied
+        # value so a fresh produce invocation always starts unverified.
+        # No CLI flag can set it; only this loop stamps it after a redeem.
+        payload.pop("_produce_ticket_redeemed_operation", None)
+        ticket_presented = bool(
+            str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
+        )
+
+        def _produce_ticket_blockers(outcome: dict[str, Any]) -> bool:
+            blockers = {str(item) for item in (outcome.get("blockers") or [])}
+            return bool(blockers & {"capability_ticket_required", "capability_ticket_invalid"})
 
         steps = []
         out = {"status": "blocked", "blockers": ["produce_no_progress"]}
@@ -870,6 +883,12 @@ def main(argv: list[str] | None = None) -> int:
                         "after_state": out.get("after_state"),
                     }
                 )
+                if ticket_presented and not _produce_ticket_blockers(out):
+                    # The one-shot ticket was redeemed on this step; later
+                    # steps of the same invocation skip re-verification.
+                    # A fresh invocation strips the marker above, so
+                    # cross-call one-shot semantics are unchanged.
+                    payload["_produce_ticket_redeemed_operation"] = produce_ticket_operation_id(payload)
                 if produce_should_stop(out):
                     break
                 phase = str(out.get("after_state") or phase)
