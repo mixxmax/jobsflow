@@ -330,6 +330,33 @@ def build_task(
         },
         "rule_pack": pack,
         "rules_compact": render_compact_rules(pack),
+        # JD-anchor supremacy (auditor constraint): the frozen plan's JD
+        # anchors are the only source of truth in review; lane template
+        # structure always yields to the plan.  The host already counted
+        # pillars vs anchors deterministically (see deterministic_lint); the
+        # auditor judges per-pillar mapping, transition wording and
+        # substantive JD fit, and must not re-litigate template structure.
+        "jd_anchor_supremacy": {
+            "instruction": (
+                "审计中唯一正源是冻结 plan 的 JD 锚点（jd_anchors + coverage_dispositions），"
+                "lane 基线模板的结构（pillar 数量、标题、过渡句、计数词）一律是从源。"
+                "审计员必须逐条核验：每条 pillar 至少映射一个 plan anchor，无映射判 P1；"
+                "成稿 pillar 总数等于 plan anchor 总数，不等判 P1；"
+                "过渡句中的计数词必须与实际 pillar 数一致，不一致判 P1。"
+                "审计员不得把偏离模板结构本身记为缺陷——pillar 标题按 JD 改写、顺序调整、"
+                "为容纳 plan 锚点而增删的过渡措辞，均不构成 finding；"
+                "结构型数字（仅计数文档内部条目、计数对象不出自任何 confirmed fact，"
+                "如 four anchors）的改写不属于 preservation/drift 问题。"
+                "JD 贴合的具体好坏仍由审计员对照 JD 原文判断，本条只约束结构服从 plan，不替代实质判断。"
+            ),
+            "machine_contract": {
+                "pillar_selector": "cover_letter blocks with section == pillar",
+                "anchor_source": "plan jd_anchors/duties/requirements excluding themes; intentionally_omitted excluded from expected count",
+                "gate": "pillar count == expected anchor count; mismatch is P1 (see deterministic_lint)",
+                "structural_counts": "a transition count word equal to the true pillar total is exempt from invented_number; a wrong count still fails both gates",
+                "agent_owns": "per-pillar anchor mapping, transition count words, substantive JD fit",
+            },
+        },
         "context_budget": {"manuals_included": 0, "fixed_rule_lines": len(render_compact_rules(pack).splitlines())},
         "read_allowlist": [
             "jd.text",

@@ -352,3 +352,67 @@ def test_legacy_stale_confirmation_for_acronym_compound_is_repaired_by_host(tmp_
     refreshed = json.loads((package / "job_manifest.json").read_text(encoding="utf-8"))
     assert refreshed["job"]["role_primary"] == "ECM/IPO Specialist"
     assert refreshed["job"]["role_selection"]["confirmation_needed"] is False
+
+
+def _preset_entity_phase(workspace, job_id, phase):
+    from tools.io_utils import atomic_write_json
+    from tools.workflow.entity_state import EntityState, entity_path
+
+    state = EntityState(entity_type="materials", entity_id=job_id, phase=phase, revision=3)
+    path = entity_path(workspace, "materials", job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, state.to_dict())
+    return path
+
+
+def test_reset_from_pdf_generated_to_plan_ready(tmp_path):
+    """T6: reset --scope draft from pdf_generated is a legal reset edge."""
+    from tools.workflow.engine import dispatch
+    from tools.workflow.entity_state import load_entity_state
+    from tools.workflow.testing_packages import build_package, build_workspace
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, job_id="C0-001")
+    _preset_entity_phase(ws, "C0-001", "pdf_generated")
+
+    out = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": "C0-001", "stage": "reset", "scope": "draft", "confirm_reset": True},
+    )
+    assert out.get("status") == "reset", out.get("blockers")
+    assert out.get("projected_entity_phase") == "plan_ready"
+    assert load_entity_state(ws, "materials", "C0-001").phase == "plan_ready"
+    # Bundle/baseline/plan survive a draft reset; only generation is archived.
+    assert (package / "jd_full.md").is_file()
+    assert (package / "job_manifest.json").is_file()
+    history = load_entity_state(ws, "materials", "C0-001").extra.get("reset_history") or []
+    assert history and history[-1]["to"] == "plan_ready"
+
+
+def test_reset_without_confirm_stays_preview_and_rejects_bad_scope(tmp_path):
+    """T7: unconfirmed reset stays preview-first; illegal scope rejected at CLI."""
+    import pytest
+
+    from tools.workflow import __main__ as workflow_cli
+    from tools.workflow.engine import dispatch
+    from tools.workflow.entity_state import load_entity_state
+    from tools.workflow.testing_packages import build_package, build_workspace
+
+    ws = build_workspace(tmp_path)
+    build_package(ws, job_id="C0-001")
+    _preset_entity_phase(ws, "C0-001", "pdf_generated")
+
+    out = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": "C0-001", "stage": "reset", "scope": "draft"},
+    )
+    assert out.get("status") == "preview"
+    assert load_entity_state(ws, "materials", "C0-001").phase == "pdf_generated"
+
+    with pytest.raises(SystemExit) as exc:
+        workflow_cli.main(
+            ["materials", "--workspace", str(ws), "--job-id", "C0-001", "reset", "--scope", "bogus"]
+        )
+    assert exc.value.code == 2

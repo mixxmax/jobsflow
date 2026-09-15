@@ -299,6 +299,122 @@ def test_intent_and_base_consumers_are_regressable(tmp_path):
     assert require_base_activation(confirmed=True) is True
 
 
+class _TicketReq:
+    def __init__(self, action, payload):
+        self.action = action
+        self.confirmation_id = None
+        self.payload = dict(payload)
+        self.actor = "test"
+
+
+class _TicketEntity:
+    phase = "idle"
+    entity_id = "T-JOB"
+
+
+@pytest.fixture
+def ticket_root(tmp_path, monkeypatch):
+    """Isolated product root with registry; tickets on; writes stay in tmp."""
+    root = tmp_path / "tproduct"
+    root.mkdir()
+    _install_registry(root)
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_ROOT", str(root))
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "observe")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_TICKETS", "on")
+    return root
+
+
+def _ticket_base():
+    return {"run_id": "t-run", "job_id": "T-JOB", "stage": "plan"}
+
+
+def _handoff_path(ticket_id):
+    from tools.workflow.sopcontrol_adapter import product_root
+
+    return product_root() / ".sopcontrol-local" / "capability_handoff" / f"{ticket_id}.json"
+
+
+def test_admit_redeems_ticket_id_only_via_handoff(ticket_root, tmp_path, monkeypatch):
+    """T1: bare --capability-ticket-id reaches redeem (no second mint)."""
+    pytest.importorskip("sopcontrol.tickets")
+    from tools.workflow import sopcontrol_adapter as adapter
+    from tools.workflow.testing_packages import build_workspace
+
+    monkeypatch.setattr(adapter, "_run_domain_consumers", lambda *a, **k: [])
+    ws = build_workspace(tmp_path)
+    issued = adapter.issue_capability_ticket(action="materials", payload=dict(_ticket_base()), run_id="t-run")
+    assert issued is not None
+    tid = issued["ticket_id"]
+    assert _handoff_path(tid).is_file()
+
+    report = adapter.admit(
+        _TicketReq("materials", {**_ticket_base(), "capability_ticket_id": tid}),
+        entity=_TicketEntity(),
+        workspace=ws,
+    )
+    assert "capability_ticket_required" not in report["blockers"]
+    assert not _handoff_path(tid).exists(), "handoff must be consumed exactly once"
+
+    # Replay of the same id must fail: a fresh challenge, never a redeem.
+    replay = adapter.admit(
+        _TicketReq("materials", {**_ticket_base(), "capability_ticket_id": tid}),
+        entity=_TicketEntity(),
+        workspace=ws,
+    )
+    assert replay["ticket_challenge"] is True
+    assert replay.get("capability_ticket_id") != tid
+
+    # The original secret is dead after the one-shot redeem.
+    stale = adapter.admit(
+        _TicketReq(
+            "materials",
+            {**_ticket_base(), "capability_ticket_id": tid, "capability_ticket_secret": issued["secret"]},
+        ),
+        entity=_TicketEntity(),
+        workspace=ws,
+    )
+    assert "capability_ticket_invalid" in stale["blockers"]
+
+
+def test_admit_unknown_ticket_id_mints_challenge(ticket_root, tmp_path, monkeypatch):
+    """T2: missing handoff + unknown ticket keeps the existing mint behavior."""
+    pytest.importorskip("sopcontrol.tickets")
+    from tools.workflow import sopcontrol_adapter as adapter
+    from tools.workflow.testing_packages import build_workspace
+
+    monkeypatch.setattr(adapter, "_run_domain_consumers", lambda *a, **k: [])
+    ws = build_workspace(tmp_path)
+    report = adapter.admit(
+        _TicketReq("materials", {**_ticket_base(), "capability_ticket_id": "tkt-no-such-ticket"}),
+        entity=_TicketEntity(),
+        workspace=ws,
+    )
+    assert report["ticket_challenge"] is True
+    assert "capability_ticket_required" in report["blockers"]
+    assert report.get("capability_ticket_id") not in (None, "", "tkt-no-such-ticket")
+
+
+def test_admit_wrong_secret_is_invalid(ticket_root, tmp_path, monkeypatch):
+    """T3: wrong secret stays capability_ticket_invalid."""
+    pytest.importorskip("sopcontrol.tickets")
+    from tools.workflow import sopcontrol_adapter as adapter
+    from tools.workflow.testing_packages import build_workspace
+
+    monkeypatch.setattr(adapter, "_run_domain_consumers", lambda *a, **k: [])
+    ws = build_workspace(tmp_path)
+    issued = adapter.issue_capability_ticket(action="materials", payload=dict(_ticket_base()), run_id="t-run")
+    assert issued is not None
+    report = adapter.admit(
+        _TicketReq(
+            "materials",
+            {**_ticket_base(), "capability_ticket_id": issued["ticket_id"], "capability_ticket_secret": "wrong"},
+        ),
+        entity=_TicketEntity(),
+        workspace=ws,
+    )
+    assert "capability_ticket_invalid" in report["blockers"]
+
+
 def test_capability_ticket_issue_and_redeem(sop_root, tmp_path, monkeypatch):
 
     pytest.importorskip("sopcontrol.tickets")
