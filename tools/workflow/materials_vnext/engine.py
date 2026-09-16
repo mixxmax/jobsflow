@@ -693,6 +693,54 @@ def _canonical_from_payload(payload: dict[str, Any], baseline: dict[str, Any]) -
     return None
 
 
+def _evidence_texts(bundle: dict[str, Any]) -> str:
+    """Serialize confirmed profile facts for structural-number classification.
+
+    The preservation gate treats a missing baseline number as structural
+    (MAP-002 transitional compat) only when none of the nouns it counts
+    appears here.  Best-effort: unserializable profiles yield an empty blob,
+    which fails closed to the pre-existing strict behavior.
+    """
+
+    try:
+        profile = (bundle or {}).get("candidate_profile") or {}
+        return json.dumps(profile, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _pillar_capacity_report(plan: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+    """Advisory pillar capacity at plan-freeze: expected vs template slots.
+
+    Never blocks plan accept; it reports the deficit (in pillars and
+    estimated lines) so the transform compresses up front instead of
+    exploding at render/PDF time.  Any failure degrades to an empty report
+    rather than failing the plan gate.
+    """
+
+    try:
+        from tools.workflow.materials_baseline import split_pillar_anchors
+
+        expected, _omitted, _themes = split_pillar_anchors(plan, (plan or {}).get("coverage_dispositions"))
+        slots_blocks = [
+            block
+            for block in (((baseline or {}).get("cover_letter") or {}).get("blocks") or [])
+            if isinstance(block, dict) and str(block.get("section") or "") == "pillar"
+        ]
+        lines = [max(1, -(-len(str(block.get("text") or "")) // 92)) for block in slots_blocks]
+        avg_lines = round(sum(lines) / len(lines)) if lines else 3
+        deficit = max(0, len(expected) - len(slots_blocks))
+        return {
+            "expected_min_pillars": len(expected),
+            "template_slots": len(slots_blocks),
+            "deficit_pillars": deficit,
+            "deficit_lines_estimate": deficit * max(1, avg_lines),
+            "next_action": "compress_transform_to_fit" if deficit else "continue_to_tailoring",
+        }
+    except (AttributeError, TypeError, ValueError):
+        return {}
+
+
 def _plan_errors(value: Any) -> list[str]:
     """Keep planning a distinct, low-cost gate before any content transform."""
 
@@ -1145,7 +1193,9 @@ class MaterialsEngine:
                 integrity_error = current.get("canonical_sha256") != digest(canonical_copy)
                 from tools.workflow.materials_vnext.transform import baseline_preservation_errors
 
-                preservation = baseline_preservation_errors(bundle.get("baseline") or {}, current)
+                preservation = baseline_preservation_errors(
+                    bundle.get("baseline") or {}, current, evidence_texts=_evidence_texts(bundle)
+                )
                 if integrity_error or preservation:
                     errors = preservation or ["canonical_sha256_mismatch"]
                     return {
@@ -1521,6 +1571,7 @@ class MaterialsEngine:
         if stage in {"plan", "run", "planning"} and not incoming_transform and payload.get("repair_patch") is None:
             plan_started = perf_counter()
             plan = payload.get("model_plan") or payload.get("plan")
+            plan_pillar_capacity: dict[str, Any] = {}
             if isinstance(plan, dict):
                 errors = _plan_errors(plan)
                 if errors:
@@ -1532,6 +1583,7 @@ class MaterialsEngine:
                 save_plan(package, frozen_plan)
                 run.update({"phase": "plan_ready", "plan_sha256": frozen_plan["plan_sha256"]})
                 save_run(package, run)
+                plan_pillar_capacity = _pillar_capacity_report(frozen_plan, bundle.get("baseline") or {})
             planning_workspace: dict[str, Any] = {}
             from tools.workflow.materials_drafting_context import load_drafting_scope
 
@@ -1566,6 +1618,7 @@ class MaterialsEngine:
                 "task_packet": _plan_packet(bundle, run, plan=load_plan(package)),
                 "draft_schema": _plan_packet(bundle, run, plan=load_plan(package)).get("draft_seed_schema"),
                 "drafting_workspace": tailoring_workspace or planning_workspace,
+                "pillar_capacity": plan_pillar_capacity,
             }
 
         if stage in {"audit_result", "audit"} or payload.get("audit_result") is not None:
@@ -1772,6 +1825,7 @@ class MaterialsEngine:
                 job_id=job_id,
                 generation_id=str(run.get("generation_id")),
                 bundle_sha256=str(bundle.get("bundle_sha256")),
+                evidence_texts=_evidence_texts(bundle),
             )
         except ValueError as exc:
             _metric(package, stage="transform", status="failed", started=transform_started, error=str(exc)[:160])

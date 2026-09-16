@@ -222,9 +222,14 @@ def test_content_words_drop_stopwords_and_fold_plurals():
     assert content_words("Contracts and Disputes") == {"contract", "dispute"}
 
 
-def _canonical_with_pillars(pillar_texts, *, coverage_dispositions=None):
+def _canonical_with_pillars(pillar_specs, *, coverage_dispositions=None):
+    """pillar_specs: list of text or (text, anchor_ids) tuples."""
     canonical = _canonical({})
-    for index, pillar_text in enumerate(pillar_texts):
+    for index, spec in enumerate(pillar_specs):
+        if isinstance(spec, tuple):
+            pillar_text, anchor_ids = spec
+        else:
+            pillar_text, anchor_ids = spec, [f"JD-{index + 1:03d}"]
         canonical["cover_letter"]["blocks"].append({
             "id": f"cl-pillar-{index + 1}",
             "type": "bullet",
@@ -234,47 +239,67 @@ def _canonical_with_pillars(pillar_texts, *, coverage_dispositions=None):
             "priority": 10 + index,
             "customized": True,
             "baseline_refs": [],
-            "jd_anchor_ids": [f"JD-{index + 1:03d}"],
+            "jd_anchor_ids": list(anchor_ids),
         })
     canonical["coverage_dispositions"] = dict(coverage_dispositions or {})
     return canonical
 
 
-def test_pillar_count_matching_plan_anchors_passes():
+def _pillar_codes(findings):
+    return {item["code"] for item in findings if item["code"].startswith("pillar_")}
+
+
+def test_pillar_anchor_full_coverage_passes():
     plan = {"duties": ["Draft vendor contracts", "Review service agreements"]}
     canonical = _canonical_with_pillars([
         "Draft vendor contracts with structured checklists.",
         "Review service agreements with clear summaries.",
     ])
     findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
-    assert "pillar_anchor_count_mismatch" not in _codes(findings)
+    assert _pillar_codes(findings) == set()
 
 
-def test_pillar_count_mismatch_is_p1():
+def test_uncovered_anchor_is_p1():
     plan = {"duties": ["Draft vendor contracts", "Review service agreements", "Track renewal dates"]}
     canonical = _canonical_with_pillars([
         "Draft vendor contracts with structured checklists.",
         "Review service agreements with clear summaries.",
     ])
     findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
-    mismatches = [item for item in findings if item["code"] == "pillar_anchor_count_mismatch"]
-    assert len(mismatches) == 1
-    assert mismatches[0]["severity"] == "P1"
-    assert mismatches[0]["material"] == "cover_letter"
-    assert "2" in mismatches[0]["evidence"] and "3" in mismatches[0]["evidence"]
+    uncovered = [item for item in findings if item["code"] == "pillar_anchor_uncovered"]
+    assert len(uncovered) == 1
+    assert uncovered[0]["severity"] == "P1"
+    assert uncovered[0]["material"] == "cover_letter"
+    assert "JD-003" in uncovered[0]["evidence"]
 
 
-def test_pillar_count_excess_over_anchors_is_p1():
-    plan = {"duties": ["Draft vendor contracts", "Review service agreements"]}
+def test_unmapped_pillar_is_p1():
+    plan = {"duties": ["Draft vendor contracts"]}
     canonical = _canonical_with_pillars([
-        "Draft vendor contracts with structured checklists.",
-        "Review service agreements with clear summaries.",
-        "Track renewal dates with a shared register.",
+        ("Draft vendor contracts with structured checklists.", ["JD-001"]),
+        ("Track renewal dates with a shared register.", []),
     ])
     findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
-    mismatches = [item for item in findings if item["code"] == "pillar_anchor_count_mismatch"]
-    assert len(mismatches) == 1
-    assert mismatches[0]["severity"] == "P1"
+    unmapped = [item for item in findings if item["code"] == "pillar_without_anchor"]
+    assert len(unmapped) == 1
+    assert unmapped[0]["severity"] == "P1"
+
+
+def test_many_to_many_coverage_passes_without_equal_counts():
+    # F0-227 isomorphic: 11 anchors answered by 4 pillars; counts differ
+    # and that is fine under N:M coverage.
+    duties = [f"Duty number {index} for vendor contract operations" for index in range(1, 12)]
+    plan = {"duties": duties}
+    groups = [["JD-001", "JD-002", "JD-003"], ["JD-004", "JD-005", "JD-006"],
+              ["JD-007", "JD-008", "JD-009"], ["JD-010", "JD-011"]]
+    canonical = _canonical_with_pillars([
+        (f"{label} cover group with structured checklists.", anchors)
+        for label, anchors in zip(
+            ["Opening", "Middle", "Further", "Closing"], groups, strict=True
+        )
+    ])
+    findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
+    assert _pillar_codes(findings) == set()
 
 
 def test_pillar_gate_ignores_positioning_themes():
@@ -287,7 +312,7 @@ def test_pillar_gate_ignores_positioning_themes():
         "Review service agreements with clear summaries.",
     ])
     findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
-    assert "pillar_anchor_count_mismatch" not in _codes(findings)
+    assert _pillar_codes(findings) == set()
 
 
 def test_pillar_gate_excludes_intentionally_omitted_anchors():
@@ -300,13 +325,54 @@ def test_pillar_gate_excludes_intentionally_omitted_anchors():
         coverage_dispositions={"JD-003": "intentionally_omitted"},
     )
     findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)
-    assert "pillar_anchor_count_mismatch" not in _codes(findings)
+    assert _pillar_codes(findings) == set()
 
 
 def test_pillar_gate_skipped_without_explicit_plan():
     canonical = _canonical_with_pillars(["Draft vendor contracts with structured checklists."])
     findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=None)
-    assert "pillar_anchor_count_mismatch" not in _codes(findings)
+    assert _pillar_codes(findings) == set()
+
+
+def test_transition_count_mismatch_is_p1():
+    canonical = _canonical({})
+    canonical["cover_letter"]["blocks"].append({
+        "id": "cl-transition", "type": "paragraph",
+        "text": "These five pillars show my fit.",
+        "section": "body", "experience_id": "", "priority": 10,
+        "customized": True, "baseline_refs": [],
+    })
+    for index in range(4):
+        canonical["cover_letter"]["blocks"].append({
+            "id": f"cl-p-{index + 1}", "type": "bullet",
+            "text": "Support vendor contract review with structured checklists.",
+            "section": "pillar", "experience_id": "", "priority": 11 + index,
+            "customized": True, "baseline_refs": [], "jd_anchor_ids": [],
+        })
+    findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=None)
+    mismatches = [item for item in findings if item["code"] == "transition_count_mismatch"]
+    assert len(mismatches) == 1
+    assert mismatches[0]["severity"] == "P1"
+
+
+def test_transition_count_match_passes_silently():
+    canonical = _canonical({})
+    canonical["cover_letter"]["blocks"].append({
+        "id": "cl-transition", "type": "paragraph",
+        "text": "These four pillars show my fit.",
+        "section": "body", "experience_id": "", "priority": 10,
+        "customized": True, "baseline_refs": [],
+    })
+    for index in range(4):
+        canonical["cover_letter"]["blocks"].append({
+            "id": f"cl-p-{index + 1}", "type": "bullet",
+            "text": "Support vendor contract review with structured checklists.",
+            "section": "pillar", "experience_id": "", "priority": 11 + index,
+            "customized": True, "baseline_refs": [], "jd_anchor_ids": [],
+        })
+    findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=None)
+    assert "transition_count_mismatch" not in _codes(findings)
+    assert [item for item in findings if item["code"] == "invented_number"] == []
 
 
 def _structural_bundle(transition_text):

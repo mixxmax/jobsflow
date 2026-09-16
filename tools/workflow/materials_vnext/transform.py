@@ -189,7 +189,52 @@ def _protected_evidence_tokens(value: Any) -> set[str]:
     return tokens
 
 
-def baseline_preservation_errors(baseline: dict[str, Any], current: dict[str, Any]) -> list[str]:
+def _evidence_words(evidence_texts: str) -> set[str]:
+    """Fold confirmed fact/evidence text into singular content words."""
+
+    words = set()
+    for match in re.findall(r"[a-z]+", str(evidence_texts or "").casefold()):
+        words.add(match[:-1] if match.endswith("s") and len(match) > 3 else match)
+    return words
+
+
+def _is_structural_number(token: str, base_text: str, evidence_words: set[str]) -> bool:
+    """True when a missing protected number only counts in-document items.
+
+    Transitional compat (MAP-002): structural counts are host-derived at
+    render, so the preservation gate must not deadlock a rewrite that
+    corrects them.  A number is structural when none of the nouns it counts
+    appears in any confirmed fact/evidence text.  Acronyms and unclassifiable
+    numbers stay protected (fail closed).
+    """
+
+    folded = str(token or "").casefold()
+    if not folded or (not folded[:1].isdigit() and folded not in _NUMBER_WORDS):
+        return False
+    nouns = {
+        noun
+        for run in semantic_lint.modifier_run_nouns(base_text, folded)
+        for noun in run
+    }
+    if not nouns:
+        return False
+    return not (nouns & evidence_words)
+
+
+def _token_present(token: str, blob: str) -> bool:
+    """Word-boundary-aware presence check for sunk-number matching."""
+
+    if token[:1].isdigit():
+        return re.search(r"(?<!\d)" + re.escape(token) + r"(?!\d)", blob) is not None
+    return re.search(r"(?<![a-z])" + re.escape(token) + r"(?![a-z])", blob) is not None
+
+
+def baseline_preservation_errors(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    evidence_texts: str = "",
+) -> list[str]:
     """Check block identity and protected evidence after all transforms.
 
     Every truthful baseline block remains represented through ``baseline_refs``
@@ -197,9 +242,20 @@ def baseline_preservation_errors(baseline: dict[str, Any], current: dict[str, An
     or explicit numeric word.  The rule is host-enforced before an audit task
     is created, so a weak model cannot trade away content to make a document
     shorter and ask the child auditor to discover it later.
+
+    Two narrow reliefs (both documented, neither weakens evidence numbers):
+    structural counts whose counted nouns appear in no confirmed fact/evidence
+    text are skipped (MAP-002 transitional compat), and a number dropped from
+    a cover-letter pillar is accepted when the same number is present in the
+    current CV text (evidence sinking migration path).
     """
 
     errors: list[str] = []
+    evidence_words = _evidence_words(evidence_texts)
+    current_cv_blob = " ".join(
+        text(block.get("text"))
+        for block in _blocks(current, "cv")
+    ).casefold()
     for material in MATERIALS:
         base_blocks = _blocks(baseline, material)
         current_blocks = _blocks(current, material)
@@ -216,9 +272,12 @@ def baseline_preservation_errors(baseline: dict[str, Any], current: dict[str, An
                 continue
             if not is_floor:
                 continue
-            baseline_tokens = _protected_evidence_tokens(base.get("text"))
+            base_text = text(base.get("text"))
+            base_section = text(base.get("section"))
+            baseline_tokens = _protected_evidence_tokens(base_text)
             current_text = " ".join(text(block.get("text")) for block in matching)
-            missing = sorted(token for token in baseline_tokens if token not in current_text.casefold())
+            current_folded = current_text.casefold()
+            missing = sorted(token for token in baseline_tokens if token not in current_folded)
             for token in missing:
                 # A legacy lane baseline may contain a different acronym slash
                 # order (for example ``IPO/ECM``) while the tailored material
@@ -228,8 +287,17 @@ def baseline_preservation_errors(baseline: dict[str, Any], current: dict[str, An
                 # baseline evidence.
                 if "/" in token:
                     left, right = token.split("/", 1)
-                    if f"{right}/{left}" in current_text.casefold():
+                    if f"{right}/{left}" in current_folded:
                         continue
+                if _is_structural_number(token, base_text, evidence_words):
+                    continue
+                if (
+                    material == "cover_letter"
+                    and base_section == "pillar"
+                    and (token[:1].isdigit() or token in _NUMBER_WORDS)
+                    and _token_present(token, current_cv_blob)
+                ):
+                    continue
                 errors.append(f"baseline_protected_evidence_removed:{material}:{base_id}:{token}")
     return sorted(set(errors))
 
@@ -542,10 +610,11 @@ def compile_canonical(
     *,
     baseline: dict[str, Any],
     original_transform: dict[str, Any],
-    patches: list[dict[str, Any]] | None,
+    patches: list[dict[Any, Any]] | None,
     job_id: str,
     generation_id: str,
     bundle_sha256: str,
+    evidence_texts: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     errors = validate_transform(original_transform, baseline)
     if errors:
@@ -561,7 +630,7 @@ def compile_canonical(
             raise ValueError("invalid_repair_patch: " + ", ".join(errors))
         state = _apply_operations(state, patch, repair=True)
         patch_rows.append(copy.deepcopy(patch))
-    preservation_errors = baseline_preservation_errors(baseline, state)
+    preservation_errors = baseline_preservation_errors(baseline, state, evidence_texts=evidence_texts)
     effective = {
         "schema_version": 1,
         "artifact_type": "jobsflow_effective_materials_transform",

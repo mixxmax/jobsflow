@@ -84,6 +84,46 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+_TRANSITION_COUNT_WORDS = (
+    "zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    "thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty"
+)
+# A hand-written structural count ("These four pillars show …",
+# "My background offers four relevant evidence anchors:").  Only the narrow
+# determiner-led shape is derived; evidence numbers counting anything else
+# pass through untouched.
+_TRANSITION_COUNT_RE = re.compile(
+    r"\b(?P<det>these|the|this|my|our)\s+"
+    r"(?P<pre>(?:[A-Za-z]+\s+){0,3}?)"
+    r"(?P<num>\d+|" + _TRANSITION_COUNT_WORDS + r")\s+"
+    r"(?P<post>(?:[A-Za-z]+\s+){0,2}?)"
+    r"(?P<noun>pillars?|anchors?)\b",
+    re.IGNORECASE,
+)
+
+
+def derive_transition_text(value: str) -> str:
+    """Drop hand-written structural counts from a transition sentence.
+
+    Host-derived rendering (fix 5.3): the outbound document never carries a
+    hand-written pillar/anchor count, so the whole "who counted correctly"
+    category disappears at render time.  Only the number token is removed;
+    surrounding words keep their original case and spacing.  Idempotent:
+    text without a structural count is returned unchanged.
+    """
+
+    def _drop(match: re.Match[str]) -> str:
+        return (
+            match.group("det")
+            + " "
+            + match.group("pre")
+            + match.group("post")
+            + match.group("noun")
+        )
+
+    return _TRANSITION_COUNT_RE.sub(_drop, str(value or ""))
+
+
 def _load(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -598,7 +638,11 @@ def _add_block(
             _add_run(paragraph, text, prototypes["compact"])
         else:
             paragraph = _new_paragraph(document, prototypes["body"])
-            _add_run(paragraph, text, prototypes["body"])
+            # Host-derived transition counts (fix 5.3): a cover-letter body
+            # paragraph never renders a hand-written pillar/anchor count.
+            # Pillars, headings and signoffs pass through untouched.
+            rendered = derive_transition_text(text) if section == "body" else text
+            _add_run(paragraph, rendered, prototypes["body"])
 
     # Do not impose a second, model-dependent layout system.  The paragraph
     # prototype copied above is the sole formatting authority; these flags are
@@ -834,8 +878,13 @@ def _render_matches_canonical(package: Path, names: dict[str, str]) -> list[str]
     errors: list[str] = []
     for material, key in (("cv", "cv_docx"), ("cover_letter", "cl_docx")):
         live = normalize_text(read_material_text(Path(package) / names[key])).casefold()
+        # Both sides go through host transition derivation: the DOCX never
+        # carries a hand-written pillar/anchor count, so the check compares
+        # derived text to derived text instead of flagging the derivation
+        # itself as a mismatch.
+        live = derive_transition_text(live)
         for line in normalize_text(expected.get(material, "")).splitlines():
-            if line.casefold() not in live:
+            if derive_transition_text(line).casefold() not in live:
                 errors.append(f"rendered_text_mismatch:{material}")
                 break
     return errors

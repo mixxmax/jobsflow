@@ -294,6 +294,43 @@ def plan_jd_anchor_catalog(plan: dict[str, Any] | None) -> list[dict[str, Any]]:
     ]
 
 
+def split_pillar_anchors(
+    plan: dict[str, Any] | None,
+    dispositions: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Split plan anchors for pillar coverage decisions.
+
+    Returns ``(expected, omitted_ids, theme_ids)`` where ``expected`` holds
+    the non-theme anchors that are not intentionally omitted.  Positioning
+    themes never take pillars, and intentionally_omitted anchors are internal
+    decisions that must not be rendered, so neither counts toward pillar
+    coverage.  Pure set arithmetic on host records; no semantic judgment.
+    """
+
+    def _clean(value: Any) -> str:
+        return " ".join(str(value or "").split()).strip()
+
+    anchors = [
+        anchor
+        for anchor in plan_jd_anchor_catalog(plan)
+        if _clean(anchor.get("source")).casefold() != "themes"
+        and _clean(anchor.get("id"))
+    ]
+    source = dispositions if isinstance(dispositions, dict) else (plan or {}).get("coverage_dispositions")
+    omitted: list[str] = []
+    if isinstance(source, dict):
+        for anchor_id, disposition in source.items():
+            if "intentionally_omitted" in str(disposition).casefold() and str(anchor_id).strip():
+                omitted.append(str(anchor_id).strip())
+    omitted_set = set(omitted)
+    expected = [anchor for anchor in anchors if _clean(anchor.get("id")) not in omitted_set]
+    return expected, sorted(omitted_set), [
+        _clean(anchor.get("id"))
+        for anchor in plan_jd_anchor_catalog(plan)
+        if _clean(anchor.get("source")).casefold() == "themes" and _clean(anchor.get("id"))
+    ]
+
+
 def baseline_transform_task_schema(
     baseline: dict[str, Any],
     *,
