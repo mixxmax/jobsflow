@@ -384,3 +384,80 @@ def test_cli_rejects_materials_files_on_commands_that_would_ignore_them(tmp_path
     blocked = json.loads(capsys.readouterr().out)
     assert blocked["blockers"] == ["materials_draft_content_required"]
     assert blocked["required"] == "materials draft --content <current response file>"
+
+
+def _t19_context(*, marker="t19"):
+    return {
+        "phase": "tailoring",
+        "task_packet": {"job_id": "C0-019", "marker": marker},
+        "response_schema": {"schema_version": 1},
+    }
+
+
+def test_prepare_drafting_workspace_never_silently_resets_response(tmp_path):
+    """T19: same scope keeps bytes; changed fingerprint backs up; missing recreates."""
+    import json as _json
+
+    from tools.workflow.materials_drafting_context import prepare_drafting_workspace
+
+    # NOTE: package_legacy mode (no staging_root) uses a fixed response path,
+    # which is the only mode where re-entry can overwrite.  Isolated staging
+    # roots are per-fingerprint directories and cannot collide by construction.
+    package = tmp_path / "pkg"
+    package.mkdir()
+
+    first = prepare_drafting_workspace(package, job_id="C0-019", **_t19_context())
+    assert first["response_action"] == "created"
+    response_file = Path(first["response_file"])
+    assert response_file.is_file()
+
+    # Simulate the model having written its 3-op transform.
+    written = _json.loads(response_file.read_text(encoding="utf-8"))
+    written["operations"] = [
+        {"action": "replace", "target_id": "x", "after_text": "model wording one"},
+        {"action": "replace", "target_id": "y", "after_text": "model wording two"},
+        {"action": "replace", "target_id": "z", "after_text": "model wording three"},
+    ]
+    response_file.write_text(_json.dumps(written, ensure_ascii=False), encoding="utf-8")
+    before_bytes = response_file.read_bytes()
+
+    second = prepare_drafting_workspace(package, job_id="C0-019", **_t19_context())
+    assert second["response_action"] == "kept"
+    assert response_file.read_bytes() == before_bytes
+
+    # Changed inputs (new fingerprint): old content backed up, fresh template written.
+    third = prepare_drafting_workspace(
+        package, job_id="C0-019", **_t19_context(marker="t19-changed")
+    )
+    assert third["response_action"] == "backed_up"
+    backups = list(Path(third["root"]).glob("*.bak.*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == before_bytes
+    fresh = _json.loads(response_file.read_text(encoding="utf-8"))
+    assert fresh.get("operations", []) == [] or "operations" not in fresh
+
+    # Missing file: recreated normally.
+    response_file.unlink()
+    fourth = prepare_drafting_workspace(package, job_id="C0-019", **_t19_context(marker="t19-changed"))
+    assert fourth["response_action"] == "created"
+    assert response_file.is_file()
+
+
+def test_submission_blocker_explicitly_rejects_backup_files(tmp_path):
+    """T19b: *.bak.* can never be submitted, with a dedicated blocker code."""
+    from tools.workflow import __main__ as workflow_cli
+    from tools.workflow.testing_packages import build_package, build_workspace
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, job_id="C0-019", with_outbound=False)
+    _ = package
+    staging = tmp_path / "staging2"
+    from tools.workflow.materials_drafting_context import prepare_drafting_workspace
+
+    out = prepare_drafting_workspace(package, job_id="C0-019", staging_root=staging, **_t19_context())
+    response_file = Path(out["response_file"])
+    backup = response_file.with_name(response_file.name + ".bak.20260916T000000Z")
+    backup.write_text("{}", encoding="utf-8")
+    blocked = workflow_cli._materials_submission_blocker(ws, "C0-019", backup, phase="tailoring")
+    assert blocked is not None
+    assert blocked["blockers"] == ["drafting_submission_backup_rejected"]

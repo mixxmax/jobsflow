@@ -58,6 +58,23 @@ def _load_store(path: Path | None, title: str, workspace: Path):
     return FileFreshStore(workspace, title, rows)
 
 
+def _archive_store(fixture: Path | None, title: str, workspace: Path):
+    """Resolve the archive backend for a fresh title.
+
+    push/scan read and write TrackerLedger for ``fresh_24h_*`` titles, so
+    archive must resolve to the same ledger-backed store; resolving to
+    FileFreshStore proposed empty rows and broke confirm digests.
+    Fixture/test callers keep FileFreshStore explicitly via --fixture, and
+    non-fresh_24h_* titles keep the legacy behavior unchanged.
+    """
+
+    if fixture is None and str(title or "").startswith("fresh_24h_"):
+        from tools.workflow.sync import LedgerArchiveStore
+
+        return LedgerArchiveStore(workspace, str(title))
+    return _load_store(fixture, title, workspace)
+
+
 def _materials_submission_blocker(
     workspace: Path,
     job_id: str,
@@ -81,6 +98,16 @@ def _materials_submission_blocker(
         return {"status": "blocked", "job_id": str(job_id), "blockers": ["package_missing"]}
     expected = expected_submission_path(Path(ctx.package), phase=phase)
     supplied_path = Path(supplied).expanduser().resolve()
+    from tools.workflow.materials_drafting_context import is_backup_path
+
+    if is_backup_path(supplied_path):
+        return {
+            "status": "blocked",
+            "job_id": str(job_id),
+            "blockers": ["drafting_submission_backup_rejected"],
+            "expected_submission": str(expected) if expected else "",
+            "submitted_path": str(supplied_path),
+        }
     if expected is None or supplied_path != expected.resolve():
         return {
             "status": "blocked",
@@ -771,12 +798,25 @@ def main(argv: list[str] | None = None) -> int:
         if args.archive_cmd == "preview":
             action = "archive_preview"
             payload["target"] = args.fresh_title
-            store = _load_store(args.fixture, args.fresh_title, workspace)
+            store = _archive_store(args.fixture, args.fresh_title, workspace)
         else:
             action = "archive_confirm"
             payload["proposal_id"] = args.proposal_id
-            payload["target"] = args.fresh_title
-            store = _load_store(args.fixture, args.fresh_title or "fresh", workspace)
+            confirm_title = str(args.fresh_title or "")
+            if not confirm_title:
+                # The proposal is the source of truth for confirm: it carries
+                # the previewed target, so entity gating and store resolution
+                # bind the same title even when --fresh-title is omitted.
+                try:
+                    from tools.workflow.confirmation import ConfirmationStore
+
+                    _proposal = ConfirmationStore(workspace).load(args.proposal_id)
+                    if isinstance(_proposal, dict):
+                        confirm_title = str(_proposal.get("target") or "")
+                except (OSError, ValueError, TypeError, RuntimeError):
+                    confirm_title = ""
+            payload["target"] = confirm_title
+            store = _archive_store(args.fixture, confirm_title or "fresh", workspace)
     elif action == "sync":
         if args.sync_cmd == "status":
             action = "sync_status"

@@ -338,6 +338,123 @@ def test_remote_change_is_not_silently_overwritten(tmp_path):
     assert store.rows[0]["CareerOps分数"] == "4.2"
 
 
+def test_trailing_slash_only_remote_diff_does_not_block(tmp_path):
+    """T15: Sheets stripping a trailing slash is cosmetic, not a conflict."""
+    store = MemoryFreshStore("fresh_24h_2026-08-14", [])
+    coordinator = SyncCoordinator(tmp_path)
+    row = {**_row(), "链接": "https://www.linkedin.com/jobs/view/4447238892/"}
+    first = coordinator.push_rows(title=store.title, incoming=[row], store=store)
+    assert first["status"] == "succeeded"
+
+    # Sheets normalizes the trailing slash away on the remote cell.
+    store.rows[0]["链接"] = "https://www.linkedin.com/jobs/view/4447238892"
+    second = coordinator.push_rows(title=store.title, incoming=[{**row}], store=store)
+    assert second["status"] == "succeeded"
+    assert store.rows[0]["链接"] == "https://www.linkedin.com/jobs/view/4447238892/"
+
+    # A substantive user-field change still blocks and reconciles as before.
+    store.rows[0]["备注"] = "用户在 Sheets 手工写的备注"
+    blocked = coordinator.push_rows(title=store.title, incoming=[{**row}], store=store)
+    assert blocked["status"] == "blocked"
+    assert blocked["blockers"] == ["remote_changed_requires_reconcile"]
+
+
+def _find_key(node, key, _missing=object()):
+    # NOTE: falsy values (0, "", False) are valid hits; only None/missing
+    # continues the search.  An earlier version used truthiness and silently
+    # missed row_count=0.
+    if isinstance(node, dict):
+        for name, value in node.items():
+            if name == key and value is not None:
+                return value
+            found = _find_key(value, key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_key(value, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _isolate_product_root(tmp_path, monkeypatch):
+    """Point SOP product state at tmp so tests never touch the real repo."""
+    root = tmp_path / "product"
+    root.mkdir(exist_ok=True)
+    rules = root / ".sopcontrol" / "rules"
+    rules.mkdir(parents=True, exist_ok=True)
+    (root / ".sopcontrol" / "manifest.yaml").write_text("controller_paths: []\n", encoding="utf-8")
+    (rules / "registry.yaml").write_text("rules: []\n", encoding="utf-8")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_ROOT", str(root))
+    return root
+
+
+def test_archive_preview_confirm_use_tracker_ledger(tmp_path, monkeypatch, capsys):
+    """T16: archive resolves fresh_24h_* titles to the TrackerLedger."""
+    import json as _json
+
+    from tools.workflow import __main__ as workflow_cli
+    from tools.workflow.fresh_store import FreshSnapshot
+    from tools.workflow.sync import LedgerArchiveStore, TrackerLedger
+
+    from tools.workflow.testing_packages import build_workspace
+
+    _isolate_product_root(tmp_path, monkeypatch)
+    ws = build_workspace(tmp_path)
+    title = "fresh_24h_2026-09-16"
+    headers = ["岗位编号", "职位", "公司", "链接"]
+    rows = [
+        {"岗位编号": "C0-901", "职位": "Role", "公司": "Acme", "链接": "https://example.test/901"},
+        {"岗位编号": "C0-902", "职位": "Role", "公司": "Beta", "链接": "https://example.test/902"},
+    ]
+    ledger = TrackerLedger(ws, title)
+    before = ledger.write(FreshSnapshot(title=title, headers=headers, rows=[dict(row) for row in rows]))
+    assert before.row_count == 2
+
+    # NOTE: --workspace must follow the subcommand; argparse nested
+    # parents=[common] lets a deeper level's default overwrite a value given
+    # at an outer level, silently resolving to the real runtime otherwise.
+    assert workflow_cli.main(["archive", "preview", "--workspace", str(ws), "--fresh-title", title]) == 0
+    preview = _json.loads(capsys.readouterr().out)
+    proposal_id = _find_key(preview, "proposal_id")
+    assert proposal_id
+    assert _find_key(preview, "row_count") == 2
+    assert _find_key(preview, "target_digest") == before.digest
+
+    assert (
+        workflow_cli.main(
+            ["archive", "confirm", "--workspace", str(ws), "--proposal-id", proposal_id]
+        )
+        == 0
+    )
+    confirm = _json.loads(capsys.readouterr().out)
+    assert _find_key(confirm, "status") == "succeeded"
+    assert ledger.read().row_count == 0
+    archived = LedgerArchiveStore(ws, title).read_archive(proposal_id)
+    assert archived.digest == before.digest
+    assert archived.row_count == 2
+
+
+def test_archive_preview_empty_ledger_unchanged(tmp_path, monkeypatch, capsys):
+    """T16b: empty ledger preview keeps the legacy empty-proposal behavior."""
+    import json as _json
+
+    from tools.workflow import __main__ as workflow_cli
+    from tools.workflow.testing_packages import build_workspace
+
+    _isolate_product_root(tmp_path, monkeypatch)
+    ws = build_workspace(tmp_path)
+    assert (
+        workflow_cli.main(
+            ["archive", "preview", "--workspace", str(ws), "--fresh-title", "fresh_24h_empty"]
+        )
+        == 0
+    )
+    preview = _json.loads(capsys.readouterr().out)
+    assert _find_key(preview, "row_count") == 0
+
+
 def test_status_only_remote_change_does_not_block_additive_push(tmp_path):
     store = AppendOnlyStore("fresh_24h_2026-08-14", [])
     old = {

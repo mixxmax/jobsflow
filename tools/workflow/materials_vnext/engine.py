@@ -337,7 +337,14 @@ def _record_resolve(
     if gate_open:
         new_phase = "content_passed" if phase in {"repair_required", "content_audit_pending", "audit_review_required"} else phase
     else:
-        new_phase = "repair_required" if phase in {"content_passed", "audit_review_required"} else phase
+        # Fix 8 (option A): a successful resolve that still leaves open
+        # blocking findings always dials to repair_required, whatever the
+        # current run phase is (including preflight-set `blocked`).  Without
+        # this, a blocked run has no compliant path back into the repair
+        # gate.  Closed/passed findings never reopen through here (see the
+        # gate_open branch above); the repair gate's own content validation,
+        # audit loop caps and repeat-detector semantics are untouched.
+        new_phase = "repair_required"
     updated = dict(run)
     updated.update({
         "phase": new_phase,

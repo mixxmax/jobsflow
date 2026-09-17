@@ -295,7 +295,7 @@ def test_many_to_many_coverage_passes_without_equal_counts():
     canonical = _canonical_with_pillars([
         (f"{label} cover group with structured checklists.", anchors)
         for label, anchors in zip(
-            ["Opening", "Middle", "Further", "Closing"], groups, strict=True
+            ["Opening", "Middle", "Further", "Closing"], groups
         )
     ])
     findings = run_semantic_lint(bundle=_bundle(), canonical=canonical, plan=plan)

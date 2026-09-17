@@ -26,8 +26,11 @@ from uuid import uuid4
 from tools.io_utils import atomic_write_json
 from tools.job_urls import normalize_job_url
 from tools.workflow.fresh_store import (
+    ArchiveReceipt,
+    ClearReceipt,
     FreshSnapshot,
     FreshStore,
+    RestoreReceipt,
     SnapshotConflict,
     _headers_for_rows,
     merge_fresh_rows,
@@ -220,6 +223,32 @@ def _merge_remote_status_fields(
     return merged
 
 
+def _cosmetic_url_equivalence(item: dict[str, Any]) -> bool:
+    """True when a system-owned remote diff is only URL normalization noise.
+
+    Sheets strips trailing slashes (and users retype case/whitespace) on
+    owner:system link cells.  Such diffs carry zero information and must not
+    block sync: the merge continues with the local canonical value, which
+    normalizes the remote cell on the next write.  Whitelisted strictly to
+    URL equivalence judged by normalize_job_url: both sides must look like
+    URLs and be equal after normalization (case-insensitive).  Any substantive
+    user-field change still takes the reconcile/pull path.
+    """
+
+    if not isinstance(item, dict) or item.get("owner") != "system":
+        return False
+    local = str(item.get("local") or "")
+    remote = str(item.get("remote") or "")
+    if not local or not remote or local == remote:
+        return False
+    if "://" not in local and "://" not in remote:
+        return False
+    try:
+        return normalize_job_url(local).casefold() == normalize_job_url(remote).casefold()
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _status_only_remote_changes(changes: Iterable[dict[str, Any]]) -> bool:
     items = list(changes)
     return bool(items) and all(
@@ -379,6 +408,73 @@ class TrackerLedger:
         if self.exists():
             return self.read()
         return self.write(snapshot)
+
+
+class LedgerArchiveStore:
+    """Archive-capable store backed by a TrackerLedger.
+
+    The archive preview/confirm gateway speaks the FileFreshStore protocol
+    (snapshot/read_active/write_archive/read_archive/clear_active/
+    restore_active), but for ``fresh_24h_*`` titles the live rows live in
+    the TrackerLedger, not in ``workflow/fresh/<title>/active.json``.
+    This wrapper adapts the ledger without changing TrackerLedger itself,
+    so push/scan keep their single source of truth and archive stops
+    proposing empty rows.  Archives land in a sibling ``archives`` directory
+    next to the ledger file; the ledger layout is otherwise untouched.
+    """
+
+    def __init__(self, workspace: Path, title: str) -> None:
+        self.workspace = Path(workspace)
+        self.title = title
+        self._ledger = TrackerLedger(self.workspace, title)
+        self.archive_dir = ledger_root(self.workspace) / "archives" / _safe(title)
+
+    def snapshot(self) -> FreshSnapshot:
+        return self._ledger.read()
+
+    def read_active(self) -> FreshSnapshot:
+        return self._ledger.read()
+
+    def _archive_path(self, archive_id: str) -> Path:
+        return self.archive_dir / f"{_safe(archive_id)}.json"
+
+    def write_archive(self, snapshot: FreshSnapshot, archive_id: str) -> ArchiveReceipt:
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        path = self._archive_path(archive_id)
+        atomic_write_json(
+            path,
+            {
+                "archive_id": archive_id,
+                "title": snapshot.title,
+                "headers": snapshot.headers,
+                "rows": snapshot.rows,
+                "digest": snapshot.digest,
+            },
+        )
+        return ArchiveReceipt(archive_id=archive_id, digest=snapshot.digest, path=str(path))
+
+    def read_archive(self, archive_id: str) -> FreshSnapshot:
+        data = json.loads(self._archive_path(archive_id).read_text(encoding="utf-8"))
+        return FreshSnapshot(
+            title=str(data.get("title") or self.title),
+            headers=list(data.get("headers") or []),
+            rows=[dict(row) for row in (data.get("rows") or [])],
+        )
+
+    def clear_active(self, expected_digest: str) -> ClearReceipt:
+        current = self._ledger.read()
+        if current.digest != expected_digest:
+            return ClearReceipt(ok=False, digest=current.digest, error="digest_mismatch")
+        empty = FreshSnapshot(title=self.title, headers=current.headers, rows=[])
+        self._ledger.write(empty)
+        return ClearReceipt(ok=True, digest=self._ledger.read().digest)
+
+    def restore_active(self, snapshot: FreshSnapshot) -> RestoreReceipt:
+        self._ledger.write(snapshot)
+        after = self._ledger.read()
+        if after.digest != snapshot.digest:
+            return RestoreReceipt(ok=False, digest=after.digest, error="restore_digest_mismatch")
+        return RestoreReceipt(ok=True, digest=after.digest)
 
 
 class SyncLedger:
@@ -597,6 +693,7 @@ class SyncCoordinator:
         unsafe_remote_changes = [
             item for item in remote_diff["remote_changes"]
             if not (status_only_remote and item.get("field") in STATUS_FIELDS)
+            and not _cosmetic_url_equivalence(item)
         ]
         if remote_diff["conflicts"] or unsafe_remote_changes or remote_diff["remote_only"]:
             report_path = self._write_conflict_report(
@@ -809,7 +906,8 @@ class SyncCoordinator:
         base = self.operations.read_projection(title, backend)
         diff = _diff_snapshots(base, local, remote)
         unsafe_remote_changes = [
-            item for item in diff["remote_changes"] if item.get("owner") != "user"
+            item for item in diff["remote_changes"]
+            if item.get("owner") != "user" and not _cosmetic_url_equivalence(item)
         ]
         status = "succeeded" if not diff["conflicts"] and not unsafe_remote_changes else "blocked"
         report_path = ""
@@ -852,7 +950,8 @@ class SyncCoordinator:
             )
             return {"status": "blocked", "blockers": ["sync_conflict"], "conflicts": diff["conflicts"], "report_path": report_path}
         blocked_remote = [
-            item for item in diff["remote_changes"] if item.get("owner") != "user"
+            item for item in diff["remote_changes"]
+            if item.get("owner") != "user" and not _cosmetic_url_equivalence(item)
         ]
         if blocked_remote:
             report_path = self._write_conflict_report(
