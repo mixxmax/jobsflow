@@ -5,8 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.workflow.fresh_store import FreshSnapshot, GSheetFreshStore, MemoryFreshStore
-from tools.workflow.sync import SyncCoordinator, TrackerLedger
+import pytest
+
+from tools.workflow.fresh_store import FreshSnapshot, GSheetFreshStore, LocalCsvFreshStore, MemoryFreshStore, SnapshotConflict
+from tools.workflow.sync import LedgerArchiveStore, SyncCoordinator, SyncLedger, TrackerLedger, _backend_name
+from tools.workflow.adapters.archive import confirm_archive, preview_archive
+from tools.workflow.confirmation import ConfirmationStore
 from tools.workflow.tracker_formats import (
     MATERIAL_STATUS_OPTIONS,
     build_material_status_format_requests,
@@ -338,6 +342,252 @@ def test_remote_change_is_not_silently_overwritten(tmp_path):
     assert store.rows[0]["CareerOps分数"] == "4.2"
 
 
+def test_trailing_slash_only_remote_diff_does_not_block(tmp_path):
+    """T15: Sheets stripping a trailing slash is cosmetic, not a conflict."""
+    store = MemoryFreshStore("fresh_24h_2026-08-14", [])
+    coordinator = SyncCoordinator(tmp_path)
+    row = {**_row(), "链接": "https://www.linkedin.com/jobs/view/4447238892/"}
+    first = coordinator.push_rows(title=store.title, incoming=[row], store=store)
+    assert first["status"] == "succeeded"
+
+    # Sheets normalizes the trailing slash away on the remote cell.
+    store.rows[0]["链接"] = "https://www.linkedin.com/jobs/view/4447238892"
+    second = coordinator.push_rows(title=store.title, incoming=[{**row}], store=store)
+    assert second["status"] == "succeeded"
+    assert store.rows[0]["链接"] == "https://www.linkedin.com/jobs/view/4447238892/"
+
+    # A substantive user-field change still blocks and reconciles as before.
+    store.rows[0]["备注"] = "用户在 Sheets 手工写的备注"
+    blocked = coordinator.push_rows(title=store.title, incoming=[{**row}], store=store)
+    assert blocked["status"] == "blocked"
+    assert blocked["blockers"] == ["remote_changed_requires_reconcile"]
+
+
+@pytest.mark.parametrize("append", [False, True])
+def test_status_plus_cosmetic_url_push(tmp_path, append):
+    store = AppendOnlyStore("fresh_24h_test", []) if append else MemoryFreshStore("fresh_24h_test", [])
+    coordinator = SyncCoordinator(tmp_path)
+    row = {**_row("未制作"), "链接": "https://www.linkedin.com/jobs/view/4447238892/"}
+    assert coordinator.push_rows(title=store.title, incoming=[row], store=store)["status"] == "succeeded"
+    store.rows[0]["状态"] = "已投递"
+    store.rows[0]["链接"] = "https://www.linkedin.com/jobs/view/4447238892"
+    incoming = {**row, "岗位编号": "C0-902", "链接": "https://example.test/902"} if append else row
+    out = coordinator.push_rows(title=store.title, incoming=[incoming], store=store)
+    assert out["status"] == "succeeded"
+    assert out["status_changes_reconciled"] is True
+    assert next(r for r in store.rows if r["岗位编号"] == "C0-901")["状态"] == "已投递"
+    assert next(r for r in TrackerLedger(tmp_path, store.title).read().rows if r["岗位编号"] == "C0-901")["状态"] == "已投递"
+
+
+@pytest.mark.parametrize("action", ["push", "reconcile", "pull"])
+@pytest.mark.parametrize("substantive", [False, True])
+def test_three_way_url_changes(tmp_path, action, substantive):
+    store = MemoryFreshStore("fresh_24h_test", [])
+    coordinator = SyncCoordinator(tmp_path)
+    row = {**_row(), "链接": "https://www.linkedin.com/jobs/view/4447238892/"}
+    assert coordinator.push_rows(title=store.title, incoming=[row], store=store)["status"] == "succeeded"
+    ledger = TrackerLedger(tmp_path, store.title)
+    local = ledger.read()
+    local.rows[0]["链接"] = "https://www.linkedin.com/jobs/view/4447238892"
+    ledger.write(local)
+    store.rows[0]["链接"] = "https://www.linkedin.com/jobs/view/4447238893/" if substantive else " https://www.linkedin.com/jobs/view/4447238892/ "
+    if action == "push":
+        out = coordinator.push_rows(title=store.title, incoming=[], store=store)
+    elif action == "reconcile":
+        out = coordinator.reconcile(title=store.title, store=store)
+    else:
+        out = coordinator.pull_user_fields(title=store.title, store=store, confirmed=True)
+    assert out["status"] == ("blocked" if substantive else "succeeded")
+    if action == "reconcile" and not substantive:
+        assert any(item["field"] == "链接" for item in out["remote_changes"])
+    if substantive:
+        assert ledger.read().digest == local.digest
+        assert store.rows[0]["链接"].endswith("4447238893/")
+
+
+def _find_key(node, key, _missing=object()):
+    # NOTE: falsy values (0, "", False) are valid hits; only None/missing
+    # continues the search.  An earlier version used truthiness and silently
+    # missed row_count=0.
+    if isinstance(node, dict):
+        for name, value in node.items():
+            if name == key and value is not None:
+                return value
+            found = _find_key(value, key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_key(value, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _isolate_product_root(tmp_path, monkeypatch):
+    """Point SOP product state at tmp so tests never touch the real repo."""
+    root = tmp_path / "product"
+    root.mkdir(exist_ok=True)
+    rules = root / ".sopcontrol" / "rules"
+    rules.mkdir(parents=True, exist_ok=True)
+    (root / ".sopcontrol" / "manifest.yaml").write_text("controller_paths: []\n", encoding="utf-8")
+    (rules / "registry.yaml").write_text("rules: []\n", encoding="utf-8")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_ROOT", str(root))
+    return root
+
+
+def test_archive_preview_confirm_use_tracker_ledger(tmp_path, monkeypatch, capsys):
+    """T16: archive resolves fresh_24h_* titles to the TrackerLedger."""
+    import json as _json
+
+    from tools.workflow import __main__ as workflow_cli
+    from tools.workflow.fresh_store import FreshSnapshot
+    from tools.workflow.sync import LedgerArchiveStore, TrackerLedger
+
+    from tools.workflow.testing_packages import build_workspace
+
+    _isolate_product_root(tmp_path, monkeypatch)
+    ws = build_workspace(tmp_path)
+    title = "fresh_24h_2026-09-16"
+    headers = ["岗位编号", "职位", "公司", "链接"]
+    rows = [
+        {"岗位编号": "C0-901", "职位": "Role", "公司": "Acme", "链接": "https://example.test/901"},
+        {"岗位编号": "C0-902", "职位": "Role", "公司": "Beta", "链接": "https://example.test/902"},
+    ]
+    ledger = TrackerLedger(ws, title)
+    before = ledger.write(FreshSnapshot(title=title, headers=headers, rows=[dict(row) for row in rows]))
+    (ws / "00_Profile" / "tracker_backend.json").write_text('{"backend": "csv"}', encoding="utf-8")
+    monkeypatch.delenv("JOBSFlow_FRESH_BACKEND", raising=False)
+    monkeypatch.delenv("GSHEET_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    projection = LocalCsvFreshStore(ws, title, rows)
+    SyncLedger(ws).write_projection(title, "csv", projection.read_active())
+    assert before.row_count == 2
+
+    # NOTE: --workspace must follow the subcommand; argparse nested
+    # parents=[common] lets a deeper level's default overwrite a value given
+    # at an outer level, silently resolving to the real runtime otherwise.
+    assert workflow_cli.main(["archive", "preview", "--workspace", str(ws), "--fresh-title", title]) == 0
+    preview = _json.loads(capsys.readouterr().out)
+    proposal_id = _find_key(preview, "proposal_id")
+    assert proposal_id
+    assert _find_key(preview, "row_count") == 2
+    assert _find_key(preview, "target_digest") == before.digest
+
+    assert (
+        workflow_cli.main(
+            ["archive", "confirm", "--workspace", str(ws), "--proposal-id", proposal_id]
+        )
+        == 0
+    )
+    confirm = _json.loads(capsys.readouterr().out)
+    assert _find_key(confirm, "status") == "succeeded"
+    assert ledger.read().row_count == 0
+    archived = LedgerArchiveStore(ws, title).read_archive(proposal_id)
+    assert archived.digest == before.digest
+    assert archived.row_count == 2
+    assert projection.read_active().rows == []
+    baseline = SyncLedger(ws).read_projection(title, "csv")
+    assert baseline.rows == []
+    assert baseline.digest == projection.read_active().digest
+    pulled = SyncCoordinator(ws).pull_user_fields(title=title, store=projection, confirmed=True)
+    assert pulled["status"] == "succeeded"
+    assert pulled["imported_rows"] == 0
+    assert ledger.read().rows == []
+
+
+@pytest.mark.parametrize("when", ["before_preview", "after_preview", "before_write"])
+def test_archive_projection_edits_are_preserved(tmp_path, when):
+    class EditingStore(MemoryFreshStore):
+        def replace_active_if_digest(self, snapshot, expected_digest):
+            if when == "before_write":
+                self.rows[0]["状态"] = "已投递"
+            return super().replace_active_if_digest(snapshot, expected_digest)
+
+    remote = EditingStore("fresh_24h_test", [_row()])
+    before = remote.read_active()
+    ledger = TrackerLedger(tmp_path, remote.title)
+    ledger.write(before)
+    sync = SyncLedger(tmp_path)
+    sync.write_projection(remote.title, "editingstore", before)
+    store = LedgerArchiveStore(tmp_path, remote.title, remote)
+    confirmations = ConfirmationStore(tmp_path)
+    if when == "before_preview":
+        remote.rows[0]["状态"] = "已投递"
+    proposal = preview_archive(store, confirmations)
+    if when == "after_preview":
+        remote.rows[0]["状态"] = "已投递"
+        sync.write_projection(remote.title, "editingstore", remote.read_active())
+    out = confirm_archive(store, confirmations, proposal["proposal_id"])
+    assert out["status"] != "succeeded"
+    assert remote.rows[0]["状态"] == "已投递"
+    assert ledger.read().digest == before.digest
+    assert confirmations.load(proposal["proposal_id"])["status"] == "pending_confirmation"
+
+
+@pytest.mark.parametrize("failure", ["before_write", "after_write", "readback", "baseline", "restore"])
+def test_archive_projection_failures_do_not_apply_proposal(tmp_path, monkeypatch, failure):
+    class FailingStore(MemoryFreshStore):
+        def replace_active_if_digest(self, snapshot, expected_digest):
+            if snapshot.rows:
+                if failure == "restore":
+                    raise OSError("restore_failed")
+                return super().replace_active_if_digest(snapshot, expected_digest)
+            if failure == "before_write":
+                raise OSError("write_failed")
+            if failure == "readback":
+                return None
+            super().replace_active_if_digest(snapshot, expected_digest)
+            if failure in {"after_write", "restore"}:
+                raise OSError("write_timeout")
+
+    remote = FailingStore("fresh_24h_test", [_row()])
+    before = remote.read_active()
+    ledger = TrackerLedger(tmp_path, remote.title)
+    ledger.write(before)
+    sync = SyncLedger(tmp_path)
+    sync.write_projection(remote.title, "failingstore", before)
+    store = LedgerArchiveStore(tmp_path, remote.title, remote)
+    confirmations = ConfirmationStore(tmp_path)
+    proposal = preview_archive(store, confirmations)
+    if failure == "baseline":
+        original = store.operations.write_projection
+
+        def fail_empty(title, backend, snapshot):
+            original(title, backend, snapshot)
+            if not snapshot.rows:
+                raise OSError("baseline_failed")
+
+        monkeypatch.setattr(store.operations, "write_projection", fail_empty)
+    out = confirm_archive(store, confirmations, proposal["proposal_id"])
+    assert out["status"] == ("critical_recovery_required" if failure == "restore" else "failed")
+    assert confirmations.load(proposal["proposal_id"])["status"] == "pending_confirmation"
+    assert ledger.read().digest == before.digest
+    assert sync.read_projection(remote.title, "failingstore").digest == before.digest
+    if failure != "restore":
+        assert remote.read_active().digest == before.digest
+    assert store.read_archive(proposal["proposal_id"]).digest == before.digest
+
+
+def test_archive_preview_empty_ledger_unchanged(tmp_path, monkeypatch, capsys):
+    """T16b: empty ledger preview keeps the legacy empty-proposal behavior."""
+    import json as _json
+
+    from tools.workflow import __main__ as workflow_cli
+    from tools.workflow.testing_packages import build_workspace
+
+    _isolate_product_root(tmp_path, monkeypatch)
+    ws = build_workspace(tmp_path)
+    assert (
+        workflow_cli.main(
+            ["archive", "preview", "--workspace", str(ws), "--fresh-title", "fresh_24h_empty"]
+        )
+        == 0
+    )
+    preview = _json.loads(capsys.readouterr().out)
+    assert _find_key(preview, "row_count") == 0
+
+
 def test_status_only_remote_change_does_not_block_additive_push(tmp_path):
     store = AppendOnlyStore("fresh_24h_2026-08-14", [])
     old = {
@@ -581,3 +831,43 @@ def test_local_only_is_a_csv_backend_alias(tmp_path):
     ) == 0
     assert list((ws / "02_Tracker" / "workflow" / "ledger").glob("*.json"))
     assert list((ws / "02_Tracker" / "workflow" / "fresh").glob("*/active.csv"))
+
+
+def test_replay_of_pre_archive_planned_operation_is_blocked(tmp_path):
+    """P2-1: a planned op recorded before archive must not resurrect rows."""
+    store = MemoryFreshStore("fresh_24h_replay_archive", [])
+    coordinator = SyncCoordinator(tmp_path)
+    assert coordinator.push_rows(title=store.title, incoming=[_row()], store=store)["status"] == "succeeded"
+    planned = coordinator.push_rows(
+        title=store.title,
+        incoming=[{**_row(), "岗位编号": "C0-902", "链接": "https://example.test/902"}],
+        store=store,
+        dry_run=True,
+    )
+    assert planned["status"] == "planned"
+    archive_store = LedgerArchiveStore(tmp_path, store.title, store)
+    confirmations = ConfirmationStore(tmp_path)
+    proposal = preview_archive(archive_store, confirmations)
+    assert confirm_archive(archive_store, confirmations, proposal["proposal_id"])["status"] == "succeeded"
+    replayed = coordinator.replay(operation_id=planned["operation_id"], store=store)
+    assert replayed["status"] == "blocked"
+    assert replayed["blockers"] == ["sync_conflict"]
+    pulled = coordinator.pull_user_fields(title=store.title, store=store, confirmed=True)
+    assert pulled["status"] == "succeeded"
+    assert pulled["imported_rows"] == 0
+    assert TrackerLedger(tmp_path, store.title).read().rows == []
+
+
+def test_archive_without_baseline_and_empty_projection_succeeds(tmp_path):
+    """P2-2: no verified baseline + already-empty projection archives the ledger."""
+    remote = MemoryFreshStore("fresh_24h_no_baseline", [])
+    ledger = TrackerLedger(tmp_path, remote.title)
+    ledger.write(FreshSnapshot(title=remote.title, headers=list(_row().keys()), rows=[_row()]))
+    assert SyncLedger(tmp_path).read_projection(remote.title, _backend_name(remote)) is None
+    store = LedgerArchiveStore(tmp_path, remote.title, remote)
+    confirmations = ConfirmationStore(tmp_path)
+    proposal = preview_archive(store, confirmations)
+    out = confirm_archive(store, confirmations, proposal["proposal_id"])
+    assert out["status"] == "succeeded"
+    assert ledger.read().rows == []
+    assert remote.read_active().rows == []

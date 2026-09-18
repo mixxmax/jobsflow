@@ -26,10 +26,14 @@ from uuid import uuid4
 from tools.io_utils import atomic_write_json
 from tools.job_urls import normalize_job_url
 from tools.workflow.fresh_store import (
+    ArchiveReceipt,
+    ClearReceipt,
     FreshSnapshot,
     FreshStore,
+    RestoreReceipt,
     SnapshotConflict,
     _headers_for_rows,
+    default_fresh_store,
     merge_fresh_rows,
 )
 from tools.fresh_24h.batch_mark import demote_previous_batch
@@ -220,6 +224,32 @@ def _merge_remote_status_fields(
     return merged
 
 
+def _cosmetic_url_equivalence(item: dict[str, Any]) -> bool:
+    """True when a system-owned remote diff is only URL normalization noise.
+
+    Sheets strips trailing slashes (and users retype case/whitespace) on
+    owner:system link cells.  Such diffs carry zero information and must not
+    block sync: the merge continues with the local canonical value, which
+    normalizes the remote cell on the next write.  Whitelisted strictly to
+    URL equivalence judged by normalize_job_url: both sides must look like
+    URLs and be equal after normalization (case-insensitive).  Any substantive
+    user-field change still takes the reconcile/pull path.
+    """
+
+    if not isinstance(item, dict) or item.get("owner") != "system":
+        return False
+    local = str(item.get("local") or "")
+    remote = str(item.get("remote") or "")
+    if not local or not remote or local == remote:
+        return False
+    if "://" not in local and "://" not in remote:
+        return False
+    try:
+        return normalize_job_url(local).casefold() == normalize_job_url(remote).casefold()
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _status_only_remote_changes(changes: Iterable[dict[str, Any]]) -> bool:
     items = list(changes)
     return bool(items) and all(
@@ -381,6 +411,118 @@ class TrackerLedger:
         return self.write(snapshot)
 
 
+class LedgerArchiveStore:
+    """Archive-capable store backed by a TrackerLedger.
+
+    The archive preview/confirm gateway speaks the FileFreshStore protocol
+    (snapshot/read_active/write_archive/read_archive/clear_active/
+    restore_active), but for ``fresh_24h_*`` titles the live rows live in
+    the TrackerLedger, not in ``workflow/fresh/<title>/active.json``.
+    This wrapper adapts the ledger without changing TrackerLedger itself,
+    so push/scan keep their single source of truth and archive stops
+    proposing empty rows.  Archives land in a sibling ``archives`` directory
+    next to the ledger file; the ledger layout is otherwise untouched.
+    """
+
+    def __init__(self, workspace: Path, title: str, projection_store: FreshStore | None = None) -> None:
+        self.workspace = Path(workspace)
+        self.title = title
+        self._ledger = TrackerLedger(self.workspace, title)
+        self.projection_store = projection_store or default_fresh_store(self.workspace, title)
+        self.backend = _backend_name(self.projection_store)
+        self.operations = SyncLedger(self.workspace)
+        self._projection_before: FreshSnapshot | None = None
+        self._baseline_before: FreshSnapshot | None = None
+        self.archive_dir = ledger_root(self.workspace) / "archives" / _safe(title)
+
+    def archive_binding(self) -> dict[str, Any]:
+        baseline = self.operations.read_projection(self.title, self.backend)
+        return {
+            "backend": self.backend,
+            "projection_target": str(getattr(self.projection_store, "sheet_id", "") or getattr(self.projection_store, "active_path", "")),
+            "projection_digest": self.projection_store.read_active().digest,
+            "baseline_digest": baseline.digest if baseline else "",
+        }
+
+    def snapshot(self) -> FreshSnapshot:
+        return self._ledger.read()
+
+    def read_active(self) -> FreshSnapshot:
+        return self._ledger.read()
+
+    def _archive_path(self, archive_id: str) -> Path:
+        return self.archive_dir / f"{_safe(archive_id)}.json"
+
+    def write_archive(self, snapshot: FreshSnapshot, archive_id: str) -> ArchiveReceipt:
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        path = self._archive_path(archive_id)
+        atomic_write_json(
+            path,
+            {
+                "archive_id": archive_id,
+                "title": snapshot.title,
+                "headers": snapshot.headers,
+                "rows": snapshot.rows,
+                "digest": snapshot.digest,
+            },
+        )
+        return ArchiveReceipt(archive_id=archive_id, digest=snapshot.digest, path=str(path))
+
+    def read_archive(self, archive_id: str) -> FreshSnapshot:
+        data = json.loads(self._archive_path(archive_id).read_text(encoding="utf-8"))
+        return FreshSnapshot(
+            title=str(data.get("title") or self.title),
+            headers=list(data.get("headers") or []),
+            rows=[dict(row) for row in (data.get("rows") or [])],
+        )
+
+    def clear_active(self, expected_digest: str) -> ClearReceipt:
+        current = self._ledger.read()
+        if current.digest != expected_digest:
+            return ClearReceipt(ok=False, digest=current.digest, error="digest_mismatch")
+        remote = self.projection_store.read_active()
+        baseline = self.operations.read_projection(self.title, self.backend)
+        if remote.digest != (baseline or current).digest:
+            if baseline is not None or remote.row_count:
+                return ClearReceipt(ok=False, digest=current.digest, error="remote_changed_requires_reconcile")
+        self._projection_before = remote
+        self._baseline_before = baseline
+        empty_projection = FreshSnapshot(title=self.title, headers=remote.headers, rows=[])
+        _replace_if_current(self.projection_store, empty_projection, expected_digest=remote.digest)
+        after = self.projection_store.read_active()
+        if after.digest != empty_projection.digest:
+            raise SyncError("projection_readback_digest_mismatch")
+        empty = FreshSnapshot(title=self.title, headers=current.headers, rows=[])
+        self._ledger.write(empty, expected_digest=expected_digest)
+        self.operations.write_projection(self.title, self.backend, after)
+        return ClearReceipt(ok=True, digest=self._ledger.read().digest)
+
+    def restore_active(self, snapshot: FreshSnapshot) -> RestoreReceipt:
+        if self._projection_before is None:
+            return RestoreReceipt(ok=True, digest=self._ledger.read().digest)
+        try:
+            remote = self.projection_store.read_active()
+            if remote.digest != self._projection_before.digest:
+                if remote.rows:
+                    raise SyncConflict("remote_changed_during_archive_recovery")
+                _replace_if_current(self.projection_store, self._projection_before, expected_digest=remote.digest)
+            if self.projection_store.read_active().digest != self._projection_before.digest:
+                raise SyncError("restore_projection_digest_mismatch")
+            local = self._ledger.read()
+            if local.digest != snapshot.digest:
+                empty = FreshSnapshot(title=self.title, headers=snapshot.headers, rows=[])
+                self._ledger.write(snapshot, expected_digest=empty.digest)
+            baseline = self.operations.read_projection(self.title, self.backend)
+            if self._baseline_before is not None:
+                if baseline is None or baseline.digest != self._baseline_before.digest:
+                    self.operations.write_projection(self.title, self.backend, self._baseline_before)
+            elif baseline is not None:
+                _projection_path(self.workspace, self.title, self.backend).unlink()
+        except Exception as exc:
+            return RestoreReceipt(ok=False, digest=self._ledger.read().digest, error=str(exc))
+        return RestoreReceipt(ok=True, digest=self._ledger.read().digest)
+
+
 class SyncLedger:
     """Operation ledger and projection snapshots for crash recovery."""
 
@@ -505,7 +647,9 @@ def _diff_snapshots(base: FreshSnapshot | None, local: FreshSnapshot, remote: Fr
                 "remote": remote_value,
                 "owner": "system" if field in SYSTEM_FIELDS else ("user" if field in USER_FIELDS else "unknown"),
             }
-            if local_changed and remote_changed and local_value != remote_value:
+            if _cosmetic_url_equivalence(item):
+                remote_changes.append(item)
+            elif local_changed and remote_changed and local_value != remote_value:
                 # A three-way split on a status field is not a real
                 # disagreement when the remote value is further along the
                 # sequence: the user advanced the row in Sheets while the host
@@ -593,10 +737,14 @@ class SyncCoordinator:
                 self.operations.write_projection(title, backend, target_before)
         projection = self.operations.read_projection(title, backend) or target_before
         remote_diff = _diff_snapshots(projection, local_before, target_before)
-        status_only_remote = _status_only_remote_changes(remote_diff["remote_changes"])
+        status_only_remote = _status_only_remote_changes(
+            item for item in remote_diff["remote_changes"]
+            if not _cosmetic_url_equivalence(item)
+        )
         unsafe_remote_changes = [
             item for item in remote_diff["remote_changes"]
             if not (status_only_remote and item.get("field") in STATUS_FIELDS)
+            and not _cosmetic_url_equivalence(item)
         ]
         if remote_diff["conflicts"] or unsafe_remote_changes or remote_diff["remote_only"]:
             report_path = self._write_conflict_report(
@@ -809,7 +957,8 @@ class SyncCoordinator:
         base = self.operations.read_projection(title, backend)
         diff = _diff_snapshots(base, local, remote)
         unsafe_remote_changes = [
-            item for item in diff["remote_changes"] if item.get("owner") != "user"
+            item for item in diff["remote_changes"]
+            if item.get("owner") != "user" and not _cosmetic_url_equivalence(item)
         ]
         status = "succeeded" if not diff["conflicts"] and not unsafe_remote_changes else "blocked"
         report_path = ""
@@ -852,7 +1001,8 @@ class SyncCoordinator:
             )
             return {"status": "blocked", "blockers": ["sync_conflict"], "conflicts": diff["conflicts"], "report_path": report_path}
         blocked_remote = [
-            item for item in diff["remote_changes"] if item.get("owner") != "user"
+            item for item in diff["remote_changes"]
+            if item.get("owner") != "user" and not _cosmetic_url_equivalence(item)
         ]
         if blocked_remote:
             report_path = self._write_conflict_report(
@@ -926,6 +1076,19 @@ class SyncCoordinator:
             operation.error = ""
             self.operations.save(operation)
             return {"status": "succeeded", "operation_id": operation_id, "idempotent": True, "target_after_digest": current.digest}
+        if (
+            projection is not None
+            and operation.target_before_digest
+            and operation.target_before_digest != expected
+        ):
+            return {
+                "status": "blocked",
+                "blockers": ["sync_conflict"],
+                "operation_id": operation_id,
+                "target_digest": current.digest,
+                "expected_digest": expected,
+                "error": "operation_predates_verified_baseline",
+            }
         if current.digest != expected:
             return {
                 "status": "blocked",

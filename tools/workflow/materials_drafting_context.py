@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,36 @@ def _response_template(
         **binding,
         "operations": [],
     }
+
+
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _nonempty_and_different(path: Path, existing: dict[str, Any] | None, fresh: dict[str, Any]) -> bool:
+    """True when overwriting would discard content worth keeping."""
+
+    try:
+        if path.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+    return existing is None or existing != fresh
+
+
+def is_backup_path(path: Path | str) -> bool:
+    """True for host-written response backups (``*.bak.<timestamp>``).
+
+    Backups live next to the live response file but are never valid
+    submissions; the submission blocker rejects them with a dedicated code
+    instead of the generic path error so the exclusion is auditable.
+    """
+
+    return ".bak." in Path(str(path or "")).name
 
 
 def _instructions(*, phase: str, response_file: str) -> str:
@@ -143,16 +174,34 @@ def prepare_drafting_workspace(
     atomic_write_json(root / "task_packet.json", task_packet)
     atomic_write_json(root / "response_schema.json", response_schema)
     atomic_write_json(root / SCOPE_NAME, scope)
-    atomic_write_json(
-        root / response_file,
-        _response_template(
-            phase=phase,
-            job_id=str(job_id),
-            context_id=context_id,
-            input_fingerprint=input_fingerprint,
-            response_schema=response_schema,
-        ),
+    fresh_response = _response_template(
+        phase=phase,
+        job_id=str(job_id),
+        context_id=context_id,
+        input_fingerprint=input_fingerprint,
+        response_schema=response_schema,
     )
+    target = root / response_file
+    existing = _read_json_object(target)
+    if (
+        isinstance(existing, dict)
+        and str(existing.get("drafting_context_id") or "") == context_id
+        and str(existing.get("drafting_input_fingerprint") or "") == input_fingerprint
+    ):
+        # Same scope: the model already wrote here; keep its content instead
+        # of silently resetting the response to an empty template (fix 9).
+        response_action = "kept"
+    else:
+        if target.is_file() and _nonempty_and_different(target, existing, fresh_response):
+            # New generation or changed inputs with prior content: back the
+            # old file up before overwriting.  rename() is atomic and loud
+            # on failure, so model content is never silently discarded.
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            target.replace(target.with_name(f"{response_file}.bak.{stamp}"))
+            response_action = "backed_up"
+        else:
+            response_action = "created"
+        atomic_write_json(target, fresh_response)
     if isolated:
         pointer = package / DRAFTING_ROOT_NAME / phase
         pointer.mkdir(parents=True, exist_ok=True)
@@ -175,6 +224,7 @@ def prepare_drafting_workspace(
         "root": str(root),
         "read_scope": str(root / SCOPE_NAME),
         "response_file": str(root / response_file),
+        "response_action": response_action,
         "current_job_only": True,
         "other_job_packages_allowed": False,
         "isolation_mode": "staging_only" if isolated else "package_legacy",

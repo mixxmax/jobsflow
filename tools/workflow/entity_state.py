@@ -53,7 +53,7 @@ ENTITY_TRANSITIONS: dict[str, dict[str, set[str]]] = {
         "content_audit_pending": {"content_passed", "repair_required", "audit_review_required", "blocked"},
         "repair_required": {"transformed", "content_audit_pending", "audit_review_required", "blocked"},
         "audit_review_required": {"inputs_frozen"},
-        "blocked": {"inputs_frozen", "plan_ready", "content_audit_pending"},
+        "blocked": {"inputs_frozen", "plan_ready", "content_audit_pending", "repair_required"},
         "content_passed": {"docx_generated", "pdf_generated"},
         "docx_generated": {"pdf_generated"},
         "pdf_generated": {"format_passed"},
@@ -320,6 +320,20 @@ def action_allowed_from(
         and entity_type == "materials"
         and stage in {"pdf", "convert", "pdf_generated"}
         and phase in {"pdf_generated", "format_passed", "apply_ready"}
+    ):
+        return True
+    # Reset scopes from a generated PDF must have a compliant path back to an
+    # editable phase.  The targets mirror store.reset() exactly: draft →
+    # plan_ready, audit → content_audit_pending, render → content_passed,
+    # all → idle.  This carve-out is scoped to the reset/restart stages only;
+    # ENTITY_TRANSITIONS is intentionally untouched so normal forward actions
+    # (e.g. legacy render from pdf_generated) keep their existing verdicts.
+    if (
+        action == "materials"
+        and entity_type == "materials"
+        and stage in {"reset", "restart"}
+        and phase == "pdf_generated"
+        and str(payload.get("scope") or "all").casefold() in {"audit", "draft", "render", "all"}
     ):
         return True
     possible = ACTION_DESTINATIONS.get(action) or set()

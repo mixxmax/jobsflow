@@ -81,6 +81,10 @@ _NUMBER_SCALE_WORDS = {
     "million", "billion", "thousand", "hundred", "mn", "bn", "percent",
     "annum", "per",
 }
+# Nouns a structural count word may count without an evidence basis: the
+# number only tallies in-document items (cover-letter pillars, plan
+# anchors), never a candidate accomplishment.  See MAP-002.
+_STRUCTURAL_COUNT_NOUNS = {"pillar", "anchor"}
 
 
 def _normalize_number_word(word: str) -> str | None:
@@ -251,6 +255,14 @@ def run_semantic_lint(
     findings: list[dict[str, Any]] = []
     employer_map = _experience_employer_map(_baseline_blocks(bundle, "cv"))
     allowed_numbers = {material: _allowed_numbers(bundle, material) for material in MATERIALS}
+    # Finished cover-letter pillars, for the structural-count exemption below
+    # (MAP-002): a transition count word that equals the true pillar total is
+    # not an invented number; a wrong count still fails both gates.
+    pillar_count = sum(
+        1
+        for block in _blocks(canonical, "cover_letter")
+        if text(block.get("section")) == "pillar"
+    )
     all_baseline_verbs = {
         material: high_risk_verbs(
             "\n".join(text(block.get("text")) for block in _baseline_blocks(bundle, material))
@@ -290,6 +302,14 @@ def run_semantic_lint(
                     for token in number_tokens(other.get("text"))
                 }
             for token in sorted(number_tokens(after_text) - experience_allowed):
+                if (
+                    material == "cover_letter"
+                    and pillar_count > 0
+                    and token.isdigit()
+                    and int(token) == pillar_count
+                    and _counts_structural_items(after_text, token)
+                ):
+                    continue
                 findings.append(_finding(
                     "invented_number", material, block_id,
                     f"number {token} has no baseline or confirmed-profile basis",
@@ -370,6 +390,123 @@ def run_semantic_lint(
 
     # 7. Every planned JD anchor is answered somewhere or internally omitted.
     findings.extend(_jd_coverage_findings(bundle, canonical, plan))
+
+    # 8. Pillar/anchor N:M coverage (JD-anchor supremacy, machine half).
+    # Pure reference checks, no semantic judgment: every expected plan anchor
+    # needs at least one referencing pillar, and every finished pillar needs
+    # at least one expected anchor reference.  Counts need not be equal — one
+    # pillar may answer several anchors.  Transition count words and
+    # substantive JD fit belong to the auditor agent (see rule MAP-002).
+    findings.extend(_pillar_anchor_coverage_findings(bundle, canonical, plan))
+    # 9. Transitional guard: a hand-written structural count word that does
+    # not match the true pillar total is P1.  The host derives counts at
+    # render time, so this gate only ever sees pre-render drafts; it stays
+    # until host derivation is the sole count source.
+    findings.extend(_transition_count_findings(canonical))
+    return findings
+
+
+def _expected_anchor_ids(
+    plan: dict[str, Any] | None,
+    dispositions: Any,
+) -> tuple[list[str], list[str]] | tuple[None, None]:
+    """Return (expected_ids, omitted_ids), or (None, None) without a plan."""
+
+    plan = dict(plan or {})
+    has_explicit_plan = bool(
+        plan.get("duties") or plan.get("requirements") or plan.get("jd_anchors")
+    )
+    if not has_explicit_plan:
+        return None, None
+    from tools.workflow.materials_baseline import split_pillar_anchors
+
+    expected, omitted, _themes = split_pillar_anchors(
+        plan, dispositions if isinstance(dispositions, dict) else None
+    )
+    return [text(anchor.get("id")) for anchor in expected], omitted
+
+
+def _pillar_blocks(canonical: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        block
+        for block in _blocks(canonical, "cover_letter")
+        if text(block.get("section")) == "pillar"
+    ]
+
+
+def _pillar_anchor_coverage_findings(
+    bundle: dict[str, Any],
+    canonical: dict[str, Any],
+    plan: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    expected_ids, _omitted = _expected_anchor_ids(
+        plan, canonical.get("coverage_dispositions")
+    )
+    if expected_ids is None:
+        return []
+    pillars = _pillar_blocks(canonical)
+    # Migration boundary: packages that never entered anchor tagging carry
+    # no jd_anchor_ids anywhere and record no dispositions.  Judging them by
+    # reference metadata would flag every legacy pillar; they stay under the
+    # text-based coverage gate (#7) instead.  Any tagging participation opts
+    # the package into strict N:M coverage.
+    dispositions = canonical.get("coverage_dispositions")
+    tagged = any(
+        isinstance(block.get("jd_anchor_ids"), list) and block.get("jd_anchor_ids")
+        for block in pillars
+    )
+    if not tagged and not (isinstance(dispositions, dict) and dispositions):
+        return []
+    referenced: set[str] = set()
+    findings: list[dict[str, Any]] = []
+    for block in pillars:
+        refs = {
+            text(item)
+            for item in (block.get("jd_anchor_ids") or [])
+            if text(item)
+        } & set(expected_ids)
+        if not refs:
+            findings.append(_finding(
+                "pillar_without_anchor",
+                "cover_letter",
+                text(block.get("id")),
+                f"pillar {text(block.get('id')) or '(untitled)'} references no expected plan anchor",
+                severity="P1",
+            ))
+        referenced |= refs
+    for anchor_id in expected_ids:
+        if anchor_id not in referenced:
+            findings.append(_finding(
+                "pillar_anchor_uncovered",
+                "cover_letter",
+                anchor_id,
+                f"plan anchor {anchor_id} is referenced by no finished pillar",
+                severity="P1",
+            ))
+    return findings
+
+
+def _transition_count_findings(canonical: dict[str, Any]) -> list[dict[str, Any]]:
+    pillars = _pillar_blocks(canonical)
+    findings: list[dict[str, Any]] = []
+    for block in _blocks(canonical, "cover_letter"):
+        if text(block.get("section")) != "body":
+            continue
+        value = text(block.get("text"))
+        for token in sorted(number_tokens(value)):
+            if not _counts_structural_items(value, token):
+                continue
+            count = int(token) if token.isdigit() else None
+            if count is None:
+                continue
+            if count != len(pillars):
+                findings.append(_finding(
+                    "transition_count_mismatch",
+                    "cover_letter",
+                    text(block.get("id")),
+                    f"transition count word {token} does not match {len(pillars)} finished pillars",
+                    severity="P1",
+                ))
     return findings
 
 
@@ -383,14 +520,16 @@ def _leak_findings(material: str, block_id: str, value: str) -> list[dict[str, A
     )]
 
 
-def _counted_noun(value: str, token: str) -> set[str]:
-    """Return the counted-noun candidates immediately following a number.
+def modifier_run_nouns(value: str, token: str) -> list[list[str]]:
+    """Return modifier runs following a number, one list per occurrence.
 
     Runs are computed per sentence: without sentence boundaries a number at a
-    clause end would absorb the next sentence's words as its object.
+    clause end would absorb the next sentence's words as its object.  Shared
+    by head-noun drift detection and structural-count classification so both
+    use one scan.
     """
 
-    heads: set[str] = set()
+    runs: list[list[str]] = []
     for sentence in re.split(r"[.;:!?\n]", str(value or "")):
         tokens = [match.group(0) for match in _TOKEN_RE.finditer(sentence)]
         normalized = {
@@ -411,8 +550,14 @@ def _counted_noun(value: str, token: str) -> set[str]:
                     break
                 run.append(_singular(folded))
             if run:
-                heads.add(run[-1])
-    return heads
+                runs.append(run)
+    return runs
+
+
+def _counted_noun(value: str, token: str) -> set[str]:
+    """Return the counted-noun candidates immediately following a number."""
+
+    return {run[-1] for run in modifier_run_nouns(value, token)}
 
 
 def _number_object_drift(before: str, after: str, token: str) -> bool:
@@ -421,6 +566,20 @@ def _number_object_drift(before: str, after: str, token: str) -> bool:
     if not before_heads or not after_heads:
         return False
     return not (before_heads & after_heads)
+
+
+def _counts_structural_items(value: str, token: str) -> bool:
+    """True when token's number plausibly counts pillars/anchors.
+
+    Uses the same per-sentence run scan as _counted_noun, but accepts any
+    structural noun inside the modifier run: in "four pillars show", the
+    run head is "show" while the counted object is still pillars.
+    """
+
+    for run in modifier_run_nouns(value, token):
+        if any(noun in _STRUCTURAL_COUNT_NOUNS for noun in run):
+            return True
+    return False
 
 
 def _language_level_findings(canonical: dict[str, Any]) -> list[dict[str, Any]]:

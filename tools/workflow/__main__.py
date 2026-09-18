@@ -58,6 +58,23 @@ def _load_store(path: Path | None, title: str, workspace: Path):
     return FileFreshStore(workspace, title, rows)
 
 
+def _archive_store(fixture: Path | None, title: str, workspace: Path):
+    """Resolve the archive backend for a fresh title.
+
+    push/scan read and write TrackerLedger for ``fresh_24h_*`` titles, so
+    archive must resolve to the same ledger-backed store; resolving to
+    FileFreshStore proposed empty rows and broke confirm digests.
+    Fixture/test callers keep FileFreshStore explicitly via --fixture, and
+    non-fresh_24h_* titles keep the legacy behavior unchanged.
+    """
+
+    if fixture is None and str(title or "").startswith("fresh_24h_"):
+        from tools.workflow.sync import LedgerArchiveStore
+
+        return LedgerArchiveStore(workspace, str(title))
+    return _load_store(fixture, title, workspace)
+
+
 def _materials_submission_blocker(
     workspace: Path,
     job_id: str,
@@ -81,6 +98,16 @@ def _materials_submission_blocker(
         return {"status": "blocked", "job_id": str(job_id), "blockers": ["package_missing"]}
     expected = expected_submission_path(Path(ctx.package), phase=phase)
     supplied_path = Path(supplied).expanduser().resolve()
+    from tools.workflow.materials_drafting_context import is_backup_path
+
+    if is_backup_path(supplied_path):
+        return {
+            "status": "blocked",
+            "job_id": str(job_id),
+            "blockers": ["drafting_submission_backup_rejected"],
+            "expected_submission": str(expected) if expected else "",
+            "submitted_path": str(supplied_path),
+        }
     if expected is None or supplied_path != expected.resolve():
         return {
             "status": "blocked",
@@ -668,13 +695,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.materials_cmd == "check":
             payload["stage"] = "plan"
             payload["materials_shell"] = "check"
-            if args.plan:
-                payload["model_plan"] = json.loads(Path(args.plan).read_text(encoding="utf-8"))
         elif args.materials_cmd == "produce":
             payload["materials_shell"] = "produce"
             payload["max_steps"] = max(1, int(args.max_steps or 4))
-            if args.plan:
-                payload["model_plan"] = json.loads(Path(args.plan).read_text(encoding="utf-8"))
             if args.content:
                 blocker = _materials_submission_blocker(
                     workspace,
@@ -771,12 +794,25 @@ def main(argv: list[str] | None = None) -> int:
         if args.archive_cmd == "preview":
             action = "archive_preview"
             payload["target"] = args.fresh_title
-            store = _load_store(args.fixture, args.fresh_title, workspace)
+            store = _archive_store(args.fixture, args.fresh_title, workspace)
         else:
             action = "archive_confirm"
             payload["proposal_id"] = args.proposal_id
-            payload["target"] = args.fresh_title
-            store = _load_store(args.fixture, args.fresh_title or "fresh", workspace)
+            confirm_title = str(args.fresh_title or "")
+            if not confirm_title:
+                # The proposal is the source of truth for confirm: it carries
+                # the previewed target, so entity gating and store resolution
+                # bind the same title even when --fresh-title is omitted.
+                try:
+                    from tools.workflow.confirmation import ConfirmationStore
+
+                    _proposal = ConfirmationStore(workspace).load(args.proposal_id)
+                    if isinstance(_proposal, dict):
+                        confirm_title = str(_proposal.get("target") or "")
+                except (OSError, ValueError, TypeError, RuntimeError):
+                    confirm_title = ""
+            payload["target"] = confirm_title
+            store = _archive_store(args.fixture, confirm_title or "fresh", workspace)
     elif action == "sync":
         if args.sync_cmd == "status":
             action = "sync_status"
@@ -836,6 +872,19 @@ def main(argv: list[str] | None = None) -> int:
         from tools.workflow.interaction_shell import next_produce_stages, produce_should_stop
         from tools.workflow.package_context import PackageContextLoader
         from tools.workflow.materials_vnext.store import load_run
+        from tools.workflow.sopcontrol_adapter import produce_ticket_operation_id
+
+        # The exemption marker is process-local: strip any caller-supplied
+        # value so a fresh produce invocation always starts unverified.
+        # No CLI flag can set it; only this loop stamps it after a redeem.
+        payload.pop("_produce_ticket_redeemed_operation", None)
+        ticket_presented = bool(
+            str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
+        )
+
+        def _produce_ticket_blockers(outcome: dict[str, Any]) -> bool:
+            blockers = {str(item) for item in (outcome.get("blockers") or [])}
+            return bool(blockers & {"capability_ticket_required", "capability_ticket_invalid"})
 
         steps = []
         out = {"status": "blocked", "blockers": ["produce_no_progress"]}
@@ -870,6 +919,12 @@ def main(argv: list[str] | None = None) -> int:
                         "after_state": out.get("after_state"),
                     }
                 )
+                if ticket_presented and not _produce_ticket_blockers(out):
+                    # The one-shot ticket was redeemed on this step; later
+                    # steps of the same invocation skip re-verification.
+                    # A fresh invocation strips the marker above, so
+                    # cross-call one-shot semantics are unchanged.
+                    payload["_produce_ticket_redeemed_operation"] = produce_ticket_operation_id(payload)
                 if produce_should_stop(out):
                     break
                 phase = str(out.get("after_state") or phase)

@@ -724,3 +724,112 @@ def test_vnext_reset_archives_generation_and_rewinds_projection(tmp_path):
     assert out["status"] == "reset"
     assert out["projected_entity_phase"] == "idle"
     assert not (package / "materials_vnext").exists()
+
+
+def _two_finding_audit(ws, package, bundle, task):
+    findings = [
+        {
+            "finding_id": "test-finding-1",
+            "severity": "P1",
+            "rule_id": "MAP-001",
+            "material": "cv",
+            "target_id": "t1",
+            "quote": "vague value response",
+            "reason": "implicit link",
+            "required_action": "make it explicit",
+        },
+        {
+            "finding_id": "test-finding-2",
+            "severity": "P1",
+            "rule_id": "MAP-001",
+            "material": "cv",
+            "target_id": "t2",
+            "quote": "another vague response",
+            "reason": "implicit link",
+            "required_action": "make it explicit",
+        },
+    ]
+    out = MaterialsEngine().handle(
+        {
+            "job_id": "C0-001",
+            "stage": "audit_result",
+            "audit_result": _audit_report(task, findings=findings, counts={"P0": 0, "P1": 2, "P2": 0}),
+        },
+        workspace=ws,
+    )
+    assert out["status"] == "blocked"
+    return findings
+
+
+def test_resolve_from_blocked_phase_dials_repair_required(tmp_path):
+    """T17: blocked run + open P1 resolve -> repair_required -> repair受理."""
+    from tools.workflow.materials_vnext.store import save_run
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    bundle, _ = _bundle(ws, package)
+    first = MaterialsEngine().handle({"job_id": "C0-001", "transform": _transform(bundle)}, workspace=ws)
+    task = first["audit_task_packet"]
+    _two_finding_audit(ws, package, bundle, task)
+    run = load_run(package)
+    run["phase"] = "blocked"
+    save_run(package, run)
+    entity = reset_entity_state(
+        ws, "materials", "C0-001", target_phase="blocked", reason="fixture"
+    )
+
+    resolved = dispatch(
+        "materials",
+        payload={
+            "job_id": "C0-001",
+            "stage": "resolve",
+            "decisions": [{"finding_id": "test-finding-1", "status": "reopened"}],
+        },
+        workspace=ws,
+    )
+    assert resolved["status"] == "succeeded"
+    assert resolved["gate_open"] is False
+    assert resolved["after_state"] == "repair_required"
+    assert load_run(package)["phase"] == "repair_required"
+    projected = load_entity_state(ws, "materials", "C0-001")
+    assert projected.phase == "repair_required"
+    assert projected.revision == entity.revision + 1
+    assert resolved["after_revision"] == projected.revision
+
+    repair = dispatch(
+        "materials",
+        payload={"job_id": "C0-001", "stage": "repair", "repair_patch": {}},
+        workspace=ws,
+    )
+    assert repair["blockers"] == ["repair_patch_required"]
+    assert load_entity_state(ws, "materials", "C0-001").phase == load_run(package)["phase"]
+
+
+def test_resolve_without_open_findings_never_dials_back_to_repair(tmp_path):
+    """T18: all-accepted resolve from a passed run stays put, never repair."""
+    from tools.workflow.materials_vnext.store import save_run
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    bundle, _ = _bundle(ws, package)
+    first = MaterialsEngine().handle({"job_id": "C0-001", "transform": _transform(bundle)}, workspace=ws)
+    task = first["audit_task_packet"]
+    _two_finding_audit(ws, package, bundle, task)
+    run = load_run(package)
+    run["phase"] = "content_passed"
+    save_run(package, run)
+
+    resolved = MaterialsEngine().handle(
+        {
+            "job_id": "C0-001",
+            "stage": "resolve",
+            "decisions": [
+                {"finding_id": "test-finding-1", "status": "user_accepted", "reason": "user confirmed wording"},
+                {"finding_id": "test-finding-2", "status": "user_accepted", "reason": "user confirmed wording"},
+            ],
+        },
+        workspace=ws,
+    )
+    assert resolved["status"] == "succeeded"
+    assert resolved["gate_open"] is True
+    assert resolved["after_state"] == "content_passed"

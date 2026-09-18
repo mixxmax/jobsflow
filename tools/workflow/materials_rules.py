@@ -13,10 +13,10 @@ import hashlib
 import json
 from typing import Any, Iterable
 
-# v7 keeps the v6 rule set and adds explicit severity definitions plus the
-# change-class routing contract.  Packets must be regenerated because the
-# embedded gate policy participates in the rules digest.
-RULES_VERSION = "materials-rules-v7"
+# v8 keeps the v7 rule set and adds MAP-002 (JD-anchor supremacy over lane
+# template structure).  Packets must be regenerated because the embedded rule
+# list participates in the rules digest.
+RULES_VERSION = "materials-rules-v8"
 
 # Keep this list compact.  A rule may point back to the handbook section for a
 # human, but the auditor receives the executable wording below.
@@ -56,6 +56,15 @@ COMPILED_RULES: tuple[dict[str, Any], ...] = (
         "evidence": "Cite the JD duty/requirement and the positive CV/CL block that answers it, or cite its internal intentionally_omitted disposition without demanding outbound gap language.",
         "repair": "add or reposition one concise positive requirement-to-evidence response when truthful; otherwise keep intentionally_omitted internal and never invent or disclose a gap",
         "source": "materials-quality-handbook:jd-mapping",
+    },
+    {
+        "rule_id": "MAP-002",
+        "severity": "P1",
+        "scope": ["cover_letter"],
+        "check": "JD-anchor supremacy: the frozen plan's JD anchors (jd_anchors plus coverage_dispositions) are the only source of truth in review. Lane baseline template structure (pillar count, titles, transitions, count words) always yields to the plan. Coverage is N:M, not one-to-one: every expected plan anchor (non-theme, not intentionally_omitted) must be referenced by at least one finished pillar (uncovered anchor is P1); every finished pillar must reference at least one expected plan anchor (unmapped pillar is P1). One pillar may answer several anchors, so pillar and anchor totals need not be equal. Packages that never entered anchor tagging (no pillar carries anchor references and no coverage dispositions) are judged by text coverage instead. Count words in transition sentences must match the actual pillar count (mismatch is P1). Never record a deviation from template structure itself as a defect: JD-driven pillar retitling, reordering, or added/removed transition wording to accommodate plan anchors is not a finding, and rewriting a structural number that only counts in-document items (for example four anchors) is not a preservation/drift problem. Substantive JD fit is still judged against the JD text; this rule only binds structure to the plan.",
+        "evidence": "Cite the uncovered anchor, the unmapped pillar, or the transition count word against the actual pillar count.",
+        "repair": "reference every expected anchor from at least one pillar, map every pillar to an expected anchor, and reconcile transition count words with the actual pillar total",
+        "source": "materials-quality-handbook:jd-anchor-supremacy",
     },
     {
         "rule_id": "STAR-001",
