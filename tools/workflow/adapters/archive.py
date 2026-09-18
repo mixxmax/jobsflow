@@ -37,6 +37,8 @@ def preview_archive(
         now=now,
         ttl_seconds=ttl_seconds,
     )
+    if callable(getattr(store, "archive_binding", None)):
+        proposal["archive_binding"] = store.archive_binding()
     confirmations.save(proposal)
     return proposal
 
@@ -72,6 +74,9 @@ def confirm_archive(
         row_count=before.row_count,
         now=now,
     )
+    if not blockers and callable(getattr(store, "archive_binding", None)):
+        if proposal.get("archive_binding") != store.archive_binding():
+            blockers.append("archive_projection_changed_requires_preview")
     if blockers:
         after = store.read_active()
         return result(

@@ -1592,9 +1592,7 @@ class MaterialsEngine:
                 save_run(package, run)
                 plan_pillar_capacity = _pillar_capacity_report(frozen_plan, bundle.get("baseline") or {})
             planning_workspace: dict[str, Any] = {}
-            from tools.workflow.materials_drafting_context import load_drafting_scope
-
-            if not load_plan(package) and not load_drafting_scope(package, phase="planning"):
+            if not load_plan(package):
                 planning_workspace = _drafting_workspace(
                     Path(workspace),
                     bundle,

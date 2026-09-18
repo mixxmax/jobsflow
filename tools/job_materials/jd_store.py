@@ -14,7 +14,7 @@ from tools.job_materials.url_normalize import normalize_job_url
 def package_id_from_path(package: Path) -> str:
     name = package.name
     # C0-005_未投_Gate → C0-005
-    m = re.match(r"^([A-G][0-2]-\d+)", name)
+    m = re.match(r"^([A-G][0-3]-\d+)", name)
     return m.group(1) if m else name
 
 

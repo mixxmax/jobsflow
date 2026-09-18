@@ -774,9 +774,13 @@ def test_resolve_from_blocked_phase_dials_repair_required(tmp_path):
     run = load_run(package)
     run["phase"] = "blocked"
     save_run(package, run)
+    entity = reset_entity_state(
+        ws, "materials", "C0-001", target_phase="blocked", reason="fixture"
+    )
 
-    resolved = MaterialsEngine().handle(
-        {
+    resolved = dispatch(
+        "materials",
+        payload={
             "job_id": "C0-001",
             "stage": "resolve",
             "decisions": [{"finding_id": "test-finding-1", "status": "reopened"}],
@@ -787,11 +791,18 @@ def test_resolve_from_blocked_phase_dials_repair_required(tmp_path):
     assert resolved["gate_open"] is False
     assert resolved["after_state"] == "repair_required"
     assert load_run(package)["phase"] == "repair_required"
+    projected = load_entity_state(ws, "materials", "C0-001")
+    assert projected.phase == "repair_required"
+    assert projected.revision == entity.revision + 1
+    assert resolved["after_revision"] == projected.revision
 
-    repair = MaterialsEngine().handle(
-        {"job_id": "C0-001", "stage": "repair", "repair_patch": {}}, workspace=ws
+    repair = dispatch(
+        "materials",
+        payload={"job_id": "C0-001", "stage": "repair", "repair_patch": {}},
+        workspace=ws,
     )
-    assert "repair_not_expected" not in (repair.get("blockers") or [])
+    assert repair["blockers"] == ["repair_patch_required"]
+    assert load_entity_state(ws, "materials", "C0-001").phase == load_run(package)["phase"]
 
 
 def test_resolve_without_open_findings_never_dials_back_to_repair(tmp_path):

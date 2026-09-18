@@ -53,7 +53,7 @@ ENTITY_TRANSITIONS: dict[str, dict[str, set[str]]] = {
         "content_audit_pending": {"content_passed", "repair_required", "audit_review_required", "blocked"},
         "repair_required": {"transformed", "content_audit_pending", "audit_review_required", "blocked"},
         "audit_review_required": {"inputs_frozen"},
-        "blocked": {"inputs_frozen", "plan_ready", "content_audit_pending"},
+        "blocked": {"inputs_frozen", "plan_ready", "content_audit_pending", "repair_required"},
         "content_passed": {"docx_generated", "pdf_generated"},
         "docx_generated": {"pdf_generated"},
         "pdf_generated": {"format_passed"},

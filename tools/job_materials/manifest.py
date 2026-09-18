@@ -24,8 +24,8 @@ from tools.job_materials.role_titles import (
 
 
 MANIFEST_SCHEMA_VERSION = 1
-TIER_LABELS = {"0": "核心", "1": "一级", "2": "二级"}
-_JOB_ID_RE = re.compile(r"^([A-G])([0-2])-(\d+)$", re.I)
+TIER_LABELS = {"0": "核心", "1": "一级", "2": "二级", "3": "剔除"}
+_JOB_ID_RE = re.compile(r"^([A-G])([0-3])-(\d+)$", re.I)
 
 
 def _clean(value: Any) -> str:

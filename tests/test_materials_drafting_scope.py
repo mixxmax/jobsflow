@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tools.workflow.engine import dispatch
 from tools.workflow.runtime_instructions import (
     RUNTIME_DELEGATE_MARKER,
@@ -76,6 +78,36 @@ def test_materials_planning_exposes_only_a_current_job_drafting_workspace(tmp_pa
         path.read_text(encoding="utf-8") for path in sorted(root.iterdir())
     )
     assert "C0-120" not in staged_text
+
+
+@pytest.mark.parametrize("response_state", ["missing", "empty", "written"])
+def test_planning_reentry_restores_response_and_preserves_model_content(tmp_path, response_state):
+    workspace = build_workspace(tmp_path)
+    build_package(workspace, "C0-001", with_outbound=False)
+    first = dispatch("materials", workspace=workspace, payload={"job_id": "C0-001"})
+    drafting = first["drafting_workspace"]
+    response_file = Path(drafting["response_file"])
+    seed = json.loads(response_file.read_text(encoding="utf-8"))
+    if response_state == "missing":
+        response_file.unlink()
+    elif response_state == "empty":
+        response_file.write_text("", encoding="utf-8")
+    else:
+        seed["duties"] = ["Preserve the model's contract review plan"]
+        response_file.write_text(json.dumps(seed), encoding="utf-8")
+    before_bytes = response_file.read_bytes() if response_state == "written" else None
+
+    resumed = dispatch("materials", workspace=workspace, payload={"job_id": "C0-001"})
+
+    assert resumed["status"] == "succeeded"
+    assert resumed["drafting_workspace"]["response_file"] == str(response_file)
+    assert resumed["drafting_workspace"]["context_id"] == drafting["context_id"]
+    assert json.loads(response_file.read_text(encoding="utf-8")) == seed
+    assert resumed["drafting_workspace"]["response_action"] == (
+        "kept" if response_state == "written" else "created"
+    )
+    if before_bytes is not None:
+        assert response_file.read_bytes() == before_bytes
 
 
 def test_tailoring_workspace_uses_the_same_operations_contract_as_the_task_packet(tmp_path):
@@ -460,4 +492,56 @@ def test_submission_blocker_explicitly_rejects_backup_files(tmp_path):
     backup.write_text("{}", encoding="utf-8")
     blocked = workflow_cli._materials_submission_blocker(ws, "C0-019", backup, phase="tailoring")
     assert blocked is not None
+    assert blocked["blockers"] == ["drafting_submission_backup_rejected"]
+
+
+def test_cli_check_and_produce_parse_plan_before_backup_rejection(tmp_path, capsys):
+    """T20: --plan is parsed by check/produce before the backup-path guard."""
+    from tools.workflow import __main__ as workflow_cli
+
+    workspace = build_workspace(tmp_path)
+    build_package(workspace, "C0-001", with_outbound=False)
+    first = dispatch("materials", workspace=workspace, payload={"job_id": "C0-001"})
+    response_file = Path(first["drafting_workspace"]["response_file"])
+    seed = json.loads(response_file.read_text(encoding="utf-8"))
+    seed.update(
+        {
+            "duties": ["Draft vendor contracts"],
+            "requirements": [],
+            "themes": ["contracts"],
+            "match_type": "transferable",
+        }
+    )
+    backup = response_file.with_name(response_file.name + ".bak.20260917T000000Z")
+    backup.write_text(json.dumps(seed), encoding="utf-8")
+
+    assert workflow_cli.main(
+        [
+            "materials",
+            "check",
+            "--workspace",
+            str(workspace),
+            "--job-id",
+            "C0-001",
+            "--plan",
+            str(backup),
+        ]
+    ) == 2
+    blocked = json.loads(capsys.readouterr().out)
+    assert blocked["blockers"] == ["drafting_submission_backup_rejected"]
+
+    capsys.readouterr()
+    assert workflow_cli.main(
+        [
+            "materials",
+            "produce",
+            "--workspace",
+            str(workspace),
+            "--job-id",
+            "C0-001",
+            "--plan",
+            str(backup),
+        ]
+    ) == 2
+    blocked = json.loads(capsys.readouterr().out)
     assert blocked["blockers"] == ["drafting_submission_backup_rejected"]

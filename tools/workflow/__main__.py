@@ -695,13 +695,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.materials_cmd == "check":
             payload["stage"] = "plan"
             payload["materials_shell"] = "check"
-            if args.plan:
-                payload["model_plan"] = json.loads(Path(args.plan).read_text(encoding="utf-8"))
         elif args.materials_cmd == "produce":
             payload["materials_shell"] = "produce"
             payload["max_steps"] = max(1, int(args.max_steps or 4))
-            if args.plan:
-                payload["model_plan"] = json.loads(Path(args.plan).read_text(encoding="utf-8"))
             if args.content:
                 blocker = _materials_submission_blocker(
                     workspace,

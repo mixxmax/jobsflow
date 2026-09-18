@@ -282,7 +282,7 @@ def validate_manifest_contract(
                 f"job_manifest.json: package directory tier is not {expected_tier_label}"
             )
 
-    id_match = re.match(r"^[A-G][0-2]-", job_id)
+    id_match = re.match(r"^[A-G][0-3]-", job_id)
     if id_match and str(tier.get("code")) != job_id[1]:
         errors.append(
             f"job_manifest.json: tier.code={tier.get('code')} disagrees with {job_id}"
