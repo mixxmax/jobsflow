@@ -173,6 +173,21 @@ class JdFetchResult:
     recommended_action: str | None = None
     requires_user_action: bool = False
     manual_hint: str | None = None
+    # Phase-3 structured contract: every result names the pipeline stage that
+    # produced it and whether the automatic bounded retry loop may repeat it.
+    # `retryable` means "safe to retry blindly" (today: timeout only, matching
+    # RETRYABLE_REASONS).  A challenge is NOT retryable in this sense: it needs
+    # user action first (requires_user_action=True); the explicit recovery
+    # flow, not the retry loop, is its second chance.
+    stage: str = "detail_fetch"
+    retryable: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.retryable is None:
+            self.retryable = bool(
+                not self.ok
+                and _stable_fail_reason(self.fail_reason) in RETRYABLE_REASONS
+            )
     manual_command: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -546,6 +561,18 @@ FAIL_REASONS = {
 }
 
 
+# Detail-fetch failure taxonomy (Phase-3 contract).  Each row is
+# (demand category -> fail_reason, stage, retryable).  `detail_reason` carries
+# the precise sub-cause (e.g. not_a_jd_page, cdp_endpoint_unavailable).
+# - timeout            -> timeout,      detail_fetch, True  (bounded loop only)
+# - cloudflare challenge -> challenge, detail_fetch, False (needs user action)
+# - 429                -> rate_limited, detail_fetch, False (honor retry_after)
+# - empty DOM          -> empty,       detail_fetch, False
+# - structure changed  -> empty + detail not_a_jd_page (body present, not a JD)
+# - CDP unavailable    -> degraded + detail cdp_endpoint_unavailable, search_probe, False
+# - cache hit          -> ok=True, stage cache, attempts 0, no browser launched
+# - user verified      -> ok=True + content_validated (recovery flow, not retry)
+# - network error      -> error,       detail_fetch, False
 def _stable_fail_reason(reason: str | None) -> str:
     """Normalize internal Playwright errors to the public failure contract."""
     value = (reason or "error").strip().lower()
@@ -2153,6 +2180,7 @@ class JobsdbHumanVerificationRecovery:
             requires_user_action=bool(manual_hint or manual_command),
             manual_hint=manual_hint,
             manual_command=manual_command,
+            stage="search_probe",
         )
 
     @staticmethod
@@ -3059,6 +3087,7 @@ def _load_success_cache_result(
         session_mode="cache",
         headless=None,
         browser_channel=None,
+        stage="cache",
     )
 
 

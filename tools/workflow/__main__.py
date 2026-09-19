@@ -92,7 +92,9 @@ def _materials_submission_blocker(
     return None
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the gateway CLI parser (no parsing, no side effects)."""
+
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--workspace", type=Path, default=None)
     common.add_argument("--dry-run", action="store_true")
@@ -357,7 +359,50 @@ def main(argv: list[str] | None = None) -> int:
     sync_retry.add_argument("--backend", choices=["auto", "csv", "gsheet", "file"], default="auto")
     sync_retry.add_argument("--fixture", type=Path)
 
-    args = ap.parse_args(argv)
+    reset_p = sub.add_parser("reset", parents=[common], help="Preview or confirm a scoped reset (never edits by hand)")
+    reset_sub = reset_p.add_subparsers(dest="reset_cmd", required=True)
+    reset_preview = reset_sub.add_parser("preview", parents=[common], help="List reset targets with digests")
+    reset_preview.add_argument("--scope", choices=["profile", "documents", "all"], required=True)
+    reset_preview.add_argument("--root", type=Path, default=None, help="Tree to reset (default: workspace for profile, product checkout for documents)")
+    reset_confirm = reset_sub.add_parser("confirm", parents=[common], help="Execute a preview-bound reset")
+    reset_confirm.add_argument("--scope", choices=["profile", "documents", "all"], required=True)
+    reset_confirm.add_argument("--proposal-id", required=True)
+    reset_confirm.add_argument("--root", type=Path, default=None)
+
+    pw = sub.add_parser("private-write", parents=[common], help="Allowlisted private archive write (no hand edits)")
+    pw.add_argument("--slug", default="", help="<company>_<role> archive slug (all modes except profile_evidence)")
+    pw.add_argument("--file", default="", help="outcome.md, job_posting.md or interview_prep_<stage>.md")
+    pw.add_argument("--content-file", type=Path, default=None, help="File whose bytes are written (all modes except copy)")
+    pw.add_argument("--mode", choices=["create", "append", "profile_preview", "copy"], default="create")
+    pw.add_argument("--expected-digest", default="")
+    pw.add_argument("--job-id", default="", help="Bound package for copy mode")
+    pw_confirm = sub.add_parser("private-confirm", parents=[common], help="Confirm a preview-bound profile append (content comes from the proposal)")
+    pw_confirm.add_argument("--proposal-id", required=True)
+
+    template = sub.add_parser("template", parents=[common], help="Register/select a private DOCX template through the gateway")
+    template_sub = template.add_subparsers(dest="template_cmd", required=True)
+    template_sub.add_parser("list", parents=[common], help="List private templates")
+    template_preview = template_sub.add_parser("preview", parents=[common], help="Preview a template registration")
+    template_preview.add_argument("--source", type=Path, required=True)
+    template_preview.add_argument("--name", required=True)
+    template_preview.add_argument("--type", dest="template_type", choices=["cv", "cover_letter"], required=True)
+    template_preview.add_argument("--notes", default="")
+    template_confirm = template_sub.add_parser("confirm", parents=[common], help="Confirm a preview-bound template registration")
+    template_confirm.add_argument("--proposal-id", required=True)
+    template_select = template_sub.add_parser("select", parents=[common], help="Select a registered template")
+    template_select.add_argument("--name", required=True)
+    template_sub.add_parser("clear", parents=[common], help="Restore the lane master as default")
+
+    outcome_p = sub.add_parser("outcome-status", parents=[common], help="Host-owned tracker status transition via sync ledger")
+    outcome_p.add_argument("--job-id", required=True)
+    outcome_p.add_argument("--value", required=True, help="One of the 材料状态 lattice members")
+    outcome_p.add_argument("--expected-row-digest", default="")
+
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     workspace = _workspace(args)
     store = None
     action = args.action
@@ -813,6 +858,90 @@ def main(argv: list[str] | None = None) -> int:
                 store = _load_store(args.fixture, args.fresh_title, workspace) if args.fixture else default_fresh_store(
                     workspace, args.fresh_title, {"backend": args.backend}
                 )
+    elif action == "reset":
+        # Reset carries its own explicit-root + proposal binding, which is
+        # stricter than the generic runtime gate (see docs/command_scope.md),
+        # so it is intentionally not in RUNTIME_WRITE_ACTIONS.
+        reset_root = args.root if getattr(args, "root", None) else None
+        if reset_root is None:
+            if args.reset_cmd == "preview" and args.scope == "documents":
+                from pathlib import Path as _Path
+
+                reset_root = _Path(__file__).resolve().parents[2]
+            else:
+                reset_root = workspace
+        if args.reset_cmd == "preview":
+            action = "reset_preview"
+            payload.update({"scope": args.scope, "root": str(reset_root)})
+        else:
+            action = "reset_confirm"
+            payload.update(
+                {"scope": args.scope, "root": str(reset_root), "proposal_id": args.proposal_id}
+            )
+    elif action == "private-confirm":
+        action = "profile_confirm"
+        payload.update({"proposal_id": args.proposal_id})
+    elif action == "private-write":
+        action = "private_write"
+        if args.mode == "copy":
+            payload.update({"slug": args.slug, "mode": "copy", "job_id": args.job_id})
+        elif args.mode == "profile_preview":
+            if args.content_file is None:
+                out = {"status": "blocked", "blockers": ["private_write_content_required"]}
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+                return 2
+            action = "profile_preview"
+            payload.update(
+                {
+                    "slug": args.slug,
+                    "filename": args.file,
+                    "content": Path(args.content_file).read_text(encoding="utf-8"),
+                }
+            )
+        elif args.content_file is None:
+            out = {"status": "blocked", "blockers": ["private_write_content_required"]}
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 2
+        else:
+            payload.update(
+                {
+                    "slug": args.slug,
+                    "filename": args.file,
+                    "content": Path(args.content_file).read_text(encoding="utf-8"),
+                    "mode": args.mode,
+                    "expected_digest": args.expected_digest,
+                }
+            )
+    elif action == "template":
+        if args.template_cmd == "list":
+            action = "template_list"
+        elif args.template_cmd == "preview":
+            action = "template_preview"
+            payload.update(
+                {
+                    "source": str(args.source),
+                    "name": args.name,
+                    "template_type": args.template_type,
+                    "notes": args.notes,
+                }
+            )
+        elif args.template_cmd == "confirm":
+            action = "template_confirm"
+            payload["proposal_id"] = args.proposal_id
+        elif args.template_cmd == "select":
+            action = "template_select"
+            payload["name"] = args.name
+        elif args.template_cmd == "clear":
+            action = "template_clear"
+    elif action == "outcome-status":
+        action = "outcome_status"
+        payload.update(
+            {
+                "job_id": args.job_id,
+                "value": args.value,
+                "expected_row_digest": args.expected_row_digest,
+            }
+        )
 
     if action in {"materials", "audit", "format", "apply"}:
         payload["materials_engine"] = "vnext"

@@ -1780,3 +1780,141 @@ def test_success_cache_precedes_open_circuit_in_enrich(monkeypatch, tmp_path):
     assert depth == "deep"
     assert hit["_enrich"]["mode"] == "cache"
     assert "Full cached JD" in text
+
+
+def test_cdp_batch_goto_timeout_reports_timeout_never_success():
+    """A goto TimeoutError inside the CDP batch session is fail-closed."""
+
+    class TimeoutPage(_FakePage):
+        def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            raise TimeoutError("Timeout 30000ms exceeded")
+
+    context = _FakeContext(page=TimeoutPage(title="x", html="<html></html>"))
+    session = _approve_cdp_fixture(browser.JobsdbCdpBatchSession(None, None, context))
+
+    result = session.fetch_once("https://hk.jobsdb.com/job/306")
+
+    assert result.ok is False
+    assert result.fail_reason == "timeout"
+    assert result.content_validated is False
+
+
+def test_cdp_verify_search_accepts_dom_replacement_without_second_response(monkeypatch, tmp_path):
+    """Cloudflare may clear in place: challenged DOM replaced, no new document response."""
+
+    body = _long_jd_body()
+    challenge_state = {
+        "title": "Just a moment...",
+        "html": "<html><body>cf-browser-verification</body></html>",
+        "selectors": {},
+    }
+    valid_state = {
+        "title": "Software Engineer - Example",
+        "html": "<html><body>clean</body></html>",
+        "selectors": {'[data-automation="jobAdDetails"]': body},
+    }
+    page = _SequencedPage([challenge_state, challenge_state, valid_state, valid_state])
+    context = _FakeContext(page=page)
+    session = SimpleNamespace(context=context)
+    recovery = browser.JobsdbHumanVerificationRecovery(verification_timeout_seconds=30)
+    recovery._endpoint_alive = lambda: True
+    recovery._connect_cdp_session = lambda: session
+    cookie_calls = []
+    monkeypatch.setattr(browser, "_workflow_gateway_active", lambda: True)
+    monkeypatch.setattr(
+        browser,
+        "_write_jobsdb_cookie_header",
+        lambda context, root: cookie_calls.append(root) or tmp_path / "cookies.txt",
+    )
+
+    result = recovery._cdp_verify_search(tmp_path)
+
+    assert result.ok is True
+    assert result.content_validated is True
+    assert cookie_calls == [tmp_path]
+
+
+def test_jobsdb_cdp_cli_serves_cache_without_connect(monkeypatch, tmp_path, capsys):
+    """A fresh success-cache hit returns status cache; CDP is never touched."""
+    from tools.fresh_24h.jd_cache import save_jd_cache
+    from tools.fresh_24h.portal_jd_browser import normalize_job_url
+
+    canon = normalize_job_url("https://hk.jobsdb.com/job/307", source="jobsdb")
+    save_jd_cache(canon, _long_jd_body(), source="browser_cdp_jobsdb", root=tmp_path)
+    monkeypatch.setattr(
+        portal_jd_cdp.JobsdbCdpBatchSession,
+        "connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cache hit must not connect CDP")
+        ),
+    )
+
+    rc = portal_jd_cdp.main(["--repo", str(tmp_path), "--urls", "https://hk.jobsdb.com/job/307"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [{"url": canon, "status": "cache"}]
+
+
+def test_fetch_result_carries_stage_and_retry_contract():
+    """Every failure names its stage; only timeout is blind-retryable."""
+    timeout = browser.JdFetchResult(ok=False, url="u", portal="linkedin", fail_reason="timeout")
+    assert timeout.stage == "detail_fetch"
+    assert timeout.retryable is True
+
+    challenge = browser.JdFetchResult(
+        ok=False, url="u", portal="jobsdb", fail_reason="challenge", requires_user_action=True
+    )
+    assert challenge.retryable is False
+
+    for reason in ("empty", "error", "rate_limited", "blocked", "degraded"):
+        result = browser.JdFetchResult(ok=False, url="u", portal="jobsdb", fail_reason=reason)
+        assert result.retryable is False, reason
+        assert result.stage == "detail_fetch"
+
+    ok_result = browser.JdFetchResult(ok=True, url="u", portal="jobsdb", text="body")
+    assert ok_result.retryable is False
+
+
+def test_challenge_result_is_structured_never_silent():
+    body = _long_jd_body()
+
+    class Page(_FakePage):
+        def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(url)
+            document = _FakeResponse(self, 403, {"cf-mitigated": "challenge"})
+            document.request.resource_type = "document"
+            for handler in list(self.handlers):
+                handler(document)
+            return document
+
+    context = _FakeContext(
+        page=Page(
+            title="Just a moment...",
+            selectors={},
+            html="<html><body>cf challenge</body></html>",
+        )
+    )
+    session = _approve_cdp_fixture(browser.JobsdbCdpBatchSession(None, None, context))
+
+    result = session.fetch_once("https://hk.jobsdb.com/job/308")
+
+    assert result.ok is False
+    assert result.fail_reason == "challenge"
+    assert result.retryable is False
+    assert result.stage == "detail_fetch"
+    assert result.content_validated is False
+
+
+def test_success_cache_result_names_cache_stage(tmp_path):
+    from tools.fresh_24h.jd_cache import save_jd_cache
+
+    url = "https://hk.jobsdb.com/job/309"
+    save_jd_cache(url, _long_jd_body(), source="browser_cdp_jobsdb", root=tmp_path)
+    result = browser._load_success_cache_result(url, "jobsdb", tmp_path)
+    assert result is not None
+    assert result.ok is True
+    assert result.stage == "cache"
+    assert result.attempts == 0
+    assert result.content_validated is True

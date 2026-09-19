@@ -105,7 +105,13 @@ Pick 4-6 from `07`'s categories, customized to the research and the stage: role 
 ### 6. Logistics
 The phone/video tips from `07` when the format calls for them, plus date and interviewer names as a header.
 
-Save the pack to `JobSearch_2026/03_Applications/<company>_<role>/interview_prep_<stage>.md` (create the folder if this application predates `/outcome`). The folder is gitignored, so the pack stays personal; one file per stage, so earlier packs remain as history. Present the pack in chat as well - the file is the artifact, the conversation is the delivery.
+Save the pack through the gateway (create-only — one file per stage, so earlier packs remain as history; a second write to the same stage is refused, pick a new stage name). Write the pack to a temp file first, then:
+
+```bash
+python3 -m tools.workflow private-write --mode create --slug <company>_<role> --file interview_prep_<stage>.md --content-file <tmp>
+```
+
+The folder is gitignored, so the pack stays personal. Present the pack in chat as well - the file is the artifact, the conversation is the delivery. Never write the pack by hand.
 
 ---
 
@@ -123,16 +129,24 @@ End with:
 
 > Good luck. After the interview, run `/outcome <company>` to log the stage and any feedback - it sharpens the prep for the next round, and once the process resolves it feeds your fit-framework calibration via `/setup`.
 
-If Step 3 drafted new STAR answers the user approved for keeps, remind them those
-were written to the gitignored application archive or private profile evidence
-record (never the tracked skill template).
+If Step 3 drafted new STAR answers the user approved for keeps, route them through
+the private evidence preview/confirm protocol; a chat-level "yes" is not a
+replacement for the stored proposal. Tracked skill templates are never edited:
+
+```bash
+python3 -m tools.workflow private-write --mode profile_preview --content-file <tmp>
+python3 -m tools.workflow private-confirm --proposal-id <proposal-id>
+```
+
+The preview output supplies the proposal id and current digest; display it and
+obtain the user's explicit confirmation before running `private-confirm`.
 
 ---
 
 ### Confirmed facts write-back
 Whenever the user confirms, corrects, or supplies a fact during the workflow that
-is not already captured in the private profile evidence record, write it to the
-gitignored workspace in the same turn:
+is not already captured in the private profile evidence record, append it through
+the gateway's `profile_preview` then `private-confirm` flow:
 
 - A fact mentioned only in conversation is an *absence, not a contradiction* — adding it to the private record is safe even if product templates and the master CV do not mention it.
 - If the new fact *corrects* a private master, fix the private copy only after explicit user confirmation. Never edit tracked product templates.
@@ -143,4 +157,4 @@ gitignored workspace in the same turn:
 2. **Honesty on gaps.** Weak matches get bridge answers (acknowledge → adjacent experience → learning path), never invented experience. Same rule as everywhere else in this repo.
 3. **Verified research only.** Company specifics go in the pack only after independent confirmation. Interviewer notes stick to public professional information.
 4. **Stage-appropriate prep.** A phone screen pack and a final-round pack are different documents; recorded feedback from earlier stages takes priority over generic question lists.
-5. **Write only to the application archive.** The prep pack lands in `JobSearch_2026/03_Applications/<company>_<role>/`; framework and profile files are never edited, except appending user-approved STAR examples to `07-interview-prep.md` on explicit request.
+5. **Write only to the application archive or the private evidence record, always through the gateway.** The prep pack lands in `JobSearch_2026/03_Applications/<company>_<role>/`; framework files and tracked skill templates (including `07-interview-prep.md`) are never edited. User-approved STAR examples go to the private evidence record through `profile_preview` followed by `private-confirm`.

@@ -7,7 +7,7 @@ PYTHON_BIN="$(command -v python3.12 || command -v python3.11 || command -v pytho
 "$PYTHON_BIN" -c 'import sys; assert sys.version_info >= (3, 10), "JobsFlow requires Python 3.10+"'
 "$PYTHON_BIN" -m venv .venv
 source .venv/bin/activate
-python3 -m pip install --require-hashes -r requirements.lock
+bash tools/setup_env.sh
 python3 setup.py --doctor
 ```
 
@@ -20,11 +20,12 @@ python3 setup.py --doctor
 
 That is enough for normal JobsFlow use (`python3 -m tools.workflow …`).
 SOP Control ships in-repo as `vendor/sopcontrol/` and is loaded automatically
-after pull — no second install step. Optional (only if you want the `sopctl`
-command on PATH):
+after pull — no second install step. If you want the `sopctl` command or a
+verified environment, use the single install contract (never a bare editable
+install — it would resolve unpinned dependencies from the network):
 
 ```bash
-python3 -m pip install -e vendor/sopcontrol
+bash tools/setup_env.sh --dev
 ```
 
 Under enforce, a missing/broken control-plane package fail-closes side-effect

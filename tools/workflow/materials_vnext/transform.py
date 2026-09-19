@@ -150,8 +150,8 @@ def normalize_transform_operations(
         if not isinstance(item, dict):
             errors.append(f"addition_not_object:{index}")
             continue
-        block = item.get("block")
-        if not isinstance(block, dict) or not text(block.get("text")):
+        addition = item.get("block")
+        if not isinstance(addition, dict) or not text(addition.get("text")):
             errors.append(f"addition_block_missing:{index}")
             continue
         anchor = text(item.get("after_id") or item.get("target_id"))
@@ -162,7 +162,7 @@ def normalize_transform_operations(
                     "action": "append_after",
                     "material": material,
                     "target_id": anchor,
-                    "block": block,
+                    "block": addition,
                 }
             )
         elif anchor:
@@ -358,10 +358,12 @@ def validate_transform(
             before = text(operation.get("before_text"))
             after = text(operation.get("after_text") or operation.get("text"))
             if not before and operation.get("_compat_rewrite"):
-                before = text(target.get("text"))
+                # Reachable only when target resolved (see the missing-target
+                # guard above); the fallback keeps this None-safe regardless.
+                before = text((target or {}).get("text"))
             if not before or not after:
                 errors.append(f"operation_replace_text_missing:{index}")
-            elif before != text(target.get("text")):
+            elif before != text((target or {}).get("text")):
                 errors.append(f"operation_before_text_mismatch:{index}:{target_id}")
             elif after == before:
                 errors.append(f"operation_noop:{index}:{target_id}")
@@ -377,7 +379,8 @@ def validate_transform(
             after_id = text(operation.get("after_id") or operation.get("target_id"))
             if after_id not in lookup:
                 errors.append(f"operation_after_target_missing:{index}:{after_id}")
-            block = operation.get("block") if isinstance(operation.get("block"), dict) else operation
+            raw_block = operation.get("block")
+            block: dict[str, Any] = raw_block if isinstance(raw_block, dict) else operation
             new_id = text(block.get("new_id") or block.get("id"))
             new_text = text(block.get("text") or block.get("after_text"))
             if not new_id or not new_text:
@@ -471,10 +474,10 @@ def _apply_operations(base: dict[str, Any], transform: dict[str, Any], *, repair
         for material in MATERIALS
     }
     for material in MATERIALS:
-        for block in result[material]:
-            block.setdefault("baseline_refs", [text(block.get("id"))] if text(block.get("id")) else [])
-            block.setdefault("baseline_before_text", text(block.get("text")))
-            block.setdefault("baseline_content_floor", bool(block.get("content_floor", not block.get("host_managed"))))
+        for existing_block in result[material]:
+            existing_block.setdefault("baseline_refs", [text(existing_block.get("id"))] if text(existing_block.get("id")) else [])
+            existing_block.setdefault("baseline_before_text", text(existing_block.get("text")))
+            existing_block.setdefault("baseline_content_floor", bool(existing_block.get("content_floor", not existing_block.get("host_managed"))))
     for operation in _ops(transform):
         material = text(operation.get("material")).casefold()
         action = text(operation.get("action")).casefold()
@@ -495,7 +498,8 @@ def _apply_operations(base: dict[str, Any], transform: dict[str, Any], *, repair
             if text(operation.get("change_reason")):
                 target["change_reason"] = text(operation.get("change_reason"))
         elif action == "append_after":
-            block = operation.get("block") if isinstance(operation.get("block"), dict) else operation
+            raw_block = operation.get("block")
+            block: dict[str, Any] = raw_block if isinstance(raw_block, dict) else operation
             section = text(block.get("section")) or ("summary" if material == "cv" else "body")
             block_type = text(block.get("type") or "bullet")
             if material == "cv" and section == "core":

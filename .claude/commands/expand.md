@@ -164,12 +164,18 @@ Wait for the user's response before writing anything.
 
 ---
 
-## Step 5: Write Confirmed Additions
+## Step 5: Write Confirmed Additions (Gateway Only — Never by Hand)
 
-Apply only the confirmed items. Write them to the gitignored personal workspace
-(`JobSearch_2026/00_Profile/expanded_competencies.md`) or to the selected
-application archive. Do not edit tracked `.claude/skills/` templates, `CLAUDE.md`,
-or product instructions, and do not rewrite an entire file.
+Apply only the confirmed items. Do not edit tracked `.claude/skills/` templates, `CLAUDE.md`,
+or product instructions, and do not rewrite an entire file. Two destinations, both digest-bound:
+
+- **Private profile evidence** (`JobSearch_2026/00_Profile/expanded_competencies.md`): technical skills, domain knowledge, methods, behavioral signals. Append-only through a stored preview proposal:
+  ```bash
+  python3 -m tools.workflow private-write --mode profile_preview --content-file <tmp>
+  python3 -m tools.workflow private-confirm --proposal-id <proposal-id>
+  ```
+  Display the preview and obtain explicit user confirmation before the second command.
+- **Selected application archive**: same append protocol as `/outcome` (`outcome.md` append mode with `--expected-digest`).
 
 ### Additions to the private profile evidence record
 - Technical skills (primary and secondary) → append to the private evidence record
@@ -214,6 +220,6 @@ After writing, present:
 - **Additive only.** This command never modifies existing profile content. It only appends.
 - **Source-traceable.** Every addition records where it came from, so future runs are idempotent and the user can verify or remove individual items later.
 - **Both approaches, always.** Web lookup and inference are applied together — not as alternatives. A named course gets its official syllabus AND a reasoned competency list.
-- **User confirms before writing.** The full competency map is shown and confirmed before a single file is touched.
+- **User confirms before writing.** The full competency map is shown first; the gateway then records a digest-bound proposal and only `private-confirm` may touch the file.
 - **Behavioral signals are labeled.** Anything inferred from tone, language, or indirect signals is marked as inferred so it is reviewed critically.
 - **GitHub is fully scanned.** All public repositories are checked, not just pinned ones — unpinned repos often contain significant competency signals.

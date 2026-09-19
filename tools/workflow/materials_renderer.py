@@ -269,7 +269,7 @@ def _template_prototypes(document, *, material: str) -> dict[str, dict[str, Any]
 
     # Both the CV and CL masters use the first two Normal paragraphs for the
     # candidate name and contact line.  Do not depend on the canonical block
-    # type: a contact block is the title in the actual runtime draft.
+    # kind: a contact block is the title in the actual runtime draft.
     if normal:
         prototypes["title"] = _paragraph_prototype(normal[0])
     if len(normal) > 1:

@@ -20,3 +20,13 @@ addopts = "-ra -m 'not legacy'"
 markers = [
   "legacy: frozen tests for the retired materials adapter; run explicitly with -m legacy",
 ]
+
+[tool.coverage.run]
+branch = true
+source = ["tools"]
+omit = ["tools/workflow/__pycache__/*"]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+skip_covered = true

@@ -665,13 +665,17 @@ class SyncCoordinator:
         # The fast Sheets projection is safe only when the confirmed batch is
         # purely additive and the schema is unchanged.  Any update, duplicate,
         # or header migration keeps the guarded full-replacement path.
+        # Only some FreshStore implementers offer the append fast path
+        # (it is intentionally absent from the protocol).  Resolve once and
+        # reuse the same bound method for the check and the call.
+        appender = getattr(store, "append_rows_if_digest", None)
         append_only = (
             bool(append_rows)
             and len(append_rows) == len(incoming)
             and stats["updated"] == 0
             and _headers_for_rows(local_before.rows, local_before.headers)
             == _headers_for_rows(merged_rows, local_before.headers)
-            and callable(getattr(store, "append_rows_if_digest", None))
+            and callable(appender)
         )
         if append_only:
             # Sheets inserts the new batch at row 2; the ordering above keeps
@@ -733,7 +737,8 @@ class SyncCoordinator:
             operation.attempts += 1
             self.operations.save(operation)
             if append_only:
-                after = store.append_rows_if_digest(
+                assert callable(appender)
+                after = appender(
                     append_rows,
                     headers=merged.headers,
                     expected_digest=target_before.digest,

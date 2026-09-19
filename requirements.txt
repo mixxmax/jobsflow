@@ -8,3 +8,11 @@ google-auth==2.49.1
 google-api-python-client==2.193.0
 playwright==1.60.0
 PyYAML==6.0.3
+# Vendored SOP Control runtime (vendor/sopcontrol/pyproject.toml).  Pinned
+# here so `pip install -e vendor/sopcontrol` never resolves them freely
+# (Phase-1 install contract: lock first, then --no-deps editable install).
+pydantic==2.13.5
+tree-sitter==0.26.0
+tree-sitter-go==0.25.0
+tree-sitter-typescript==0.23.2
+tree-sitter-rust==0.24.2

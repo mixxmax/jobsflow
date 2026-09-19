@@ -57,9 +57,18 @@ Also collect, without interrogating - one or two open questions are enough:
 
 Create or update `JobSearch_2026/03_Applications/<company>_<role>/`. All content here is personal data and is inside the gitignored workspace, so nothing needs redacting.
 
-1. **Submitted DOCX/PDF files** - copy (never move) the submitted files from the selected package. If a file already exists in the archive, leave it - the archived version is what was actually submitted. If no draft files exist (application made outside `/apply`), skip with a note.
-2. **`job_posting.md`** - if it already exists, leave it. Otherwise try WebFetch on the tracker row's `source` URL and save the posting text. If the URL is dead (postings expire fast - this is exactly why the archive matters), ask the user to paste the posting, or write a stub noting the posting is unavailable. **Never reconstruct a posting from memory.**
-3. **`outcome.md`** - write or update it in exactly the format documented in `documents/README.md`, so `/setup` Path A parses it without special cases:
+All archive writes go through the narrow gateway adapter — never write files by hand (see `docs/command_scope.md`). Derive the slug as `<company>_<role>` (lowercase, underscores for spaces).
+
+1. **Submitted DOCX/PDF files** - copy (never move) the submitted files from the selected package:
+   ```bash
+   python3 -m tools.workflow private-write --mode copy --slug <slug> --job-id <岗位编号>
+   ```
+   Existing archive files are left untouched (the archived version is what was actually submitted). If no draft files exist (application made outside `/apply`), skip with a note.
+2. **`job_posting.md`** - create-only. If it already exists, leave it. Otherwise fetch the posting text (WebFetch on the tracker row's `source` URL; if dead, ask the user to paste it or write a stub noting unavailability — **never reconstruct a posting from memory**), save it to a temp file, then:
+   ```bash
+   python3 -m tools.workflow private-write --mode create --slug <slug> --file job_posting.md --content-file <tmp>
+   ```
+3. **`outcome.md`** - create once, then append-only with digest binding, in exactly the format documented in `documents/README.md`, so `/setup` Path A parses it without special cases. For appends, read the current file digest from the previous gateway receipt and pass `--expected-digest`; a `private_write_stale` response means someone changed the file — re-read and retry, never overwrite blindly:
 
 ```markdown
 # Outcome: <Company> — <Role>
@@ -84,9 +93,15 @@ Update rules: tick stage checkboxes as they are reached (add the date in parenth
 
 ---
 
-## Step 4: Update the Tracker
+## Step 4: Update the Tracker (Through the Sync Ledger — Never Edit the CSV)
 
-Update the matched row's `材料状态` (and, if present, notes) with the outcome stage and append a short dated note. Never restructure the CSV, reorder rows, or touch other rows.
+The tracker CSV/Sheets is a sync projection; direct edits would desync the ledger and break later pushes. Status moves go through the host-owned transition (forward-only along 未制作 → 已制作 → 已投递 → 面试中 → 已结束 → 已录用; later states are never downgraded):
+
+```bash
+python3 -m tools.workflow outcome-status --job-id <岗位编号> --value <面试中|已结束|已录用…>
+```
+
+Dated notes go to `outcome.md` Notes (append mode with `--expected-digest`), not into tracker cells. Never restructure the CSV, reorder rows, or touch other rows.
 
 ---
 

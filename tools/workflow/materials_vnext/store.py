@@ -55,21 +55,30 @@ def save_run(package: Path, value: dict[str, Any]) -> dict[str, Any]:
     # ``performance`` projection instead of letting that stale snapshot erase
     # timing, rerender and failure evidence.
     existing = load_run(Path(package))
-    current_performance = existing.get("performance") if isinstance(existing.get("performance"), dict) else {}
-    incoming_performance = value.get("performance") if isinstance(value.get("performance"), dict) else {}
+    raw_current_performance = existing.get("performance")
+    current_performance: dict[str, Any] = (
+        raw_current_performance if isinstance(raw_current_performance, dict) else {}
+    )
+    raw_incoming_performance = value.get("performance")
+    incoming_performance: dict[str, Any] = (
+        raw_incoming_performance if isinstance(raw_incoming_performance, dict) else {}
+    )
     if current_performance or incoming_performance:
         merged_performance = dict(current_performance)
-        merged_stages = dict(current_performance.get("stages") or {})
+        merged_stages: dict[str, Any] = dict(current_performance.get("stages") or {})
         for stage_name, incoming_stage in (incoming_performance.get("stages") or {}).items():
             if not isinstance(incoming_stage, dict):
                 continue
-            current_stage = merged_stages.get(stage_name) if isinstance(merged_stages.get(stage_name), dict) else {}
+            raw_current_stage = merged_stages.get(stage_name)
+            current_stage: dict[str, Any] = (
+                raw_current_stage if isinstance(raw_current_stage, dict) else {}
+            )
             incoming_attempts = int(incoming_stage.get("attempts") or 0)
             current_attempts = int(current_stage.get("attempts") or 0)
             if incoming_attempts >= current_attempts:
                 merged_stages[stage_name] = dict(incoming_stage)
         merged_performance["stages"] = merged_stages
-        reasons = dict(current_performance.get("failure_reasons") or {})
+        reasons: dict[str, Any] = dict(current_performance.get("failure_reasons") or {})
         for reason, count in (incoming_performance.get("failure_reasons") or {}).items():
             reasons[str(reason)] = max(int(reasons.get(str(reason)) or 0), int(count or 0))
         merged_performance["failure_reasons"] = reasons
@@ -112,10 +121,12 @@ def record_stage_metric(
     run = load_run(Path(package))
     if not run:
         return {}
-    performance = run.get("performance") if isinstance(run.get("performance"), dict) else {}
+    raw_performance = run.get("performance")
+    performance: dict[str, Any] = raw_performance if isinstance(raw_performance, dict) else {}
     performance.setdefault("schema_version", 1)
-    stages = performance.setdefault("stages", {})
-    entry = stages.get(stage_name) if isinstance(stages.get(stage_name), dict) else {}
+    stages: dict[str, Any] = performance.setdefault("stages", {})
+    raw_entry = stages.get(stage_name)
+    entry: dict[str, Any] = raw_entry if isinstance(raw_entry, dict) else {}
     duration = max(0, int(float(duration_ms or 0)))
     entry["attempts"] = int(entry.get("attempts") or 0) + 1
     entry["total_duration_ms"] = int(entry.get("total_duration_ms") or 0) + duration
@@ -139,7 +150,7 @@ def record_stage_metric(
             if value is not None
         }
     stages[stage_name] = entry
-    reasons = performance.setdefault("failure_reasons", {})
+    reasons: dict[str, Any] = performance.setdefault("failure_reasons", {})
     if error:
         reason = str(error).strip()
         reasons[reason] = int(reasons.get(reason) or 0) + 1
@@ -304,9 +315,11 @@ def _recorded_artifact_names(package: Path) -> set[str]:
         state_dir(Path(package)) / "artifact_hashes.json",
     ):
         value = load(candidate)
-        files = value.get("filenames") if isinstance(value.get("filenames"), dict) else {}
+        raw_files = value.get("filenames")
+        files: dict[str, Any] = raw_files if isinstance(raw_files, dict) else {}
         names.update(str(item) for item in files.values() if str(item).strip())
-        hashes = value.get("files") if isinstance(value.get("files"), dict) else {}
+        raw_hashes = value.get("files")
+        hashes: dict[str, Any] = raw_hashes if isinstance(raw_hashes, dict) else {}
         names.update(str(item) for item in hashes if str(item).strip())
     return names
 

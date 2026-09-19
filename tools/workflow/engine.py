@@ -373,6 +373,21 @@ def dispatch(
     runner=None,
 ) -> dict[str, Any]:
     payload = dict(payload or {})
+    if action in {
+        "private_write", "outcome_status", "profile_preview", "profile_confirm",
+        "template_preview", "template_list", "template_confirm", "template_select", "template_clear",
+    }:
+        # Private writes must never auto-create runtime directories under the
+        # product checkout.  Refuse here — before entity loading or audit
+        # writes touch the filesystem — so a product-root workspace leaves
+        # zero trace.  The adapter repeats the check as defense in depth.
+        try:
+            from tools.workflow.interaction_shell import product_root
+
+            if Path(workspace).expanduser().resolve() == product_root().resolve():
+                return result(status="blocked", blockers=["private_write_product_root_refused"])
+        except (OSError, RuntimeError):
+            pass
     # There is one materials implementation.  Callers using the Python API
     # (tests, runtime delegates, and model harnesses) must receive the same
     # vNext gateway behavior as ``python3 -m tools.workflow``; otherwise a
@@ -383,7 +398,8 @@ def dispatch(
         # model harnesses must not be able to select the retired chain.
         payload["materials_engine"] = "vnext"
     if action == "scan":
-        fixture = payload.get("fixture") if isinstance(payload.get("fixture"), dict) else {}
+        raw_fixture = payload.get("fixture")
+        fixture: dict[str, Any] = raw_fixture if isinstance(raw_fixture, dict) else {}
         if not str(payload.get("run_id") or "").strip():
             try:
                 from tools.workflow.sopcontrol_adapter import capability_ticket_run_id
@@ -493,12 +509,27 @@ def _run_adapter(action, payload, workspace, store, dry_run, now):
         return base_adapter.handle(payload, workspace=workspace, dry_run=dry_run)
     if action == "intent":
         return intent_adapter.handle(payload, workspace=workspace, dry_run=dry_run)
+    if action in {"reset_preview", "reset_confirm"}:
+        from tools.workflow import reset as reset_adapter
+
+        return reset_adapter.handle(action, payload, workspace=workspace)
+    if action in {
+        "private_write", "outcome_status", "profile_preview", "profile_confirm",
+    }:
+        from tools.workflow import private_notes as private_notes_adapter
+
+        return private_notes_adapter.handle(action, payload, workspace=workspace)
+    if action in {"template_list", "template_preview", "template_confirm", "template_select", "template_clear"}:
+        from tools.workflow import template_adapter
+
+        return template_adapter.handle(action, payload, workspace=workspace)
     return result(status="blocked", blockers=["unknown_action"])
 
 
 def _entity_for(action: str, payload: dict[str, Any], store) -> tuple[str, str]:
     if action in {"scan", "push"}:
-        fixture = payload.get("fixture") if isinstance(payload.get("fixture"), dict) else {}
+        raw_fixture = payload.get("fixture")
+        fixture: dict[str, Any] = raw_fixture if isinstance(raw_fixture, dict) else {}
         return "scan", str(
             payload.get("run_id") or fixture.get("run_id") or payload.get("mode") or "latest"
         )
@@ -514,6 +545,18 @@ def _entity_for(action: str, payload: dict[str, Any], store) -> tuple[str, str]:
         return "base", str(payload.get("lane") or payload.get("base_cmd") or "base")
     if action == "intent":
         return "intent", str(payload.get("intent_cmd") or "intent")
+    if action in {"reset_preview", "reset_confirm"}:
+        import hashlib
+
+        scope = str(payload.get("scope") or "unknown")
+        root = str(payload.get("root") or payload.get("workspace") or "")
+        digest = hashlib.sha256(root.encode("utf-8")).hexdigest()[:12]
+        return "reset", f"{scope}-{digest}"
+    if action in {
+        "private_write", "outcome_status", "profile_preview", "profile_confirm",
+        "template_preview", "template_confirm", "template_select", "template_clear",
+    }:
+        return "private", "workspace"
     return "scan", "latest"
 
 
@@ -551,9 +594,12 @@ def _audit(
     *,
     duration_ms: int,
 ) -> str:
-    validation = out.get("validation") if isinstance(out.get("validation"), dict) else {}
-    run = out.get("run") if isinstance(out.get("run"), dict) else {}
-    digest_map = validation.get("current_hashes") or run.get("scored_hashes") or {}
+    raw_validation = out.get("validation")
+    validation: dict[str, Any] = raw_validation if isinstance(raw_validation, dict) else {}
+    raw_run = out.get("run")
+    run: dict[str, Any] = raw_run if isinstance(raw_run, dict) else {}
+    raw_digest_map = validation.get("current_hashes") or run.get("scored_hashes") or {}
+    digest_map: dict[str, Any] = raw_digest_map if isinstance(raw_digest_map, dict) else {}
     recorded = append_workflow_event(
         workspace,
         {

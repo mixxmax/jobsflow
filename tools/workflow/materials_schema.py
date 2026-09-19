@@ -25,7 +25,7 @@ MATCH_TYPES = {"direct", "transferable", "stretch", "unsupported"}
 # response exists.  It must never be rendered as a negative sentence.
 COVERAGE_DISPOSITIONS = {"direct", "transferable", "intentionally_omitted"}
 
-MATERIALS_PLAN_SCHEMA = {
+MATERIALS_PLAN_SCHEMA: dict[str, Any] = {
     "name": "materials_plan.v1",
     "required": ["task_type", "duties", "themes", "match_type"],
     "optional": ["requirements", "jd_anchors", "coverage_dispositions", "forbidden_claims", "claim_ledger"],

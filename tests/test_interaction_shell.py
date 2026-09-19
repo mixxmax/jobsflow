@@ -254,7 +254,7 @@ def test_setup_pointer_roundtrip_and_priority(tmp_path, monkeypatch):
 
 
 def test_runtime_pointer_is_gitignored():
-    text = Path("/Users/xiezhijie/ai-job-search/.gitignore").read_text(encoding="utf-8")
+    text = (Path(__file__).parents[1] / ".gitignore").read_text(encoding="utf-8")
     assert ".jobsflow-runtime.json" in text
 
 

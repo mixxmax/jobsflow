@@ -54,12 +54,18 @@ from tools.workflow.materials_vnext.store import (
     write_event,
 )
 from tools.workflow.materials_vnext.transform import compile_canonical, validate_transform
+from tools.workflow.materials_vnext.stages_light import (
+    RESOLUTION_STATUSES,
+    USER_RULING_STATUSES,
+    stage_reset,
+    stage_role_choose,
+    stage_rulings,
+    stage_status,
+)
 
 # Audit finding rulings a user may record.  ``fixed`` is a producer-side
 # claim and never opens the gate by itself; only the three explicit user
 # rulings suppress a finding, and every ruling stays auditable in the ledger.
-RESOLUTION_STATUSES = {"open", "fixed", "user_accepted", "user_rejected", "not_actionable", "reopened"}
-USER_RULING_STATUSES = {"user_accepted", "user_rejected", "not_actionable"}
 _DISPATCH_FAILURES = {
     "auditor_timeout",
     "auditor_launch_failed",
@@ -106,7 +112,8 @@ def _write_email(package: Path, bundle: dict[str, Any]) -> Path:
     frozen entity contract and contains no model-generated claims.
     """
 
-    entity = bundle.get("entity") if isinstance(bundle.get("entity"), dict) else {}
+    raw_entity = bundle.get("entity")
+    entity: dict[str, Any] = raw_entity if isinstance(raw_entity, dict) else {}
     role = text(entity.get("role_primary")) or "the position"
     target = text(entity.get("application_target")) or "Hiring Team"
     candidate = ""
@@ -245,188 +252,6 @@ def _run_or_new(package: Path, bundle: dict[str, Any], job_id: str, *, producer_
     return save_run(package, run)
 
 
-def _record_resolve(
-    package: Path,
-    run: dict[str, Any],
-    decisions: Any,
-    *,
-    workspace: Path,
-) -> dict[str, Any]:
-    """Record user rulings on audit findings into the disposition ledger.
-
-    A ruling is a first-class record — it keeps the material hash, the rule
-    category and the reason, and it suppresses only the three explicit user
-    ruling statuses.  It is never rewritten into an independent audit pass.
-    """
-
-    result = load_audit_result(package)
-    if not result.get("findings"):
-        return {"status": "blocked", "blockers": ["audit_result_missing"], "next_action": "run_content_audit_first", "engine": "materials-vnext"}
-    if not isinstance(decisions, list) or not decisions:
-        return {"status": "blocked", "blockers": ["resolve_decisions_required"], "next_action": "submit_decisions_list", "engine": "materials-vnext"}
-    findings = [dict(item) for item in result.get("findings") or [] if isinstance(item, dict)]
-    ledger = load_dispositions(package)
-    applied: list[dict[str, Any]] = []
-    errors: list[str] = []
-    canonical_sha = text(run.get("canonical_sha256"))
-    for index, raw in enumerate(decisions):
-        if not isinstance(raw, dict):
-            errors.append(f"decision_not_object:{index}")
-            continue
-        status = text(raw.get("status")).casefold()
-        if status not in RESOLUTION_STATUSES:
-            errors.append(f"decision_status_invalid:{index}:{status}")
-            continue
-        if status in USER_RULING_STATUSES and len(text(raw.get("reason"))) < 4:
-            errors.append(f"decision_reason_required:{index}:{status}")
-            continue
-        ident = text(raw.get("fingerprint")) or text(raw.get("finding_id"))
-        finding = next(
-            (
-                item for item in findings
-                if (text(item.get("fingerprint")) and text(item.get("fingerprint")) == ident)
-                or (text(item.get("finding_id")) and text(item.get("finding_id")) == ident)
-            ),
-            None,
-        )
-        if finding is None:
-            errors.append(f"decision_finding_not_found:{index}:{ident}")
-            continue
-        fingerprint = text(finding.get("fingerprint"))
-        finding["disposition"] = status
-        finding["disposition_reason"] = text(raw.get("reason"))
-        finding["disposition_decided_at"] = run.get("updated_at") or ""
-        applied.append({"fingerprint": fingerprint, "status": status})
-        ledger[fingerprint] = {
-            "status": status,
-            "rule_id": text(finding.get("rule_id")),
-            "material": text(finding.get("material") or finding.get("artifact")),
-            "target_id": text(finding.get("target_id")),
-            "reason": text(raw.get("reason")),
-            "decided_at": finding["disposition_decided_at"],
-            "generation_id": run.get("generation_id"),
-            "accepted_material_hash": canonical_sha,
-        }
-    if errors:
-        return {"status": "blocked", "blockers": ["resolve_decisions_invalid"], "errors": sorted(set(errors)), "engine": "materials-vnext"}
-    result["findings"] = findings
-    open_blockers = [
-        item for item in findings
-        if item.get("severity") in {"P0", "P1"} and item.get("disposition") not in USER_RULING_STATUSES
-    ]
-    suppressed = [
-        item for item in findings
-        if item.get("severity") in {"P0", "P1"} and item.get("disposition") in USER_RULING_STATUSES
-    ]
-    gate_open = not open_blockers
-    result["status"] = "passed" if gate_open else "repair_required"
-    result["content_gate"] = "passed" if gate_open else "blocked"
-    result["open_counts"] = {
-        "P0": sum(1 for item in findings if item.get("severity") == "P0" and item.get("disposition") not in USER_RULING_STATUSES),
-        "P1": sum(1 for item in findings if item.get("severity") == "P1" and item.get("disposition") not in USER_RULING_STATUSES),
-        "P2": sum(1 for item in findings if item.get("severity") == "P2" and item.get("disposition") not in USER_RULING_STATUSES),
-    }
-    result["gate_basis"] = "user_dispositions" if gate_open and suppressed else result.get("gate_basis")
-    # A user ruling never upgrades the audit into an independent pass.
-    if gate_open and result.get("produced_by") == "independent_child_audit" and suppressed:
-        result["independent_audit_passed"] = False
-    save_dispositions(package, ledger)
-    atomic_write_json(state_dir(package) / "audit_result.json", result)
-    atomic_write_json(Path(package) / "materials_audit.json", result)
-    phase = str(run.get("phase") or "")
-    if gate_open:
-        new_phase = "content_passed" if phase in {"repair_required", "content_audit_pending", "audit_review_required"} else phase
-    else:
-        new_phase = "repair_required" if phase in {"content_passed", "audit_review_required"} else phase
-    updated = dict(run)
-    updated.update({
-        "phase": new_phase,
-        "audit_result_sha256": digest(result),
-        "last_error": "" if gate_open else "open_findings_after_resolution",
-    })
-    save_run(package, updated)
-    write_event(
-        package,
-        "audit_dispositions_recorded",
-        generation_id=run.get("generation_id"),
-        decisions=len(applied),
-        gate_open=gate_open,
-    )
-    return {
-        "status": "succeeded",
-        "after_state": new_phase,
-        "decisions_applied": applied,
-        "open_blocking_findings": len(open_blockers),
-        "suppressed_by_user_ruling": len(suppressed),
-        "gate_open": gate_open,
-        "independent_audit_passed": bool(result.get("independent_audit_passed")),
-        "engine": "materials-vnext",
-    }
-
-
-def _record_acceptance(package: Path, run: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    """Record the user accepting materials without an independent audit.
-
-    This is the only sanctioned path that opens the content gate without a
-    real child audit.  It stores an explicit, hash-bound acceptance record;
-    ``independent_audit_passed`` stays false and audit dispatch is suspended
-    so no background audit can be launched against the user's decision.
-    """
-
-    phase = str(run.get("phase") or "")
-    if phase not in {"content_audit_pending", "repair_required", "audit_review_required"}:
-        return {
-            "status": "blocked",
-            "after_state": phase,
-            "blockers": ["acceptance_not_expected_in_phase"],
-            "next_action": "use_resolve_for_rulings_or_continue_pipeline",
-            "engine": "materials-vnext",
-        }
-    reason = text(payload.get("acceptance_reason"))
-    if len(reason) < 8:
-        return {
-            "status": "blocked",
-            "blockers": ["acceptance_reason_required"],
-            "next_action": "provide_acceptance_reason_of_at_least_8_chars",
-            "engine": "materials-vnext",
-        }
-    from tools.workflow.materials_hashes import semantic_material_hashes
-
-    accepted_hash = text(run.get("canonical_sha256"))
-    record = {
-        "schema_version": 1,
-        "job_id": run.get("job_id"),
-        "generation_id": run.get("generation_id"),
-        "accepted_material_hash": accepted_hash,
-        "semantic_material_hashes": semantic_material_hashes(Path(package)),
-        "independent_audit_passed": False,
-        "user_accepted": True,
-        "acceptance_reason": reason,
-        "decided_at": run.get("updated_at") or "",
-    }
-    save_acceptance(package, record)
-    updated = dict(run)
-    updated.update({
-        "phase": "content_passed",
-        "audit_acceptance": {
-            "user_accepted": True,
-            "accepted_material_hash": accepted_hash,
-            "generation_id": run.get("generation_id"),
-            "acceptance_reason": reason,
-        },
-        "audit_dispatch_suspended": True,
-        "last_error": "",
-    })
-    save_run(package, updated)
-    write_event(package, "audit_user_acceptance_recorded", generation_id=run.get("generation_id"), accepted_material_hash=accepted_hash)
-    return {
-        "status": "succeeded",
-        "after_state": "content_passed",
-        "user_accepted": True,
-        "independent_audit_passed": False,
-        "audit_dispatch_suspended": True,
-        "engine": "materials-vnext",
-    }
 
 
 def _dispatch_audit_task(task: dict[str, Any], *, package: Path, payload: dict[str, Any], run: dict[str, Any]) -> dict[str, Any] | None:
@@ -458,7 +283,8 @@ def _plan_packet(
     plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     baseline = bundle.get("baseline") or {}
-    candidate_profile = bundle.get("candidate_profile") if isinstance(bundle.get("candidate_profile"), dict) else {}
+    raw_candidate_profile = bundle.get("candidate_profile")
+    candidate_profile: dict[str, Any] = raw_candidate_profile if isinstance(raw_candidate_profile, dict) else {}
     from tools.workflow.materials_baseline import baseline_transform_task_schema, plan_jd_anchor_catalog
 
     content_baseline = {
@@ -480,8 +306,10 @@ def _plan_packet(
         jd_anchors=plan_jd_anchor_catalog(plan or {}),
         contract="vnext",
     )
-    entity = bundle.get("entity") if isinstance(bundle.get("entity"), dict) else {}
-    role_contract = entity.get("role_title_contract") if isinstance(entity.get("role_title_contract"), dict) else {}
+    raw_entity = bundle.get("entity")
+    entity: dict[str, Any] = raw_entity if isinstance(raw_entity, dict) else {}
+    raw_role_contract = entity.get("role_title_contract")
+    role_contract: dict[str, Any] = raw_role_contract if isinstance(raw_role_contract, dict) else {}
     if not role_contract:
         role_contract = {
             "primary": entity.get("role_primary") or "",
@@ -493,8 +321,10 @@ def _plan_packet(
                 "model_action": "use the host-supplied title; do not reorder or inspect another package",
             },
         }
-    research = bundle.get("company_research") if isinstance(bundle.get("company_research"), dict) else {}
-    research_quality = research.get("quality") if isinstance(research.get("quality"), dict) else {}
+    raw_research = bundle.get("company_research")
+    research: dict[str, Any] = raw_research if isinstance(raw_research, dict) else {}
+    raw_research_quality = research.get("quality")
+    research_quality: dict[str, Any] = raw_research_quality if isinstance(raw_research_quality, dict) else {}
     research_ready = bool(research_quality.get("ready_for_tailoring"))
     research_available = bool(
         research.get("sources")
@@ -787,7 +617,8 @@ def _seed_canonical_from_baseline(
     )
     if not anchor:
         anchor = "the selected JD duties"
-    baseline = bundle.get("baseline") if isinstance(bundle.get("baseline"), dict) else {}
+    raw_baseline = bundle.get("baseline")
+    baseline: dict[str, Any] = raw_baseline if isinstance(raw_baseline, dict) else {}
     canonical: dict[str, Any] = {
         "schema_version": 1,
         "artifact_type": "jobsflow_canonical_cv_cl",
@@ -910,110 +741,15 @@ class MaterialsEngine:
             if legacy is not None:
                 return {**legacy, "engine": "materials-vnext", "engine_version": "materials-vnext-1"}
         if stage == "status":
-            from tools.workflow.materials_vnext.migration import migration_blocker as _migration_blocker
-            from tools.workflow.materials_vnext.store import load_run as _load_run
-
-            vnext_run = _load_run(package)
-            if vnext_run:
-                return {
-                    "status": "succeeded",
-                    "job_id": job_id,
-                    "materials_run": vnext_run,
-                    "engine": "materials-vnext",
-                    "side_effects": [],
-                }
-            legacy = _migration_blocker(Path(workspace), package, job_id)
-            if legacy is not None:
-                return {**legacy, "job_id": job_id, "materials_run": None, "engine": "materials-vnext"}
-            return {
-                "status": "succeeded",
-                "job_id": job_id,
-                "phase": "idle",
-                "materials_run": None,
-                "engine": "materials-vnext",
-                "side_effects": [],
-            }
+            return stage_status(package=package, job_id=job_id, workspace=Path(workspace))
         if stage in {"role_choose", "role-choose"}:
-            from tools.job_materials.role_titles import build_role_title_contract
-
-            title = text(payload.get("title") or "")
-            if not title:
-                return {
-                    "status": "blocked",
-                    "blockers": ["role_choose_requires_title"],
-                    "engine": "materials-vnext",
-                    "job_id": job_id,
-                }
-            manifest_path = package / "job_manifest.json"
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, TypeError):
-                manifest = {}
-            job = dict(manifest.get("job") or {})
-            display = text(job.get("role_display") or title)
-            selected = build_role_title_contract(display, selected_primary=title)
-            job["role_title_contract"] = selected
-            job["role_display"] = text(selected.get("primary") or title)
-            manifest["job"] = job
-            atomic_write_json(manifest_path, manifest)
-            # Keep the materials entity phase unchanged; role selection is a
-            # package-manifest write, not a generation-phase advance.
-            return {
-                "status": "succeeded",
-                "job_id": job_id,
-                "role_title_contract": selected,
-                "side_effects": ["role_title_selected"],
-                "engine": "materials-vnext",
-            }
+            return stage_role_choose(package=package, job_id=job_id, payload=payload)
         if stage in {"reset", "restart"}:
-            scope = text(payload.get("scope") or "all").casefold()
-            if scope not in {"audit", "draft", "render", "all"}:
-                scope = "all"
-            # Default fail-closed: any harness (including direct engine imports)
-            # must confirm. Tests may pass allow_unconfirmed_reset=True.
-            import os as _os
-
-            allow_unconfirmed = bool(payload.get("allow_unconfirmed_reset")) or str(
-                _os.environ.get("JOBSFLOW_MATERIALS_ALLOW_UNCONFIRMED_RESET", "") or ""
-            ).strip() in {"1", "true", "yes", "on"}
-            confirmed = bool(payload.get("confirm_reset") or payload.get("confirmed"))
-            if not confirmed and not allow_unconfirmed:
-                return {
-                    "status": "preview",
-                    "job_id": job_id,
-                    "scope": scope,
-                    "requires_confirmation": True,
-                    "next_action": "repeat_with_--confirm-reset",
-                    "engine": "materials-vnext",
-                }
-            out = reset(package, scope=scope, workspace=Path(workspace), job_id=job_id)
-            target_phase = {
-                "audit": "content_audit_pending",
-                "draft": "plan_ready",
-                "render": "content_passed",
-                "all": "idle",
-            }[scope]
-            try:
-                from tools.workflow.entity_state import reset_entity_state
-
-                projected = reset_entity_state(
-                    Path(workspace),
-                    "materials",
-                    job_id,
-                    target_phase=target_phase,
-                    reason=f"materials_vnext_reset:{scope}",
-                )
-                out["projected_entity_phase"] = projected.phase
-                out["projected_entity_revision"] = projected.revision
-            except (OSError, ValueError, RuntimeError) as exc:
-                out["status"] = "blocked"
-                out["blockers"] = ["entity_state_reset_failed"]
-                out["error"] = str(exc)
-            return {**out, "engine": "materials-vnext", "job_id": job_id}
+            return stage_reset(package=package, job_id=job_id, workspace=Path(workspace), payload=payload)
         try:
             ctx, bundle = build_bundle(Path(workspace), job_id, force=bool(payload.get("new_generation")))
             if not bundle_current(package)[0]:
-                response = {"status": "blocked", "blockers": ["bundle_invalid"], "engine": "materials-vnext"}
+                response: dict[str, Any] = {"status": "blocked", "blockers": ["bundle_invalid"], "engine": "materials-vnext"}
                 if stage in {"apply", "ready"}:
                     response["apply_ready"] = False
                 if stage in {"format", "mechanical_format"}:
@@ -1031,22 +767,13 @@ class MaterialsEngine:
         # User-ruling and acceptance stages operate on the recorded audit
         # state.  They run before any drafting/transform handling because they
         # never involve new content.
-        if stage == "resolve" or payload.get("decisions") is not None:
-            return _record_resolve(package, run, payload.get("decisions"), workspace=Path(workspace))
-        if stage == "accept":
-            return _record_acceptance(package, run, payload)
-        if stage == "audit" and text(payload.get("audit_dispatch")).casefold() in {"suspend", "resume"}:
-            updated = dict(run)
-            suspend = text(payload.get("audit_dispatch")).casefold() == "suspend"
-            updated["audit_dispatch_suspended"] = suspend
-            save_run(package, updated)
-            write_event(package, "audit_dispatch_" + ("suspended" if suspend else "resumed"), generation_id=run.get("generation_id"))
-            return {
-                "status": "succeeded",
-                "after_state": updated.get("phase"),
-                "audit_dispatch_suspended": suspend,
-                "engine": "materials-vnext",
-            }
+        # User-ruling and acceptance stages operate on the recorded audit
+        # state (see stage_rulings); they never involve new content.
+        ruling = stage_rulings(
+            package=package, run=run, payload=payload, workspace=Path(workspace), stage=stage
+        )
+        if ruling is not None:
+            return ruling
 
         # Normalize the model submission once. A complete canonical
         # replacement that silently drops baseline blocks must be reported as
@@ -1485,7 +1212,6 @@ class MaterialsEngine:
             # cannot decide when or how V-column is updated; the bound
             # package/ledger determines the target and the sync coordinator
             # projects the same value to CSV/Sheets.
-            tracker_status: dict[str, Any]
             if not report.get("apply_ready"):
                 tracker_status = {
                     "status": "not_attempted",
@@ -1570,8 +1296,8 @@ class MaterialsEngine:
 
         if stage in {"audit_result", "audit"} or payload.get("audit_result") is not None:
             task = load_audit_task(package)
-            report = payload.get("audit_result")
-            if stage == "audit" and report is None:
+            audit_report: dict[str, Any] | None = payload.get("audit_result")
+            if stage == "audit" and audit_report is None:
                 if not task:
                     canonical = load_canonical(package)
                     if not canonical:
@@ -1602,10 +1328,10 @@ class MaterialsEngine:
                     "audit_dispatch": dispatched,
                     "engine": "materials-vnext",
                 }
-            if not task or not isinstance(report, dict):
+            if not task or not isinstance(audit_report, dict):
                 return {"status": "blocked", "blockers": ["audit_task_or_result_missing"], "engine": "materials-vnext"}
             try:
-                normalized = record_result(package, report, task=task, run=run)
+                normalized = record_result(package, audit_report, task=task, run=run)
             except ValueError as exc:
                 return {"status": "blocked", "blockers": ["invalid_audit_result"], "error": str(exc), "engine": "materials-vnext"}
             return {"status": "succeeded" if normalized.get("status") == "passed" else "blocked", "after_state": load_run(package).get("phase"), "engine": "materials-vnext", "audit": normalized}

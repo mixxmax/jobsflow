@@ -249,26 +249,58 @@ def test_material_lanes_follow_private_setup_mapping(tmp_path):
 
 
 
-def test_formal_query_pool_keeps_legaltech_capability_queries_on_g_lane():
-    from pathlib import Path
+def test_setup_generated_query_pool_preserves_lane_hints_and_terms(tmp_path):
+    """Setup-generated configs keep each query's lane hint/cadence/terms.
 
-    path = Path(__file__).parents[1] / "JobSearch_2026" / "00_Profile" / "queries.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    by_id = {item["id"]: item for item in data["queries"]}
-    expected = {
-        "g_legal_workflow_tools": "legal workflow tools",
-        "g_document_automation": "document automation legal",
-        "g_practitioner_workflow_efficiency": "practitioner workflow efficiency legal",
-        "g_legaltech_process_design_qa": "legal technology requirements process design quality assurance",
-        "g_legal_ops_implementation_support": "legal operations technology implementation support",
-        "g_legal_product_design": "legal product design",
+    Synthetic equivalent of the formal query-pool contract the private
+    runtime instantiates for its capability queries.  Uses synthetic data
+    only; never reads the gitignored private runtime instance.
+    """
+    from tools.fresh_24h.validate_queries import main as validate_queries_main
+
+    profession = {
+        "domain": "synthetic",
+        "mandatory_buckets": ["alpha", "beta", "gamma"],
+        "queries": [
+            {
+                "id": "synth_widget_tools",
+                "terms": {
+                    "linkedin": "synthetic widget tools",
+                    "jobsdb": "synthetic widget tools",
+                    "ctgoodjobs": "synthetic widget tools",
+                },
+                "track_hint": "G",
+                "cadence": "every_scan",
+            },
+            {
+                "id": "synth_gadget_testing",
+                "terms": {
+                    "linkedin": "synthetic gadget testing",
+                    "jobsdb": "synthetic gadget testing",
+                    "ctgoodjobs": "synthetic gadget testing",
+                },
+                "track_hint": "A",
+                "cadence": "every_scan",
+            },
+        ],
     }
-    for query_id, term in expected.items():
-        assert by_id[query_id]["track_hint"] == "G"
-        assert by_id[query_id]["cadence"] == "every_scan"
-        assert by_id[query_id]["terms"]["linkedin"] == term
-        assert by_id[query_id]["terms"]["jobsdb"] == term
-        assert by_id[query_id]["terms"]["ctgoodjobs"] == term
+    config = setup.build_queries_config(profession=profession, location="Hong Kong")
+    by_id = {item["id"]: item for item in config["queries"]}
+    assert by_id["synth_widget_tools"]["track_hint"] == "G"
+    assert by_id["synth_widget_tools"]["cadence"] == "every_scan"
+    for portal in ("linkedin", "jobsdb", "ctgoodjobs"):
+        assert by_id["synth_widget_tools"]["terms"][portal] == "synthetic widget tools"
+        assert by_id["synth_gadget_testing"]["terms"][portal] == "synthetic gadget testing"
+    path = tmp_path / "queries.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    assert validate_queries_main([str(path)]) == 0
+
+
+def test_public_query_template_stays_setup_required():
+    """The tracked template ships no profession-specific queries or buckets."""
+    from tools.fresh_24h.validate_queries import main as validate_queries_main
+
+    assert validate_queries_main([]) == 0
 
 
 def test_pdf_conversion_cache_is_content_and_engine_aware(tmp_path):

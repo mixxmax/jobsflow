@@ -172,13 +172,36 @@ cd jobsflow
 ### 2. 安裝
 
 ```bash
-PYTHON_BIN="$(command -v python3.12 || command -v python3.11 || command -v python3)"
-"$PYTHON_BIN" -c 'import sys; assert sys.version_info >= (3, 10), "JobsFlow requires Python 3.10+"'
-"$PYTHON_BIN" -m venv .venv
+"$(command -v python3.12 || command -v python3.11 || command -v python3)" -m venv .venv
 source .venv/bin/activate
-python3 -m pip install --require-hashes -r requirements.lock
+bash tools/setup_env.sh          # 运行依赖 + 钉死的 vendored SOP Control
+bash tools/setup_env.sh --check-only   # 仅验证环境，不安装（离线可用）
 python3 setup.py --doctor
 ```
+
+这是唯一的官方安装路径，CI 跑的是同一脚本（`--dev --strict`）外加系统
+LibreOffice。明确声明：本仓库是**源码运行模式**，不是标准 Python 包——
+`pip install .` 不受支持（根 `setup.py` 是安装向导，没有 `[build-system]`），
+安装测试（`tests/test_install_contract.py::test_clean_venv_acceptance_from_scratch`）
+按源码模式在干净虚拟环境里逐项验收。
+`sopctl` CLI 需要 editable 安装（脚本已含），workflow 网关在没有它时
+也能从 `vendor/` 直接导入同版本控制平面。贡献者用：
+
+```bash
+bash tools/setup_env.sh --dev      # 含 pytest 等开发依赖
+```
+
+主要行为开关（默认值即不设置时的行为）：
+
+| 开关 | 默认 | 说明 |
+|---|---|---|
+| `JOBSFLOW_SOPCONTROL_MODE` | 有 registry 时 `enforce`，否则 `off` | `observe`/`warn` 只记录不拦截；生产模型不能设 `off` |
+| `JOBSFLOW_SOPCONTROL_ALLOW_RELAX` / `JOBSFLOW_SOPCONTROL_TEST` | 关闭 | 仅测试夹具可放宽，生产无效 |
+| `JOBSFLOW_SOPCONTROL_ROOT` | 自动定位产品根 | 覆盖控制平面根目录（测试用） |
+
+`doctor` 会明确报告 `sopcontrol_mode`（`missing`/`off`/`observe`/`warn`/`enforce`）；
+缺失且 registry 存在时会给出修复命令，受治理的写操作则直接以
+`sopcontrol_unavailable` 失败关闭，不会静默放行。
 
 换模型或换执行平台时，先运行只读检查：
 

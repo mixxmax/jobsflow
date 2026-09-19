@@ -221,7 +221,7 @@ def check_prerequisites() -> dict[str, bool]:
         else:
             warn("Playwright installed but chromium not. Run: playwright install chromium")
     except ImportError:
-        warn("Playwright not installed. Install: pip install playwright && playwright install chromium")
+        warn("Playwright not installed. Re-run bash tools/setup_env.sh, then playwright install chromium")
 
     return results
 
@@ -268,7 +268,7 @@ def run_doctor() -> int:
         warn(f"materials base CV/CL: unavailable ({exc})")
     failed = [name for name, ready in checks.items() if not ready]
     if failed:
-        print("\nFix core Python packages with: python3 -m pip install -r requirements.lock")
+        print("\nFix core Python packages with: bash tools/setup_env.sh")
         print("Fix portal packages with: python3 setup.py --install-portals")
         print(f"Doctor: {len(failed)} check(s) need attention")
         return 1
@@ -323,6 +323,18 @@ def doctor_snapshot() -> dict[str, Any]:
             (cli_dir / "package.json").exists()
             and (cli_dir / "bun.lock").exists()
         )
+    # Explicit controller report: distinguish "not installed" from the
+    # observe/warn/enforce/off modes instead of silently passing.  A missing
+    # package with a portable registry present fail-closes governed writes
+    # (blocker sopcontrol_unavailable), so surface it here with a repair.
+    try:
+        from tools.workflow.sopcontrol_adapter import _import_sopcontrol, current_mode
+
+        _sop_api, _sop_err = _import_sopcontrol()
+        sopcontrol_mode = "missing" if _sop_api is None else current_mode()
+    except Exception:
+        sopcontrol_mode = "missing"
+    checks["sopcontrol"] = sopcontrol_mode != "missing"
     checks["tracker"] = bool(
         list((REPO / "JobSearch_2026" / "02_Tracker").glob("hk_apply_list_*.csv"))
     )
@@ -348,15 +360,23 @@ def doctor_snapshot() -> dict[str, Any]:
         elif name == "libreoffice":
             repair_commands.append("Install LibreOffice (headless soffice is required)")
         elif name == "playwright_browser":
-            repair_commands.append("playwright install chromium")
+            repair_commands.append("bash tools/setup_env.sh, then playwright install chromium")
         elif name.startswith("python_package:"):
-            if "python3 -m pip install -r requirements.lock" not in repair_commands:
-                repair_commands.append("python3 -m pip install -r requirements.lock")
+            if "bash tools/setup_env.sh" not in repair_commands:
+                repair_commands.append("bash tools/setup_env.sh")
         elif name.startswith("portal:"):
             if "python3 setup.py --install-portals" not in repair_commands:
                 repair_commands.append("python3 setup.py --install-portals")
         elif name == "tracker":
             repair_commands.append("python3 setup.py --resume-folder /path/to/cv-folder")
+        elif name == "sopcontrol":
+            repair_commands.append("bash tools/setup_env.sh (installs the pinned vendored SOP Control)")
+    if "sopcontrol" in failed and not (REPO / ".sopcontrol" / "rules" / "registry.yaml").is_file():
+        # No portable registry: the controller is intentionally off, so a
+        # missing package is not a failure.  (Post-loop on purpose: never
+        # mutate the list being iterated above.)
+        failed = [name for name in failed if name != "sopcontrol"]
+        checks["sopcontrol"] = True
     return {
         "schema_version": 1,
         "ready": not failed,
@@ -364,6 +384,7 @@ def doctor_snapshot() -> dict[str, Any]:
         "materials_ready": materials_base_ready,
         "materials_base": base_snapshot,
         "checks": checks,
+        "sopcontrol_mode": sopcontrol_mode,
         "failed": failed,
         "next_action": (
             "continue"
