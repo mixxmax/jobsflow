@@ -39,6 +39,7 @@ jobs:
       # contract (tools/setup_env.sh); no bare pip installs in CI.
       - run: bash tools/setup_env.sh --dev
       - run: python tools/lint_skills.py
+      - run: python tools/validate_command_scope.py
 
   security-guards:
     name: Security guards (permissions, gitignore, manifests)
@@ -73,12 +74,12 @@ jobs:
       - name: Install and verify environment (shared script)
         run: bash tools/setup_env.sh --dev --strict
       # Incremental type gate: only the modules listed in
-      # tools/check_types.py block. The rest of the tree is a recorded,
-      # non-blocking baseline (see docs/legacy_retirement.md).
+      # tools/check_types.py block. The rest of the tree is a recorded
+      # baseline (see docs/legacy_retirement.md).
       - name: Typecheck typed modules
         run: python tools/check_types.py
       - run: python -m pytest -q --cov=tools --cov-report=xml --cov-report=html --cov-report=term
-      - name: Coverage baseline (non-blocking; thresholds in tools/coverage_thresholds.json)
+      - name: Coverage gate (ratified branch thresholds)
         run: python tools/check_coverage.py
       - name: Upload coverage reports
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -159,14 +160,12 @@ jobs:
             -k 'not clean_venv_acceptance_from_scratch'
 
   dependency-review:
-    name: Dependency review (upstream PRs only)
-    # Requires the repo's Dependency graph, which forks never inherit and
-    # which may be disabled upstream - so: upstream PRs only, and the
-    # graph is probed first. If it is unavailable, the job warns and
-    # passes instead of hard-failing (the same graceful-skip pattern the
-    # workflow uses for optional tools). Enabling Dependency graph under
-    # Settings -> Advanced Security activates the real check.
-    if: github.event_name == 'pull_request' && github.repository == 'MadsLorentzen/ai-job-search'
+    name: Dependency review
+    # The dependency graph may be disabled on a fork. Probe it first; if it
+    # is unavailable, warn and pass rather than pretending the check ran.
+    # Enabling Dependency graph under Settings -> Advanced Security activates
+    # the real review for this repository.
+    if: github.event_name == 'pull_request' && github.repository == 'mixxmax/jobsflow'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

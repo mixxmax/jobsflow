@@ -77,7 +77,7 @@ class TestQualityControlUnit(unittest.TestCase):
 
     def test_sanitizer_redaction(self):
         """Verify that PII, tokens, cookies, emails, and private paths are redacted."""
-        raw_text = "Contact me at candidate@example.com or +1 555-123-4567. Bearer eyJhbGciOi. Path: /Users/xiezhijie/JobSearch_2026/00_Profile/resume.docx?token=secret123"
+        raw_text = "Contact me at candidate@example.com or +1 555-123-4567. Bearer eyJhbGciOi. Path: /Users/testuser/JobSearch_2026/00_Profile/resume.docx?token=secret123"
         sanitized = sanitize_text(raw_text)
 
         self.assertNotIn("candidate@example.com", sanitized)

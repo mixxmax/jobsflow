@@ -602,6 +602,7 @@ def test_gateway_ignores_a_legacy_engine_request(tmp_path):
     assert out["engine_version"] == "materials-vnext-1"
 
 
+@pytest.mark.legacy
 def test_direct_legacy_adapters_fail_closed(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws, with_outbound=False)

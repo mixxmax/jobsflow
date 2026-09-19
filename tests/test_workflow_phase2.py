@@ -16,7 +16,7 @@ from tools.workflow.task_packet import evaluate_model_output
 from tools.workflow.testing_packages import build_package, build_workspace, prepare_package_for_apply
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_materials_missing_jd_is_blocked(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws, full_jd=False, with_plan=False, with_outbound=False)
@@ -27,7 +27,7 @@ def test_materials_missing_jd_is_blocked(tmp_path):
     assert "next_command" not in out
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_materials_loads_real_packet_content(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws, with_plan=False, with_outbound=False)
@@ -48,7 +48,7 @@ def test_materials_loads_real_packet_content(tmp_path):
     assert packet["input_hashes"]["jd"]
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_compliant_package_can_reach_apply_ready(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws)
@@ -70,7 +70,7 @@ def test_transferable_as_direct_is_not_an_apply_blocker_without_other_failures(t
     assert "transferable_upgraded_to_direct" not in out["blockers"]
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_recruiter_name_blocks_apply(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws, recruiter_in_name=True)
@@ -79,7 +79,7 @@ def test_recruiter_name_blocks_apply(tmp_path):
     assert "recruiter_in_filename" in out["blockers"]
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_language_mismatch_blocks_apply(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws, language_mismatch=True)
@@ -88,7 +88,7 @@ def test_language_mismatch_blocks_apply(tmp_path):
     assert "language_inconsistent" in out["blockers"] or "numbers_inconsistent" in out["blockers"]
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_missing_attachment_blocks_apply(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws, missing_attachment=True)
@@ -97,7 +97,7 @@ def test_missing_attachment_blocks_apply(tmp_path):
     assert "required_attachment_missing" in out["blockers"]
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_stale_assessment_blocks_materials(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws, assessment_stale=True, with_plan=False, with_outbound=False)
@@ -106,7 +106,7 @@ def test_stale_assessment_blocks_materials(tmp_path):
     assert "assessment_missing_or_stale" in out["blockers"]
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_schema_repair_then_review(tmp_path):
     ws = build_workspace(tmp_path)
     build_package(ws, with_plan=False, with_outbound=False)
