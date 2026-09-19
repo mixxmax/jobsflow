@@ -13,7 +13,7 @@ from tools.workflow.materials_orchestrator import reset
 from tools.workflow.testing_packages import baseline_transform_fixture, build_package, build_workspace
 
 
-pytestmark = pytest.mark.legacy
+pytestmark = pytest.mark.retired_legacy
 
 
 def _plan(package):

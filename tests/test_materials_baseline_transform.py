@@ -86,7 +86,7 @@ def test_host_removes_optional_address_slot_and_seeds_jd_placeholders(tmp_path):
     assert "Draft vendor contracts" in cl_text
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_host_owns_cover_letter_company_line_and_model_cannot_rewrite_it(tmp_path):
     workspace = build_workspace(tmp_path)
     cl_master = workspace / "01_Masters" / "C_track" / "cl_master_C_test_v1.docx"
@@ -303,7 +303,7 @@ def test_audit_fingerprint_binds_the_frozen_lane_content_baseline(tmp_path):
     assert second != first
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_apply_fails_closed_if_the_bound_lane_baseline_changes_after_render(tmp_path):
     workspace = build_workspace(tmp_path)
     package = build_package(workspace)
@@ -440,7 +440,7 @@ def test_near_total_rewrite_is_rejected_but_focused_rewriting_remains_available(
     assert "baseline_transform_too_broad:cv" in outcome["error"]
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_broad_but_not_replacement_delta_routes_to_stronger_audit(tmp_path):
     workspace = build_workspace(tmp_path)
     package = build_package(workspace, with_outbound=False)
@@ -609,7 +609,7 @@ def test_complete_looking_replacement_cannot_bypass_the_baseline(tmp_path):
     assert "Summary prototype" in "\n".join(block["text"] for block in current["cv"]["blocks"])
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_transform_can_reorder_existing_evidence_without_rewriting_the_cv(tmp_path):
     workspace = build_workspace(tmp_path)
     package = build_package(workspace, with_outbound=False)
@@ -664,7 +664,7 @@ def test_transform_can_reorder_existing_evidence_without_rewriting_the_cv(tmp_pa
     assert draft["baseline_dispositions"][target["id"]]["action"] == "reorder"
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_transform_can_merge_baseline_blocks_only_with_traceable_coverage(tmp_path):
     workspace = build_workspace(tmp_path)
     package = build_package(workspace, with_outbound=False)
@@ -724,7 +724,7 @@ def test_transform_can_merge_baseline_blocks_only_with_traceable_coverage(tmp_pa
     )
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_content_audit_refuses_a_canonical_file_with_silent_baseline_loss(tmp_path):
     workspace = build_workspace(tmp_path)
     package = build_package(workspace, with_outbound=False)

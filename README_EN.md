@@ -543,7 +543,14 @@ python3 tools/public_release_check.py --history
 pytest -q
 ```
 
-See [PUBLIC_RELEASE.md](PUBLIC_RELEASE.md) for release hygiene and history handling.
+See [docs/PUBLIC_READINESS_2026-07-31.md](docs/PUBLIC_READINESS_2026-07-31.md) for release hygiene and history handling.
+
+### Credits and product lineage
+
+JobsFlow is maintained as an independent product line. It preserves the MIT
+license and copyright attribution from [ai-job-search](https://github.com/MadsLorentzen/ai-job-search);
+the workflow, SOP Control, materials pipeline and reliability work are
+maintained in this repository.
 
 ## Version
 

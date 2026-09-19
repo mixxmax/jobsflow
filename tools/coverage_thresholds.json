@@ -1,36 +1,36 @@
 {
-  "_comment": "Stage-1 baseline (non-blocking): enforce=false only records. Flip enforce to true when stage-2 thresholds below are ratified; check_coverage.py then fails the build on regression. Branch coverage is the primary metric; failure-path coverage is reviewed per module, not averaged.",
-  "enforce": false,
+  "_comment": "Stage-2 ratified branch thresholds (2026-09-19 clean worktree run). Branch coverage is the primary metric; failure-path coverage is reviewed per module, not averaged. Thresholds are deliberately below the observed baseline to catch regressions without freezing incidental test-layout noise.",
+  "enforce": true,
   "modules": {
     "tools/workflow/policy.py": {
-      "branch": 0.0,
-      "note": "stage-1 baseline 92.7% (term, final-tree VM run 2026-09-19; TOTAL 66.1%)",
-      "baseline": 92.7
+      "branch": 85.0,
+      "note": "observed 87.5% (clean worktree, 784 passed; ratified floor 85.0%)",
+      "baseline": 87.5
     },
     "tools/workflow/entity_state.py": {
-      "branch": 0.0,
-      "note": "stage-1 baseline 90.1% (term, final-tree VM run 2026-09-19; TOTAL 66.1%)",
-      "baseline": 90.1
+      "branch": 75.0,
+      "note": "observed 76.5% (clean worktree, 784 passed; ratified floor 75.0%)",
+      "baseline": 76.5
     },
     "tools/workflow/confirmation.py": {
-      "branch": 0.0,
-      "note": "stage-1 baseline 87.6% (term, final-tree VM run 2026-09-19; TOTAL 66.1%)",
-      "baseline": 87.6
+      "branch": 75.0,
+      "note": "observed 78.9% (clean worktree, 784 passed; ratified floor 75.0%)",
+      "baseline": 78.9
     },
     "tools/workflow/reset.py": {
-      "branch": 0.0,
-      "note": "stage-1 baseline 82.3% (term, final-tree VM run 2026-09-19; TOTAL 66.1%)",
-      "baseline": 82.3
+      "branch": 65.0,
+      "note": "observed 69.8% (clean worktree, 784 passed; ratified floor 65.0%)",
+      "baseline": 69.8
     },
     "tools/workflow/private_notes.py": {
-      "branch": 0.0,
-      "note": "stage-1 baseline 78.8% (term, final-tree VM run 2026-09-19; TOTAL 66.1%)",
-      "baseline": 78.8
+      "branch": 60.0,
+      "note": "observed 61.9% (clean worktree, 784 passed; ratified floor 60.0%)",
+      "baseline": 61.9
     },
     "tools/workflow/materials_vnext": {
-      "branch": 0.0,
-      "note": "stage-1 baseline: package-level, see per-file table in CI artifacts",
-      "baseline": null
+      "branch": 65.0,
+      "note": "observed 68.9% package branch coverage (clean worktree, 784 passed; ratified floor 65.0%)",
+      "baseline": 68.9
     }
   }
 }

@@ -67,7 +67,7 @@ def test_push_merges_and_keeps_old_fresh_rows(tmp_path):
     assert any(is_assigned_job_id(job_id) for job_id in ids)
 
 
-@pytest.mark.legacy
+@pytest.mark.retired_legacy
 def test_editing_cv_or_plan_invalidates_apply_ready(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws)

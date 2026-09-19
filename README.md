@@ -709,7 +709,11 @@ python3 tools/public_release_check.py --source
 pytest -q
 ```
 
-發佈衞生、歷史清理和可復現檢查見 [PUBLIC_RELEASE.md](PUBLIC_RELEASE.md)；完整的安全邊界與運行規則見 [docs/system_rules.md](docs/system_rules.md)。提交前請確認 `python3 tools/public_release_check.py --source` 通過，並只發布乾淨快照，不要把個人工作區歷史帶入公開倉庫。
+發佈衞生、歷史清理和可復現檢查見 [docs/PUBLIC_READINESS_2026-07-31.md](docs/PUBLIC_READINESS_2026-07-31.md)；完整的安全邊界與運行規則見 [docs/system_rules.md](docs/system_rules.md)。提交前請確認 `python3 tools/public_release_check.py --source` 通過，並只發布乾淨快照，不要把個人工作區歷史帶入公開倉庫。
+
+### 致謝與產品沿革
+
+JobsFlow 是獨立維護的產品線，保留了源自 [ai-job-search](https://github.com/MadsLorentzen/ai-job-search) 的 MIT 許可與版權聲明；本倉庫後續的工作流、SOP Control、材料鏈和可靠性修復均在本項目中獨立維護。
 
 ---
 

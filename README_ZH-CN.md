@@ -674,7 +674,11 @@ python3 tools/public_release_check.py --source
 pytest -q
 ```
 
-发布卫生、历史清理和可复现检查见 [PUBLIC_RELEASE.md](PUBLIC_RELEASE.md)；完整的安全边界与运行规则见 [docs/system_rules.md](docs/system_rules.md)。提交前请确认 `python3 tools/public_release_check.py --source` 通过，并只发布干净快照，不要把个人工作区历史带入公开仓库。
+发布卫生、历史清理和可复现检查见 [docs/PUBLIC_READINESS_2026-07-31.md](docs/PUBLIC_READINESS_2026-07-31.md)；完整的安全边界与运行规则见 [docs/system_rules.md](docs/system_rules.md)。提交前请确认 `python3 tools/public_release_check.py --source` 通过，并只发布干净快照，不要把个人工作区历史带入公开仓库。
+
+### 致谢与产品沿革
+
+JobsFlow 是独立维护的产品线，保留了源自 [ai-job-search](https://github.com/MadsLorentzen/ai-job-search) 的 MIT 许可与版权声明；本仓库后续的工作流、SOP Control、材料链和可靠性修复均在本项目中独立维护。
 
 ---
 

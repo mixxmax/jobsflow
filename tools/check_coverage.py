@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Coverage gate, stage-1: record baseline, do not block.
+"""Coverage gate, stage-2: enforce ratified branch thresholds.
 
-Reads tools/coverage_thresholds.json.  With "enforce": false (current) it
-prints the per-module branch table from coverage.xml and always exits 0.
-Flipping "enforce" to true (stage 2, after ratified thresholds) makes any
-module below its branch threshold fail the build.
+Reads tools/coverage_thresholds.json and prints the per-module branch table
+from coverage.xml.  A module below its ratified branch threshold fails the
+build; the thresholds are intentionally conservative so they detect
+regressions without turning incidental test-layout changes into noise.
 """
 
 from __future__ import annotations
@@ -77,7 +77,9 @@ def main() -> int:
             print(f"  - {item}", file=sys.stderr)
         return 1
     if not config.get("enforce"):
-        print("(baseline mode: enforce=false, not blocking)")
+        # Keep this branch for local compatibility with an explicitly
+        # disabled configuration, but never use it in the checked-in gate.
+        print("(coverage enforcement disabled by configuration)")
     else:
         print("coverage thresholds met")
     return 0
