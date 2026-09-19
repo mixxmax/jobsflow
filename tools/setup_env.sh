@@ -47,6 +47,9 @@ if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
 else
     PYTHON_BIN=""
     for candidate in \
+        "${JOBSFLOW_PYTHON:-}" \
+        "${pythonLocation:-}/bin/python" \
+        "${Python_ROOT_DIR:-}/bin/python" \
         "$(command -v python 2>/dev/null)" \
         "$(command -v python3 2>/dev/null)" \
         "$(command -v python3.12 2>/dev/null)" \
