@@ -43,17 +43,24 @@ if __package__ in {None, ""}:
 from tools.salary_parsing import PARSED, parse_localized_number
 
 
-# Column name patterns for auto-detection
-COMPANY_PATTERNS = {"firma", "company", "virksomhed", "employer", "arbejdsgiver"}
-CITY_PATTERNS = {"by", "city", "kommune", "location", "lokation", "sted"}
-COUNT_PATTERNS = {"antal", "count", "number", "n", "employees", "medarbejdere"}
-INDEX_PATTERNS = {"indeks", "index", "idx", "salary", "løn", "median", "average", "gennemsnit"}
+# Column name patterns for auto-detection (English + Traditional/Simplified Chinese,
+# tuned for Hong Kong salary exports).
+COMPANY_PATTERNS = {"company", "employer", "公司", "企業", "企业", "僱主", "雇主"}
+CITY_PATTERNS = {"city", "location", "城市", "地區", "地区", "地點", "地点"}
+COUNT_PATTERNS = {"count", "number", "n", "employees", "數量", "数量", "人數", "人数", "僱員", "雇员"}
+INDEX_PATTERNS = {
+    "index", "idx", "salary", "median", "average",
+    "指數", "指数", "薪金", "薪资", "薪酬", "中位數", "中位数", "平均數", "平均数",
+}
 # "Compound" tokens: pattern words allowed to match as a substring of a larger
-# header token, for languages that glue words together (e.g. Danish "lønindeks"
-# -> løn + indeks). Languages that write headers as separate words need none.
-# Ships populated for this repo's Danish demonstration data; a fork targeting
-# another locale edits this constant.
-COMPOUND_PATTERNS = {"antal", "indeks", "løn", "gennemsnit", "medarbejdere"}
+# header token. Chinese headers have no word spaces (e.g. "薪金指數" is one
+# token), so CJK keywords live here; spaced English headers match whole-token
+# and need none.
+COMPOUND_PATTERNS = {
+    "數量", "数量", "人數", "人数", "僱員", "雇员",
+    "指數", "指数", "薪金", "薪资", "薪酬",
+    "中位數", "中位数", "平均數", "平均数",
+}
 
 
 def parse_numeric_cell(value):
@@ -80,7 +87,7 @@ def header_matches(header, patterns):
     languages that form compound words.
     """
     h = header.lower().strip()
-    tokens = set(re.findall(r"[a-zæøåöäü0-9]+", h))
+    tokens = set(re.findall(r"[a-zæøåöäü0-9\u4e00-\u9fff]+", h))
 
     for p in patterns:
         if p in tokens:
@@ -94,7 +101,12 @@ def strip_type_patterns(header, patterns):
     """Remove count/index words from a header to derive a category name."""
     name = header.lower()
     for p in patterns:
-        name = re.sub(rf"(?<![a-zæøåöäü0-9]){re.escape(p)}(?![a-zæøåöäü0-9])", "", name)
+        if re.search(r"[\u4e00-\u9fff]", p):
+            # CJK headers have no word spaces, so glued keywords ("工程師數量")
+            # are stripped without word-boundary lookarounds.
+            name = name.replace(p, "")
+        else:
+            name = re.sub(rf"(?<![a-zæøåöäü0-9]){re.escape(p)}(?![a-zæøåöäü0-9])", "", name)
     return name.strip(" _-")
 
 

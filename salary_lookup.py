@@ -12,7 +12,7 @@ instructions on the expected format and how to convert from Excel.
 
 Usage:
     python salary_lookup.py "Company Name"
-    python salary_lookup.py "Company Name" --city "København"
+    python salary_lookup.py "Company Name" --city "Hong Kong"
     python salary_lookup.py "Company Name" --json
     python salary_lookup.py --list-all
 """
@@ -26,19 +26,22 @@ from pathlib import Path
 
 DATA_FILE = Path(__file__).parent / "salary_data.json"
 
-# Common Danish <-> anglicized spelling variants
+# Latin diacritic folding for fuzzy matching (e.g. ü -> u, æ -> ae).
+# Kept generic: Hong Kong data routinely contains European company names.
 SPELLING_VARIANTS = {
     "ø": "o", "æ": "ae", "å": "aa",
     "ö": "o", "ä": "ae", "ü": "u",
 }
 
-# Legal suffixes and noise to strip when matching company names
+# Legal suffixes and noise to strip when matching company names.
+# Covers English common-law forms and Chinese forms used in Hong Kong.
 STRIP_PATTERNS = [
-    r"\ba/s\b", r"\baps\b", r"\bi/s\b", r"\bp/s\b", r"\bk/s\b",
-    r"\bivs\b", r"\bamba\b", r"\ba\.m\.b\.a\.\b",
-    r"\(vg\)", r"\(.*?\)",  # (VG) and other parentheticals
-    r"\bdanmark\b", r"\bdenmark\b", r"\bscandinavia\b", r"\bnordic\b",
-    r"\bgroup\b", r"\bholding\b",
+    r"\bltd\.?\b", r"\blimited\b",
+    r"\bllc\b", r"\binc\.?\b", r"\bincorporated\b",
+    r"\bcorp\.?\b", r"\bcorporation\b", r"\bplc\b", r"\bgmbh\b", r"\bpty\.?\b",
+    r"股份有限公司", r"有限公司",
+    r"\(.*?\)",  # parentheticals: (Hong Kong), (Asia), etc.
+    r"\bgroup\b", r"\bholding\b", r"\bholdings\b",
     r",\s*.*$",  # everything after comma (sub-entities)
 ]
 
@@ -62,15 +65,15 @@ def normalize(s):
     s = s.lower().strip()
     for pat in STRIP_PATTERNS:
         s = re.sub(pat, "", s)
-    s = re.sub(r"[^a-zæøåöäü0-9]", "", s)
+    s = re.sub(r"[^a-zæøåöäü0-9\u4e00-\u9fff]", "", s)
     return s.strip()
 
 
 def anglicize(s):
-    """Convert Danish/Nordic characters to anglicized equivalents."""
+    """Fold Latin diacritics to ASCII equivalents for fuzzy matching."""
     s = s.lower()
-    for danish, english in SPELLING_VARIANTS.items():
-        s = s.replace(danish, english)
+    for folded, english in SPELLING_VARIANTS.items():
+        s = s.replace(folded, english)
     return s
 
 
@@ -79,7 +82,7 @@ def extract_core_words(s):
     s = s.lower()
     for pat in STRIP_PATTERNS:
         s = re.sub(pat, "", s)
-    words = re.findall(r"[a-zæøåöäü0-9]+", s)
+    words = re.findall(r"[a-zæøåöäü0-9\u4e00-\u9fff]+", s)
     return [w for w in words if len(w) > 1]
 
 
@@ -278,7 +281,7 @@ def main():
         if args.city:
             print(f"  (filtered by city: {args.city})")
         print("\nTry a shorter or different name. Company names in the dataset")
-        print("may include legal suffixes like 'A/S' or 'ApS'.")
+        print("may include legal suffixes like 'Limited', 'LLC' or '有限公司'.")
         sys.exit(1)
 
     if args.json:
