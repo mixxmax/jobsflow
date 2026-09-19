@@ -29,7 +29,7 @@ describe("runSearch", () => {
     }) as typeof process.stdout.write;
 
     const code = await runSearch({
-      location: "Copenhagen, Denmark",
+      location: "Hong Kong",
       jobage: 9999,
       page: 1,
       limit: 0,
