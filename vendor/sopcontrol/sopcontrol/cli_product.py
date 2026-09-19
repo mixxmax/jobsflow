@@ -21,11 +21,14 @@ def cmd_compat(args) -> int:
             f"platform: os={plat['os']} python={plat['python']} "
             f"supported={plat['python_supported'] and plat['os_supported']}"
         )
+        print(f"  os_support_level={plat['os_support_level']} ({plat['os_probe']})")
+        print(f"  python_support_level={plat['python_support_level']} ({plat['python_probe']})")
         print("declared matrix:")
         print(f"  python: {report['matrix']['python']}")
         print(f"  os: {report['matrix']['os']}")
         for name, meta in report["matrix"]["harnesses"].items():
-            print(f"  harness {name}: {meta['status']} — {meta['interception']}")
+            print(f"  harness {name}: {meta['status']} "
+                  f"[level={meta.get('support_level', 'unproven')}] — {meta['interception']}")
         print("perf budgets (seconds):")
         for k, v in PERF_BUDGETS.items():
             print(f"  {k}: {v}")

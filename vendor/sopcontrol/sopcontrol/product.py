@@ -10,6 +10,13 @@ from typing import Any
 from .attachment import apply_attachment, attachment_status, plan_attachment
 from .coverage import control_coverage
 
+# Evidence-graded support levels. "live_verified" means a probe actually ran
+# green on this machine; anything else is "unproven" — never forged from
+# OS/version strings alone (§A1).
+SUPPORT_LIVE_VERIFIED = "live_verified"
+SUPPORT_DECLARED = "declared"
+SUPPORT_UNPROVEN = "unproven"
+
 # Declared support matrix — documentation + runtime self-check share this table.
 INSTALL_MATRIX: dict[str, Any] = {
     "python": ["3.10", "3.11", "3.12"],
@@ -22,16 +29,22 @@ INSTALL_MATRIX: dict[str, Any] = {
         "opencode": {
             "interception": "runtime plugin tool.execute.before",
             "status": "live_verified",
+            "support_level": SUPPORT_LIVE_VERIFIED,
+            "evidence": "tests/harness/test_adapters.py, tests/harness/test_action_plane.py",
             "notes": "Requires writable .opencode/plugins",
         },
         "claude": {
             "interception": "PreToolUse protocol via .claude/settings.json",
             "status": "protocol_adapted",
+            "support_level": "protocol_adapted",
+            "evidence": "tests/harness/test_claude_hooks.py",
             "notes": "Live depends on environment API key; corrupt settings → local gap",
         },
         "codex": {
             "interception": "none pre-tool; projection + sopctl wrap/enter + git/CI gate",
             "status": "live_verified_posthoc",
+            "support_level": "live_verified_posthoc",
+            "evidence": "tests/harness (wrap/enter/gate posthoc paths)",
             "notes": "Must not report runtime enforceable for pre-tool",
         },
     },
@@ -47,15 +60,55 @@ PERF_BUDGETS = {
 }
 
 
-def current_platform_info() -> dict[str, Any]:
+def _probe_python_subprocess() -> tuple[bool, str]:
+    """Genuine probe: can this interpreter actually spawn and run code?
+
+    A version string only proves what the binary claims; spawning proves
+    the runtime works here. Returns (ok, evidence_detail).
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.exit(0)"],
+            capture_output=True, timeout=30)
+        if proc.returncode == 0:
+            return True, f"spawn {sys.executable} rc=0"
+        return False, f"spawn {sys.executable} rc={proc.returncode}"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def current_platform_info(*, probe: bool = True) -> dict[str, Any]:
+    """Declared membership (supported) is separate from probe evidence (level).
+
+    support_level is "live_verified" only when the cell matches this machine
+    AND the corresponding probe just ran green. Anything else is "unproven" —
+    never forged from OS/version strings.
+    """
+    from .resolve_cli import hook_shell_available
+
+    py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    py_supported = py_version in {v for v in INSTALL_MATRIX["python"]}
+    os_name = platform.system()
+    os_supported = os_name in {"Darwin", "Linux", "Windows"}
+    if probe:
+        py_ok, py_why = _probe_python_subprocess()
+        shell_ok, shell_why = hook_shell_available()
+    else:
+        py_ok, py_why = False, "probe skipped"
+        shell_ok, shell_why = False, "probe skipped"
     return {
         "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        "python_supported": f"{sys.version_info.major}.{sys.version_info.minor}"
-        in {v for v in INSTALL_MATRIX["python"]},
-        "os": platform.system(),
-        "os_supported": platform.system() in {"Darwin", "Linux", "Windows"},
-        "os_verified": platform.system() == "Darwin" and platform.machine() == "arm64",
-        "python_verified": f"{sys.version_info.major}.{sys.version_info.minor}" == "3.12",
+        "python_supported": py_supported,
+        "python_support_level": (
+            SUPPORT_LIVE_VERIFIED if (py_supported and py_ok) else SUPPORT_UNPROVEN),
+        "python_probe": py_why,
+        "os": os_name,
+        "os_supported": os_supported,
+        "os_support_level": (
+            SUPPORT_LIVE_VERIFIED if (os_supported and shell_ok) else SUPPORT_UNPROVEN),
+        "os_probe": shell_why,
         "platform": platform.platform(),
         "machine": platform.machine(),
     }

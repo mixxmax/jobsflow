@@ -314,32 +314,36 @@ def confirm_candidate(
 
         rid = rule_id or ("DR-" + content_hash({"statement": statement})[:8].upper())
         registry = Registry(root / ".sopcontrol" / "rules" / "registry.yaml")
-        rules = registry.load()
-        existing = next((r for r in rules if r.rule_id == rid), None)
-        owner = "user" if (user_attested or (confirmation_id and confirmation_secret)) else (actor or "agent")
-        if existing is None:
-            first_quote = record.sources[0].ref if record.sources else source_ref_of(record)
-            rule = Rule(
-                rule_id=rid, statement=statement,
-                modality=record.suggested_modality,  # type: ignore[arg-type]
-                status=RuleStatus.proposed, rule_class="dynamic_sop",
-                owner=owner,
-                source=SourceRef(type="user_conversation", ref=first_quote),
-                activation=(ActivationSelector.model_validate(activation)
-                            if activation else ActivationSelector()),
-                flexibility=(Flexibility.model_validate(flexibility)
-                             if flexibility else Flexibility()),
-                tags=["dynamic_sop"],
-            )
-            registry.add(rule)
-        else:
-            rid = existing.rule_id
-        # 生命周期：确认只保证 accepted；compiled 必须另走 compile_rule（§6.1）。
-        current = next(r for r in registry.load() if r.rule_id == rid)
-        if current.status != RuleStatus.accepted:
-            registry.transition(rid, RuleStatus.accepted)
+        # 同一锁保护整个确认事务（C4）：add 与 accepted 迁移之间不允许插入
+        # 其他写入，否则并发确认可能产生重复登记或状态丢失。exclusive 可重入，
+        # 内层 add/transition 照常工作。
+        with registry.exclusive():
+            rules = registry.load()
+            existing = next((r for r in rules if r.rule_id == rid), None)
+            owner = "user" if (user_attested or (confirmation_id and confirmation_secret)) else (actor or "agent")
+            if existing is None:
+                first_quote = record.sources[0].ref if record.sources else source_ref_of(record)
+                rule = Rule(
+                    rule_id=rid, statement=statement,
+                    modality=record.suggested_modality,  # type: ignore[arg-type]
+                    status=RuleStatus.proposed, rule_class="dynamic_sop",
+                    owner=owner,
+                    source=SourceRef(type="user_conversation", ref=first_quote),
+                    activation=(ActivationSelector.model_validate(activation)
+                                if activation else ActivationSelector()),
+                    flexibility=(Flexibility.model_validate(flexibility)
+                                 if flexibility else Flexibility()),
+                    tags=["dynamic_sop"],
+                )
+                registry.add(rule)
+            else:
+                rid = existing.rule_id
+            # 生命周期：确认只保证 accepted；compiled 必须另走 compile_rule（§6.1）。
+            current = next(r for r in registry.load() if r.rule_id == rid)
+            if current.status != RuleStatus.accepted:
+                registry.transition(rid, RuleStatus.accepted)
+            final = next(r for r in registry.load() if r.rule_id == rid)
         store.triage(candidate_id, "triaged")
-        final = next(r for r in registry.load() if r.rule_id == rid)
         return {"decision": decision, "rule_id": rid,
                 "rule_status": final.status.value, "permanent": True,
                 "status": "confirmed",
@@ -402,15 +406,17 @@ def compile_rule(root: Path | str, rule_id: str, *,
     rule.compile_digest = digest
     rule.compile_tool = "sopcontrol-compile/1"
     rule.compiled_at = utcnow()
-    registry.transition(rule_id, RuleStatus.compiled)
-    # transition 只改状态；证据字段需显式回写（registry 按 rule_id 全量保存）。
-    rules = registry.load()
-    for r in rules:
-        if r.rule_id == rule_id:
-            r.compile_digest = digest
-            r.compile_tool = "sopcontrol-compile/1"
-            r.compiled_at = rule.compiled_at
-    registry.save(rules)
+    # 同一锁保护编译事务（C4）：transition 与证据回写之间不允许插入其他写入。
+    with registry.exclusive():
+        registry.transition(rule_id, RuleStatus.compiled)
+        # transition 只改状态；证据字段需显式回写（registry 按 rule_id 全量保存）。
+        rules = registry.load()
+        for r in rules:
+            if r.rule_id == rule_id:
+                r.compile_digest = digest
+                r.compile_tool = "sopcontrol-compile/1"
+                r.compiled_at = rule.compiled_at
+        registry.save(rules)
     return {"rule_id": rule_id, "rule_status": RuleStatus.compiled.value,
             "compile_digest": digest, "compile_tool": "sopcontrol-compile/1",
             "compiled_by": actor,
@@ -507,45 +513,12 @@ def select_rules(rules: list[Rule], context: dict[str, str]
     WP-F：本函数只收 rules 显式入参，永不读取 once-only 会话文件——
     会话残留无论如何不能影响规则选择（见测试）。
 
-    not_applicable 项带可解释原因（§4.4 要求的措辞形态）：
-    "规则 DR-001 存在且 active；本次未选择，因为 action=jobs.scan，规则要求 action=materials.audit。"
-    unproven 项（§5.2）：规则约束了某维度但本次上下文缺失——无法证明适用，
-    不选择，也不伪装成 not_applicable：
-    "规则 DR-001 未激活：无法证明 action，规则要求 action=materials.audit。"
+    实现委托统一入口 rule_select（单点语义；reason 措辞保持 §4.4/§5.2 原样）。
     空选择器维度 = 不限。
     """
-    selected: list[Rule] = []
-    not_applicable: list[dict[str, str]] = []
-    unproven: list[dict[str, str]] = []
-    for rule in rules:
-        if rule.status not in (RuleStatus.accepted, RuleStatus.compiled,
-                               RuleStatus.activated, RuleStatus.monitored):
-            continue  # 非权威态不参与选择（observed/proposed 不得硬拦截）
-        mismatches: list[tuple[str, str, str]] = []
-        missing: list[tuple[str, str]] = []
-        for field in _SELECTOR_FIELDS:
-            wanted = getattr(rule.activation, field)
-            if not wanted:
-                continue
-            dim = _CONTEXT_KEYS[field]
-            ctx_value = str(context.get(dim, ""))
-            if not ctx_value:
-                missing.append((dim, wanted[0]))
-            elif ctx_value not in wanted:
-                mismatches.append((dim, ctx_value, wanted[0]))
-        if missing:
-            dim, required = missing[0]
-            unproven.append({
-                "rule_id": rule.rule_id, "missing_field": dim,
-                "reason": (f"规则 {rule.rule_id} 未激活：无法证明 {dim}，"
-                           f"规则要求 {dim}={required}。"),
-                "rule_class": rule.rule_class})
-        elif mismatches:
-            dim, actual, required = mismatches[0]
-            reason = (f"规则 {rule.rule_id} 存在且 {rule.status.value}；"
-                      f"本次未选择，因为 {dim}={actual}，规则要求 {dim}={required}。")
-            not_applicable.append({"rule_id": rule.rule_id, "reason": reason,
-                                   "rule_class": rule.rule_class})
-        else:
-            selected.append(rule)
-    return selected, not_applicable, unproven
+    from .rule_select import select_rules_for_action
+
+    selection = select_rules_for_action(rules, context)
+    by_id = {rule.rule_id: rule for rule in rules}
+    return ([by_id[s.rule_id] for s in selection.selected if s.rule_id in by_id],
+            selection.not_applicable, selection.unproven)

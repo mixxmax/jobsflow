@@ -12,6 +12,7 @@ from .model import Modality, RiskLevel, Rule, RuleStatus, SourceRef, utcnow
 from .registry import Registry, RegistryError
 
 __all__ = [
+    "cmd_confirm",
     "cmd_rule_add",
     "cmd_rule_list",
     "cmd_rule_accept",
@@ -63,15 +64,92 @@ def cmd_rule_add(args) -> int:
             detail = "；".join(c["reason"] for c in conflicts)
             print(f"错误: 规则冲突（14.1 场景10）：{detail}", file=sys.stderr)
             return 2
+        # P0 确认原子性：accepted 写入前先验确认凭据；无凭据/错凭据零写入。
+        # CLI 自称（--owner/actor）不等于用户确认，不能铸造权威。
+        from .confirmation import (
+            ConfirmationError,
+            approve_confirmation,
+            change_digest,
+        )
+        from .identity import load_identity
+
+        confirmation_id = getattr(args, "confirmation_id", "") or ""
+        if not confirmation_id:
+            print("错误: --status accepted 需要可信确认凭据（--confirmation-id + "
+                  "secret）；先 sopctl confirm request，再凭用户批准执行。"
+                  "未写入任何规则", file=sys.stderr)
+            return 2
+        try:
+            ident = load_identity(root)
+            approval = approve_confirmation(
+                root, confirmation_id,
+                secret=getattr(args, "confirmation_secret", "") or "",
+                secret_file=getattr(args, "secret_file", "") or "",
+                expected_digest=change_digest(rule.rule_id, rule.statement),
+                expected_project_id=(ident.project_id if ident else ""))
+        except ConfirmationError as exc:
+            print(f"错误: 确认凭据无效: {exc}。未写入任何规则", file=sys.stderr)
+            return 2
+        confirmed_via = approval["confirmation_id"]
+    else:
+        confirmed_via = ""
     reg.add(rule)
     print(f"已登记规则 {rule.rule_id} [{rule.status.value}]：{rule.statement}")
     if rule.status == RuleStatus.accepted:
-        print("注意：规则已直接置为 accepted；常规流程应从 proposed 出发，经确认后 accept")
+        print(f"确认凭据已消费: {confirmed_via} "
+              f"(authority={approval['authority']}, "
+              f"human_presence={approval['human_presence']})")
     return 0
 
 
 def _scope_label(paths: list[str]) -> str:
     return ", ".join(paths) if paths else "project"
+
+
+def cmd_confirm(args) -> int:
+    """可信确认通道：request（预览）/ approve（一次性消费）/ show（只读）。"""
+    import json as _json
+
+    from .confirmation import (
+        ConfirmationError,
+        approve_confirmation,
+        request_confirmation,
+        show_confirmation,
+    )
+    from .identity import load_identity
+
+    root = _project(args.path)
+    sub = getattr(args, "sub", "")
+    try:
+        if sub == "request":
+            ident = load_identity(root)
+            record = request_confirmation(
+                root, kind=args.kind, subject_id=args.subject,
+                digest=args.digest, purpose=getattr(args, "purpose", "") or "",
+                project_id=(ident.project_id if ident else ""),
+                ttl_seconds=getattr(args, "ttl", 3600) or 3600)
+            print(_json.dumps(record, ensure_ascii=False, indent=2))
+            print("下一步: 用户侧批准后，由宿主持有的 secret 经 --confirmation-secret "
+                  "或 --secret-file 执行 sopctl confirm approve；secret 只在 0600 "
+                  "handoff，不在此输出（无可信通道的宿主显示 needs_user 指引）")
+            return 0
+        if sub == "approve":
+            approval = approve_confirmation(
+                root, args.confirmation_id,
+                secret=getattr(args, "confirmation_secret", "") or "",
+                secret_file=getattr(args, "secret_file", "") or "",
+                expected_digest=getattr(args, "digest", "") or "")
+            print(_json.dumps(approval, ensure_ascii=False, indent=2))
+            return 0
+        if sub == "show":
+            print(_json.dumps(show_confirmation(root, args.confirmation_id),
+                              ensure_ascii=False, indent=2))
+            return 0
+    except ConfirmationError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    print(f"未知子命令: {sub}", file=sys.stderr)
+    return 2
 
 
 def cmd_rule_list(args) -> int:
@@ -99,11 +177,42 @@ def cmd_rule_list(args) -> int:
 
 
 def cmd_rule_accept(args) -> int:
-    root = _project(args.path)
-    rule = Registry(root / ".sopcontrol" / "rules" / "registry.yaml").transition(
-        args.rule_id, RuleStatus.accepted
+    from .confirmation import (
+        ConfirmationError,
+        approve_confirmation,
+        change_digest,
     )
+    from .identity import load_identity
+
+    root = _project(args.path)
+    reg = Registry(root / ".sopcontrol" / "rules" / "registry.yaml")
+    rules = reg.load()
+    target = next((r for r in rules if r.rule_id == args.rule_id), None)
+    if target is None:
+        print(f"错误: 未找到规则 {args.rule_id}", file=sys.stderr)
+        return 2
+    # P0 确认原子性：先验确认凭据，再迁移；无/错凭据零写入。
+    confirmation_id = getattr(args, "confirmation_id", "") or ""
+    if not confirmation_id:
+        print("错误: rule accept 需要可信确认凭据（--confirmation-id + secret）；"
+              "未迁移任何规则", file=sys.stderr)
+        return 2
+    try:
+        ident = load_identity(root)
+        approval = approve_confirmation(
+            root, confirmation_id,
+            secret=getattr(args, "confirmation_secret", "") or "",
+            secret_file=getattr(args, "secret_file", "") or "",
+            expected_digest=change_digest(target.rule_id, target.statement),
+            expected_project_id=(ident.project_id if ident else ""))
+    except ConfirmationError as exc:
+        print(f"错误: 确认凭据无效: {exc}。未迁移任何规则", file=sys.stderr)
+        return 2
+    rule = reg.transition(args.rule_id, RuleStatus.accepted)
     print(f"{rule.rule_id} 已接受（accepted_at={rule.accepted_at}）；下一步 sopctl audit 检查吸收")
+    print(f"确认凭据已消费: {approval['confirmation_id']} "
+          f"(authority={approval['authority']}, "
+          f"human_presence={approval['human_presence']})")
     return 0
 
 

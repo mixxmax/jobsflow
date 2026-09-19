@@ -207,8 +207,8 @@ def cmd_harness_check(args) -> int:
     落 trace / Action Plane receipt 在这一层：决策函数是纯的（宪法测试守卫），
     写盘只能由调用方做。未知工具也必须留下事件，不得静默消失（Phase B）。
     """
-    from .action_plane import commit_action_result, evaluate_payload
-    from .harness import extract_claimed_model, gate_status_for_push
+    from .action_plane import commit_action_result
+    from .harness import decide_harness_action, extract_claimed_model, gate_status_for_push
     from .intent import load_session_intent
     from .trace import append_event
 
@@ -232,20 +232,33 @@ def cmd_harness_check(args) -> int:
             gate_status = gate_status_for_push(root)
         session = load_session_intent(root)
         bound_executor = ""
+        executor_unknown = False
         try:
             from .task import TaskStore, active_bound_executor
 
             bound_executor = active_bound_executor(TaskStore(root).list_all())
         except Exception:
+            # 任务账本不可读 ≠ 无绑定执行者（WP-C）：保留守卫，后续受控写升级。
+            executor_unknown = True
             bound_executor = ""
 
-        action_decision = evaluate_payload(
+        action_decision = decide_harness_action(
             payload,
+            root=root,
             gate_status=gate_status,
             session_intent=session.intent,
             bound_executor=bound_executor or None,
             claimed_model=extract_claimed_model(payload) or None,
         )
+        if (executor_unknown and action_decision.decision == "allow"
+                and action_decision.surface in {"filesystem_write", "shell"}):
+            # 解析失败路径保留守卫：账本坏了不能当成没人绑定就放行写动作。
+            action_decision = action_decision.model_copy(update={
+                "decision": "ask",
+                "reason": (action_decision.reason
+                           + "；但任务账本不可读，无法确认执行者绑定，写动作升级为需明确确认"
+                             "（下一步: 修复任务账本后重试，或明确本次放行意图）"),
+            })
         # Wire protocol: observe maps to allow (visible, not blocking)
         wire = (
             "allow" if action_decision.decision == "observe"
@@ -271,13 +284,16 @@ def cmd_harness_check(args) -> int:
             pass
     from .capability_events import CapabilityEvent, append_capability_event
 
+    capability_detail = {"rule_ids": decision.rule_ids}
+    if action_decision is not None and action_decision.selection_evidence:
+        capability_detail["selection_evidence"] = action_decision.selection_evidence
     append_capability_event(
         root,
         CapabilityEvent(
             kind="guard.decision",
             subject=tool,
             outcome=decision.permissionDecision,
-            detail={"rule_ids": decision.rule_ids},
+            detail=capability_detail,
         ),
     )
     # 无感生长：拒绝即记账，不跑全仓 audit
@@ -460,4 +476,3 @@ def cmd_wrap(args) -> int:
     if gate_code != 0:
         print("[sopctl wrap] 事后门未过：变更未获信任，git 推送将被 pre-push 钩子与 CI 阻断", file=sys.stderr)
     return code if code != 0 else gate_code
-

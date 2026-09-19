@@ -702,7 +702,7 @@ def evaluate_transition(
         if ledger_tampered:
             return TransitionDecision(
                 allowed=True, to_status=TaskStatus.blocked, repair_count=task.repair_count,
-                reason="证据账本被篡改或损坏：信任根受损，转人工（12.2 fail-closed）",
+                reason="证据账本完整性校验失败：信任根受损，转人工（12.2 fail-closed）",
                 next_action="sopctl doctor 复核账本，人工裁决后重建任务",
             )
         if controller_dirty:
