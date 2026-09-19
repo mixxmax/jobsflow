@@ -72,30 +72,27 @@ def test_interview_pack_is_create_only_per_stage(tmp_path):
     assert other_stage["status"] == "succeeded"
 
 
-def test_profile_kind_append_requires_explicit_confirmation(tmp_path):
+def test_profile_kind_append_requires_preview_confirmation(tmp_path):
     ws = _workspace(tmp_path)
     created = create_archive_file(ws, slug="acme_ml", filename="outcome.md", content="# outcome\n")
-    from tools.workflow.private_notes import append_profile_note
+    from tools.workflow.private_notes import append_profile_note, profile_confirm, profile_preview
 
+    # The retired boolean helper can remain importable for compatibility, but
+    # it must never turn a model-supplied flag into a write.
     refused = append_profile_note(
-        ws,
-        slug="acme_ml",
-        filename="outcome.md",
-        content="STAR: synthetic\n",
-        expected_digest=created["after"],
-        confirmed=False,
+        ws, slug="acme_ml", filename="outcome.md", content="STAR: synthetic\n",
+        expected_digest=created["after"], confirmed=True,
     )
     assert refused["status"] == "blocked"
-    assert refused["blockers"] == ["private_write_confirmation_required"]
-    ok = append_profile_note(
-        ws,
-        slug="acme_ml",
-        filename="outcome.md",
-        content="STAR: synthetic\n",
-        expected_digest=created["after"],
-        confirmed=True,
+    assert refused["blockers"] == ["profile_mode_retired"]
+    proposal = profile_preview(
+        ws, slug="acme_ml", filename="outcome.md", content="STAR: synthetic\n"
     )
+    assert proposal["status"] == "succeeded"
+    assert (ws / "03_Applications" / "acme_ml" / "outcome.md").read_text() == "# outcome\n"
+    ok = profile_confirm(ws, proposal_id=proposal["proposal_id"])
     assert ok["status"] == "succeeded"
+    assert (ws / "03_Applications" / "acme_ml" / "outcome.md").read_text() == "# outcome\nSTAR: synthetic\n"
 
 
 def test_private_write_flows_through_the_gateway(tmp_path):
@@ -164,21 +161,24 @@ def test_outcome_status_never_downgrades_and_rejects_unknown_values(tmp_path):
 
 
 def test_profile_evidence_append_requires_confirmation_and_digest(tmp_path):
-    from tools.workflow.private_notes import append_profile_evidence
+    from tools.workflow.private_notes import append_profile_evidence, profile_confirm, profile_preview
 
     ws = _workspace(tmp_path)
     (ws / "00_Profile").mkdir(parents=True, exist_ok=True)
-    refused = append_profile_evidence(ws, content="STAR: x\n", expected_digest="", confirmed=False)
+    refused = append_profile_evidence(ws, content="STAR: x\n", expected_digest="", confirmed=True)
     assert refused["status"] == "blocked"
-    assert refused["blockers"] == ["private_write_confirmation_required"]
-    created = append_profile_evidence(ws, content="STAR: x\n", expected_digest="", confirmed=True)
+    assert refused["blockers"] == ["profile_mode_retired"]
+    created = profile_preview(ws, slug="", filename="", content="STAR: x\n")
     assert created["status"] == "succeeded"
+    confirmed = profile_confirm(ws, proposal_id=created["proposal_id"])
+    assert confirmed["status"] == "succeeded"
     assert (ws / "00_Profile" / "expanded_competencies.md").read_text() == "STAR: x\n"
-    stale = append_profile_evidence(
-        ws, content="STAR: y\n", expected_digest="deadbeef", confirmed=True
-    )
-    assert stale["status"] == "blocked"
-    assert stale["blockers"] == ["private_write_stale"]
+    stale = profile_preview(ws, slug="", filename="", content="STAR: y\n")
+    assert stale["status"] == "succeeded"
+    (ws / "00_Profile" / "expanded_competencies.md").write_text("changed\n", encoding="utf-8")
+    stale_confirm = profile_confirm(ws, proposal_id=stale["proposal_id"])
+    assert stale_confirm["status"] == "blocked"
+    assert stale_confirm["blockers"] == ["profile_proposal_stale"]
 
 
 def test_copy_submitted_artifacts_is_create_only(tmp_path):
@@ -268,7 +268,8 @@ def test_private_writes_stay_inside_allowlisted_dirs(tmp_path):
     evidenced = notes.append_profile_evidence(
         ws, content="STAR: x\n", expected_digest="", confirmed=True
     )
-    assert evidenced["status"] == "succeeded"
+    assert evidenced["status"] == "blocked"
+    assert evidenced["blockers"] == ["profile_mode_retired"]
     for evil_slug in ("../evil", "..", "a/b", "", "ACME"):
         out = notes.create_archive_file(ws, slug=evil_slug, filename="outcome.md", content="x")
         assert out["status"] == "blocked", evil_slug
@@ -288,7 +289,4 @@ def test_private_writes_stay_inside_allowlisted_dirs(tmp_path):
         for path in (ws).rglob("*")
         if path.is_file()
     )
-    assert inside == [
-        "00_Profile/expanded_competencies.md",
-        "03_Applications/acme_ml/outcome.md",
-    ]
+    assert inside == ["03_Applications/acme_ml/outcome.md"]

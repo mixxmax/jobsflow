@@ -37,6 +37,7 @@ def _workspace(tmp_path: Path) -> Path:
     (profile / "config.personal.json").write_text('{"name": "synthetic"}', encoding="utf-8")
     (profile / "resume_runtime" / "resume.txt").write_text("synthetic resume", encoding="utf-8")
     (profile / "fact_evidence.json").write_text('{"records": []}', encoding="utf-8")
+    (profile / "expanded_competencies.md").write_text("synthetic competencies", encoding="utf-8")
     return ws
 
 
@@ -90,6 +91,7 @@ def test_profile_scope_resets_private_workspace_not_product_templates(tmp_path):
     assert out["status"] == "succeeded"
     assert not (ws / "00_Profile" / "queries.json").exists()
     assert not (ws / "00_Profile" / "resume_runtime" / "resume.txt").exists()
+    assert not (ws / "00_Profile" / "expanded_competencies.md").exists()
 
 
 def test_tampered_proposal_path_outside_root_is_refused(tmp_path):
@@ -108,19 +110,34 @@ def test_tampered_proposal_path_outside_root_is_refused(tmp_path):
     assert (root / "documents" / "cv" / "old.pdf").exists()
 
 
+def test_tampered_proposal_subset_is_refused(tmp_path):
+    root = _product_root(tmp_path)
+    preview = preview_reset(root, scope="documents")
+    store = root / ".jobsflow-reset" / "proposals"
+    path = store / f"{preview['proposal_id']}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["targets"] = data["targets"][:-1]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    out = confirm_reset(root, scope="documents", proposal_id=preview["proposal_id"])
+    assert out["status"] == "blocked"
+    assert out["blockers"] == ["reset_targets_changed"]
+    assert (root / "documents" / "cv" / "old.pdf").exists()
+
+
 def test_failed_execution_restores_everything(tmp_path, monkeypatch):
     import tools.workflow.reset as reset_mod
+    import os
 
     root = _product_root(tmp_path)
     preview = preview_reset(root, scope="documents")
-    real_unlink = Path.unlink
+    real_replace = os.replace
 
-    def fail_on_pdf(self, missing_ok=False):
-        if self.name == "old.pdf":
+    def fail_on_pdf(source, destination):
+        if Path(source).name == "old.pdf":
             raise OSError("simulated crash mid-reset")
-        return real_unlink(self, missing_ok=missing_ok)
+        return real_replace(source, destination)
 
-    monkeypatch.setattr(Path, "unlink", fail_on_pdf)
+    monkeypatch.setattr(os, "replace", fail_on_pdf)
     out = reset_mod.confirm_reset(root, scope="documents", proposal_id=preview["proposal_id"])
     assert out["status"] == "failed"
     assert (root / "documents" / "cv" / "old.pdf").exists()

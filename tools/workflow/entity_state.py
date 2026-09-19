@@ -273,6 +273,10 @@ ACTION_DESTINATIONS: dict[str, set[str]] = {
     "reset_confirm": {"reset_executed"},
     "private_write": {"private_written"},
     "outcome_status": {"private_written"},
+    "profile_confirm": {"private_written"},
+    "template_confirm": {"private_written"},
+    "template_select": {"private_written"},
+    "template_clear": {"private_written"},
 }
 
 
@@ -294,6 +298,10 @@ def action_is_mutating(action: str) -> bool:
         "reset_confirm",
         "private_write",
         "outcome_status",
+        "profile_confirm",
+        "template_confirm",
+        "template_select",
+        "template_clear",
     }
 
 

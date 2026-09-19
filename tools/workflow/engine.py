@@ -373,7 +373,10 @@ def dispatch(
     runner=None,
 ) -> dict[str, Any]:
     payload = dict(payload or {})
-    if action in {"private_write", "outcome_status"}:
+    if action in {
+        "private_write", "outcome_status", "profile_preview", "profile_confirm",
+        "template_preview", "template_list", "template_confirm", "template_select", "template_clear",
+    }:
         # Private writes must never auto-create runtime directories under the
         # product checkout.  Refuse here — before entity loading or audit
         # writes touch the filesystem — so a product-root workspace leaves
@@ -510,10 +513,16 @@ def _run_adapter(action, payload, workspace, store, dry_run, now):
         from tools.workflow import reset as reset_adapter
 
         return reset_adapter.handle(action, payload, workspace=workspace)
-    if action in {"private_write", "outcome_status"}:
+    if action in {
+        "private_write", "outcome_status", "profile_preview", "profile_confirm",
+    }:
         from tools.workflow import private_notes as private_notes_adapter
 
         return private_notes_adapter.handle(action, payload, workspace=workspace)
+    if action in {"template_list", "template_preview", "template_confirm", "template_select", "template_clear"}:
+        from tools.workflow import template_adapter
+
+        return template_adapter.handle(action, payload, workspace=workspace)
     return result(status="blocked", blockers=["unknown_action"])
 
 
@@ -543,7 +552,10 @@ def _entity_for(action: str, payload: dict[str, Any], store) -> tuple[str, str]:
         root = str(payload.get("root") or payload.get("workspace") or "")
         digest = hashlib.sha256(root.encode("utf-8")).hexdigest()[:12]
         return "reset", f"{scope}-{digest}"
-    if action in {"private_write", "outcome_status"}:
+    if action in {
+        "private_write", "outcome_status", "profile_preview", "profile_confirm",
+        "template_preview", "template_confirm", "template_select", "template_clear",
+    }:
         return "private", "workspace"
     return "scan", "latest"
 

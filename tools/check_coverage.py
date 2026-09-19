@@ -10,6 +10,7 @@ module below its branch threshold fail the build.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -25,7 +26,9 @@ def _module_branch(xml_root: ET.Element, module: str) -> float | None:
     # ("workflow/policy.py"), while the thresholds file uses repo-root paths
     # ("tools/workflow/policy.py"): compare both forms.
     forms = {module, module.removeprefix("tools/")}
-    hits: list[float] = []
+    covered = 0
+    total = 0
+    condition_re = re.compile(r"\((\d+)\s*/\s*(\d+)\)")
     for node in xml_root.iter("class"):
         filename = str(node.get("filename") or "")
         if filename not in forms and not any(
@@ -36,15 +39,17 @@ def _module_branch(xml_root: ET.Element, module: str) -> float | None:
             if line.get("branch") != "true":
                 continue
             taken = str(line.get("condition-coverage") or "")
-            # condition-coverage looks like "50% (1/2)".
-            pct = taken.split("%", 1)[0].strip()
-            try:
-                hits.append(float(pct))
-            except ValueError:
+            # condition-coverage looks like "50% (1/2)".  Aggregate branch
+            # conditions, rather than averaging line percentages: a line
+            # with four conditions must weigh four times a line with one.
+            match = condition_re.search(taken)
+            if match is None:
                 continue
-    if not hits:
+            covered += int(match.group(1))
+            total += int(match.group(2))
+    if total == 0:
         return None
-    return round(sum(hits) / len(hits), 1)
+    return round(100.0 * covered / total, 1)
 
 
 def main() -> int:

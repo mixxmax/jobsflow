@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from tools.io_utils import atomic_write_json
 
 PROPOSAL_SCHEMA_VERSION = 1
 DEFAULT_TTL_SECONDS = 24 * 3600
+_PROPOSAL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 
 def utcnow() -> datetime:
@@ -34,6 +36,8 @@ class ConfirmationStore:
         self.root = self.workspace / "02_Tracker" / "workflow" / "confirmations"
 
     def path_for(self, proposal_id: str) -> Path:
+        if not _PROPOSAL_ID_RE.fullmatch(str(proposal_id or "")):
+            raise ValueError("proposal_id_invalid")
         return self.root / f"{proposal_id}.json"
 
     def save(self, proposal: dict[str, Any]) -> Path:
@@ -45,7 +49,10 @@ class ConfirmationStore:
     def load(self, proposal_id: str | None) -> dict[str, Any] | None:
         if not proposal_id:
             return None
-        path = self.path_for(proposal_id)
+        try:
+            path = self.path_for(proposal_id)
+        except ValueError:
+            return None
         if not path.is_file():
             return None
         data = json.loads(path.read_text(encoding="utf-8"))

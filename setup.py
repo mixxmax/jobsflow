@@ -221,7 +221,7 @@ def check_prerequisites() -> dict[str, bool]:
         else:
             warn("Playwright installed but chromium not. Run: playwright install chromium")
     except ImportError:
-        warn("Playwright not installed. Install: pip install playwright && playwright install chromium")
+        warn("Playwright not installed. Re-run bash tools/setup_env.sh, then playwright install chromium")
 
     return results
 
@@ -268,7 +268,7 @@ def run_doctor() -> int:
         warn(f"materials base CV/CL: unavailable ({exc})")
     failed = [name for name, ready in checks.items() if not ready]
     if failed:
-        print("\nFix core Python packages with: python3 -m pip install -r requirements.lock")
+        print("\nFix core Python packages with: bash tools/setup_env.sh")
         print("Fix portal packages with: python3 setup.py --install-portals")
         print(f"Doctor: {len(failed)} check(s) need attention")
         return 1
@@ -360,10 +360,10 @@ def doctor_snapshot() -> dict[str, Any]:
         elif name == "libreoffice":
             repair_commands.append("Install LibreOffice (headless soffice is required)")
         elif name == "playwright_browser":
-            repair_commands.append("playwright install chromium")
+            repair_commands.append("bash tools/setup_env.sh, then playwright install chromium")
         elif name.startswith("python_package:"):
-            if "python3 -m pip install -r requirements.lock" not in repair_commands:
-                repair_commands.append("python3 -m pip install -r requirements.lock")
+            if "bash tools/setup_env.sh" not in repair_commands:
+                repair_commands.append("bash tools/setup_env.sh")
         elif name.startswith("portal:"):
             if "python3 setup.py --install-portals" not in repair_commands:
                 repair_commands.append("python3 setup.py --install-portals")

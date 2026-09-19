@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from tools.workflow.engine import dispatch
-from tools.workflow.interaction_shell import product_root
 from tools.workflow.private_notes import record_application_status
 
 
@@ -69,8 +68,17 @@ def test_bound_runtime_allows_private_write(tmp_path):
     assert (ws / "03_Applications" / "acme_ml" / "outcome.md").exists()
 
 
-def test_product_checkout_never_grows_private_dirs(tmp_path):
-    repo = product_root()
+def test_product_checkout_never_grows_private_dirs(tmp_path, monkeypatch):
+    # Use an isolated synthetic checkout.  The former test inspected the real
+    # worktree and became order-dependent once another test emitted an audit
+    # event under its product root.
+    repo = tmp_path / "product"
+    repo.mkdir()
+    import tools.workflow.private_notes as private_notes
+    import tools.workflow.interaction_shell as shell
+
+    monkeypatch.setattr(shell, "product_root", lambda: repo)
+    monkeypatch.setattr(private_notes, "product_root", lambda: repo)
     for name in ("00_Profile", "02_Tracker", "03_Applications"):
         assert not (repo / name).exists(), f"precondition: product root must not contain {name}"
     out = dispatch(

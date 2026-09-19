@@ -34,6 +34,13 @@ RUNTIME_WRITE_ACTIONS = frozenset(
         "sync_retry",
         "private_write",
         "outcome_status",
+        "profile_preview",
+        "profile_confirm",
+        "template_preview",
+        "template_list",
+        "template_confirm",
+        "template_select",
+        "template_clear",
     }
 )
 RUNTIME_POINTER_NAME = ".jobsflow-runtime.json"
@@ -345,7 +352,8 @@ def _prompt_for_action(action: str, internal: dict[str, Any]) -> dict[str, Any] 
         or ""
     )
     blockers = {str(item) for item in (internal.get("blockers") or [])}
-    contract = internal.get("role_title_contract") if isinstance(internal.get("role_title_contract"), dict) else {}
+    contract_raw = internal.get("role_title_contract")
+    contract: dict[str, Any] = contract_raw if isinstance(contract_raw, dict) else {}
     if (
         action == "materials"
         and (

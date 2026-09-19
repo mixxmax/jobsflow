@@ -1,9 +1,12 @@
 # /add-template — Register a private DOCX layout
 
 `/apply` uses the selected lane's DOCX master through the one product renderer
-and exports it with LibreOffice headless. This command records a user's
-preferred layout without editing tracked product files or introducing a second
-LaTeX-only workflow; models cannot choose a parallel rendering path.
+and exports it with LibreOffice headless. This command records a private layout
+reference without editing tracked product files or introducing a second
+LaTeX-only workflow; models cannot choose a parallel rendering path. The
+current vNext renderer does not silently substitute arbitrary user DOCX files;
+the lane master remains the production template until a future renderer change
+explicitly adds and tests that contract.
 
 `$ARGUMENTS` may contain `--list`, `--use <name>`, a template path, or nothing.
 
@@ -33,16 +36,29 @@ master.
 
 ## Registration flow
 
-1. Ask whether the file is a CV or Cover Letter template and read the supplied
-   `.docx` (or a directory containing it).
-2. Ask for a short kebab-case name, or infer one from the filename.
-3. Record the style rules that must survive tailoring: page size, margins,
-   section order, heading style, font, bullet format, contact placement and any
-   known layout limits.
-4. Copy only the profile-agnostic layout into the private template directory.
-   Replace personal values with `[YOUR_NAME]`, `[YOUR_EMAIL]`,
-   `[YOUR_PHONE]`, `[YOUR_LINKEDIN_URL]` and similar placeholders.
-5. Write `TEMPLATE.md` with this contract:
+The model must not copy files, create the template directory, or edit
+`TEMPLATE.md` directly.  The gateway owns validation, preview records and the
+private copy.  After asking the user for the type and name, run:
+
+```bash
+python3 -m tools.workflow template preview \
+  --source "/absolute/path/to/template.docx" \
+  --name <kebab-case-name> \
+  --type cv|cover_letter \
+  --notes "page size, margins, font and other constraints"
+```
+
+Show the returned proposal and wait for explicit user confirmation.  Only then
+run the exact `proposal_id` returned by the preview:
+
+```bash
+python3 -m tools.workflow template confirm --proposal-id <proposal-id>
+```
+
+The gateway rejects symlinks, invalid DOCX files, unsafe names, stale source
+files and expired proposals.  It writes the private copy and `TEMPLATE.md`
+atomically under the bound runtime.  The model must not bypass this with a
+shell copy or a direct Python write.  The metadata contract is:
 
    ```markdown
    # Template: <name>
@@ -52,7 +68,7 @@ master.
    - **Engine:** LibreOffice headless
    - **Page target:** exactly 1 A4 page
    - **Fonts:** <system or document-embedded font>
-   - **Status:** private reference; loaded by the fixed renderer for a selected package
+   - **Status:** private reference; not automatically substituted into vNext
 
    ## Style rules
 
@@ -63,19 +79,35 @@ master.
    - <pitfall, or none>
    ```
 
-6. Validate a copy in a scratch package: open the DOCX, replace placeholders
-   with dummy content, run the fixed `tools.workflow materials render/pdf` chain, then check that
-   the PDF has one page and a readable text layer. If it overflows, adjust
-   spacing or content; never stretch glyphs or hide overflow by overlaying pages.
-7. On `/apply`, the product renderer loads the selected lane template into the
-   bound package, applies only verified evidence, and exports after content is
-   final. Report the template name and PDF checks to the user.
+After confirmation, validate a copy in a scratch package: open the DOCX, replace
+placeholders with dummy content, run the fixed `tools.workflow materials
+render/pdf` chain, then check that the PDF has one page and a readable text
+layer. If it overflows, adjust spacing or content; never stretch glyphs or hide
+overflow by overlaying pages. On `/apply`, the product renderer loads the
+selected lane template into the bound package, applies only verified evidence,
+and exports after content is final. Report the template name and PDF checks to
+the user.
+
+## `--list`
+
+Use the gateway to inspect registered templates:
+
+```bash
+python3 -m tools.workflow template list
+```
 
 ## `--use <name>`
 
 Select a private template as the reference for the next selected package. The
-selection is private runtime state. `--use default` clears the selection and
-restores the lane DOCX master.
+selection is private runtime state and must use the gateway:
+
+```bash
+python3 -m tools.workflow template select --name <name>
+python3 -m tools.workflow template clear
+```
+
+`template clear` clears the private reference. The fixed lane DOCX master
+remains the production renderer input.
 
 ## Design rules
 

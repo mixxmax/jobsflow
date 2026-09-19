@@ -7,7 +7,7 @@ PYTHON_BIN="$(command -v python3.12 || command -v python3.11 || command -v pytho
 "$PYTHON_BIN" -c 'import sys; assert sys.version_info >= (3, 10), "JobsFlow requires Python 3.10+"'
 "$PYTHON_BIN" -m venv .venv
 source .venv/bin/activate
-python3 -m pip install --require-hashes -r requirements.lock
+bash tools/setup_env.sh
 python3 setup.py --doctor
 ```
 

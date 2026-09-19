@@ -18,11 +18,11 @@
 | /doctor | 只读环境+就绪 | 无 | 无 | 无 | 无（不碰浏览器） | — | `tools.workflow doctor` |
 | /reset | 预览列目标 | profile 范围清画像数据 | documents 范围清用户文件 | 预览绑定执行 | 无 | 预览 + 输入 `RESET` | `tools.workflow reset`（preview/confirm，唯一允许手写的删文件路径：无） |
 | /outcome | 读 tracker/归档 | 经 narrow adapter 写归档文件、经 sync ledger 更新状态 | 无 | 无 | 无 | 普通追加免二次确认（目标+版本绑定） | `tools.workflow private-write`（文件）+ `tools.workflow outcome-status`（状态） |
-| /interview | 读归档/材料 | 每 stage 一个新建 prep 包（create-only） | 无 | 无 | 无 | STAR 画像追加需显式确认 | `tools.workflow private-write`（文件/`profile_evidence`） |
-| /expand | 读画像/文档 | 仅追加确认过的条目 | 无 | 无 | 无（公开信息发现另行） | 逐条确认 | `tools.workflow private-write`（`profile_evidence`/append） |
+| /interview | 读归档/材料 | 每 stage 一个新建 prep 包（create-only）；画像追加仅 preview→confirm | 无 | 无 | 无 | STAR 画像追加需显式确认 | `tools.workflow private-write`（文件）+ `private-confirm`（画像） |
+| /expand | 读画像/文档 | 仅追加确认过的条目，且经 digest-bound preview→confirm | 无 | 无 | 无（公开信息发现另行） | 逐条确认 | `tools.workflow private-write --mode profile_preview` + `private-confirm` |
 | /rank | 读 tracker/JD | 无（兼容入口，指向 /materials） | 无 | 无 | 无 | — | 文档内跳转，不执行 |
 | /add-portal | 读 portal/ewish | 无（产出归用户 fork） | 新 skill 脚手架 | 无 | 在线试查 | 注册前试查 | generator（产出不合 upstream） |
-| /add-template | 读用户模板 | 登记私有 DOCX 版式 | 无 | 无 | 无 | — | 注册逻辑（不碰产品渲染链） |
+| /add-template | 读用户模板 | 预览确认后登记私有 DOCX 版式、选择/清除活动模板 | 无 | 无 | 无 | 注册需 preview→confirm；选择经 gateway | `tools.workflow template`（固定 lane renderer 仍是唯一渲染链） |
 
 规则：
 

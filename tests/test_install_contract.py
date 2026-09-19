@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 import setup
 
@@ -23,21 +26,58 @@ def _soffice_present() -> bool:
     ).exists()
 
 
-def _venv_env() -> dict:
-    """Run the script as if the test interpreter's venv were activated."""
-    import os
-    import sys
+def _supported_python() -> str | None:
+    """Prefer an installed supported interpreter for local acceptance tests."""
 
-    # sys.prefix is venv-aware; sys.executable may be a symlink into a
-    # Homebrew cellar, so never derive the venv via path resolution.
-    venv = Path(sys.prefix)
+    import os
+
+    candidates = [
+        os.environ.get("JOBSFLOW_TEST_PYTHON", ""),
+        # When the suite is already running inside the product venv, prefer
+        # that interpreter so its installed vendored SOP Control is visible.
+        # A system python3.12 earlier on PATH may be supported but not carry
+        # the repository's runtime dependencies.
+        sys.executable,
+        shutil.which("python3.12") or "",
+        shutil.which("python3.11") or "",
+        shutil.which("python3.10") or "",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", "import sys; print(int(sys.version_info >= (3, 10)))"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if probe.returncode == 0 and probe.stdout.strip() == "1":
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _venv_env() -> dict:
+    """Run the script with the first supported local interpreter on PATH."""
+    import os
+
     env = dict(os.environ)
-    env["VIRTUAL_ENV"] = str(venv)
-    env["PATH"] = str(venv / "bin") + os.pathsep + env.get("PATH", "")
+    candidate = _supported_python()
+    if candidate:
+        env.pop("VIRTUAL_ENV", None)
+        env["PATH"] = str(Path(candidate).parent) + os.pathsep + env.get("PATH", "")
     return env
 
 
 def test_setup_env_check_only_passes_offline():
+    candidate = _supported_python()
+    if candidate is None:
+        pytest.skip("no Python 3.10+ interpreter available")
+    probe = subprocess.run([candidate, "-c", "import sopcontrol"], capture_output=True, check=False)
+    if probe.returncode != 0:
+        pytest.skip("no supported interpreter with an installed SOP Control runtime")
     proc = subprocess.run(
         ["bash", str(SCRIPT), "--check-only"],
         capture_output=True,
@@ -51,6 +91,11 @@ def test_setup_env_check_only_passes_offline():
 
 
 def test_setup_env_strict_matches_soffice_presence():
+    candidate = _supported_python()
+    if candidate is None:
+        pytest.skip("no Python 3.10+ interpreter available")
+    if subprocess.run([candidate, "-c", "import sopcontrol"], capture_output=True, check=False).returncode != 0:
+        pytest.skip("no supported interpreter with an installed SOP Control runtime")
     proc = subprocess.run(
         ["bash", str(SCRIPT), "--check-only", "--strict"],
         capture_output=True,
@@ -80,8 +125,11 @@ def test_clean_venv_acceptance_from_scratch(tmp_path):
     import subprocess
     import sys
 
+    base_python = _supported_python()
+    if base_python is None:
+        pytest.skip("no Python 3.10+ interpreter available")
     venv = tmp_path / "accept-venv"
-    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, timeout=300)
+    subprocess.run([base_python, "-m", "venv", str(venv)], check=True, timeout=300)
     venv_python = str(venv / "bin" / "python")
     env = dict(os.environ)
     env["VIRTUAL_ENV"] = str(venv)

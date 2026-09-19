@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,11 +26,13 @@ from tools.workflow.contracts import result
 
 RESET_DIR_NAME = ".jobsflow-reset"
 PROPOSAL_TTL_SECONDS = 24 * 3600
+_PROPOSAL_ID_RE = re.compile(r"^reset-[0-9a-f]{12}$")
 
 PROFILE_FILES = (
     "00_Profile/queries.json",
     "00_Profile/config.personal.json",
     "00_Profile/fact_evidence.json",
+    "00_Profile/expanded_competencies.md",
 )
 PROFILE_SUBDIRS = ("00_Profile/resume_runtime",)
 _PROFILE_FILE_NAMES = {path.split("/", 1)[1] for path in PROFILE_FILES}
@@ -132,9 +136,80 @@ def _inventory_digest(inventory: list[dict[str, Any]]) -> str:
     return _sha_bytes(raw.encode("utf-8"))
 
 
+def _targets_digest(targets: list[dict[str, Any]]) -> str:
+    """Digest the exact reset target set, not merely the whole inventory."""
+
+    canonical = [
+        {
+            "rel": str(item.get("rel") or ""),
+            "sha256": str(item.get("sha256") or ""),
+            "kind": str(item.get("kind") or "delete"),
+            "status": str(item.get("status") or "has_content"),
+        }
+        for item in targets
+    ]
+    canonical.sort(key=lambda item: (item["rel"], item["sha256"]))
+    raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return _sha_bytes(raw.encode("utf-8"))
+
+
 def _store_paths(root: Path) -> tuple[Path, Path, Path]:
     base = root / RESET_DIR_NAME
     return base / "proposals", base / "backups", base / "audit.jsonl"
+
+
+def _transactions_dir(root: Path) -> Path:
+    return root / RESET_DIR_NAME / "transactions"
+
+
+def _recover_incomplete(root: Path) -> list[str]:
+    """Restore any transaction interrupted before its committed marker.
+
+    Multi-file filesystem operations cannot be made globally atomic with
+    ordinary files.  The journal makes them crash-consistent: the next
+    gateway invocation restores every moved file before accepting new work.
+    """
+
+    directory = _transactions_dir(root)
+    if not directory.is_dir():
+        return []
+    recovered: list[str] = []
+    for tx_dir in sorted(path for path in directory.iterdir() if path.is_dir()):
+        manifest_path = tx_dir / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            raise RuntimeError(f"reset_transaction_manifest_invalid:{tx_dir.name}")
+        if not isinstance(manifest, dict):
+            raise RuntimeError(f"reset_transaction_manifest_invalid:{tx_dir.name}")
+        if manifest.get("status") == "committed":
+            _, backups_root, _ = _store_paths(root)
+            backups_root.mkdir(parents=True, exist_ok=True)
+            backup_dir = backups_root / tx_dir.name
+            if not backup_dir.exists():
+                os.replace(tx_dir, backup_dir)
+            continue
+        for item in manifest.get("targets") or []:
+            rel = str((item or {}).get("rel") or "")
+            if not _is_target(root, rel):
+                raise RuntimeError(f"reset_transaction_target_invalid:{rel}")
+            quarantine = tx_dir / "files" / rel
+            try:
+                quarantine.resolve().relative_to((tx_dir / "files").resolve())
+            except ValueError:
+                raise RuntimeError(f"reset_transaction_target_invalid:{rel}")
+            if not quarantine.is_file():
+                continue
+            target = _resolve_within(root, rel)
+            if target.exists():
+                raise RuntimeError(f"reset_transaction_restore_conflict:{rel}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(quarantine, target)
+        manifest = dict(manifest)
+        manifest["status"] = "recovered"
+        atomic_write_json(manifest_path, manifest)
+        recovered.append(tx_dir.name)
+    return recovered
 
 
 def _require_scope_layout(root: Path, scope: str) -> str | None:
@@ -150,6 +225,10 @@ def preview_reset(root: Path | str, *, scope: str) -> dict[str, Any]:
 
     root = Path(root).expanduser().resolve()
     try:
+        recovered_transactions = _recover_incomplete(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return result(status="blocked", after_state="idle", blockers=["reset_recovery_required"], error=str(exc))
+    try:
         _scope_dirs(scope)
     except ValueError:
         return result(status="blocked", after_state="idle", blockers=["reset_scope_invalid"])
@@ -162,6 +241,7 @@ def preview_reset(root: Path | str, *, scope: str) -> dict[str, Any]:
         for item in inventory
         if _is_target(root, item["rel"])
     ]
+    target_digest = _targets_digest(targets)
     proposal_id = f"reset-{hashlib.sha256(f'{scope}:{_inventory_digest(inventory)}:{_utcnow()}'.encode()).hexdigest()[:12]}"
     proposals_dir, _, _ = _store_paths(root)
     proposals_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +254,7 @@ def preview_reset(root: Path | str, *, scope: str) -> dict[str, Any]:
             "root": str(root),
             "created_at": _utcnow(),
             "inventory_digest": _inventory_digest(inventory),
+            "targets_digest": target_digest,
             "targets": targets,
         },
     )
@@ -183,12 +264,16 @@ def preview_reset(root: Path | str, *, scope: str) -> dict[str, Any]:
         proposal_id=proposal_id,
         scope=scope,
         targets=targets,
-        target_digest=_inventory_digest(inventory),
+        inventory_digest=_inventory_digest(inventory),
+        target_digest=target_digest,
+        recovered_transactions=recovered_transactions,
         next_action="reset_confirm",
     )
 
 
 def _load_proposal(root: Path, proposal_id: str) -> dict[str, Any] | None:
+    if not _PROPOSAL_ID_RE.fullmatch(str(proposal_id or "")):
+        return None
     proposals_dir, _, _ = _store_paths(root)
     try:
         data = json.loads((proposals_dir / f"{proposal_id}.json").read_text(encoding="utf-8"))
@@ -208,6 +293,10 @@ def confirm_reset(root: Path | str, *, scope: str, proposal_id: str | None) -> d
     """Execute a preview-bound reset atomically, or change nothing."""
 
     root = Path(root).expanduser().resolve()
+    try:
+        recovered_transactions = _recover_incomplete(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return result(status="blocked", after_state="reset_previewed", blockers=["reset_recovery_required"], error=str(exc))
     proposal = _load_proposal(root, proposal_id or "")
     if proposal is None or proposal.get("proposal_id") != (proposal_id or ""):
         return result(status="blocked", after_state="reset_previewed", blockers=["reset_proposal_unknown"])
@@ -236,27 +325,81 @@ def confirm_reset(root: Path | str, *, scope: str, proposal_id: str | None) -> d
     if _inventory_digest(inventory) != proposal.get("inventory_digest"):
         return result(status="blocked", after_state="reset_previewed", blockers=["reset_proposal_stale"])
 
+    expected_targets = [
+        {**item, "kind": "delete", "status": "has_content"}
+        for item in inventory
+        if _is_target(root, item["rel"])
+    ]
+    if _targets_digest(expected_targets) != str(proposal.get("targets_digest") or ""):
+        return result(status="blocked", after_state="reset_previewed", blockers=["reset_targets_changed"])
+    if _targets_digest(resolved_item_targets := [
+        {"rel": rel, "sha256": next(
+            (str(item.get("sha256") or "") for item in targets if str(item.get("rel") or "") == rel),
+            "",
+        ), "kind": "delete", "status": "has_content"}
+        for rel, _ in resolved
+    ]) != str(proposal.get("targets_digest") or ""):
+        return result(status="blocked", after_state="reset_previewed", blockers=["reset_targets_changed"])
+
     before = {item["rel"]: item["sha256"] for item in inventory}
     proposals_dir, backups_root, _ = _store_paths(root)
+    transaction_dir = _transactions_dir(root) / str(proposal_id)
     backup_dir = backups_root / str(proposal_id)
+    manifest_path = transaction_dir / "manifest.json"
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        if transaction_dir.exists() or backup_dir.exists():
+            raise OSError("reset_transaction_exists")
+        transaction_dir.joinpath("files").mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            manifest_path,
+            {
+                "schema_version": 1,
+                "proposal_id": proposal_id,
+                "scope": scope,
+                "status": "prepared",
+                "targets": [{"rel": rel} for rel, _ in resolved],
+            },
+        )
         staged = []
         for rel, path in resolved:
             if not path.is_file():
                 continue
-            backup_path = backup_dir / rel
-            backup_path.parent.mkdir(parents=True, exist_ok=True)
-            backup_path.write_bytes(path.read_bytes())
+            quarantine_path = transaction_dir / "files" / rel
+            quarantine_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, quarantine_path)
             staged.append((rel, path))
-        for rel, path in staged:
-            path.unlink()
+            atomic_write_json(
+                manifest_path,
+                {
+                    "schema_version": 1,
+                    "proposal_id": proposal_id,
+                    "scope": scope,
+                    "status": "moving",
+                    "targets": [{"rel": item_rel} for item_rel, _ in staged],
+                },
+            )
         _prune_empty_dirs(root, scope)
         missing = [rel for rel, path in staged if path.exists()]
         if missing:
             raise OSError(f"reset_delete_incomplete:{sorted(missing)}")
+        atomic_write_json(
+            manifest_path,
+            {
+                "schema_version": 1,
+                "proposal_id": proposal_id,
+                "scope": scope,
+                "status": "committed",
+                "targets": [{"rel": rel} for rel, _ in staged],
+            },
+        )
+        backups_root.mkdir(parents=True, exist_ok=True)
+        os.replace(transaction_dir, backup_dir)
     except Exception as exc:
-        restored = _restore(backup_dir, root)
+        restored = False
+        try:
+            restored = bool(_recover_incomplete(root))
+        except (OSError, RuntimeError, ValueError):
+            restored = False
         receipt = {
             "proposal_id": proposal_id,
             "scope": scope,
@@ -278,7 +421,16 @@ def confirm_reset(root: Path | str, *, scope: str, proposal_id: str | None) -> d
         {"rel": rel, "before": before.get(rel, ""), "after": ""}
         for rel, _ in staged
     ]
-    _audit(root, {"proposal_id": proposal_id, "scope": scope, "status": "executed", "targets": receipt_targets})
+    _audit(
+        root,
+        {
+            "proposal_id": proposal_id,
+            "scope": scope,
+            "status": "executed",
+            "targets": receipt_targets,
+            "recovered_transactions": recovered_transactions,
+        },
+    )
     try:
         (proposals_dir / f"{proposal_id}.json").unlink()
     except OSError:
