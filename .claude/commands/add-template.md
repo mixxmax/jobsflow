@@ -17,6 +17,10 @@ JobSearch_2026/00_Profile/templates/<name>/template.docx
 JobSearch_2026/00_Profile/templates/<name>/TEMPLATE.md
 ```
 
+`<name>` must match `^[a-z0-9-]+$` (reject anything else — no `..`, no slashes,
+no spaces); the templates directory is the only writable root. Never write
+outside it, and never follow this command with edits to tracked files.
+
 Never write a filled template into `.claude/skills/`, `CLAUDE.md`, `cv/`, or
 tracked documentation. A template is a layout reference; it does not authorize
 automatic application submission.

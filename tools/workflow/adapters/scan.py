@@ -23,6 +23,25 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def detail_blackout(score_meta: dict[str, Any] | None) -> dict[str, int | bool]:
+    """Whether score-side detail enrichment blacked out.
+
+    A run whose deep/detail fetch was attempted but produced zero successes
+    and zero cache hits must not consume the refresh window: the listings are
+    kept (tracker + observation dedupe), but ``last_refresh_at`` stays so a
+    later run — after the user fixes Chrome/CDP or the wave passes — sees the
+    same window again.  Partial success (any deep_ok) still advances: the run
+    was useful, and per-row failures stay explainable in ``enrich_errors``.
+    """
+
+    meta = score_meta if isinstance(score_meta, dict) else {}
+    attempted = int(meta.get("deep_attempted") or 0)
+    ok = int(meta.get("deep_ok") or 0)
+    cache_hits = int(meta.get("deep_cache_hits") or 0)
+    blackout = attempted > 0 and ok == 0 and cache_hits == 0
+    return {"blackout": blackout, "attempted": attempted, "ok": ok, "cache_hits": cache_hits}
+
+
 def write_run_record(
     workspace: Path,
     *,
@@ -288,13 +307,17 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
     scan_counts = scan_summary.get("counts") or {}
     scan_errors = list(scan_summary.get("errors") or [])
     scan_degraded = bool(scan_summary.get("scan_degraded") or scan_errors)
-    cursor_safe = bool(scan_summary.get("cursor_safe")) and not scan_errors
+    detail = detail_blackout(score_meta)
+    cursor_safe = (
+        bool(scan_summary.get("cursor_safe")) and not scan_errors and not detail["blackout"]
+    )
     diagnostics = {
         "scan": {
             "counts": scan_counts,
             "errors": scan_errors,
             "error_count": len(scan_errors),
             "request_deduped": int(scan_summary.get("request_deduped") or 0),
+            "detail_blackout": detail,
         },
         "score": {
             key: score_meta.get(key)
@@ -335,6 +358,7 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
             "scan_errors": scan_errors,
             "scan_degraded": scan_degraded,
             "cursor_safe": cursor_safe,
+            "detail_blackout": detail,
             "dedupe_keys": list(scan_summary.get("dedupe_keys") or [])[-500:],
             "dedupe_policy": scan_summary.get("dedupe_policy"),
             "recent_dedupe_key_count": int(scan_summary.get("recent_dedupe_key_count") or 0),

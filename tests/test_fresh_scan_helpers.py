@@ -404,3 +404,74 @@ def test_local_tracker_merge_writes_main_csv_and_custom_columns(tmp_path):
     assert rows[0]["岗位编号"] == "A0-004"
     assert "轮班要求" in rows[0]
     assert rows[0]["本轮新增"] == "是"
+
+
+def test_one_portal_crash_does_not_stop_other_portals(monkeypatch, tmp_path, capsys):
+    from tools.fresh_24h import fresh_24h_scan as scan
+
+    repo = tmp_path
+    tracker = repo / "JobSearch_2026" / "02_Tracker"
+    tracker.mkdir(parents=True)
+    tracker_csv = tracker / "hk_apply_list_2026-08-25.csv"
+    tracker_csv.write_text("岗位编号,职位,公司,链接\nA0-001,Old,Old Co,https://old.example/1\n", encoding="utf-8")
+    queries = repo / "queries.json"
+    queries.write_text(
+        json.dumps(
+            {
+                "setup_required": False,
+                "portals": {
+                    "linkedin": {"enabled": True, "cli": "fake.ts"},
+                    "jobsdb": {"enabled": True, "cli": "fake.ts"},
+                },
+                "queries": [
+                    {"id": "q1", "track_hint": "A", "terms": {"linkedin": "legal", "jobsdb": "legal"}},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from datetime import datetime, timedelta, timezone
+
+    fresh_date = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def fake_requests(_repo, _cli, requests, *, portal, delay_seconds):
+        if portal == "jobsdb":
+            raise RuntimeError("simulated portal crash")
+        return [
+            (
+                requests[0],
+                [
+                    {
+                        "id": "12345678",
+                        "title": "Legal Counsel",
+                        "company": "Acme",
+                        "url": "https://www.linkedin.com/jobs/view/12345678",
+                        "date": fresh_date,
+                        "teaser": "Legal compliance support",
+                    }
+                ],
+                None,
+            )
+        ]
+
+    monkeypatch.setattr(scan, "run_portal_requests", fake_requests)
+
+    code = scan.main(
+        [
+            "--repo",
+            str(repo),
+            "--tracker",
+            str(tracker_csv),
+            "--queries",
+            str(queries),
+            "--mode",
+            "temp",
+            "--no-record",
+        ]
+    )
+    assert code == 0
+    candidates = sorted(tracker.glob("fresh_24h_*.csv"))
+    assert candidates, "linkedin rows must still be written when jobsdb crashes"
+    body = candidates[0].read_text(encoding="utf-8")
+    assert "12345678" in body or "Legal Counsel" in body

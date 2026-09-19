@@ -119,8 +119,10 @@ Do not proceed to Step 5 until search, detail, and tests all pass.
 ## Step 5: Register
 
 1. Ask whether the user wants the new portal added to the `/scan` search strategy.
-   If yes, add its CLI path and setup-required query bucket to the private
-   `JobSearch_2026/00_Profile/queries.json`; never edit a removed `job-scraper`
+   If yes, register its CLI path and setup-required query bucket through the
+   intent gateway (`/intent add`, then `intent confirm` after explicit user
+   confirmation) — never hand-edit the private
+   `JobSearch_2026/00_Profile/queries.json`, never edit a removed `job-scraper`
    skill or tracked query preset.
 2. Remind the user to add the install line for their own records if they maintain a fork README:
    ```bash

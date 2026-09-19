@@ -97,3 +97,23 @@ def test_two_pass_hard_drops_below_final_by_default(monkeypatch, tmp_path):
 
     assert rows == []
     assert len(meta["dropped_final"]) == 1
+
+
+def test_detail_blackout_blocks_cursor_advance():
+    from tools.workflow.adapters.scan import detail_blackout
+
+    assert detail_blackout({})["blackout"] is False
+    assert detail_blackout(None)["blackout"] is False
+    assert detail_blackout({"deep_attempted": 3, "deep_ok": 0, "deep_cache_hits": 0}) == {
+        "blackout": True,
+        "attempted": 3,
+        "ok": 0,
+        "cache_hits": 0,
+    }
+    # Partial success stays useful: the run advances, per-row failures stay
+    # explainable in enrich_errors.
+    assert detail_blackout({"deep_attempted": 3, "deep_ok": 1, "deep_cache_hits": 0})["blackout"] is False
+    # Cache-covered details are successes, not failures.
+    assert detail_blackout({"deep_attempted": 3, "deep_ok": 0, "deep_cache_hits": 3})["blackout"] is False
+    # Nothing attempted: nothing to protect.
+    assert detail_blackout({"deep_attempted": 0, "deep_ok": 0, "deep_cache_hits": 0})["blackout"] is False

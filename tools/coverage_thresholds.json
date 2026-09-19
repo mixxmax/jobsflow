@@ -1,0 +1,36 @@
+{
+  "_comment": "Stage-1 baseline (non-blocking): enforce=false only records. Flip enforce to true when stage-2 thresholds below are ratified; check_coverage.py then fails the build on regression. Branch coverage is the primary metric; failure-path coverage is reviewed per module, not averaged.",
+  "enforce": false,
+  "modules": {
+    "tools/workflow/policy.py": {
+      "branch": 0.0,
+      "note": "stage-1 baseline 92.7% (term, final-tree VM run 2026-09-19; TOTAL 66.1%)",
+      "baseline": 92.7
+    },
+    "tools/workflow/entity_state.py": {
+      "branch": 0.0,
+      "note": "stage-1 baseline 90.1% (term, final-tree VM run 2026-09-19; TOTAL 66.1%)",
+      "baseline": 90.1
+    },
+    "tools/workflow/confirmation.py": {
+      "branch": 0.0,
+      "note": "stage-1 baseline 87.6% (term, final-tree VM run 2026-09-19; TOTAL 66.1%)",
+      "baseline": 87.6
+    },
+    "tools/workflow/reset.py": {
+      "branch": 0.0,
+      "note": "stage-1 baseline 82.3% (term, final-tree VM run 2026-09-19; TOTAL 66.1%)",
+      "baseline": 82.3
+    },
+    "tools/workflow/private_notes.py": {
+      "branch": 0.0,
+      "note": "stage-1 baseline 78.8% (term, final-tree VM run 2026-09-19; TOTAL 66.1%)",
+      "baseline": 78.8
+    },
+    "tools/workflow/materials_vnext": {
+      "branch": 0.0,
+      "note": "stage-1 baseline: package-level, see per-file table in CI artifacts",
+      "baseline": null
+    }
+  }
+}

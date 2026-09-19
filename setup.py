@@ -323,6 +323,18 @@ def doctor_snapshot() -> dict[str, Any]:
             (cli_dir / "package.json").exists()
             and (cli_dir / "bun.lock").exists()
         )
+    # Explicit controller report: distinguish "not installed" from the
+    # observe/warn/enforce/off modes instead of silently passing.  A missing
+    # package with a portable registry present fail-closes governed writes
+    # (blocker sopcontrol_unavailable), so surface it here with a repair.
+    try:
+        from tools.workflow.sopcontrol_adapter import _import_sopcontrol, current_mode
+
+        _sop_api, _sop_err = _import_sopcontrol()
+        sopcontrol_mode = "missing" if _sop_api is None else current_mode()
+    except Exception:
+        sopcontrol_mode = "missing"
+    checks["sopcontrol"] = sopcontrol_mode != "missing"
     checks["tracker"] = bool(
         list((REPO / "JobSearch_2026" / "02_Tracker").glob("hk_apply_list_*.csv"))
     )
@@ -357,6 +369,14 @@ def doctor_snapshot() -> dict[str, Any]:
                 repair_commands.append("python3 setup.py --install-portals")
         elif name == "tracker":
             repair_commands.append("python3 setup.py --resume-folder /path/to/cv-folder")
+        elif name == "sopcontrol":
+            repair_commands.append("bash tools/setup_env.sh (installs the pinned vendored SOP Control)")
+    if "sopcontrol" in failed and not (REPO / ".sopcontrol" / "rules" / "registry.yaml").is_file():
+        # No portable registry: the controller is intentionally off, so a
+        # missing package is not a failure.  (Post-loop on purpose: never
+        # mutate the list being iterated above.)
+        failed = [name for name in failed if name != "sopcontrol"]
+        checks["sopcontrol"] = True
     return {
         "schema_version": 1,
         "ready": not failed,
@@ -364,6 +384,7 @@ def doctor_snapshot() -> dict[str, Any]:
         "materials_ready": materials_base_ready,
         "materials_base": base_snapshot,
         "checks": checks,
+        "sopcontrol_mode": sopcontrol_mode,
         "failed": failed,
         "next_action": (
             "continue"

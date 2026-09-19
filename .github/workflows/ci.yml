@@ -57,18 +57,34 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      - run: pip install --require-hashes -r requirements-dev.lock
-      - name: Install vendored SOP Control
+      # The maintained PDF path is DOCX + LibreOffice headless (see
+      # CONTRIBUTING.md). The materials suites convert real DOCX files, so
+      # the runner must provide soffice; without it pdf_generated fails and
+      # the whole materials chain goes red for environmental reasons.
+      - name: Install LibreOffice (headless PDF path)
         run: |
-          test -f vendor/sopcontrol/plugins/__init__.py
-          test -f vendor/sopcontrol/sopcontrol/__init__.py
-          test -f vendor/sopcontrol/VENDOR_MANIFEST.json
-          pip install -e vendor/sopcontrol
-      - name: Verify vendor pin/manifest/import
-        run: |
-          python tools/vendorize_sopcontrol.py --verify
-          python -c "import sopcontrol,importlib.metadata as m; assert sopcontrol.__version__==m.version('sopcontrol')"
-      - run: python -m pytest -q
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer
+          soffice --version
+      # Same install contract as the README quickstart (tools/setup_env.sh).
+      # --strict additionally requires headless LibreOffice for the PDF stage.
+      - name: Install and verify environment (shared script)
+        run: bash tools/setup_env.sh --dev --strict
+      # Incremental type gate: only the modules listed in
+      # tools/check_types.py block. The rest of the tree is a recorded,
+      # non-blocking baseline (see docs/legacy_retirement.md).
+      - name: Typecheck typed modules
+        run: python tools/check_types.py
+      - run: python -m pytest -q --cov=tools --cov-report=xml --cov-report=html --cov-report=term
+      - name: Coverage baseline (non-blocking; thresholds in tools/coverage_thresholds.json)
+        run: python tools/check_coverage.py
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-reports
+          path: |
+            coverage.xml
+            htmlcov/
       - run: python tools/fresh_24h/validate_queries.py
 
   sopcontrol-gate:
@@ -106,6 +122,12 @@ jobs:
         run: python -m sopcontrol.cli doctor .
       - name: sopctl gate
         run: python -m sopcontrol.cli gate .
+      # A green governance gate only proves its own accepted rules passed.
+      # It says nothing about the product build or test suite. Only the
+      # ci-success aggregation below is the release signal.
+      # 治理规则通过，不表示产品构建通过。
+      - name: State gate scope
+        run: echo "::notice::SOP Control gate passed for its accepted rules only; product release requires the ci-success job."
 
   dependency-review:
     name: Dependency review (upstream PRs only)
@@ -158,3 +180,25 @@ jobs:
         working-directory: .agents/skills/${{ matrix.tool }}/cli
       - run: bun test
         working-directory: .agents/skills/${{ matrix.tool }}/cli
+
+  # Single aggregation point for branch protection / rulesets: require
+  # ci-success (not any individual job) so that a green governance gate
+  # alone can never present as a passing build.
+  ci-success:
+    name: CI success (all required checks)
+    runs-on: ubuntu-latest
+    needs: [lint, security-guards, python-tests, sopcontrol-gate, cli-typecheck]
+    if: always()
+    steps:
+      - name: Verify every required job succeeded
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          failed = {k: v.get("result") for k, v in needs.items() if v.get("result") != "success"}
+          if failed:
+              raise SystemExit(f"required jobs not green: {failed}")
+          print("all required jobs succeeded")
+          EOF
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}

@@ -113,6 +113,26 @@ ACTION_RULES: dict[str, dict[str, Any]] = {
         "rule_ids": ["INTENT-001"],
         "requires_confirmation": False,
     },
+    "reset_preview": {
+        "autonomy": "A3",
+        "rule_ids": [],
+        "requires_confirmation": False,
+    },
+    "reset_confirm": {
+        "autonomy": "A3",
+        "rule_ids": [],
+        "requires_confirmation": True,
+    },
+    "private_write": {
+        "autonomy": "A0",
+        "rule_ids": [],
+        "requires_confirmation": False,
+    },
+    "outcome_status": {
+        "autonomy": "A0",
+        "rule_ids": ["SYNC-001"],
+        "requires_confirmation": False,
+    },
 }
 
 
@@ -165,6 +185,14 @@ def decide(request: ActionRequest) -> PolicyDecision:
             "generate_materials", "create_cv", "create_cl", "render_docx", "render_pdf",
         },
         "materials": {"legacy_pipeline", "direct_docx", "direct_pdf", "direct_convert"},
+        "private_write": {
+            "root", "path", "workspace_override", "force", "recursive",
+            "delete", "direct_write", "absolute",
+        },
+        "outcome_status": {
+            "rows", "write_rows", "direct_write", "append_tracker",
+            "clear_fresh", "assign_ids", "allocate_ids",
+        },
     }
     forbidden = sorted(
         key for key in forbidden_by_action.get(request.action, set())

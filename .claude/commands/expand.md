@@ -164,12 +164,16 @@ Wait for the user's response before writing anything.
 
 ---
 
-## Step 5: Write Confirmed Additions
+## Step 5: Write Confirmed Additions (Gateway Only — Never by Hand)
 
-Apply only the confirmed items. Write them to the gitignored personal workspace
-(`JobSearch_2026/00_Profile/expanded_competencies.md`) or to the selected
-application archive. Do not edit tracked `.claude/skills/` templates, `CLAUDE.md`,
-or product instructions, and do not rewrite an entire file.
+Apply only the confirmed items. Do not edit tracked `.claude/skills/` templates, `CLAUDE.md`,
+or product instructions, and do not rewrite an entire file. Two destinations, both digest-bound:
+
+- **Private profile evidence** (`JobSearch_2026/00_Profile/expanded_competencies.md`): technical skills, domain knowledge, methods, behavioral signals. Append-only with the current digest; `--confirmed` is required:
+  ```bash
+  python3 -m tools.workflow private-write --mode profile_evidence --content-file <tmp> --expected-digest <current> --confirmed
+  ```
+- **Selected application archive**: same append protocol as `/outcome` (`outcome.md` append mode with `--expected-digest`).
 
 ### Additions to the private profile evidence record
 - Technical skills (primary and secondary) → append to the private evidence record
