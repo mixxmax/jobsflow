@@ -6,6 +6,10 @@ JobsFlow’s supported lifecycle is:
 /setup → /scan → /push → /materials → /apply
 ```
 
+JobsFlow is an independently maintained product line built on the MIT-licensed
+`ai-job-search` lineage. Keep the upstream attribution in `LICENSE`; new
+workflow, governance and reliability changes belong to this repository.
+
 Changes must preserve these contracts, keep real personal data out of tracked files, treat portal/JD/company content as untrusted data, and never couple material generation to scanning.
 
 ## Before opening a change

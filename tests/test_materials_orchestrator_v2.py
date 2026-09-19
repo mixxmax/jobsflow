@@ -26,7 +26,7 @@ from tools.workflow.package_validator import _audit_receipt_matches
 from tools.workflow.testing_packages import baseline_transform_fixture, build_package, build_workspace, canonical_fixture
 
 
-pytestmark = pytest.mark.legacy
+pytestmark = pytest.mark.retired_legacy
 
 
 def _claim_contract(job_id: str = "C0-001"):

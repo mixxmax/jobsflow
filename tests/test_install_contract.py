@@ -211,7 +211,18 @@ def test_locks_are_installed_with_hashes_everywhere():
 def _normalized_name(spec: str) -> str:
     import re
 
-    return re.split(r"[<>=!~;\s\[]", spec.strip(), 1)[0].strip().lower().replace("_", "-")
+    return re.split(r"[<>=!~;\s\[]", spec.strip(), maxsplit=1)[0].strip().lower().replace("_", "-")
+
+
+def _requirement_pins(path: Path) -> dict[str, str]:
+    pins: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "-")) or "==" not in line:
+            continue
+        name, version = line.split("==", 1)
+        pins[_normalized_name(name)] = version.split()[0].strip()
+    return pins
 
 
 def test_vendor_runtime_deps_are_pinned_in_top_level_locks():
@@ -228,12 +239,7 @@ def test_vendor_runtime_deps_are_pinned_in_top_level_locks():
     vendor_deps = [dep for dep in vendor_deps if dep]
     assert len(vendor_deps) >= 3, f"unexpected vendor dependency list: {vendor_deps}"
 
-    pins = {}
-    for line in (REPO / "requirements.txt").read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith(("#", "-r")) or "==" not in line:
-            continue
-        pins[_normalized_name(line.split("==")[0])] = line.split("==")[1].strip()
+    pins = _requirement_pins(REPO / "requirements.txt")
 
     lock_names = set()
     for line in (REPO / "requirements.lock").read_text(encoding="utf-8").splitlines():
@@ -245,3 +251,29 @@ def test_vendor_runtime_deps_are_pinned_in_top_level_locks():
     missing_lock = [dep for dep in vendor_deps if dep not in lock_names]
     assert missing_pin == [], f"vendor deps without == pin in requirements.txt: {missing_pin}"
     assert missing_lock == [], f"vendor deps missing from requirements.lock: {missing_lock}"
+
+
+def test_root_project_dependencies_match_the_single_runtime_declaration():
+    """Metadata must not advertise a different runtime than setup_env installs."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10 uses the locked tomli package.
+        import tomli as tomllib
+
+    project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = list(project.get("project", {}).get("dependencies") or [])
+    pins = _requirement_pins(REPO / "requirements.txt")
+    missing = []
+    mismatched = []
+    for spec in declared:
+        name = _normalized_name(spec)
+        if "==" not in spec:
+            missing.append(f"{name} (not exact-pinned in pyproject)")
+            continue
+        expected = spec.split("==", 1)[1].strip()
+        if pins.get(name) is None:
+            missing.append(name)
+        elif pins[name] != expected:
+            mismatched.append(f"{name}: pyproject={expected}, requirements={pins[name]}")
+    assert missing == [], f"project dependencies missing from requirements.txt: {missing}"
+    assert mismatched == [], f"project dependency pins disagree: {mismatched}"
