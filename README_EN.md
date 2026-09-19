@@ -20,13 +20,17 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-09-15 · SOP Control 0.4.0 Beta vendored
+## 🆕 Latest update · 2026-09-19 · Mainline reliability and governance hardening
 
-- **Ships with [SOP Control v0.4.0](https://github.com/mixxmax/sopcontrol):** `vendor/sopcontrol` and `tools/sopcontrol_pin.txt` pin the same commit; `vendorize --verify` checks the digest.
-- **Fail-closed formal entry:** `python -m tools.workflow` keeps scan / push / materials / apply / learn on one gateway; a missing control plane cannot pretend to allow side effects.
-- **Dynamic SOP needs real user confirmation:** permanent learning/control promotion cannot be self-attested by the model; `once_only` never becomes a permanent rule.
-- **Activity logs are inspectable:** controlled runs can be reviewed with `sopctl log report` (gated / admitted / blocked / unproven).
-- **Materials and retrieval:** capacity preflight, JD cache, bounded retries and JobsDB recovery remain gateway-managed.
+This update fixes the problems that made a clean clone, a new machine or a different model less reproducible:
+
+- **One installation contract:** `tools/setup_env.sh`, hash-locked dependencies, vendored SOP Control and CI now use the same installation path, with Python 3.10/3.11 compatibility checks.
+- **Governance green is not product green:** the SOP Control gate is separate from product tests; `ci-success` aggregates every required check, and main accepts only a fully green workflow.
+- **Governed private writes:** reset, outcome, interview and expand now use scoped gateway paths with confirmation, proposal binding and audit evidence; missing control fails closed.
+- **Diagnosable failures, no silent success:** scan/browser failures expose stage, retryability and observations; the refresh cursor advances only after a verified scoring artifact.
+- **Quality and maintainability:** Python type checks, coverage reports and clean-environment acceptance are part of CI; unreachable legacy write code was removed and selected high-risk stages were decomposed.
+
+This mainline reliability update does not change the existing JobsDB user flow; private runtime data remains outside the public repository.
 
 ### Why JobsFlow?
 
@@ -88,6 +92,7 @@ Artifacts, state and traceable evidence
 - **Hard boundaries, flexible judgment:** the system owns previews, confirmations, legal state transitions, package boundaries and required outputs; the model still handles company research, JD interpretation and wording.
 - **Safe hand-off:** another model or harness can continue from the same workspace and state. Harnesses with hooks can intercept before an action; without hooks, the gateway's final gates still apply.
 - **Fail closed with a next step:** missing inputs, stale artifacts or unconfirmed side effects return a diagnostic next action instead of inviting the model to guess, browse another package or silently modify unrelated work.
+- **Versioned and auditable control:** SOP Control is pinned with a verified digest and travels with the repository. `sopctl log report` distinguishes gated, admitted, blocked and unproven runs; dynamic rules require real user confirmation, and `once_only` observations never silently become permanent rules.
 
 SOP Control therefore reduces cross-model drift and rework without adding a daily control conversation. Most users only need the normal `/setup`, `/scan`, `/push`, `/materials` and `/apply` commands.
 
@@ -201,6 +206,12 @@ identities from the latest three temporary observations; daily/preview scans
 use the requested time window. The scanner does not reread the entire tracker,
 and a partial run remembers jobs already seen without moving the refresh
 watermark, so a retry does not immediately show the same rows.
+
+Materials run a capacity preflight before rendering. If CV or cover letter content
+would exceed the budget, only the affected material is sent back for a targeted
+revision instead of generating a PDF that is expected to fail. JD caching, bounded
+retries and human recovery hand-off are gateway-managed as well, so transient
+failures do not become false successes or repeated downloads.
 
 The local ledger owns row identity and numbering; CSV and Google Sheets are
 replayable projections. `push` reports which backend it used and warns when

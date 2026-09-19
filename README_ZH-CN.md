@@ -34,13 +34,17 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 
 ---
 
-## 🆕 最新更新 · 2026-09-15 · SOP Control 0.4.0 Beta 随仓钉死
+## 🆕 最新更新 · 2026-09-19 · 主干可靠性与治理加固
 
-- **内嵌 [SOP Control v0.4.0](https://github.com/mixxmax/sopcontrol)**：`vendor/sopcontrol` 与 `tools/sopcontrol_pin.txt` 钉死同一 commit；`vendorize --verify` 校验 digest。
-- **正式入口 fail-closed**：`python -m tools.workflow` 的 scan / push / materials / apply / learn 走统一 gateway；缺控制面不会假装放行有副作用的写入。
-- **动态 SOP 需真实用户确认**：永久学习/控制晋升不能靠模型自报；`once_only` 不进永久规则。
-- **活动日志可复盘**：受控运行可对照 `sopctl log report`，区分 gated / admitted / blocked / unproven。
-- **材料链与扫描**：容量预检、JD 缓存、受控重试与 JobsDB 恢复交接仍由网关管理。
+这次更新集中修复“在新机器、新模型或干净 clone 上仍能可靠运行”的问题：
+
+- **唯一安装契约**：`tools/setup_env.sh`、哈希锁定依赖、vendored SOP Control 和 CI 使用同一条安装路径，并验证 Python 3.10/3.11 兼容性。
+- **治理绿不再冒充产品绿**：SOP Control gate 与产品测试分开，`ci-success` 聚合所有必要检查；主分支只接受完整 CI 通过的变更。
+- **私有写入受 gateway 管理**：reset、outcome、interview、expand 等路径增加范围、确认、摘要绑定和审计；缺少必要控制时 fail-closed。
+- **失败可诊断、不可静默成功**：扫描/浏览器错误带有阶段、可重试性和观测信息；只有已验证的评分产物才会推进刷新游标。
+- **质量与可维护性加固**：新增 Python 类型检查、coverage 报告、干净环境验收，并清理不可达旧写入代码、拆分部分高风险处理阶段。
+
+JobsFlow 的求职功能与 JobsDB 的既有使用方式未因本次主干可靠性修复而改变；私人工作区仍不会进入公开仓库。
 
 ## 🎯 解决什么问题？
 
@@ -146,6 +150,7 @@ JobsFlow 统一网关
 - **边界写死，判断留给模型**：是否预览、是否确认、能否进入下一阶段、是否只能在当前岗位包内写入，由系统控制；公司研究、JD 解读和措辞仍由模型完成。
 - **换模型或平台仍能接手**：在同一个产品工作区内，规则、状态和已完成证据可以延续。支持 hooks 的 harness 可在动作前拦截；没有 hooks 时，统一网关的最终门仍然生效。
 - **失败会返回下一步**：缺输入、产物过期或未确认的副作用会停在可诊断状态，不让模型猜测、翻看其他岗位或静默改动无关文件。
+- **控制面可验证且可复盘**：SOP Control 随仓固定版本与 digest；受控运行可用 `sopctl log report` 区分 gated、admitted、blocked 和 unproven。动态规则只有在真实用户确认后才会升级，`once_only` 不会偷偷变成永久规则。
 
 因此，SOP Control 的作用是减少跨模型、跨会话的偏差和返工，而不是增加一轮日常对话。普通用户仍只需使用 `/setup`、`/scan`、`/push`、`/materials` 和 `/apply`。
 
@@ -285,6 +290,9 @@ CV 和 Cover Letter 是两份平行基础版，具体岗位只提交有限 JD �
 本地 ledger 是岗位身份和编号的权威来源，CSV/Google Sheets 只是可重放的投影；`push` 会明确报告实际
 使用的后端，配置不足时提示改用本地 CSV。JobsDB 的缓存、人工恢复和熔断规则见下方专节；所有降级只
 影响私人运行，不会把 token、cookie 或个人资料带入公开产品。
+
+材料制作在渲染前先做容量预检；超出预算时只要求对应的 CV 或 CL 定向修改，不先生成必然失败的 PDF。
+JD 缓存优先、受控重试和人工恢复交接也由 gateway 管理，避免把同一份资料重抓多次或把暂时失败误记成成功。
 
 ### 我们的 LLMO 策略
 

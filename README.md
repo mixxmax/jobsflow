@@ -34,13 +34,17 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
 
 ---
 
-## 🆕 最新更新 · 2026-09-15 · SOP Control 0.4.0 Beta 隨倉釘死
+## 🆕 最新更新 · 2026-09-19 · 主幹可靠性與治理加固
 
-- **內嵌 [SOP Control v0.4.0](https://github.com/mixxmax/sopcontrol)**：`vendor/sopcontrol` 與 `tools/sopcontrol_pin.txt` 釘死同一 commit；`vendorize --verify` 校驗 digest。
-- **正式入口 fail-closed**：`python -m tools.workflow` 的 scan / push / materials / apply / learn 走統一 gateway；缺控制面不會假裝放行有副作用的寫入。
-- **動態 SOP 需真實用戶確認**：`learn decide --route control` / 永久動態規則不能靠模型自報或二次空呼叫晉升；`once_only` 不進永久規則。
-- **活動日誌可複盤**：受控運行可對照 SOP Control 的 `sopctl log report`，區分 gated / admitted / blocked / unproven。
-- **材料鏈與掃描**：容量預檢、JD 緩存、受控重試與 JobsDB 恢復交接仍由網關管理。
+這次更新集中修復「在新機器、新模型或乾淨 clone 上仍能可靠運行」的問題：
+
+- **唯一安裝契約**：`tools/setup_env.sh`、雜湊鎖定依賴、vendored SOP Control 和 CI 使用同一條安裝路徑，並驗證 Python 3.10/3.11 相容性。
+- **治理綠不再冒充產品綠**：SOP Control gate 與產品測試分開，`ci-success` 聚合所有必要檢查；主分支只接受完整 CI 通過的變更。
+- **私有寫入受 gateway 管理**：reset、outcome、interview、expand 等路徑增加範圍、確認、摘要綁定和審計；缺少必要控制時 fail-closed。
+- **失敗可診斷、不可靜默成功**：掃描/瀏覽器錯誤帶有階段、可重試性和觀測資訊；只有已驗證的評分產物才會推進刷新游標。
+- **品質與可維護性加固**：新增 Python 類型檢查、coverage 報告、乾淨環境驗收，並清理不可達舊寫入代碼、拆分部分高風險處理階段。
+
+JobsFlow 的求職功能與 JobsDB 的既有使用方式未因本次主幹可靠性修復而改變；私人工作區仍不會進入公開倉庫。
 
 ## 🎯 解決什麼問題？
 
@@ -146,6 +150,7 @@ JobsFlow 統一 gateway
 - **把邊界寫死，把判斷留給模型**：是否預覽、是否確認、是否可以進入下一階段、是否只能在當前崗位包內寫入，由系統控制；公司研究、JD 解讀和措辭等仍由模型完成。
 - **換模型或平台仍可接手**：只要在同一產品工作區使用統一 gateway，規則、狀態和已完成證據可以延續。支持即時 hooks 的 harness 可在動作前攔截；即使沒有 hooks，gateway 的最終門仍會生效。
 - **失敗會停在可診斷狀態**：缺輸入、過期產物或未確認的副作用會返回下一步，而不是讓模型猜測、繞路或靜默修改其他崗位。
+- **控制面可驗證且可複盤**：SOP Control 隨倉固定版本與 digest；受控運行可用 `sopctl log report` 區分 gated、admitted、blocked 和 unproven。動態規則只有在真實用戶確認後才會升級，`once_only` 不會偷偷變成永久規則。
 
 因此，SOP Control 的作用不是增加一輪對話，而是減少跨模型、跨會話時的偏差和返工；普通用戶仍只需使用 `/setup`、`/scan`、`/push`、`/materials` 和 `/apply`。
 
@@ -320,6 +325,9 @@ python3 -m tools.workflow base confirm --lane A --confirm
 本地 ledger 是崗位身份和編號的權威來源，CSV/Google Sheets 只是可重放的投影；`push` 會明確報告實際
 使用的後端，配置不足時提示改用本地 CSV。JobsDB 的緩存、人工恢復和熔斷規則見下方專節；所有降級只
 影響私人運行，不會把 token、cookie 或個人資料帶入公開產品。
+
+材料製作在渲染前先做容量預檢；超出預算時只要求對應的 CV 或 CL 定向修改，不先生成必然失敗的 PDF。
+JD 緩存優先、受控重試和人工恢復交接也由 gateway 管理，避免把同一份資料重抓多次或把暫時失敗誤記成成功。
 
 ### 我們的 LLMO 策略
 
