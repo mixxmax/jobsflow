@@ -36,25 +36,33 @@ else
     LOCK="$REPO/requirements.lock"
 fi
 
-# An activated virtualenv always wins: never bypass it just because a
-# system python3.12 exists elsewhere on PATH.  Otherwise probe PATH plus the
-# well-known Homebrew/Linux locations (a bare `python3` is often an old
-# system interpreter, e.g. macOS 3.9, which must not be picked silently).
+# An activated virtualenv always wins: never bypass it just because another
+# interpreter exists elsewhere on PATH.  In CI, actions/setup-python makes
+# the matrix interpreter the plain `python`; that interpreter must remain the
+# one we install into and the one subsequent steps invoke.  Otherwise probe
+# PATH plus well-known locations, but validate the version before selecting a
+# candidate (a bare macOS `python3` may still be 3.9).
 if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
     PYTHON_BIN="$VIRTUAL_ENV/bin/python"
 else
     PYTHON_BIN=""
     for candidate in \
+        "$(command -v python 2>/dev/null)" \
+        "$(command -v python3 2>/dev/null)" \
         "$(command -v python3.12 2>/dev/null)" \
         "$(command -v python3.11 2>/dev/null)" \
+        "$(command -v python3.10 2>/dev/null)" \
         /opt/homebrew/bin/python3.12 \
         /opt/homebrew/bin/python3.11 \
+        /opt/homebrew/bin/python3.10 \
         /usr/local/bin/python3.12 \
         /usr/local/bin/python3.11 \
-        "$(command -v python3 2>/dev/null)"; do
+        /usr/local/bin/python3.10; do
         if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-            PYTHON_BIN="$candidate"
-            break
+            if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+                PYTHON_BIN="$candidate"
+                break
+            fi
         fi
     done
 fi
