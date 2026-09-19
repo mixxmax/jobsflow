@@ -1,7 +1,10 @@
 """可审查规则候选：聚合观察事实，但永不写入或激活 Rule。"""
 from __future__ import annotations
 
+import fcntl
 import json
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
@@ -92,9 +95,39 @@ class CorrectionObservation(BaseModel):
 
 
 class CandidateStore:
+    """候选存储：load-modify-save 必须持锁，否则并发确认丢失更新（C4）。"""
+
+    _process_locks: dict[str, threading.RLock] = {}
+    _process_locks_guard = threading.Lock()
+
     def __init__(self, root: Path):
         self.root = Path(root)
         self.path = self.root / ".sopcontrol" / "rules" / "candidates.yaml"
+
+    @contextmanager
+    def exclusive(self):
+        """进程内 RLock + 跨进程 flock：load-modify-save 原子化。"""
+        import os as _os
+
+        key = str(self.path.resolve()) if self.path.exists() else str(self.path.absolute())
+        with CandidateStore._process_locks_guard:
+            lock = CandidateStore._process_locks.setdefault(key, threading.RLock())
+        with lock:
+            lock_path = self.path.parent / ".candidates.lock"
+            try:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                fd = _os.open(str(lock_path), _os.O_CREAT | _os.O_RDWR, 0o600)
+            except OSError:
+                yield
+                return
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    _os.close(fd)
 
     def _legacy_record(self, data: dict) -> CandidateRecord:
         statement = _normalize(str(data.get("statement") or ""))
@@ -147,15 +180,28 @@ class CandidateStore:
         return [self._legacy_record(item) for item in data if isinstance(item, dict)]
 
     def save(self, records: list[CandidateRecord]) -> None:
+        import os as _os
+        import tempfile as _tempfile
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            yaml.safe_dump(
-                [record.model_dump(mode="json") for record in records],
-                allow_unicode=True,
-                sort_keys=False,
-            ),
-            encoding="utf-8",
-        )
+        fd, tmp = _tempfile.mkstemp(prefix=".candidates.", suffix=".tmp",
+                                    dir=str(self.path.parent))
+        try:
+            with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(yaml.safe_dump(
+                    [record.model_dump(mode="json") for record in records],
+                    allow_unicode=True,
+                    sort_keys=False,
+                ))
+                fh.flush()
+                _os.fsync(fh.fileno())
+            _os.replace(tmp, self.path)
+        except Exception:
+            try:
+                _os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def get(self, candidate_id: str) -> CandidateRecord:
         for record in self.load():
@@ -184,32 +230,34 @@ class CandidateStore:
             suggested_action=suggested_action,
         )
         records = self.load()
-        record = next((item for item in records if item.fingerprint == fingerprint), None)
-        created = record is None
-        if record is None:
-            record = CandidateRecord(
-                candidate_id=f"CAND-{fingerprint}",
-                fingerprint=fingerprint,
-                kind=kind,
-                statement=normalized,
-                scope_guess=_normalize(scope_guess) or "project",
-                suggested_action=suggested_action,
-                suggested_modality=suggested_modality,
-                note=note or "候选只供审查；晋升仍须显式 sopctl rule add",
-                priority=priority if priority in ("low", "high") else "low",
-                explicit_once_only=bool(explicit_once_only),
-            )
-            records.append(record)
-        occurrence_ids = {item.occurrence_id for item in record.sources}
-        if source.occurrence_id not in occurrence_ids:
-            record.sources.append(source)
-            record.frequency = len({item.occurrence_id for item in record.sources})
-            record.first_seen_at = min(item.observed_at for item in record.sources)
-            record.last_seen_at = max(item.observed_at for item in record.sources)
-            self.save(records)
-        elif created:
-            self.save(records)
-        return record, created
+        with self.exclusive():
+            records = self.load()
+            record = next((item for item in records if item.fingerprint == fingerprint), None)
+            created = record is None
+            if record is None:
+                record = CandidateRecord(
+                    candidate_id=f"CAND-{fingerprint}",
+                    fingerprint=fingerprint,
+                    kind=kind,
+                    statement=normalized,
+                    scope_guess=_normalize(scope_guess) or "project",
+                    suggested_action=suggested_action,
+                    suggested_modality=suggested_modality,
+                    note=note or "候选只供审查；晋升仍须显式 sopctl rule add",
+                    priority=priority if priority in ("low", "high") else "low",
+                    explicit_once_only=bool(explicit_once_only),
+                )
+                records.append(record)
+            occurrence_ids = {item.occurrence_id for item in record.sources}
+            if source.occurrence_id not in occurrence_ids:
+                record.sources.append(source)
+                record.frequency = len({item.occurrence_id for item in record.sources})
+                record.first_seen_at = min(item.observed_at for item in record.sources)
+                record.last_seen_at = max(item.observed_at for item in record.sources)
+                self.save(records)
+            elif created:
+                self.save(records)
+            return record, created
 
     def triage_many(
         self,
@@ -222,16 +270,17 @@ class CandidateStore:
         requested = list(dict.fromkeys(candidate_ids))
         if not requested:
             raise ValueError("至少提供一个候选 ID")
-        records = self.load()
-        by_id = {record.candidate_id: record for record in records}
-        missing = [candidate_id for candidate_id in requested if candidate_id not in by_id]
-        if missing:
-            raise KeyError("未找到候选: " + ", ".join(missing))
-        changed = [by_id[candidate_id] for candidate_id in requested]
-        for record in changed:
-            record.status = status
-        self.save(records)
-        return changed
+        with self.exclusive():
+            records = self.load()
+            by_id = {record.candidate_id: record for record in records}
+            missing = [candidate_id for candidate_id in requested if candidate_id not in by_id]
+            if missing:
+                raise KeyError("未找到候选: " + ", ".join(missing))
+            changed = [by_id[candidate_id] for candidate_id in requested]
+            for record in changed:
+                record.status = status
+            self.save(records)
+            return changed
 
     def triage(self, candidate_id: str, status: CandidateStatus) -> CandidateRecord:
         return self.triage_many([candidate_id], status)[0]

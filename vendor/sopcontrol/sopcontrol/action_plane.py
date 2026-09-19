@@ -83,11 +83,18 @@ def build_envelope(
     surface, operation = classify_tool(raw_tool, tool_input)
     target = target_from_input(surface, tool_input)
     claimed = extract_claimed_model(payload)
+    # 宿主声明的副作用（host-claimed write entry 通道）：未知工具自称受控写入口时，
+    # 不得 observe→allow（WP-C）。声明并入指纹（影响决策必须影响指纹）。
+    claimed_raw = payload.get("claimed_side_effects")
+    claimed_effects = sorted({str(x).strip() for x in claimed_raw
+                              if isinstance(claimed_raw, list) and str(x).strip()}) \
+        if isinstance(claimed_raw, list) else []
     # Digest over tool name + non-secret field names/lengths, not bodies.
     digest_basis = {
         "tool": normalize_tool_name(raw_tool),
         "surface": surface,
         "target": target,
+        "claimed_side_effects": claimed_effects,
         "keys": sorted(str(k) for k in tool_input.keys()),
         "sizes": {
             str(k): (len(str(v)) if v is not None else 0)
@@ -110,7 +117,8 @@ def build_envelope(
         raw_tool_name=raw_tool,
         raw_event_digest=_digest(digest_basis),
         input_fingerprint=_digest({"surface": surface, "operation": operation, "target": target}),
-        requested_side_effects=side_effects_for(surface),
+        requested_side_effects=side_effects_for(surface) + [
+            e for e in claimed_effects if e not in side_effects_for(surface)],
         summary=_safe_summary(surface, tool_input),
     )
 
@@ -292,6 +300,23 @@ def evaluate_action(
     gap = ""
     if surface == "unknown":
         gap = f"unrecognized_tool:{envelope.raw_tool_name or envelope.operation}"
+    if surface in {"unknown", "mcp"} and envelope.requested_side_effects:
+        # 宿主自称受控写入口：不得 observe→allow（WP-C）。要么走正式
+        # wrapper/受控入口重放，要么明确本次放行意图。
+        claimed = ",".join(envelope.requested_side_effects)
+        return ActionDecision(
+            decision="ask",
+            reason=(
+                f"工具 {envelope.raw_tool_name or envelope.operation} 自称受控写入口 "
+                f"({claimed})：不能观察后默认放行。"
+                f"请经正式 wrapper/受控入口重放，或明确本次放行意图"
+            ),
+            rule_ids=[],
+            surface=surface,
+            operation=envelope.operation,
+            gap=gap or f"claimed_write:{envelope.raw_tool_name or envelope.operation}",
+            envelope=envelope,
+        )
     return ActionDecision(
         decision="observe",
         reason=(
@@ -358,6 +383,7 @@ def commit_action_result(
         "operation": decision.operation,
         "decision": decision.decision,
         "rule_ids": list(decision.rule_ids),
+        "selection_evidence": decision.selection_evidence,
         "raw_event_digest": envelope.raw_event_digest if envelope else "",
         "input_fingerprint": fingerprint,
         "target_digest": _digest(envelope.target) if envelope and envelope.target else "",

@@ -186,7 +186,7 @@ def run_gate(root: Path) -> int:
         print(f"FAIL(阻断) {v.rule_id}: {v.reason[:100]}", file=sys.stderr)
 
     if tampered:
-        print("FAIL(阻断): 证据账本被篡改或损坏（运行 sopctl doctor 复核）", file=sys.stderr)
+        print("FAIL(阻断): 证据账本完整性校验失败（损坏/不一致；运行 sopctl doctor 复核）", file=sys.stderr)
 
     from .capability_events import CapabilityEvent, append_capability_event
 
@@ -215,7 +215,7 @@ def run_gate(root: Path) -> int:
                     source="gate",
                     subject="ledger",
                     rule_ids=["TRUST-LEDGER"],
-                    reason="证据账本被篡改或损坏",
+                    reason="证据账本完整性校验失败",
                 )
             for v in fails:
                 ambient_grow_on_control_deny(

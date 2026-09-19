@@ -79,6 +79,7 @@ DETAIL_ALLOWLIST = frozenset({
     "duration_ms", "event_count", "classification", "subject", "digest",
     "kind", "route", "window_id", "adapter", "no_candidate_reason",
     "old_version", "new_version", "rollback", "schema_version",
+    "selection_evidence",
 })
 
 _SECRET_KEY_RE = re.compile(

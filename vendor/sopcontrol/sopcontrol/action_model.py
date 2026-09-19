@@ -70,6 +70,9 @@ class ActionDecision(BaseModel):
     operation: str = ""
     gap: str = ""
     envelope: Optional[ActionEnvelope] = None
+    # 统一选择入口的选择证据标识（rule_select.decide_action_with_rules 写入；
+    # commit_action_result 落账；空=未走统一入口，旧行为兼容）。
+    selection_evidence: str = ""
 
 
 class ActionResult(BaseModel):

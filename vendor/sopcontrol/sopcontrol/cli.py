@@ -227,14 +227,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--legacy-marker", action="append", help="受控入口之外的旧路径符号，存活即算绕过，可重复")
     p.add_argument("--guard-id", action="append", help="哪个运行时 guard 执行本规则（可重复；必须是拦截器已声明的 id）")
     p.add_argument("--tag", action="append")
+    p.add_argument("--confirmation-id", default="",
+                   help="可信确认凭据（confirm request/approve 得到；--status accepted 建议提供）")
+    p.add_argument("--confirmation-secret", default="",
+                   help="显式 secret（必填显式传入；不自动读 handoff）")
+    p.add_argument("--secret-file", default="",
+                   help="确认 secret 文件（0600；与 --confirmation-secret 二选一）")
     p.set_defaults(func=cmd_rule_add)
 
     p = rule_sub.add_parser("list", help="列出规则")
     p.add_argument("path", nargs="?", default=".")
     p.set_defaults(func=cmd_rule_list)
 
-    p = rule_sub.add_parser("accept", help="接受一条规则（生命周期迁移）")
+    p = rule_sub.add_parser("accept", help="接受一条规则（生命周期迁移，需可信确认凭据）")
     p.add_argument("rule_id")
+    p.add_argument("--confirmation-id", default="", help="可信确认凭据 ID（必填）")
+    p.add_argument("--confirmation-secret", default="",
+                   help="显式 secret（必填显式传入；不自动读 handoff）")
+    p.add_argument("--secret-file", default="",
+                   help="secret 文件（0600；与 --confirmation-secret 二选一）")
     p.add_argument("path", nargs="?", default=".")
     p.set_defaults(func=cmd_rule_accept)
 
@@ -1088,6 +1099,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--effect", default="")
     p.add_argument("--task-id", default="")
     p.set_defaults(func=cmd_ticket, sub="redeem")
+
+    confirm = sub.add_parser(
+        "confirm",
+        help="可信确认通道（预览→批准一次性绑定；本地 CLI 批准记 claimed，人类在场 UNPROVEN）",
+    )
+    confirm_sub = confirm.add_subparsers(dest="sub")
+    p = confirm_sub.add_parser("request", help="签发确认请求（预览，不消费）")
+    p.add_argument("path", nargs="?", default=".")
+    p.add_argument("--kind", required=True, help="如 rule-accept / scope-relax / rollback")
+    p.add_argument("--subject", required=True, help=" subject id，如规则 id")
+    p.add_argument("--digest", required=True, help="变更内容摘要（change_digest）")
+    p.add_argument("--purpose", default="", help="用途说明")
+    p.add_argument("--ttl", type=int, default=3600)
+    p.set_defaults(func=cmd_confirm, sub="request")
+    p = confirm_sub.add_parser("approve", help="批准确认请求（一次性消费，需显式 secret）")
+    p.add_argument("path", nargs="?", default=".")
+    p.add_argument("--confirmation-id", required=True)
+    p.add_argument("--confirmation-secret", default="",
+                   help="显式 secret（必填显式传入；不自动读 handoff）")
+    p.add_argument("--secret-file", default="",
+                   help="secret 文件（0600；与 --confirmation-secret 二选一）")
+    p.add_argument("--digest", default="", help="期望变更摘要（不一致即拒）")
+    p.set_defaults(func=cmd_confirm, sub="approve")
+    p = confirm_sub.add_parser("show", help="查看确认请求状态（只读）")
+    p.add_argument("path", nargs="?", default=".")
+    p.add_argument("--confirmation-id", required=True)
+    p.set_defaults(func=cmd_confirm, sub="show")
 
     event = sub.add_parser(
         "event",

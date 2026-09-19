@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import re
 import shlex
-from pathlib import PurePosixPath
-from typing import Literal, Optional
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -160,6 +161,297 @@ def extract_claimed_model(payload: dict) -> str:
     return ""
 
 
+def _first_text(*values: object) -> str:
+    """Return the first scalar, non-empty value without inventing context."""
+    for value in values:
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def build_harness_selection_context(
+    payload: dict,
+    *,
+    root: Path | None,
+    operation: str,
+    target: str,
+    task_id: str,
+) -> dict[str, str]:
+    """Build one stable selector context for every runtime harness admission.
+
+    The selector context is deliberately derived from the incoming payload and
+    short project metadata only.  It contains no timestamps, random IDs, or
+    absolute paths, so the selection evidence remains reproducible for the same
+    admission.  Missing dimensions stay empty; the selector then reports them
+    as ``unproven`` instead of treating them as a match.
+    """
+    tool_input = payload.get("tool_input")
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    supplied = payload.get("selection_context")
+    supplied = supplied if isinstance(supplied, dict) else {}
+    project_name = root.name if root is not None else ""
+
+    project = _first_text(
+        payload.get("project"), supplied.get("project"),
+        payload.get("project_id"), supplied.get("project_id"), project_name,
+    )
+    product = _first_text(
+        payload.get("product"), supplied.get("product"),
+        payload.get("project"), supplied.get("project"), project_name,
+    )
+    action = _first_text(
+        payload.get("action"), supplied.get("action"),
+        payload.get("operation"), supplied.get("operation"), operation,
+    )
+    selected_target = _first_text(
+        payload.get("target"), payload.get("path"),
+        supplied.get("target"), supplied.get("path"),
+        tool_input.get("target"), tool_input.get("path"),
+        tool_input.get("file_path"), tool_input.get("filePath"),
+        tool_input.get("url"), target,
+    )
+    selected_task = _first_text(
+        payload.get("task_id"), supplied.get("task_id"),
+        tool_input.get("task_id"), task_id,
+    )
+    return {
+        "product": product,
+        "project": project,
+        "action": action,
+        "operation": _first_text(
+            payload.get("operation"), supplied.get("operation"), operation,
+        ),
+        "phase": _first_text(
+            payload.get("phase"), payload.get("sop_phase"),
+            supplied.get("phase"), supplied.get("sop_phase"),
+            tool_input.get("phase"), tool_input.get("sop_phase"),
+        ),
+        "target": selected_target,
+        "path": selected_target,
+        "task_id": selected_task,
+        "artifact_kind": _first_text(
+            payload.get("artifact_kind"), supplied.get("artifact_kind"),
+            tool_input.get("artifact_kind"),
+        ),
+        "actor": _first_text(
+            payload.get("actor"), supplied.get("actor"),
+        ),
+    }
+
+
+def _load_effective_harness_rules(root: Path | None) -> tuple[list[Any], str, str]:
+    """Load the fixed-time effective rule set.
+
+    Returns (rules, digest, status) with status in {"ok", "empty", "corrupt"}:
+    - "empty": 无注册表文件或零规则——旧项目兼容路径（legacy observe 语义）；
+    - "corrupt": 文件存在但无法解析——调用方必须对受控写 fail-closed，
+      不得折叠为空规则集继续放行；
+    - "ok": 健康非空。
+    A malformed registry must not create a false claim that rules ran.
+    """
+    if root is None:
+        return [], "", "empty"
+    from pathlib import Path as _Path
+
+    registry_path = _Path(root) / ".sopcontrol" / "rules" / "registry.yaml"
+    if not registry_path.is_file():
+        return [], "", "empty"
+    try:
+        from .model import content_hash, effective_rules, utcnow
+        from .registry import Registry
+
+        rules = effective_rules(
+            Registry(registry_path).load(),
+            at=utcnow(),
+        )
+        if not rules:
+            return [], "", "empty"
+        digest = content_hash({
+            "rules": [
+                rule.model_dump(mode="json")
+                for rule in sorted(rules, key=lambda item: item.rule_id)
+            ],
+        })
+        return rules, digest, "ok"
+    except Exception:
+        # 文件存在但无法解析：corrupt。调用方不得折叠为空规则集，
+        # 必须不对失败的加载附加 selection_evidence，且受控写 fail-closed。
+        return [], "", "corrupt"
+
+
+def _consumed_proofs_path(root: Path) -> Path:
+    return Path(root) / ".sopcontrol-local" / "consumed_proofs.jsonl"
+
+
+def settle_host_proofs(
+    root: Path | str | None, proofs: dict[str, Any], *,
+    rule_ids: list[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """一次性消费结算（I/O 层，fcntl 锁下读-验-记）。
+
+    返回 (usable, refused)：已消费的 proof_id 直接拒绝（重放），其余原样
+    交回调用方做结构校验。root 为空（纯兼容路径）时无法持久化消费记录，
+    全部拒绝——不能在无法保证单次性的地方接受一次性证明。
+    """
+    import fcntl
+    import json as _json
+
+    refused: dict[str, str] = {}
+    if not isinstance(proofs, dict):
+        return {}, {}
+    if root is None:
+        return {}, {str(k): "无项目上下文，无法保证单次消费" for k in proofs}
+    root = Path(root)
+    path = _consumed_proofs_path(root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = path.open("a+")
+    except OSError:
+        return {}, {str(k): "消费记录不可写" for k in proofs}
+    usable: dict[str, Any] = {}
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+        fd.seek(0)
+        consumed: set[str] = set()
+        for line in fd.read().splitlines():
+            try:
+                record = _json.loads(line)
+            except ValueError:
+                continue
+            pid = record.get("proof_id")
+            if pid:
+                consumed.add(str(pid))
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for rule_id, proof in proofs.items():
+            pid = proof.get("proof_id") if isinstance(proof, dict) else ""
+            if not pid or not str(pid).strip():
+                refused[str(rule_id)] = "证明缺少 proof_id（无法单次消费）"
+                continue
+            if str(pid) in consumed:
+                refused[str(rule_id)] = f"证明 {pid} 已被消费：重放拒绝"
+                continue
+            usable[str(rule_id)] = proof
+            consumed.add(str(pid))
+            fd.write(_json.dumps({"proof_id": str(pid), "rule_id": str(rule_id),
+                                  "at": now_iso}, ensure_ascii=False) + "\n")
+        fd.flush()
+        try:
+            import os as _os
+
+            _os.fsync(fd.fileno())
+        except OSError:
+            pass
+        return usable, refused
+    finally:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            fd.close()
+
+
+def decide_harness_action(
+    payload: dict,
+    *,
+    root: Path | str | None = None,
+    gate_status: Optional[str] = None,
+    session_intent: Optional[str] = None,
+    bound_executor: Optional[str] = None,
+    claimed_model: Optional[str] = None,
+    harness: str = "",
+) -> Any:
+    """Run the real harness admission through the unified rule selector.
+
+    ``root=None`` keeps the compatibility adapter pure and preserves the
+    no-registry behavior.  The CLI admission supplies the project root, which
+    enables the effective registry and the same selector context used by this
+    adapter.
+    """
+    from .action_plane import build_envelope
+    from .rule_select import decide_action_with_rules
+
+    project_root = Path(root).resolve() if root is not None else None
+    decision_payload = dict(payload)
+    if claimed_model is not None and claimed_model.strip():
+        decision_payload["model"] = claimed_model.strip()
+    tool_input = decision_payload.get("tool_input")
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    envelope = build_envelope(decision_payload, harness=harness)
+    task_id = _first_text(
+        decision_payload.get("task_id"), tool_input.get("task_id"),
+    )
+    project_id = _first_text(
+        decision_payload.get("project_id"), decision_payload.get("project"),
+        project_root.name if project_root is not None else "",
+    )
+    worktree_id = _first_text(decision_payload.get("worktree_id"))
+    run_id = _first_text(decision_payload.get("run_id"))
+    context = build_harness_selection_context(
+        decision_payload,
+        root=project_root,
+        operation=envelope.operation,
+        target=envelope.target,
+        task_id=task_id,
+    )
+    rules, rules_digest, rules_status = _load_effective_harness_rules(project_root)
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    now = _dt.now(_tz.utc)
+    raw_proofs = decision_payload.get("host_proofs")
+    usable_proofs: dict[str, Any] | None = None
+    refused_proofs: dict[str, str] = {}
+    if raw_proofs is not None:
+        # host_proofs 在场即进入证明通道：非 dict 载荷直接 ask，不静默忽略。
+        if not isinstance(raw_proofs, dict):
+            from .action_model import ActionDecision as _ActionDecision
+
+            return _ActionDecision(
+                decision="ask",
+                reason="host_proofs 必须是对象（rule_id→证明）：畸形证明载荷不得忽略",
+                rule_ids=[],
+                surface=envelope.surface,
+                operation=envelope.operation,
+                envelope=envelope,
+            )
+        usable_proofs, refused_proofs = settle_host_proofs(
+            project_root, raw_proofs)
+    decision = decide_action_with_rules(
+        rules,
+        decision_payload,
+        context,
+        gate_status=gate_status,
+        session_intent=session_intent,
+        bound_executor=bound_executor,
+        tool_input=tool_input,
+        harness=harness,
+        rules_digest=rules_digest,
+        project_id=project_id,
+        worktree_id=worktree_id,
+        task_id=task_id,
+        run_id=run_id,
+        host_proofs=usable_proofs,
+        rejected_proofs=refused_proofs,
+        now=now,
+    )
+    if (rules_status == "corrupt" and envelope.surface in {"filesystem_write", "shell"}
+            and decision.decision in ("allow", "observe")):
+        # 注册表损坏：受控写 fail-closed（读侧仍走 legacy observe；
+        # 已有 deny 等更强判定优先保留，不降级为 ask）。
+        from .action_model import ActionDecision as _ActionDecision2
+
+        return _ActionDecision2(
+            decision="ask",
+            reason=("规则库损坏，无法加载有效规则：受控写动作不得按“无规则”放行。"
+                    "下一步: 修复注册表后重试，或明确本次放行意图"),
+            rule_ids=list(decision.rule_ids),
+            surface=envelope.surface,
+            operation=envelope.operation,
+            gap="registry_corrupt",
+            envelope=envelope,
+        )
+    return decision
+
+
 def check_tool_call(
     payload: dict,
     gate_status: Optional[str] = None,
@@ -167,22 +459,26 @@ def check_tool_call(
     *,
     bound_executor: Optional[str] = None,
     claimed_model: Optional[str] = None,
+    project_root: Path | str | None = None,
+    harness: str = "",
 ) -> HookDecision:
     """Compatibility wrapper over Action Plane (Phase B).
 
-    Still a pure function (no I/O). Claude/OpenCode protocol only speaks
-    allow/deny/ask — ActionDecision.observe maps to allow for the wire format
-    while commit_action_result (CLI layer) records the observe event.
+    It remains pure when ``project_root`` is omitted. Claude/OpenCode protocol
+    only speaks allow/deny/ask — ActionDecision.observe maps to allow for the
+    wire format while commit_action_result (CLI layer) records the observe
+    event. Supplying a project root is the explicit runtime-admission path and
+    loads the effective registry through decide_harness_action.
     """
-    from .action_plane import evaluate_payload
-
     intent = session_intent or str(payload.get("session_intent") or "")
-    decision = evaluate_payload(
+    decision = decide_harness_action(
         payload,
+        root=project_root,
         gate_status=gate_status,
         session_intent=intent,
         bound_executor=bound_executor,
         claimed_model=claimed_model,
+        harness=harness,
     )
     # Protocol mapping: observe is visible-but-not-blocking on the wire.
     if decision.decision == "observe":
