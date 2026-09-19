@@ -38,7 +38,10 @@ declaration and re-compiling both locks:
 
 ```bash
 uv pip compile --generate-hashes requirements.txt -o requirements.lock
-uv pip compile --generate-hashes requirements-dev.txt -o requirements-dev.lock
+# Compile the development lock for the minimum supported Python so conditional
+# dependencies (for example tomli/exceptiongroup on Python 3.10) are present
+# for every CI interpreter.
+uv pip compile --python-version 3.10 --generate-hashes requirements-dev.txt -o requirements-dev.lock
 ```
 
 Rules:

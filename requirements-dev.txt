@@ -2,3 +2,6 @@
 pytest==8.4.2
 mypy==1.18.1
 pytest-cov==6.2.1
+# mypy and pytest import tomli on Python 3.10; keep it explicit so the
+# hash-locked install is valid across every supported interpreter.
+tomli==2.4.1
