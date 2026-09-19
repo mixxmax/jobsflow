@@ -17,6 +17,7 @@ from typing import Any
 
 from tools.io_utils import atomic_write_text
 from tools.workflow.contracts import result
+from tools.workflow.interaction_shell import product_root, runtime_gate
 
 _SLUG_RE = re.compile(r"^[a-z0-9_]{1,80}$")
 _STAGE_RE = re.compile(r"^[a-z0-9_]{1,40}$")
@@ -301,8 +302,47 @@ def copy_submitted_artifacts(workspace: Path, *, slug: str, job_id: str) -> dict
     return result(status="succeeded", after_state="private_written", copied=copied, skipped=skipped)
 
 
+def _resolve_workspace(workspace: Path | str) -> Path:
+    """Resolve the runtime workspace, refusing the product checkout itself.
+
+    Private writes must never auto-create 00_Profile/02_Tracker/03_Applications
+    under the product root: a workspace is only valid when it already looks
+    like a runtime instance (checked by the gate below).
+    """
+
+    resolved = Path(workspace).expanduser().resolve()
+    if resolved == product_root().resolve():
+        raise ValueError("private_write_product_root_refused")
+    return resolved
+
+
+def _gateway_check(action: str, workspace: Path | str) -> dict[str, Any] | None:
+    """Enforce runtime binding before any private write.  Returns None to run."""
+
+    try:
+        resolved = _resolve_workspace(workspace)
+    except ValueError as exc:
+        return result(status="blocked", blockers=[str(exc)])
+    gated = runtime_gate(action, resolved)
+    if gated is not None:
+        return result(
+            status="blocked",
+            blockers=["runtime_workspace_invalid"],
+            message=gated.get("message"),
+            user_prompt=gated.get("user_prompt"),
+            next_action=gated.get("next_action"),
+        )
+    return None
+
+
 def handle(action: str, payload: dict[str, Any], *, workspace: Path) -> dict[str, Any]:
     """Gateway entrypoint: ``private_write`` / ``outcome_status``."""
+
+    if action in {"private_write", "outcome_status"}:
+        blocked = _gateway_check(action, workspace)
+        if blocked is not None:
+            return blocked
+        workspace = _resolve_workspace(workspace)
 
     if action == "private_write":
         mode = str(payload.get("mode") or "create").strip()

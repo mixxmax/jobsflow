@@ -32,6 +32,8 @@ RUNTIME_WRITE_ACTIONS = frozenset(
         "promote",
         "sync_pull",
         "sync_retry",
+        "private_write",
+        "outcome_status",
     }
 )
 RUNTIME_POINTER_NAME = ".jobsflow-runtime.json"

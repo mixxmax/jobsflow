@@ -373,6 +373,18 @@ def dispatch(
     runner=None,
 ) -> dict[str, Any]:
     payload = dict(payload or {})
+    if action in {"private_write", "outcome_status"}:
+        # Private writes must never auto-create runtime directories under the
+        # product checkout.  Refuse here — before entity loading or audit
+        # writes touch the filesystem — so a product-root workspace leaves
+        # zero trace.  The adapter repeats the check as defense in depth.
+        try:
+            from tools.workflow.interaction_shell import product_root
+
+            if Path(workspace).expanduser().resolve() == product_root().resolve():
+                return result(status="blocked", blockers=["private_write_product_root_refused"])
+        except (OSError, RuntimeError):
+            pass
     # There is one materials implementation.  Callers using the Python API
     # (tests, runtime delegates, and model harnesses) must receive the same
     # vNext gateway behavior as ``python3 -m tools.workflow``; otherwise a

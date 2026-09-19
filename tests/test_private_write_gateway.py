@@ -14,6 +14,7 @@ from tools.workflow.private_notes import append_archive_file, create_archive_fil
 
 def _workspace(tmp_path: Path) -> Path:
     ws = tmp_path / "JobSearch_2026"
+    (ws / "00_Profile").mkdir(parents=True)
     (ws / "03_Applications").mkdir(parents=True)
     return ws
 
