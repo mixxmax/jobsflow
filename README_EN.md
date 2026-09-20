@@ -77,6 +77,7 @@ See [`docs/typesafe_advisory_judgments.md`](docs/typesafe_advisory_judgments.md)
 | Silently skips what a weaker model missed | Enforces schemas, gates, source checks and coverage checks |
 | Uses a fixed industry template | Generates industry-aware directions from your CV and intent |
 
+---
 ## Product structure: standards, inputs, outputs and hand-offs
 
 JobsFlow keeps business SOP inside one bounded pipeline: `scan / push / materials / audit / format / apply / base / intent / archive / sync` all enter the unified gateway before their business adapters. A model cannot switch to a legacy route or bypass the state machine; missing confirmation, current inputs or required artifacts stop the action. Materials use one chain, `materials-vnext-1`: baseline → bounded JD delta → CV/CL content audit → DOCX/PDF format gates.

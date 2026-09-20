@@ -75,7 +75,15 @@ def test_render_stage_narrows_a_page_budget_failure(tmp_path, monkeypatch):
 
     class BudgetExceeded(ValueError):
         def __init__(self) -> None:
-            self.report = {"material": "cv", "over_by": 4, "units": 50, "budget": 46}
+            # Shape copied from the real _page_budget_report, so this double
+            # cannot drift from the keys the renderer actually emits.
+            self.report = {
+                "material": "cv",
+                "points": 692.0,
+                "budget_points": 648.0,
+                "over_by_points": 44.0,
+                "top_paragraphs": [],
+            }
             super().__init__("cv exceeds its one-page budget")
 
     monkeypatch.setattr(materials_renderer, "PageBudgetExceeded", BudgetExceeded, raising=False)
@@ -89,4 +97,5 @@ def test_render_stage_narrows_a_page_budget_failure(tmp_path, monkeypatch):
     assert result["blockers"] == ["page_budget_exceeded"]
     assert result["next_action"] == "revise_only_over_budget_materials"
     assert result["page_budget"]["material"] == "cv"
+    assert result["page_budget"]["over_by_points"] > 0
     assert result["engine"] == "materials-vnext"

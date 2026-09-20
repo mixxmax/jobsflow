@@ -81,6 +81,7 @@ python3 -m tools.workflow materials typesafe --job-id <id>
 
 細節見 [`docs/typesafe_advisory_judgments.md`](docs/typesafe_advisory_judgments.md)。
 
+---
 ## 🎯 解決什麼問題？
 
 求職難，往往不是「找不到連結」，而是**整條鏈路運營不起來**：

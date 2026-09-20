@@ -1577,7 +1577,23 @@ class MaterialsEngine:
         run.update({"phase": "transformed", "effective_transform_sha256": effective.get("effective_transform_sha256"), "canonical_sha256": canonical.get("canonical_sha256")})
         save_run(package, run)
         preflight_started = perf_counter()
-        preflight = run_preflight(bundle=bundle, canonical=canonical, effective_transform=effective, plan=load_plan(package) or {})
+        # The lane masters are resolved once here so the pre-render capacity
+        # gate can measure the built documents exactly instead of trusting a
+        # character count.  Without them it degrades to that count, which is
+        # what the render gate catches later.
+        try:
+            from tools.workflow.materials_renderer import _template_paths
+
+            lane_templates = _template_paths(package, Path(workspace))
+        except (ImportError, OSError, ValueError):
+            lane_templates = None
+        preflight = run_preflight(
+            bundle=bundle,
+            canonical=canonical,
+            effective_transform=effective,
+            plan=load_plan(package) or {},
+            templates=lane_templates,
+        )
         _metric(
             package,
             stage="preflight",
