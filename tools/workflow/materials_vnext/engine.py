@@ -105,6 +105,24 @@ def _metric(
         return
 
 
+def _page_budget_error() -> type[BaseException] | None:
+    """Resolve the renderer's optional pre-render page-budget exception.
+
+    Resolved before the render call rather than imported inside the ``try``:
+    a name imported there is function-local, so a renderer that does not
+    export it turns the ``except`` clause itself into an ``UnboundLocalError``
+    instead of the intended ``ImportError``.  The engine therefore works with
+    either renderer, and narrows the response to a targeted revision as soon
+    as the renderer enforces the budget itself.
+    """
+
+    try:
+        from tools.workflow import materials_renderer
+    except ImportError:  # pragma: no cover - renderer is a hard dependency
+        return None
+    return getattr(materials_renderer, "PageBudgetExceeded", None)
+
+
 def _write_email(package: Path, bundle: dict[str, Any]) -> Path:
     """Create the deterministic email artifact after CV/CL content passes.
 
@@ -764,6 +782,23 @@ class MaterialsEngine:
                 response["format_passed"] = False
             return response
 
+        # The TypeSafe advisory is an optional, auto-enabled side channel.  It
+        # is placed here - after the bundle is frozen, before any drafting - so
+        # it can only ever read the current job's frozen state, and it returns
+        # before the transform handling below so it can never advance or block
+        # the chain.
+        if stage in {"typesafe", "advisory"}:
+            from tools.workflow.materials_vnext.advisory import stage_typesafe
+
+            return stage_typesafe(
+                package=package,
+                job_id=job_id,
+                bundle=bundle,
+                canonical=load_canonical(package) or None,
+                payload=payload,
+                dry_run=dry_run,
+            )
+
         # User-ruling and acceptance stages operate on the recorded audit
         # state.  They run before any drafting/transform handling because they
         # never involve new content.
@@ -969,11 +1004,22 @@ class MaterialsEngine:
                     **capacity_blocker,
                     "engine": "materials-vnext",
                 }
+            budget_error = _page_budget_error()
             try:
                 from tools.workflow.materials_renderer import render_canonical_docx
 
                 rendered = render_canonical_docx(package, Path(workspace), force=bool(payload.get("force")))
             except (OSError, ValueError, RuntimeError) as exc:
+                if budget_error is not None and isinstance(exc, budget_error):
+                    _metric(package, stage="render", status="blocked", started=render_started, error=str(exc)[:160])
+                    return {
+                        "status": "blocked",
+                        "blockers": ["page_budget_exceeded"],
+                        "error": str(exc),
+                        "next_action": "revise_only_over_budget_materials",
+                        "page_budget": getattr(exc, "report", None),
+                        "engine": "materials-vnext",
+                    }
                 _metric(package, stage="render", status="failed", started=render_started, error=str(exc)[:160])
                 return {"status": "blocked", "blockers": ["docx_render_failed"], "error": str(exc), "engine": "materials-vnext"}
             _metric(package, stage="render", status="succeeded", started=render_started, cached=False)
@@ -1049,6 +1095,7 @@ class MaterialsEngine:
                     **capacity_blocker,
                     "engine": "materials-vnext",
                 }
+            budget_error = _page_budget_error()
             try:
                 from tools.workflow.materials_renderer import convert_rendered_pdfs
 
@@ -1060,6 +1107,16 @@ class MaterialsEngine:
                     parallel=bool(payload.get("parallel", True)),
                 )
             except (OSError, ValueError, RuntimeError) as exc:
+                if budget_error is not None and isinstance(exc, budget_error):
+                    _metric(package, stage="pdf", status="blocked", started=pdf_started, error=str(exc)[:160])
+                    return {
+                        "status": "blocked",
+                        "blockers": ["page_budget_exceeded"],
+                        "error": str(exc),
+                        "next_action": "revise_only_over_budget_materials",
+                        "page_budget": getattr(exc, "report", None),
+                        "engine": "materials-vnext",
+                    }
                 _metric(package, stage="pdf", status="failed", started=pdf_started, error=str(exc)[:160])
                 return {"status": "failed", "blockers": ["pdf_conversion_failed"], "error": str(exc), "engine": "materials-vnext"}
             _metric(package, stage="pdf", status="succeeded", started=pdf_started, cached=False, parallel=bool(payload.get("parallel", True)))

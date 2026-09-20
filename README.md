@@ -34,17 +34,52 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
 
 ---
 
-## 🆕 最新更新 · 2026-09-19 · 主幹可靠性與治理加固
+## 🆕 最新更新 · 2026-09-20 · 可選接入 TypeSafe / Jev 咨詢式判斷
 
-這次更新集中修復「在新機器、新模型或乾淨 clone 上仍能可靠運行」的問題：
+JobsFlow 現在可以接入 **TypeSafe（System One / Jev）** 對當前崗位的材料行做語義判斷：這行是否真的支撐該 JD 要求、這兩行是否重複、刪掉這行會損失多少證據，輸出一份排序好的 advisory 報告。
 
-- **唯一安裝契約**：`tools/setup_env.sh`、雜湊鎖定依賴、vendored SOP Control 和 CI 使用同一條安裝路徑，並驗證 Python 3.10/3.11 相容性。
-- **治理綠不再冒充產品綠**：SOP Control gate 與產品測試分開，`ci-success` 聚合所有必要檢查；主分支只接受完整 CI 通過的變更。
-- **私有寫入受 gateway 管理**：reset、outcome、interview、expand 等路徑增加範圍、確認、摘要綁定和審計；缺少必要控制時 fail-closed。
-- **失敗可診斷、不可靜默成功**：掃描/瀏覽器錯誤帶有階段、可重試性和觀測資訊；只有已驗證的評分產物才會推進刷新游標。
-- **品質與可維護性加固**：新增 Python 類型檢查、coverage 報告、乾淨環境驗收，並清理不可達舊寫入代碼、拆分部分高風險處理階段。
+它的定位是一條**只讀旁路**：不參與掃描、入表、材料、渲染、格式門或 apply 的任何判定，永遠不是門禁。
 
-JobsFlow 的求職功能與 JobsDB 的既有使用方式未因本次主幹可靠性修復而改變；私人工作區仍不會進入公開倉庫。
+**接入只有一個事實：給了 `TYPESAFE_API_KEY` 就自動啟用，不給就完全不啟用。** 不需要改配置、不需要改代碼、不需要設 flag，也不需要為了 JobsFlow 和 TypeSafe 的銜接做任何適配——適配已經在產品線內完成了。
+
+### 安裝（兩步，一次性）
+
+```bash
+bash tools/setup_env.sh --advisory     # 只裝這一個附加項，走哈希鎖，不污染運行依賴
+export TYPESAFE_API_KEY="ts-你的key"   # 你自己的 key
+```
+
+想讓 key 長期生效，寫進 `~/.zshenv`（所有 zsh 都讀它，比 `~/.zshrc` 可靠）：
+
+```bash
+echo 'export TYPESAFE_API_KEY="ts-你的key"' >> ~/.zshenv
+```
+
+**key 只要放在你自己機器的環境變量裡。** 產品只在發起調用的那一刻從 `os.environ` 讀它，不寫入任何文件、不進 git、不進 CI。不要把它貼給任何對話方，也不要提交進倉庫。
+
+### 用起來
+
+先確認開沒開（只讀，不花 API 費用）：
+
+```bash
+python3 -m tools.workflow materials status --job-id <id>
+```
+
+看返回裡的 `result.typesafe`：`enabled: true` 就是通了；沒通會告訴你差哪一半（`key_present` / `sdk_present`）和還差什麼命令。
+
+跑一次：
+
+```bash
+python3 -m tools.workflow materials typesafe --job-id <id>
+```
+
+報告寫在該崗位包的 `materials_vnext/typesafe_advisory.json`。不想花費就用 `--dry-run`，它連請求都不發。
+
+### 不裝會怎樣
+
+完全不受影響。掃描、入表、材料、渲染、格式門、apply 全部照常；`materials typesafe` 照樣返回 `succeeded`，只是不寫文件、不發請求。沒有 key 的機器上產品行為與有 key 的機器完全一致——這一條有用例守着。
+
+細節見 [`docs/typesafe_advisory_judgments.md`](docs/typesafe_advisory_judgments.md)。
 
 ## 🎯 解決什麼問題？
 
@@ -151,6 +186,8 @@ JobsFlow 統一 gateway
 - **換模型或平台仍可接手**：只要在同一產品工作區使用統一 gateway，規則、狀態和已完成證據可以延續。支持即時 hooks 的 harness 可在動作前攔截；即使沒有 hooks，gateway 的最終門仍會生效。
 - **失敗會停在可診斷狀態**：缺輸入、過期產物或未確認的副作用會返回下一步，而不是讓模型猜測、繞路或靜默修改其他崗位。
 - **控制面可驗證且可複盤**：SOP Control 隨倉固定版本與 digest；受控運行可用 `sopctl log report` 區分 gated、admitted、blocked 和 unproven。動態規則只有在真實用戶確認後才會升級，`once_only` 不會偷偷變成永久規則。
+- **治理綠不等於產品綠**：SOP Control gate 與產品測試是兩件事，CI 的 `ci-success` 聚合全部必要作業；主分支只接受完整 CI 通過的變更，不會把「控制面通過」當成「產品通過」。
+- **私有寫入全部受 gateway 管理**：reset、outcome、interview、expand 等路徑都有範圍、確認、摘要綁定和審計；缺少必要控制時 fail-closed，不會靜默放行。
 
 因此，SOP Control 的作用不是增加一輪對話，而是減少跨模型、跨會話時的偏差和返工；普通用戶仍只需使用 `/setup`、`/scan`、`/push`、`/materials` 和 `/apply`。
 
@@ -195,6 +232,33 @@ LibreOffice。明确声明：本仓库是**源码运行模式**，不是标准 P
 ```bash
 bash tools/setup_env.sh --dev      # 含 pytest 等开发依赖
 ```
+
+**只有一条安装路径。** `tools/setup_env.sh`、哈希锁定依赖、vendored SOP Control 和 CI 跑的是同一套流程，不存在第二套「照 README 手拼」的环境。脚本会校验 Python 3.10 / 3.11 兼容性；`--check-only` 可离线只验证、不安装。可选附加项（如下方的 TypeSafe 咨询层）也走同一脚本的 `--advisory` 开关，不绕过哈希锁。
+
+### 可選：TypeSafe 咨詢式判斷（給了 API key 就自動啟用）
+
+材料鏈有一條**可選**的只讀旁路：用 TypeSafe System One 對當前崗位的材料行做語義
+判斷（這行是否真的支撐該 JD 要求、這兩行是否重複、刪掉這行會損失多少證據），
+輸出一份排序好的 advisory 報告。它永遠不是門禁——任何掃描、入表、材料、渲染、
+格式門、apply 都不經過它。
+
+開關只有一個事實：**給了 `TYPESAFE_API_KEY` 就自動啟用，不給就完全不啟用。**
+不需要改配置、不需要改代碼、不需要設 flag：
+
+```bash
+bash tools/setup_env.sh --advisory    # 只裝這一個附加項（哈希鎖，可選）
+export TYPESAFE_API_KEY=...
+python3 -m tools.workflow materials status --job-id <id>    # 看這一層開沒開
+python3 -m tools.workflow materials typesafe --job-id <id>  # 跑一次
+```
+
+`materials status` 的 `result.typesafe` 會直接告訴你開沒開、差哪一半
+（`key_present` / `sdk_present`）以及還差什麼命令。沒配 key 的機器上，
+`materials typesafe` 照樣返回 `succeeded`，只是不寫文件、不發請求——
+產品行為與有 key 的機器完全一致。它只寫一個文件
+（`materials_vnext/typesafe_advisory.json`），且只在真的跑出報告時才寫；
+`--dry-run` 連請求都不發。細節見
+[`docs/typesafe_advisory_judgments.md`](docs/typesafe_advisory_judgments.md)。
 
 主要行为开关（默认值即不设置时的行为）：
 
@@ -328,6 +392,10 @@ python3 -m tools.workflow base confirm --lane A --confirm
 
 材料製作在渲染前先做容量預檢；超出預算時只要求對應的 CV 或 CL 定向修改，不先生成必然失敗的 PDF。
 JD 緩存優先、受控重試和人工恢復交接也由 gateway 管理，避免把同一份資料重抓多次或把暫時失敗誤記成成功。
+
+掃描和瀏覽器層的失敗都帶階段、可重試性和觀測資訊，不會以「靜默成功」結案：缺 JD、門戶熔斷、
+救援未完成都會在預覽裡明確標出，只有已驗證的評分產物才會推進刷新游標。反過來說，一個崗位看得見
+但抓不全，系統會記住「看過了」而不是假裝它不存在。
 
 ### 我們的 LLMO 策略
 
@@ -706,8 +774,12 @@ JobsFlow 只有一套產品代碼、規則和狀態機。`JobSearch_2026/` 不�
 python3 setup.py --doctor-json
 python3 tools/security_guards.py
 python3 tools/public_release_check.py --source
+python3 tools/check_types.py
 pytest -q
 ```
+
+產品線另有用例覆蓋率報告與乾淨虛擬環境驗收（`tests/test_install_contract.py`），
+並持續清理不可達的舊寫入代碼、拆分高風險處理階段——這些是維護性門禁，不改變求職功能本身。
 
 發佈衞生、歷史清理和可復現檢查見 [docs/PUBLIC_READINESS_2026-07-31.md](docs/PUBLIC_READINESS_2026-07-31.md)；完整的安全邊界與運行規則見 [docs/system_rules.md](docs/system_rules.md)。提交前請確認 `python3 tools/public_release_check.py --source` 通過，並只發布乾淨快照，不要把個人工作區歷史帶入公開倉庫。
 
@@ -719,7 +791,7 @@ JobsFlow 是獨立維護的產品線，保留了源自 [ai-job-search](https://g
 
 ## 📦 版本
 
-當前主線：**1.1** - 統一 SOP gateway 與狀態機、lane 鎖定和確認入表、基礎版增量材料鏈、獨立 CV/CL 內容審計、固定 lane-master DOCX/PDF 渲染、JD 緩存與受控 JobsDB 恢復。
+當前主線：**1.2** - 統一 SOP gateway 與狀態機、lane 鎖定和確認入表、基礎版增量材料鏈、獨立 CV/CL 內容審計、固定 lane-master DOCX/PDF 渲染、JD 緩存與受控 JobsDB 恢復，以及可選的 TypeSafe / Jev 只讀咨詢旁路（給了 `TYPESAFE_API_KEY` 就自動啟用）。
 
 ---
 

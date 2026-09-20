@@ -1,0 +1,17 @@
+# Optional extras for the read-only TypeSafe advisory judgments
+# (`tools/workflow/typesafe_judgments.py`).
+#
+# This is NOT part of the runtime install. `tools/setup_env.sh` installs
+# `requirements.lock` only; the advisory extra is opt-in:
+#
+#   bash tools/setup_env.sh --advisory
+#
+# The workflow gateway and the materials engine never import this package, so
+# the product installs, scans, pushes and renders materials without it. The
+# advisory layer reports itself as disabled (`materials status` shows
+# `typesafe.enabled: false`) and stays silent until both this package and
+# `TYPESAFE_API_KEY` are present.
+#
+# Constrained against requirements.txt so the shared pins (pydantic,
+# typing-extensions) can never drift from the runtime lock.
+typesafe-sdk==0.7.0
