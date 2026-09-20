@@ -10,9 +10,10 @@ from tools.workflow.materials_renderer import (
     PageBudgetExceeded,
     _add_block,
     _job_heading_parts,
-    _layout_units,
-    _page_budget_units,
+    _page_budget_report,
+    _paragraph_points,
     _template_prototypes,
+    _usable_points,
     mechanical_format_gate,
     render_canonical_docx,
 )
@@ -385,12 +386,20 @@ def _bind_passing_audit_to_canonical(package):
     save_run(package, run)
 
 
-def test_page_budget_units_counts_empty_paragraph_as_full_line():
+def test_paragraph_points_counts_empty_paragraph_as_full_line():
+    from docx.shared import Pt
+
     document = Document()
-    document.add_paragraph("Short line.")
-    document.add_paragraph("")
-    document.add_paragraph("")
-    assert _page_budget_units(document, material="cv") == _layout_units(document, material="cv") + 1.5
+    line = document.add_paragraph()
+    run = line.add_run("Short line.")
+    run.font.size = Pt(10)
+    empty = document.add_paragraph()
+    empty_run = empty.add_run("")
+    empty_run.font.size = Pt(10)
+    line_cost = _paragraph_points(line, material="cv")
+    empty_cost = _paragraph_points(empty, material="cv")
+    assert empty_cost == line_cost
+    assert line_cost > 10.0
 
 
 def test_render_blocks_over_budget_before_writing_anything(tmp_path):
@@ -417,8 +426,8 @@ def test_render_blocks_over_budget_before_writing_anything(tmp_path):
     else:
         raise AssertionError("expected PageBudgetExceeded for a 25-bullet overflow")
     assert report["material"] == "cv"
-    assert report["over_by"] > 0
-    assert report["units"] > report["budget"]
+    assert report["over_by_points"] > 0
+    assert report["points"] > report["budget_points"]
     assert len(report["top_paragraphs"]) == 3
     # Nothing was written: previous DOCX, receipt and PDF set are untouched.
     assert {key: container_hash(package / names[key]) for key in ("cv_docx", "cl_docx")} == before_docx
@@ -451,5 +460,79 @@ def test_render_stage_reports_page_budget_with_revision_scope(tmp_path):
     assert out["blockers"] == ["page_budget_exceeded"]
     assert out["next_action"] == "revise_only_over_budget_materials"
     assert out["page_budget"]["material"] == "cv"
-    assert out["page_budget"]["over_by"] > 0
+    assert out["page_budget"]["over_by_points"] > 0
     assert load_run(package)["phase"] == "content_passed"
+
+
+def _styled_template(tmp_path, name, *, size, spacing, after, top_margin_cm=2.54, bottom_margin_cm=2.54):
+    """Build a template with vertically-differentiated styles.
+
+    Same character widths for every style (fallback 90), so two documents
+    with identical text measure identical units but different points.
+    """
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.shared import Cm, Pt
+
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Cm(top_margin_cm)
+    section.bottom_margin = Cm(bottom_margin_cm)
+    style = document.styles.add_style("Uniform", WD_STYLE_TYPE.PARAGRAPH)
+    style.base_style = document.styles["Normal"]
+    style.font.size = Pt(size)
+    style.paragraph_format.line_spacing = spacing
+    style.paragraph_format.space_after = Pt(after)
+    path = tmp_path / name
+    document.save(str(path))
+    return path
+
+
+def _uniform_doc(template, *, count, text):
+    document = Document(str(template))
+    for paragraph in list(document.paragraphs):
+        paragraph.style = document.styles["Uniform"]
+    for _ in range(count):
+        paragraph = document.add_paragraph(style="Uniform")
+        paragraph.add_run(text)
+    return document
+
+
+def test_budget_reads_template_geometry_not_material_constants(tmp_path):
+    """Same content passes on a roomy template and blocks on a tight one."""
+    from docx.shared import Cm
+
+    text = "x" * 90
+    roomy = _styled_template(tmp_path, "roomy_tpl.docx", size=9, spacing=1.0, after=0)
+    roomy_report = _page_budget_report(_uniform_doc(roomy, count=30, text=text), material="cv")
+    assert roomy_report["over_by_points"] <= 0
+    # Same style metrics as roomy — only the body geometry shrinks.
+    tight = _styled_template(tmp_path, "tight_tpl.docx", size=9, spacing=1.0, after=0)
+    # shrink the tight template's body so the same 30 paragraphs overflow it
+    from tools.workflow.materials_renderer import _layout_units
+
+    tight_doc = Document(str(tight))
+    tight_doc.sections[0].top_margin = Cm(10.0)
+    tight_doc.sections[0].bottom_margin = Cm(10.0)
+    tight_doc.save(str(tight))
+    tight_doc = _uniform_doc(tight, count=30, text=text)
+    roomy_doc = _uniform_doc(roomy, count=30, text=text)
+    # Same text, same units — but the tight template's body is shorter.
+    assert _layout_units(tight_doc, material="cv") == _layout_units(roomy_doc, material="cv")
+    tight_report = _page_budget_report(tight_doc, material="cv")
+    assert tight_report["over_by_points"] > 0
+
+
+def test_same_units_different_styles_get_different_verdicts(tmp_path):
+    """The units model's blind spot: identical units, Tall blocks, Flat passes."""
+    from tools.workflow.materials_renderer import _layout_units
+
+    text = "x" * 90
+    tall = _styled_template(tmp_path, "tall_tpl.docx", size=11, spacing=1.5, after=9)
+    flat = _styled_template(tmp_path, "flat_tpl.docx", size=9, spacing=1.0, after=0)
+    tall_doc = _uniform_doc(tall, count=30, text=text)
+    flat_doc = _uniform_doc(flat, count=30, text=text)
+    assert _layout_units(tall_doc, material="cv") == _layout_units(flat_doc, material="cv")
+    tall_report = _page_budget_report(tall_doc, material="cv")
+    flat_report = _page_budget_report(flat_doc, material="cv")
+    assert tall_report["over_by_points"] > 0
+    assert flat_report["over_by_points"] <= 0
