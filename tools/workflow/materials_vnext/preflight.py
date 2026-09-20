@@ -32,6 +32,27 @@ _CAPACITY_OVER_RATIO = 1.08
 _CAPACITY_RATIO_MIN_MASTER_LINES = 20
 
 
+def _document_shape(blocks: list[Any]) -> tuple[int, tuple[str, ...]]:
+    """Cheap structural fingerprint: invisible-block count and style multiset.
+
+    ``estimate_canonical_capacity`` skips ``host_managed_optional`` blocks, so
+    its line count is calibrated against the master's *shape*.  Appending an
+    invisible block, dropping one, or moving content into a style with a
+    different per-paragraph cost all change height without changing that line
+    count.  Comparing shapes costs a dict walk and closes the gap cheaply.
+    """
+
+    invisible = 0
+    styles: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if bool(block.get("host_managed_optional")):
+            invisible += 1
+        styles.append(str(block.get("source_style") or "Normal"))
+    return invisible, tuple(sorted(styles))
+
+
 def _texts(canonical: dict[str, Any]) -> dict[str, str]:
     result: dict[str, str] = {}
     for material in MATERIALS:
@@ -47,14 +68,30 @@ def _finding(code: str, material: str, evidence: str, *, severity: str = "P0") -
     return {"code": code, "severity": severity, "material": material, "evidence": evidence[:300]}
 
 
-def evaluate_capacity(*, canonical: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+def evaluate_capacity(
+    *,
+    canonical: dict[str, Any],
+    baseline: dict[str, Any],
+    templates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return the bounded, per-material pre-render page-budget decision.
 
-    The estimate is intentionally conservative: it compares each tailored
-    material with its own lane master and never mixes CV and Cover Letter
-    budgets.  A caller may use the result without running semantic checks,
-    which lets the render/PDF adapters defend themselves if a canonical file
-    was changed after the original preflight.
+    Two tiers.  The character estimate is a *trigger*: cheap enough to run on
+    every transform, and calibrated only against the master's document shape.
+    When ``templates`` is supplied, every material the trigger flags is then
+    measured exactly against its own template geometry, and that measurement
+    is the verdict -- so preflight and the render gate cannot disagree.  A
+    trigger that fires on a document which fits is not a false block; it is a
+    measurement that came back clean.
+
+    Without ``templates`` the estimate is the whole verdict, which leaves the
+    estimator's blind spot (invisible blocks, style swaps) open until the
+    render gate catches it.  Callers that can resolve the lane masters should
+    pass them.
+
+    The result is usable without running semantic checks, which lets the
+    render/PDF adapters defend themselves if a canonical file was changed
+    after the original preflight.
     """
 
     from tools.workflow.materials_renderer import estimate_canonical_capacity
@@ -79,20 +116,52 @@ def evaluate_capacity(*, canonical: dict[str, Any], baseline: dict[str, Any]) ->
         item = estimate.get(material)
         if not isinstance(item, dict) or int(item.get("master_lines") or 0) <= 0:
             raise ValueError(f"capacity_estimate_unavailable:{material}")
-    over = [
+
+    def _blocks(material: str, source: dict[str, Any]) -> list[Any]:
+        return [item for item in (source.get(material) or {}).get("blocks") or [] if isinstance(item, dict)]
+
+    def _grown_past_master(material: str) -> bool:
+        item = estimate.get(material) or {}
+        return int(item.get("over_master_lines") or 0) >= _CAPACITY_OVER_LINES or (
+            int(item.get("master_lines") or 0) >= _CAPACITY_RATIO_MIN_MASTER_LINES
+            and float(item.get("ratio") or 0) > _CAPACITY_OVER_RATIO
+        )
+
+    # Suspicion: either the line count grew past the master, or the document's
+    # shape moved away from the shape the line count is calibrated against.
+    # Both are dict walks; neither opens a template.
+    triggered = [
         material
         for material in MATERIALS
-        if (
-            int((estimate.get(material) or {}).get("over_master_lines") or 0) >= _CAPACITY_OVER_LINES
-            or (
-                int((estimate.get(material) or {}).get("master_lines") or 0) >= _CAPACITY_RATIO_MIN_MASTER_LINES
-                and float((estimate.get(material) or {}).get("ratio") or 0) > _CAPACITY_OVER_RATIO
-            )
-        )
+        if _grown_past_master(material)
+        or _document_shape(_blocks(material, canonical)) != _document_shape(_blocks(material, baseline))
     ]
+
+    measured: dict[str, dict[str, Any] | None] = {}
+    if templates:
+        from tools.workflow.materials_renderer import measure_page_budget
+
+        measured = measure_page_budget(canonical, templates, triggered)
+        over = []
+        for material in triggered:
+            report = measured.get(material)
+            if not isinstance(report, dict):
+                # No measurement is not a pass.  Failing closed here keeps an
+                # unreadable template from silently reopening the blind spot.
+                raise ValueError(f"capacity_measure_unavailable:{material}")
+            if float(report.get("over_by_points") or 0.0) > 0:
+                over.append(material)
+    else:
+        # Degraded: the character estimate is the whole verdict, exactly as it
+        # was before the geometry tier existed.  Shape changes alone block
+        # nothing, because there is nothing to measure them against.
+        over = [material for material in MATERIALS if _grown_past_master(material)]
+
     return {
         "status": "blocked" if over else "passed",
         "materials": over,
+        "triggered": triggered,
+        "measured": measured,
         "estimate": estimate,
         "thresholds": {
             "over_master_lines": _CAPACITY_OVER_LINES,
@@ -109,6 +178,7 @@ def run_preflight(
     canonical: dict[str, Any],
     effective_transform: dict[str, Any],
     plan: dict[str, Any] | None = None,
+    templates: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     for error in effective_transform.get("baseline_preservation_errors") or []:
@@ -178,20 +248,28 @@ def run_preflight(
     # the lane master's estimated one-page budget.  This runs before the
     # independent child audit and before any renderer/PDF process.
     try:
-        capacity_gate = evaluate_capacity(canonical=canonical, baseline=baseline)
+        capacity_gate = evaluate_capacity(canonical=canonical, baseline=baseline, templates=templates)
         capacity = capacity_gate.get("estimate") or {}
+        measured = capacity_gate.get("measured") or {}
         for material in capacity_gate.get("materials") or []:
             item = capacity.get(material) or {}
-            findings.append(_finding(
-                "capacity_budget_exceeded",
-                material,
-                (
+            report = measured.get(material) if isinstance(measured.get(material), dict) else None
+            if report is not None:
+                # The measured verdict: name the geometry the renderer will
+                # apply, so the revision is aimed at the real overflow.
+                evidence = (
+                    f"measured {report.get('points'):.0f}pt against a "
+                    f"{report.get('budget_points'):.0f}pt body "
+                    f"(+{report.get('over_by_points'):.0f}pt over); "
+                    "revise this material before rendering"
+                )
+            else:
+                evidence = (
                     f"estimated {item.get('estimated_lines')} wrapped lines vs master "
                     f"{item.get('master_lines')} (+{item.get('over_master_lines')}); "
                     "revise this material before rendering"
-                ),
-                severity="P1",
-            ))
+                )
+            findings.append(_finding("capacity_budget_exceeded", material, evidence, severity="P1"))
     except (ImportError, OSError, ValueError, TypeError, KeyError):
         capacity = {}
         capacity_gate = {
