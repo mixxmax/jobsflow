@@ -272,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
             "check",
             "produce",
             "role-choose",
+            "typesafe",
         ],
         default="run",
     )
@@ -733,6 +734,10 @@ def main(argv: list[str] | None = None) -> int:
                 payload["model_transform"] = json.loads(Path(args.content).read_text(encoding="utf-8"))
         elif args.materials_cmd == "status":
             payload["stage"] = "status"
+        elif args.materials_cmd == "typesafe":
+            # Optional advisory side channel: on when a credential exists, off
+            # otherwise, and never a gate either way.
+            payload["stage"] = "typesafe"
         elif args.materials_cmd == "reset":
             payload["stage"] = "reset"
             payload["scope"] = args.scope

@@ -20,17 +20,52 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-09-19 · Mainline reliability and governance hardening
+## 🆕 Latest update · 2026-09-20 · Optional TypeSafe / Jev advisory judgments
 
-This update fixes the problems that made a clean clone, a new machine or a different model less reproducible:
+JobsFlow can now use **TypeSafe (System One / Jev)** to make semantic judgments about the material lines of the current job: whether a line really supports that JD requirement, whether two lines are redundant, and how much evidence would be lost by cutting a line. The output is a sorted advisory report.
 
-- **One installation contract:** `tools/setup_env.sh`, hash-locked dependencies, vendored SOP Control and CI now use the same installation path, with Python 3.10/3.11 compatibility checks.
-- **Governance green is not product green:** the SOP Control gate is separate from product tests; `ci-success` aggregates every required check, and main accepts only a fully green workflow.
-- **Governed private writes:** reset, outcome, interview and expand now use scoped gateway paths with confirmation, proposal binding and audit evidence; missing control fails closed.
-- **Diagnosable failures, no silent success:** scan/browser failures expose stage, retryability and observations; the refresh cursor advances only after a verified scoring artifact.
-- **Quality and maintainability:** Python type checks, coverage reports and clean-environment acceptance are part of CI; unreachable legacy write code was removed and selected high-risk stages were decomposed.
+It is a **read-only side channel**: it takes no part in any scan, tracker write, material, render, format gate or apply decision. It is never a gate.
 
-This mainline reliability update does not change the existing JobsDB user flow; private runtime data remains outside the public repository.
+**There is exactly one fact about enabling it: give it `TYPESAFE_API_KEY` and it turns on; do not, and it stays off.** No config to edit, no code to change, no flag to set — and no adaptation between JobsFlow and TypeSafe for you to write. The integration lives in the product line.
+
+### Install (two steps, once)
+
+```bash
+bash tools/setup_env.sh --advisory     # installs only this extra, hash-locked, runtime deps untouched
+export TYPESAFE_API_KEY="ts-your-key"  # your own key
+```
+
+To make the key permanent, put it in `~/.zshenv` (every zsh reads it; more reliable than `~/.zshrc`):
+
+```bash
+echo 'export TYPESAFE_API_KEY="ts-your-key"' >> ~/.zshenv
+```
+
+**The key only needs to live in your own machine's environment.** The product reads it from `os.environ` at call time and nothing else — it is never written to a file, never committed, never sent to CI. Do not paste it to anyone in a conversation, and never commit it.
+
+### Using it
+
+Check whether it is on first (read-only, costs no API credits):
+
+```bash
+python3 -m tools.workflow materials status --job-id <id>
+```
+
+Look at `result.typesafe`: `enabled: true` means it is on. If not, it tells you which half is missing (`key_present` / `sdk_present`) and the command that fixes it.
+
+Run it once:
+
+```bash
+python3 -m tools.workflow materials typesafe --job-id <id>
+```
+
+The report is written to `materials_vnext/typesafe_advisory.json` inside that job's package. Use `--dry-run` if you do not want to spend credits — it sends no request at all.
+
+### What happens if you do not install it
+
+Nothing changes. Scan, tracker writes, materials, render, format gates and apply all behave exactly as before; `materials typesafe` still returns `succeeded`, it just writes no file and sends no request. The product behaves identically with and without a key — that is covered by tests.
+
+See [`docs/typesafe_advisory_judgments.md`](docs/typesafe_advisory_judgments.md) for details.
 
 ### Why JobsFlow?
 
@@ -93,6 +128,8 @@ Artifacts, state and traceable evidence
 - **Safe hand-off:** another model or harness can continue from the same workspace and state. Harnesses with hooks can intercept before an action; without hooks, the gateway's final gates still apply.
 - **Fail closed with a next step:** missing inputs, stale artifacts or unconfirmed side effects return a diagnostic next action instead of inviting the model to guess, browse another package or silently modify unrelated work.
 - **Versioned and auditable control:** SOP Control is pinned with a verified digest and travels with the repository. `sopctl log report` distinguishes gated, admitted, blocked and unproven runs; dynamic rules require real user confirmation, and `once_only` observations never silently become permanent rules.
+- **Governance green is not product green:** the SOP Control gate and the product tests are separate things, and CI's `ci-success` aggregates every required job. Main accepts only a fully green workflow, so a passing control plane is never reported as a passing product.
+- **Governed private writes:** reset, outcome, interview and expand all run through scoped gateway paths with confirmation, proposal binding and audit evidence. When a required control is missing, they fail closed instead of proceeding silently.
 
 SOP Control therefore reduces cross-model drift and rework without adding a daily control conversation. Most users only need the normal `/setup`, `/scan`, `/push`, `/materials` and `/apply` commands.
 
@@ -120,6 +157,13 @@ python3 setup.py --doctor
 python3 setup.py --resume-folder ~/Documents/my-cv
 python3 setup.py --install-portals
 ```
+
+**There is one installation path.** `tools/setup_env.sh`, the hash-locked
+dependencies, vendored SOP Control and CI all run the same flow, so there is no
+second "hand-assembled from the README" environment. The script checks Python
+3.10 / 3.11 compatibility, and `--check-only` verifies offline without
+installing. Optional extras — such as the TypeSafe advisory layer above — use the
+same script's `--advisory` switch and never bypass the hash lock.
 
 When switching models or harnesses, run the read-only handoff check first:
 
@@ -212,6 +256,13 @@ would exceed the budget, only the affected material is sent back for a targeted
 revision instead of generating a PDF that is expected to fail. JD caching, bounded
 retries and human recovery hand-off are gateway-managed as well, so transient
 failures do not become false successes or repeated downloads.
+
+Scan and browser failures also carry stage, retryability and observation data, so
+nothing closes as a silent success: a missing JD, a portal circuit breaker or an
+unfinished rescue is marked explicitly in the preview, and the refresh cursor
+advances only after a verified scoring artifact. Conversely, when a role is visible
+but not fully retrievable, the system remembers that it was seen rather than
+pretending it never existed.
 
 The local ledger owns row identity and numbering; CSV and Google Sheets are
 replayable projections. `push` reports which backend it used and warns when
@@ -540,8 +591,14 @@ python3 setup.py --doctor-json
 python3 tools/security_guards.py
 python3 tools/public_release_check.py --source
 python3 tools/public_release_check.py --history
+python3 tools/check_types.py
 pytest -q
 ```
+
+The product line also reports test coverage and runs a clean-virtual-environment
+acceptance pass (`tests/test_install_contract.py`), and it keeps removing
+unreachable legacy write code and decomposing high-risk stages. Those are
+maintainability gates; they do not change the job-search behaviour.
 
 See [docs/PUBLIC_READINESS_2026-07-31.md](docs/PUBLIC_READINESS_2026-07-31.md) for release hygiene and history handling.
 
@@ -554,7 +611,8 @@ maintained in this repository.
 
 ## Version
 
-**1.1** — governed SOP gateway and state machine, locked lane/confirmed entry,
+**1.2** — governed SOP gateway and state machine, locked lane/confirmed entry,
 baseline-anchored bounded material tailoring, independent CV/CL content audit,
-fixed lane-master DOCX/PDF rendering, cached JD retrieval and controlled JobsDB
-recovery.
+fixed lane-master DOCX/PDF rendering, cached JD retrieval, controlled JobsDB
+recovery, and the optional TypeSafe / Jev read-only advisory side channel (on
+automatically when `TYPESAFE_API_KEY` is present).

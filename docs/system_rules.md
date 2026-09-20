@@ -677,6 +677,32 @@ settled items, survive an audit-scope reset, and are never silently rewritten
 into an independent audit pass. `audit --suspend-audit` / `--resume-audit`
 stop or restart automatic dispatch.
 
+### 5.1.2 Optional TypeSafe advisory side channel
+
+`materials typesafe` is an optional, auto-enabled advisory side channel. It is
+enabled exactly when both `TYPESAFE_API_KEY` is non-empty and the `typesafe-sdk`
+package is importable; otherwise it is off. `typesafe_status()` is the single
+source of that decision and is surfaced verbatim by `materials status`. No
+configuration file, flag or code change enables it, and nothing disables it
+beyond removing the key.
+
+The advisory is never a gate. It always returns `status: succeeded`; a missing
+credential, a missing canonical, unfrozen JD anchors or a failed upstream
+request only change `applied` and `reason`. It never advances or rewinds the
+run phase, never touches the canonical hash, and never writes audit, format or
+apply state. Its only write is `materials_vnext/typesafe_advisory.json`, and
+only when a report was actually produced; `--dry-run` writes nothing and sends
+no request. Its input is built solely from the current job's frozen bundle,
+plan and canonical — the plan's `jd_anchors` excluding `source == "themes"`
+positioning themes, and the canonical's own `cv`/`cover_letter` blocks. It
+never reads another job package, canonical or audit.
+
+Installation is opt-in (`bash tools/setup_env.sh --advisory`) and lives in its
+own hash lock constrained against the runtime lock, so it cannot move a pin the
+product already owns. The CI job probing `secrets.TYPESAFE_API_KEY` skips and
+succeeds when the secret is absent. See
+`docs/typesafe_advisory_judgments.md`.
+
 ## 6. Final checks
 
 Before ending a relevant task, confirm:

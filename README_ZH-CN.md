@@ -34,17 +34,52 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 
 ---
 
-## 🆕 最新更新 · 2026-09-19 · 主干可靠性与治理加固
+## 🆕 最新更新 · 2026-09-20 · 可选接入 TypeSafe / Jev 咨询式判断
 
-这次更新集中修复“在新机器、新模型或干净 clone 上仍能可靠运行”的问题：
+JobsFlow 现在可以接入 **TypeSafe（System One / Jev）** 对当前岗位的材料行做语义判断：这行是否真的支撑该 JD 要求、这两行是否重复、删掉这行会损失多少证据，输出一份排序好的 advisory 报告。
 
-- **唯一安装契约**：`tools/setup_env.sh`、哈希锁定依赖、vendored SOP Control 和 CI 使用同一条安装路径，并验证 Python 3.10/3.11 兼容性。
-- **治理绿不再冒充产品绿**：SOP Control gate 与产品测试分开，`ci-success` 聚合所有必要检查；主分支只接受完整 CI 通过的变更。
-- **私有写入受 gateway 管理**：reset、outcome、interview、expand 等路径增加范围、确认、摘要绑定和审计；缺少必要控制时 fail-closed。
-- **失败可诊断、不可静默成功**：扫描/浏览器错误带有阶段、可重试性和观测信息；只有已验证的评分产物才会推进刷新游标。
-- **质量与可维护性加固**：新增 Python 类型检查、coverage 报告、干净环境验收，并清理不可达旧写入代码、拆分部分高风险处理阶段。
+它的定位是一条**只读旁路**：不参与扫描、入表、材料、渲染、格式门或 apply 的任何判定，永远不是门禁。
 
-JobsFlow 的求职功能与 JobsDB 的既有使用方式未因本次主干可靠性修复而改变；私人工作区仍不会进入公开仓库。
+**接入只有一个事实：给了 `TYPESAFE_API_KEY` 就自动启用，不给就完全不启用。** 不需要改配置、不需要改代码、不需要设 flag，也不需要为了 JobsFlow 和 TypeSafe 的衔接做任何适配——适配已经在产品线内完成了。
+
+### 安装（两步，一次性）
+
+```bash
+bash tools/setup_env.sh --advisory     # 只装这一个附加项，走哈希锁，不污染运行依赖
+export TYPESAFE_API_KEY="ts-你的key"   # 你自己的 key
+```
+
+想让 key 长期生效，写进 `~/.zshenv`（所有 zsh 都读它，比 `~/.zshrc` 可靠）：
+
+```bash
+echo 'export TYPESAFE_API_KEY="ts-你的key"' >> ~/.zshenv
+```
+
+**key 只要放在你自己机器的环境变量里。** 产品只在发起调用的那一刻从 `os.environ` 读它，不写入任何文件、不进 git、不进 CI。不要把它贴给任何对话方，也不要提交进仓库。
+
+### 用起来
+
+先确认开没开（只读，不花 API 费用）：
+
+```bash
+python3 -m tools.workflow materials status --job-id <id>
+```
+
+看返回里的 `result.typesafe`：`enabled: true` 就是通了；没通会告诉你差哪一半（`key_present` / `sdk_present`）和还差什么命令。
+
+跑一次：
+
+```bash
+python3 -m tools.workflow materials typesafe --job-id <id>
+```
+
+报告写在该岗位包的 `materials_vnext/typesafe_advisory.json`。不想花费就用 `--dry-run`，它连请求都不发。
+
+### 不装会怎样
+
+完全不受影响。扫描、入表、材料、渲染、格式门、apply 全部照常；`materials typesafe` 照样返回 `succeeded`，只是不写文件、不发请求。没有 key 的机器上产品行为与有 key 的机器完全一致——这一条有用例守着。
+
+细节见 [`docs/typesafe_advisory_judgments.md`](docs/typesafe_advisory_judgments.md)。
 
 ## 🎯 解决什么问题？
 
@@ -151,6 +186,8 @@ JobsFlow 统一网关
 - **换模型或平台仍能接手**：在同一个产品工作区内，规则、状态和已完成证据可以延续。支持 hooks 的 harness 可在动作前拦截；没有 hooks 时，统一网关的最终门仍然生效。
 - **失败会返回下一步**：缺输入、产物过期或未确认的副作用会停在可诊断状态，不让模型猜测、翻看其他岗位或静默改动无关文件。
 - **控制面可验证且可复盘**：SOP Control 随仓固定版本与 digest；受控运行可用 `sopctl log report` 区分 gated、admitted、blocked 和 unproven。动态规则只有在真实用户确认后才会升级，`once_only` 不会偷偷变成永久规则。
+- **治理绿不等于产品绿**：SOP Control gate 与产品测试是两件事，CI 的 `ci-success` 聚合全部必要作业；主分支只接受完整 CI 通过的变更，不会把「控制面通过」当成「产品通过」。
+- **私有写入全部受 gateway 管理**：reset、outcome、interview、expand 等路径都有范围、确认、摘要绑定和审计；缺少必要控制时 fail-closed，不会静默放行。
 
 因此，SOP Control 的作用是减少跨模型、跨会话的偏差和返工，而不是增加一轮日常对话。普通用户仍只需使用 `/setup`、`/scan`、`/push`、`/materials` 和 `/apply`。
 
@@ -184,6 +221,8 @@ source .venv/bin/activate
 python3 -m pip install --require-hashes -r requirements.lock
 python3 setup.py --doctor
 ```
+
+**只有一条安装路径。** `tools/setup_env.sh`、哈希锁定依赖、vendored SOP Control 和 CI 跑的是同一套流程，不存在第二套「照 README 手拼」的环境。脚本会校验 Python 3.10 / 3.11 兼容性；`--check-only` 可离线只验证、不安装。可选附加项（如下方的 TypeSafe 咨询层）也走同一脚本的 `--advisory` 开关，不绕过哈希锁。
 
 跟你的 AI 助手说：
 
@@ -293,6 +332,10 @@ CV 和 Cover Letter 是两份平行基础版，具体岗位只提交有限 JD �
 
 材料制作在渲染前先做容量预检；超出预算时只要求对应的 CV 或 CL 定向修改，不先生成必然失败的 PDF。
 JD 缓存优先、受控重试和人工恢复交接也由 gateway 管理，避免把同一份资料重抓多次或把暂时失败误记成成功。
+
+扫描和浏览器层的失败都带阶段、可重试性和观测信息，不会以「静默成功」结案：缺 JD、门户熔断、
+救援未完成都会在预览里明确标出，只有已验证的评分产物才会推进刷新游标。反过来说，一个岗位看得见
+但抓不全，系统会记住「看过了」而不是假装它不存在。
 
 ### 我们的 LLMO 策略
 
@@ -671,8 +714,12 @@ JobsFlow 只有一套产品代码、规则和状态机。`JobSearch_2026/` 不�
 python3 setup.py --doctor-json
 python3 tools/security_guards.py
 python3 tools/public_release_check.py --source
+python3 tools/check_types.py
 pytest -q
 ```
+
+产品线另有用例覆盖率报告与干净虚拟环境验收（`tests/test_install_contract.py`），
+并持续清理不可达的旧写入代码、拆分高风险处理阶段——这些是维护性门禁，不改变求职功能本身。
 
 发布卫生、历史清理和可复现检查见 [docs/PUBLIC_READINESS_2026-07-31.md](docs/PUBLIC_READINESS_2026-07-31.md)；完整的安全边界与运行规则见 [docs/system_rules.md](docs/system_rules.md)。提交前请确认 `python3 tools/public_release_check.py --source` 通过，并只发布干净快照，不要把个人工作区历史带入公开仓库。
 
@@ -684,7 +731,7 @@ JobsFlow 是独立维护的产品线，保留了源自 [ai-job-search](https://g
 
 ## 📦 版本
 
-当前主线：**1.1** - 统一 SOP 网关与状态机、lane 锁定和确认入表、基础版增量材料链、独立 CV/CL 内容审计、固定 lane-master DOCX/PDF 渲染、JD 缓存与受控 JobsDB 恢复。
+当前主线：**1.2** - 统一 SOP 网关与状态机、lane 锁定和确认入表、基础版增量材料链、独立 CV/CL 内容审计、固定 lane-master DOCX/PDF 渲染、JD 缓存与受控 JobsDB 恢复，以及可选的 TypeSafe / Jev 只读咨询旁路（给了 `TYPESAFE_API_KEY` 就自动启用）。
 
 ---
 

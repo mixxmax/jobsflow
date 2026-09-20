@@ -11,6 +11,12 @@
 #   bash tools/setup_env.sh --dev              # contributors/CI: + pytest/mypy/cov
 #   bash tools/setup_env.sh --check-only       # offline verification, no installs
 #   bash tools/setup_env.sh --dev --strict     # CI: also require soffice
+#   bash tools/setup_env.sh --advisory         # opt-in: TypeSafe advisory extra
+#
+# The default install deliberately excludes the TypeSafe advisory extra: the
+# gateway never imports it, so the product runs without it.  `--advisory` is
+# opt-in and is still only half of the switch -- the other half is
+# TYPESAFE_API_KEY in the environment, which setup_env.sh never sets.
 #
 # Install order is load-bearing: the unified hash lock first (it now pins
 # SOP Control's runtime deps), then the vendored tree with --no-deps so pip
@@ -20,11 +26,13 @@ set -euo pipefail
 DEV=0
 CHECK_ONLY=0
 STRICT=0
+ADVISORY=0
 for arg in "$@"; do
     case "$arg" in
         --dev) DEV=1 ;;
         --check-only) CHECK_ONLY=1 ;;
         --strict) STRICT=1 ;;
+        --advisory) ADVISORY=1 ;;
         *) echo "ERROR: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -35,6 +43,7 @@ if [ "$DEV" -eq 1 ]; then
 else
     LOCK="$REPO/requirements.lock"
 fi
+ADVISORY_LOCK="$REPO/requirements-advisory.lock"
 
 # An activated virtualenv always wins: never bypass it just because another
 # interpreter exists elsewhere on PATH.  In CI, actions/setup-python makes
@@ -90,6 +99,10 @@ fi
 
 step "check 3/7: lock file present ($LOCK)"
 test -f "$LOCK" || fail "lock file missing: $LOCK"
+if [ "$ADVISORY" -eq 1 ]; then
+    test -f "$ADVISORY_LOCK" || fail "advisory lock missing: $ADVISORY_LOCK"
+    echo "advisory extra requested: $ADVISORY_LOCK"
+fi
 
 if [ "$CHECK_ONLY" -eq 0 ]; then
     step "installing unified lock"
@@ -99,6 +112,13 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     test -f "$REPO/vendor/sopcontrol/sopcontrol/__init__.py"
     test -f "$REPO/vendor/sopcontrol/VENDOR_MANIFEST.json"
     "$PYTHON_BIN" -m pip install --no-deps -e "$REPO/vendor/sopcontrol"
+    if [ "$ADVISORY" -eq 1 ]; then
+        # Constrained against requirements.txt, so this can never move a pin the
+        # runtime lock already owns.  Still optional: the product does not read
+        # this package unless TYPESAFE_API_KEY is also set.
+        step "installing optional TypeSafe advisory extra"
+        "$PYTHON_BIN" -m pip install --require-hashes -r "$ADVISORY_LOCK"
+    fi
 fi
 
 step "check 4/7: vendor pin/manifest/import"
@@ -152,4 +172,18 @@ cd "$REPO"
 "$PYTHON_BIN" -c "import tools.workflow; print('tools.workflow importable')"
 "$PYTHON_BIN" -c "import sopcontrol; print('sopcontrol importable')"
 
-step "setup_env OK (dev=$DEV check_only=$CHECK_ONLY strict=$STRICT)"
+# The TypeSafe advisory is the one part of the product that is switched on by
+# the environment rather than by this script.  Report its state on every run so
+# a new machine immediately sees what is missing instead of guessing.
+"$PYTHON_BIN" - <<'EOF'
+from tools.workflow.typesafe_judgments import typesafe_status
+
+status = typesafe_status()
+state = "enabled" if status.get("enabled") else "disabled"
+print(f"typesafe advisory: {state} ({status.get('reason')})")
+if not status.get("enabled"):
+    print(f"  to enable: {status.get('next_action', '')}")
+    print("  the product runs identically without it; only the advisory report is skipped")
+EOF
+
+step "setup_env OK (dev=$DEV check_only=$CHECK_ONLY strict=$STRICT advisory=$ADVISORY)"

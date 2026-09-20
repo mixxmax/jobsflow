@@ -19,6 +19,12 @@ dependencies = [
   "tree-sitter-rust==0.24.2",
 ]
 
+# Optional extras. `advisory` powers the read-only TypeSafe judgment CLI; the
+# gateway and the materials engine never import it, so the product installs and
+# runs without it.
+[project.optional-dependencies]
+advisory = ["typesafe-sdk==0.7.0"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -m 'not legacy and not retired_legacy'"

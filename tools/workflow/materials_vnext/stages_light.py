@@ -220,23 +220,31 @@ def stage_status(*, package: Path, job_id: str, workspace: Path) -> dict[str, An
     from tools.workflow.materials_vnext.migration import migration_blocker as _migration_blocker
     from tools.workflow.materials_vnext.store import load_run as _load_run
 
+    # The optional TypeSafe advisory reports its own auto-enable decision here,
+    # so "is it wired up on this machine?" is answerable without spending a
+    # request or reading the install docs.
+    from tools.workflow.materials_vnext.advisory import advisory_status
+
+    typesafe = advisory_status()
     vnext_run = _load_run(package)
     if vnext_run:
         return {
             "status": "succeeded",
             "job_id": job_id,
             "materials_run": vnext_run,
+            "typesafe": typesafe,
             "engine": "materials-vnext",
             "side_effects": [],
         }
     legacy = _migration_blocker(Path(workspace), package, job_id)
     if legacy is not None:
-        return {**legacy, "job_id": job_id, "materials_run": None, "engine": "materials-vnext"}
+        return {**legacy, "job_id": job_id, "materials_run": None, "typesafe": typesafe, "engine": "materials-vnext"}
     return {
         "status": "succeeded",
         "job_id": job_id,
         "phase": "idle",
         "materials_run": None,
+        "typesafe": typesafe,
         "engine": "materials-vnext",
         "side_effects": [],
     }
