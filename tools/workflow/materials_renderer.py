@@ -403,7 +403,27 @@ def _job_heading_parts(text: str) -> tuple[str, str | None]:
     return value, None
 
 
-def _layout_units(document, *, material: str) -> float:
+# Wrapped-line widths (characters per line) of the lane-master styles, shared
+# by the balance heuristic and the one-page budget gate.  Keep both readers on
+# this table; a silent fork would let the gate and the renderer disagree.
+_LAYOUT_WIDTHS: dict[str, dict[str, int]] = {
+    "cv": {
+        "Normal": 92,
+        "Resume Section": 96,
+        "Job Heading": 84,
+        "Resume Bullet": 94,
+        "Compact Line": 104,
+    },
+    "cover_letter": {
+        "Normal": 88,
+        "Letter Body": 88,
+        "Letter Bullet": 88,
+        "Letter Compact": 100,
+    },
+}
+
+
+def _layout_units(document, *, material: str, empty_unit: float = 0.25) -> float:
     """Estimate wrapped-line demand without opening Word or a PDF engine.
 
     This is deliberately a routing heuristic, not a page-count assertion.  It
@@ -412,30 +432,82 @@ def _layout_units(document, *, material: str) -> float:
     unbalanced lower half of the page.
     """
 
-    widths = {
-        "cv": {
-            "Normal": 92,
-            "Resume Section": 96,
-            "Job Heading": 84,
-            "Resume Bullet": 94,
-            "Compact Line": 104,
-        },
-        "cover_letter": {
-            "Normal": 88,
-            "Letter Body": 88,
-            "Letter Bullet": 88,
-            "Letter Compact": 100,
-        },
-    }[material]
+    widths = _LAYOUT_WIDTHS[material]
     total = 0.0
     for paragraph in document.paragraphs:
         text = str(paragraph.text or "")
         if not text:
-            total += 0.25
+            total += empty_unit
             continue
         width = widths.get(str(paragraph.style.name), 90)
         total += sum(max(1, ceil(len(part) / width)) for part in text.split("\n"))
     return total
+
+
+# Rendered-page budget in layout units, fitted against LibreOffice output on
+# synthetic lane-master fixtures (2026-09-20): CV renders 1 page at 46 units
+# and 2 pages at 47; cover letter renders 1 page at 45 and 2 pages at 46.
+# Structure variants (short bullets, long paragraphs, extra headings) flip in
+# the same band, so one threshold per material is sufficient.  Crossing the
+# budget blocks before any DOCX is saved or PDF converted; the format gate's
+# page_count_exceeded stays the final authority for anything that slips past.
+_PAGE_BUDGET_UNITS: dict[str, float] = {
+    "cv": 46.0,
+    "cover_letter": 45.0,
+}
+
+
+class PageBudgetExceeded(ValueError):
+    """A rendered DOCX exceeds its one-page layout budget.
+
+    Raised before any file is written so the caller can ask for a narrow
+    revision instead of failing a whole generation after PDF conversion.
+    Carries the measurement in ``report``.
+    """
+
+    def __init__(self, report: dict[str, Any]) -> None:
+        self.report = report
+        super().__init__(
+            "page_budget_exceeded:{material}:units={units:.1f}:budget={budget:.1f}:over_by={over_by:.1f}".format(**report)
+        )
+
+
+def _page_budget_units(document, *, material: str) -> float:
+    """Wrapped-line demand for the one-page gate.
+
+    Same width model as :func:`_layout_units`, except an empty paragraph
+    counts as a full unit: LibreOffice gives it a full line height, and the
+    0.25 routing weight would otherwise let 40 empty paragraphs (18 measured
+    units) slip through as a 2-page PDF.
+    """
+
+    return _layout_units(document, material=material, empty_unit=1.0)
+
+
+def _page_budget_report(document, *, material: str) -> dict[str, Any]:
+    """Measure a built (unsaved) document against its one-page budget."""
+
+    budget = _PAGE_BUDGET_UNITS[material]
+    widths = _LAYOUT_WIDTHS[material]
+    scored = []
+    for index, paragraph in enumerate(document.paragraphs):
+        text = str(paragraph.text or "")
+        style = str(paragraph.style.name)
+        if not text:
+            units = 1.0
+        else:
+            width = widths.get(style, 90)
+            units = float(sum(max(1, ceil(len(part) / width)) for part in text.split("\n")))
+        scored.append({"index": index, "style": style, "units": units, "preview": text[:60] or "(empty paragraph)"})
+    scored.sort(key=lambda item: item["units"], reverse=True)
+    units = _page_budget_units(document, material=material)
+    return {
+        "material": material,
+        "units": round(units, 2),
+        "budget": budget,
+        "over_by": round(units - budget, 2),
+        "top_paragraphs": scored[:3],
+    }
 
 
 def _apply_visual_balance(
@@ -608,15 +680,18 @@ def _add_block(
     paragraph.paragraph_format.widow_control = True
 
 
-def _render_document(
+def _build_document(
     blocks: list[dict[str, Any]],
-    path: Path,
     *,
     material: str,
-    title: str,
-    author: str,
     template: Path,
-) -> None:
+):
+    """Render blocks into an in-memory document without touching the disk.
+
+    Lets callers measure the built document (one-page budget gate) before
+    deciding to save it.  No file side effects.
+    """
+
     document = _template_document(template, material=material)
     prototypes = _template_prototypes(document, material=material)
     target_units = _layout_units(document, material=material)
@@ -630,8 +705,25 @@ def _render_document(
         target_units=target_units,
         target_paragraphs=target_paragraphs,
     )
+    return document, layout_balance
+
+
+def _save_document(document, path: Path, *, material: str, title: str, author: str) -> None:
     document.save(str(path))
     sanitize_docx_metadata(path, title=title, subject="Job application CV" if material == "cv" else "Job application Cover Letter", author=author)
+
+
+def _render_document(
+    blocks: list[dict[str, Any]],
+    path: Path,
+    *,
+    material: str,
+    title: str,
+    author: str,
+    template: Path,
+) -> None:
+    document, layout_balance = _build_document(blocks, material=material, template=template)
+    _save_document(document, path, material=material, title=title, author=author)
     return layout_balance
 
 
@@ -751,22 +843,27 @@ def render_canonical_docx(package: Path, workspace: Path, *, force: bool = False
     candidate = _candidate_name(Path(workspace))
     cv = package / names["cv_docx"]
     cl = package / names["cl_docx"]
-    cv_layout = _render_document(
+    # Build both documents in memory first and measure them against the
+    # fitted one-page budget BEFORE archiving previous outputs or writing
+    # anything.  A block here leaves the package exactly as it was: no DOCX
+    # overwritten, no receipt rewritten, no PDF attempted, so the producer
+    # revises one material instead of resetting the whole generation.
+    cv_document, cv_layout = _build_document(
         list((draft.get("cv") or {}).get("blocks") or []),
-        cv,
         material="cv",
-        title=cv.stem,
-        author=candidate,
         template=templates["cv"],
     )
-    cl_layout = _render_document(
+    cl_document, cl_layout = _build_document(
         list((draft.get("cover_letter") or {}).get("blocks") or []),
-        cl,
         material="cover_letter",
-        title=cl.stem,
-        author=candidate,
         template=templates["cover_letter"],
     )
+    for material, document in (("cv", cv_document), ("cover_letter", cl_document)):
+        report = _page_budget_report(document, material=material)
+        if report["over_by"] > 0:
+            raise PageBudgetExceeded(report)
+    _save_document(cv_document, cv, material="cv", title=cv.stem, author=candidate)
+    _save_document(cl_document, cl, material="cover_letter", title=cl.stem, author=candidate)
     receipt = {
         "schema_version": 1,
         "renderer_version": RENDERER_VERSION,

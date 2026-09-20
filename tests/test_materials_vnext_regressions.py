@@ -7,8 +7,11 @@ import json
 from docx import Document
 
 from tools.workflow.materials_renderer import (
+    PageBudgetExceeded,
     _add_block,
     _job_heading_parts,
+    _layout_units,
+    _page_budget_units,
     _template_prototypes,
     mechanical_format_gate,
     render_canonical_docx,
@@ -329,3 +332,124 @@ def test_draft_reset_archives_external_staging_contexts(tmp_path):
     assert reset["status"] == "reset"
     assert not staging.exists()
     assert list((package / ".history").glob("materials-vnext-reset-draft-*/materials_drafting_contexts/C0-001"))
+
+
+def _bloat_canonical_cv(package, *, count=25, host_managed_optional=True):
+    """Append overflow bullets to the canonical CV and re-anchor its digest."""
+    from tools.workflow.materials_draft import canonical_digest, load_canonical_draft
+
+    path = package / "materials_draft.canonical.json"
+    draft = load_canonical_draft(package)
+    blocks = list((draft.get("cv") or {}).get("blocks") or [])
+    for index in range(count):
+        blocks.append({
+            "id": f"overflow-{index}",
+            "type": "bullet",
+            # ~130 chars = 2 wrapped lines each: 25 bullets ≈ 50 units plus
+            # the 8-unit base, well over the 46-unit CV budget.
+            "text": "Reviewed vendor contracts and converted findings into an accurate operations checklist for the payments team.",
+            "section": "experience",
+            "source_style": "Resume Bullet",
+            "claim_ids": [],
+            "host_managed_optional": host_managed_optional,
+        })
+    draft["cv"]["blocks"] = blocks
+    draft["canonical_sha256"] = canonical_digest(draft)
+    path.write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
+    return draft
+
+
+def _bind_passing_audit_to_canonical(package):
+    """Record a synthetic passing audit consistently bound to the live canonical.
+
+    Writes the renderer-read ``materials_audit.json`` AND the engine-read
+    digest binding (``run.audit_result_sha256``) from the same content, so
+    both audit checks pass on genuine hashes.  Used to place a generation at
+    ``content_passed`` with an over-budget canonical without faking any hash.
+    """
+    from tools.workflow.materials_hashes import semantic_material_hashes
+    from tools.workflow.materials_vnext.contracts import digest
+    from tools.workflow.materials_vnext.store import load_run, save_run
+
+    run = load_run(package)
+    report = {
+        "status": "passed",
+        "content_gate": "passed",
+        "generation_id": run.get("generation_id"),
+        "semantic_material_hashes": semantic_material_hashes(package),
+        "open_counts": {"P0": 0, "P1": 0, "P2": 0},
+    }
+    (package / "materials_audit.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    run["phase"] = "content_passed"
+    run["audit_result_sha256"] = digest(report)
+    save_run(package, run)
+
+
+def test_page_budget_units_counts_empty_paragraph_as_full_line():
+    document = Document()
+    document.add_paragraph("Short line.")
+    document.add_paragraph("")
+    document.add_paragraph("")
+    assert _page_budget_units(document, material="cv") == _layout_units(document, material="cv") + 1.5
+
+
+def test_render_blocks_over_budget_before_writing_anything(tmp_path):
+    from tools.workflow.materials_hashes import container_hash
+    from tools.workflow.materials_renderer import expected_filenames
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws)
+    prepare_package_for_apply(ws)
+    names = expected_filenames(package, ws)
+    before_docx = {
+        key: container_hash(package / names[key]) for key in ("cv_docx", "cl_docx")
+    }
+    before_receipt = (package / "materials_render_receipt.json").read_bytes()
+    before_pdfs = sorted(path.name for path in package.glob("*.pdf"))
+
+    _bloat_canonical_cv(package)
+    _bind_passing_audit_to_canonical(package)
+
+    try:
+        render_canonical_docx(package, ws, force=True)
+    except PageBudgetExceeded as exc:
+        report = exc.report
+    else:
+        raise AssertionError("expected PageBudgetExceeded for a 25-bullet overflow")
+    assert report["material"] == "cv"
+    assert report["over_by"] > 0
+    assert report["units"] > report["budget"]
+    assert len(report["top_paragraphs"]) == 3
+    # Nothing was written: previous DOCX, receipt and PDF set are untouched.
+    assert {key: container_hash(package / names[key]) for key in ("cv_docx", "cl_docx")} == before_docx
+    assert (package / "materials_render_receipt.json").read_bytes() == before_receipt
+    assert sorted(path.name for path in package.glob("*.pdf")) == before_pdfs
+
+
+def test_render_stage_reports_page_budget_with_revision_scope(tmp_path):
+    from tools.workflow.materials_vnext.store import load_run
+    from tools.workflow.testing_packages import baseline_transform_fixture
+
+    ws = build_workspace(tmp_path)
+    package = build_package(ws)
+    plan = json.loads((package / "materials_plan.validated.json").read_text(encoding="utf-8"))
+    assert dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "model_plan": plan})["status"] == "succeeded"
+    drafted = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": "C0-001", "canonical_draft": baseline_transform_fixture(package, "C0-001")},
+    )
+    assert drafted["status"] == "succeeded"
+    # host_managed_optional blocks are invisible to the character estimator
+    # but render as real paragraphs: canonical passes the cheap capacity
+    # gate (ratio preserved) yet exceeds the fitted page budget.
+    _bloat_canonical_cv(package)
+    _bind_passing_audit_to_canonical(package)
+
+    out = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "stage": "render"})
+    assert out["status"] == "blocked"
+    assert out["blockers"] == ["page_budget_exceeded"]
+    assert out["next_action"] == "revise_only_over_budget_materials"
+    assert out["page_budget"]["material"] == "cv"
+    assert out["page_budget"]["over_by"] > 0
+    assert load_run(package)["phase"] == "content_passed"
