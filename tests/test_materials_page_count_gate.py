@@ -1,21 +1,16 @@
-"""The pre-render capacity gate is a cheap trigger with an exact verdict.
+"""The pre-render capacity gate measures the real PDF page count.
 
-``estimate_canonical_capacity`` counts wrapped characters.  It reports
-``ratio == 1.0`` for a canonical exactly as long as its lane master, even when
-that canonical carries twenty-five ``host_managed_optional`` blocks the
-estimator deliberately skips and renders as two pages.  That makes it a poor
-verdict and a fine trigger: the renderer's geometry model already measures a
-built document against its own template section, so preflight can pay that
-cost only for the materials worth measuring.
+The character/geometry estimate that used to gate rendering was 15-25% off
+against real lane masters: it reported 904pt for a document that renders at
+769pt, and it reported a fitting document for one that overflows.  It existed
+only to avoid one LibreOffice conversion.  So the gate no longer predicts --
+it renders each material into a temporary DOCX, converts it through the same
+engine the format gate uses, and counts the pages of the result.
 
-Two tiers, therefore.  The character comparison stays on every transform and
-raises a *suspicion*; geometry then decides.  Suspicion is raised either by the
-line-count thresholds or by a change in the document's shape -- the estimator
-is calibrated against the master's shape, so adding a host-managed block or
-swapping a style moves height without moving the line count.
-
-Geometry below is the C-lane master's, measured rather than assumed: a 648pt
-body, 24.3pt per ``Resume Bullet``, and 26.6pt per ``Letter Bullet``.
+The authority is unchanged: the format gate's ``page_count`` check on the
+rendered PDF.  This only moves that check earlier, before any DOCX/PDF work is
+committed to the package, so a producer revises one material instead of
+resetting a whole generation.
 """
 
 from __future__ import annotations
@@ -27,22 +22,14 @@ import pytest
 from tools.workflow.materials_vnext.preflight import evaluate_capacity, run_preflight
 from tools.workflow.testing_packages import build_package, build_workspace
 
-# 118 characters: two wrapped lines at the estimator's 94-char Resume Bullet
-# width, so every copy costs 24.3pt of real height.
+# One Resume Bullet paragraph costs roughly 24pt of the 648pt synthetic C-lane
+# body, so forty of them is comfortably past a single page.  The count is
+# deliberately generous: the point of the test is the *verdict*, not a tight
+# boundary, and the boundary is whatever LibreOffice actually reports.
+_OVERFLOWING = 40
+# Enough to make the old character trigger fire, few enough to fit one page.
+_FITTING = 6
 _BULLET_TEXT = "Reviewed vendor contracts and converted findings into an accurate operations checklist for the payments team."
-# Verified against master_C_test_v1.docx: 8 paragraphs, 169.7pt, 648pt body.
-_MASTER_CV_POINTS = 169.7
-_MASTER_CL_POINTS = 156.7
-_CV_BULLET_POINTS = 24.3
-_CL_BULLET_POINTS = 26.6
-_BODY_POINTS = 648.0
-# 25 invisible bullets: the estimator still says 8 lines, the document is
-# 777.2pt -- 129.2pt past a 648pt body, i.e. certainly two pages.
-_OVERFLOWING = 25
-_OVER_BY_POINTS = 129.2
-# 6 ordinary bullets: 12 lines over the master, so the cheap trigger fires,
-# and 315.5pt -- comfortably inside the body.
-_TRIGGERING = 6
 
 
 def _prepared(tmp_path):
@@ -113,78 +100,46 @@ def _effective():
     }
 
 
-def test_geometry_blocks_what_the_character_estimator_cannot_see(tmp_path):
-    """The estimator's known blind spot: invisible blocks are real paragraphs."""
+def test_a_material_that_renders_to_two_pages_is_blocked_before_render(tmp_path):
+    """The verdict is the real page count, not a character estimate."""
 
     ws, package, bundle, baseline, templates = _prepared(tmp_path)
     canonical = _canonical(baseline, count=_OVERFLOWING, host_managed_optional=True)
-
-    estimate = evaluate_capacity(canonical=canonical, baseline=baseline)
-    # The trigger is silent: same line count as the master, ratio exactly 1.0.
-    assert estimate["estimate"]["cv"]["estimated_lines"] == estimate["estimate"]["cv"]["master_lines"] == 8
-    assert estimate["estimate"]["cv"]["ratio"] == 1.0
-    assert estimate["status"] == "passed"
 
     gate = evaluate_capacity(canonical=canonical, baseline=baseline, templates=templates)
     assert gate["status"] == "blocked"
     assert gate["materials"] == ["cv"]
     assert gate["next_action"] == "revise_only_over_budget_materials"
-    report = gate["measured"]["cv"]
-    assert report["points"] == pytest.approx(_MASTER_CV_POINTS + _OVERFLOWING * _CV_BULLET_POINTS, abs=1.5)
-    assert report["budget_points"] == pytest.approx(_BODY_POINTS, abs=0.1)
-    assert report["over_by_points"] == pytest.approx(_OVER_BY_POINTS, abs=1.5)
+    assert gate["pages"]["cv"] > 1
+    assert gate["pages"]["cover_letter"] == 1
 
 
-def test_a_shape_preserving_rewrite_stays_on_the_cheap_path(tmp_path):
-    """Nothing suspicious: no template is opened and nothing is measured."""
+def test_the_lane_master_itself_passes(tmp_path):
+    """A document that renders to exactly one page is not blocked."""
 
     ws, package, bundle, baseline, templates = _prepared(tmp_path)
-    # Rewrite one bullet's text in place.  Line count and document shape both
-    # stay put, so the estimator's verdict is trusted without a measurement.
-    canonical = _canonical(baseline)
-    target = canonical["cv"]["blocks"][-1]
-    target["text"] = "Negotiated and reviewed vendor contracts for the payments operations team."
 
-    gate = evaluate_capacity(canonical=canonical, baseline=baseline, templates=templates)
+    gate = evaluate_capacity(canonical=baseline, baseline=baseline, templates=templates)
     assert gate["status"] == "passed"
-    assert gate["triggered"] == []
-    assert gate["measured"] == {}
+    assert gate["materials"] == []
+    assert gate["pages"] == {"cv": 1, "cover_letter": 1}
     assert gate["next_action"] == "continue_to_content_audit"
 
 
-def test_a_triggered_material_that_fits_is_not_blocked(tmp_path):
-    """The trigger only buys a measurement; geometry still decides."""
+def test_the_trigger_is_gone_the_gate_measures_every_material(tmp_path):
+    """Nothing is guessed from line counts: every material is measured."""
 
     ws, package, bundle, baseline, templates = _prepared(tmp_path)
-    canonical = _canonical(baseline, count=_TRIGGERING)
+    canonical = _canonical(baseline, count=_FITTING)
 
     gate = evaluate_capacity(canonical=canonical, baseline=baseline, templates=templates)
-    assert gate["estimate"]["cv"]["over_master_lines"] >= 4
-    assert gate["triggered"] == ["cv"]
-    # Measured, and it fits: 315.5pt inside a 648pt body.
-    assert gate["measured"]["cv"]["points"] == pytest.approx(_MASTER_CV_POINTS + _TRIGGERING * _CV_BULLET_POINTS, abs=1.5)
-    assert gate["measured"]["cv"]["over_by_points"] < 0
     assert gate["status"] == "passed"
-    assert gate["materials"] == []
-
-
-def test_without_templates_the_character_estimate_is_the_whole_verdict(tmp_path):
-    """Documented degradation: no measurement, so the blind spot is open."""
-
-    ws, package, bundle, baseline, templates = _prepared(tmp_path)
-    canonical = _canonical(baseline, count=_OVERFLOWING, host_managed_optional=True)
-
-    gate = evaluate_capacity(canonical=canonical, baseline=baseline, templates=None)
-    # Suspicion is still raised -- the shape moved -- but with nothing to
-    # measure there is no verdict to back it, so it is not acted on.  This is
-    # exactly the blind spot the two tiers exist to close.
-    assert gate["triggered"] == ["cv"]
-    assert gate["measured"] == {}
-    assert gate["status"] == "passed"
+    assert gate["pages"]["cv"] == 1
+    assert gate["pages"]["cover_letter"] == 1
 
 
 def test_each_material_is_measured_against_its_own_template(tmp_path):
-    """Budgets never cross materials: an overflowing letter blocks only it."""
+    """An overflowing letter blocks only it; the CV stays untouched."""
 
     ws, package, bundle, baseline, templates = _prepared(tmp_path)
     canonical = _canonical(baseline, material="cover_letter", count=_OVERFLOWING, host_managed_optional=True)
@@ -192,25 +147,22 @@ def test_each_material_is_measured_against_its_own_template(tmp_path):
     gate = evaluate_capacity(canonical=canonical, baseline=baseline, templates=templates)
     assert gate["status"] == "blocked"
     assert gate["materials"] == ["cover_letter"]
-    assert "cv" not in gate["measured"]
-    report = gate["measured"]["cover_letter"]
-    assert report["points"] == pytest.approx(_MASTER_CL_POINTS + _OVERFLOWING * _CL_BULLET_POINTS, abs=1.5)
-    assert report["over_by_points"] == pytest.approx(173.7, abs=1.5)
+    assert gate["pages"]["cv"] == 1
+    assert gate["pages"]["cover_letter"] > 1
 
 
-def test_an_unreadable_template_fails_closed(tmp_path):
+def test_without_lane_masters_the_gate_fails_closed(tmp_path):
     """No measurement is not a pass: preflight must block, not guess."""
 
     ws, package, bundle, baseline, _ = _prepared(tmp_path)
     canonical = _canonical(baseline, count=_OVERFLOWING, host_managed_optional=True)
 
-    broken = {"cv": tmp_path / "absent_master.docx", "cover_letter": tmp_path / "absent_cl.docx"}
     with pytest.raises(ValueError, match="capacity_measure_unavailable"):
-        evaluate_capacity(canonical=canonical, baseline=baseline, templates=broken)
+        evaluate_capacity(canonical=canonical, baseline=baseline, templates=None)
 
 
-def test_preflight_finding_carries_the_measured_numbers(tmp_path):
-    """The revision instruction names the measured overflow, not line counts."""
+def test_preflight_finding_carries_the_real_page_count(tmp_path):
+    """The revision instruction names the pages LibreOffice produced."""
 
     ws, package, bundle, baseline, templates = _prepared(tmp_path)
     canonical = _canonical(baseline, count=_OVERFLOWING, host_managed_optional=True)
@@ -226,15 +178,31 @@ def test_preflight_finding_carries_the_measured_numbers(tmp_path):
     assert len(blocking) == 1
     finding = blocking[0]
     assert finding["material"] == "cv"
-    assert "777pt" in finding["evidence"]
-    assert "648pt" in finding["evidence"]
-    assert "+129pt" in finding["evidence"]
+    assert "pages" in finding["evidence"]
+    assert "2 pages" in finding["evidence"]
     assert result["capacity_gate"]["status"] == "blocked"
     assert result["capacity_gate"]["materials"] == ["cv"]
+    assert result["status"] == "blocked"
 
 
-def test_preflight_without_templates_reports_the_estimate_only(tmp_path):
-    """Same blind spot, now visible in the finding: it stays a pass."""
+def test_preflight_passes_a_one_page_canonical(tmp_path):
+    """The unchanged baseline is the ordinary pass path, not a blocker."""
+
+    ws, package, bundle, baseline, templates = _prepared(tmp_path)
+
+    result = run_preflight(
+        bundle=_bundle(baseline),
+        canonical=baseline,
+        effective_transform=_effective(),
+        plan={},
+        templates=templates,
+    )
+    assert result["capacity_gate"]["status"] == "passed"
+    assert "capacity_budget_exceeded" not in {item["code"] for item in result["blocking"]}
+
+
+def test_preflight_without_templates_reports_the_gate_unavailable(tmp_path):
+    """Same fail-closed path, now visible as a blocking finding."""
 
     ws, package, bundle, baseline, _ = _prepared(tmp_path)
     canonical = _canonical(baseline, count=_OVERFLOWING, host_managed_optional=True)
@@ -245,12 +213,14 @@ def test_preflight_without_templates_reports_the_estimate_only(tmp_path):
         effective_transform=_effective(),
         plan={},
     )
-    assert "capacity_budget_exceeded" not in {item["code"] for item in result["blocking"]}
-    assert result["capacity_gate"]["measured"] == {}
+    codes = [item["code"] for item in result["blocking"]]
+    assert "capacity_gate_unavailable" in codes
+    assert result["status"] == "blocked"
+    assert result["capacity_gate"]["status"] == "unavailable"
 
 
 def test_preflight_measurement_failure_becomes_a_blocker(tmp_path):
-    """run_preflight's fail-closed path covers the measurement, not just the estimate."""
+    """A broken template is a missing measurement, which is a blocker."""
 
     ws, package, bundle, baseline, _ = _prepared(tmp_path)
     canonical = _canonical(baseline, count=_OVERFLOWING, host_managed_optional=True)
@@ -266,3 +236,32 @@ def test_preflight_measurement_failure_becomes_a_blocker(tmp_path):
     assert "capacity_gate_unavailable" in codes
     assert result["status"] == "blocked"
     assert result["capacity_gate"]["status"] == "unavailable"
+
+
+def test_measure_page_count_reports_both_materials(tmp_path):
+    """The measurement itself is a real render, not a model of one."""
+
+    from tools.workflow.materials_renderer import measure_page_count
+
+    ws, package, bundle, baseline, templates = _prepared(tmp_path)
+    canonical = _canonical(baseline, count=_OVERFLOWING, host_managed_optional=True)
+
+    pages = measure_page_count(canonical, templates)
+    assert set(pages) == {"cv", "cover_letter"}
+    assert pages["cv"] > 1
+    assert pages["cover_letter"] == 1
+
+
+def test_measuring_leaves_the_package_untouched(tmp_path):
+    """Preflight measures a canonical it has not committed to rendering."""
+
+    from tools.workflow.materials_renderer import measure_page_count
+
+    ws, package, bundle, baseline, templates = _prepared(tmp_path)
+    before = sorted(item.name for item in package.iterdir())
+    canonical = _canonical(baseline, count=_OVERFLOWING, host_managed_optional=True)
+
+    measure_page_count(canonical, templates)
+
+    assert sorted(item.name for item in package.iterdir()) == before
+    assert not list(tmp_path.rglob("*pagemeasure*"))
