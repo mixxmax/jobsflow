@@ -1,12 +1,15 @@
-"""The engine must survive either shape of the renderer's page-budget signal.
+"""The engine must narrow the renderer's page-count signal, not every error.
 
-The renderer owns the pre-render capacity budget and is free to enforce it
-itself.  When it does, it raises an exception carrying a measurement report;
-when it does not, it raises nothing the engine has to narrow.  The engine used
-to import that exception inside the ``try`` it guarded, which made the name
-function-local: a renderer without the symbol turned the ``except`` clause
-itself into an ``UnboundLocalError`` and broke every render, with or without a
-page-budget problem.
+The renderer owns the pre-render page budget and is free to enforce it itself.
+It does so by raising a plain ``ValueError`` whose message is prefixed with
+``capacity_budget_exceeded`` and carries the offending material and the page
+count that produced it.  The engine has to tell that apart from any other
+render failure, because the two get very different responses: a budget overrun
+is a narrow revision of one material, anything else is a whole-generation
+failure.
+
+There is no dedicated exception type any more.  The budget is a measurement,
+not a model, so the message is the whole contract.
 """
 
 from __future__ import annotations
@@ -45,26 +48,18 @@ def _drive_to_render_stage(ws, job_id: str = "C0-001"):
     return package
 
 
-def test_page_budget_error_is_optional(monkeypatch):
-    """A renderer that never enforces the budget yields None, not a crash."""
+def test_a_non_capacity_failure_is_not_a_budget_failure():
+    """Every other render error keeps its own, wider response."""
 
-    monkeypatch.delattr(materials_renderer, "PageBudgetExceeded", raising=False)
-    assert _page_budget_error() is None
+    assert _page_budget_error(ValueError("docx_render_failed")) is None
+    assert _page_budget_error(RuntimeError("template unreadable")) is None
+    assert _page_budget_error(OSError("disk full")) is None
 
 
-def test_render_stage_survives_a_renderer_without_the_symbol(tmp_path, monkeypatch):
-    ws = build_workspace(tmp_path)
-    _drive_to_render_stage(ws)
-
-    monkeypatch.delattr(materials_renderer, "PageBudgetExceeded", raising=False)
-    monkeypatch.setattr(
-        materials_renderer,
-        "render_canonical_docx",
-        lambda *args, **kwargs: {"renderer_version": "stub", "cached": False},
-    )
-    result = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "stage": "render"})
-    assert result["status"] == "succeeded"
-    assert result["after_state"] == "docx_generated"
+def test_a_capacity_failure_names_the_offending_material():
+    assert _page_budget_error(ValueError("capacity_budget_exceeded:cv:2pages")) == ["cv"]
+    assert _page_budget_error(ValueError("capacity_budget_exceeded:cover_letter:3pages")) == ["cover_letter"]
+    assert _page_budget_error(ValueError("capacity_measure_unavailable:cv")) is None
 
 
 def test_render_stage_narrows_a_page_budget_failure(tmp_path, monkeypatch):
@@ -73,29 +68,30 @@ def test_render_stage_narrows_a_page_budget_failure(tmp_path, monkeypatch):
     ws = build_workspace(tmp_path)
     _drive_to_render_stage(ws)
 
-    class BudgetExceeded(ValueError):
-        def __init__(self) -> None:
-            # Shape copied from the real _page_budget_report, so this double
-            # cannot drift from the keys the renderer actually emits.
-            self.report = {
-                "material": "cv",
-                "points": 692.0,
-                "budget_points": 648.0,
-                "over_by_points": 44.0,
-                "top_paragraphs": [],
-            }
-            super().__init__("cv exceeds its one-page budget")
-
-    monkeypatch.setattr(materials_renderer, "PageBudgetExceeded", BudgetExceeded, raising=False)
-
     def _over_budget(*args, **kwargs):
-        raise BudgetExceeded()
+        raise ValueError("capacity_budget_exceeded:cv:2pages")
 
     monkeypatch.setattr(materials_renderer, "render_canonical_docx", _over_budget)
     result = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "stage": "render"})
     assert result["status"] == "blocked"
-    assert result["blockers"] == ["page_budget_exceeded"]
+    assert result["blockers"] == ["capacity_budget_exceeded"]
     assert result["next_action"] == "revise_only_over_budget_materials"
-    assert result["page_budget"]["material"] == "cv"
-    assert result["page_budget"]["over_by_points"] > 0
+    assert result["capacity_gate"]["materials"] == ["cv"]
+    assert "2pages" in result["error"]
+    assert result["engine"] == "materials-vnext"
+
+
+def test_render_stage_survives_a_renderer_without_the_signal(tmp_path, monkeypatch):
+    """A renderer that raises something else still fails, but as itself."""
+
+    ws = build_workspace(tmp_path)
+    _drive_to_render_stage(ws)
+
+    def _broken(*args, **kwargs):
+        raise ValueError("docx_render_failed:template unreadable")
+
+    monkeypatch.setattr(materials_renderer, "render_canonical_docx", _broken)
+    result = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "stage": "render"})
+    assert result["status"] == "blocked"
+    assert result["blockers"] == ["docx_render_failed"]
     assert result["engine"] == "materials-vnext"

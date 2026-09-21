@@ -1,11 +1,10 @@
-"""Capacity estimation, soffice serialization and strict-apply gate coverage."""
+"""Page-count measurement, soffice serialization and strict-apply gate coverage."""
 
 from __future__ import annotations
 
 import json
 
 from tools.workflow.engine import dispatch
-from tools.workflow.materials_renderer import estimate_canonical_capacity
 from tools.workflow.materials_vnext.engine import MaterialsEngine
 from tools.workflow.materials_vnext.store import load_run
 from tools.workflow.testing_packages import (
@@ -17,49 +16,52 @@ from tools.workflow.testing_packages import (
 from tests.test_materials_vnext import _audit_report, _bundle, _transform
 
 
-def test_estimate_canonical_capacity_measures_growth_against_the_master():
-    baseline = {
-        "cv": {"blocks": [{"id": "b1", "text": "x" * 180, "source_style": "Resume Bullet"}]},
-        "cover_letter": {"blocks": [{"id": "c1", "text": "y" * 90, "source_style": "Normal"}]},
-    }
-    canonical = {
-        "cv": {"blocks": [{"id": "b1", "text": "x" * 380, "source_style": "Resume Bullet"}]},
-        "cover_letter": {"blocks": [{"id": "c1", "text": "y" * 90, "source_style": "Normal"}]},
-    }
-    report = estimate_canonical_capacity(canonical, baseline)
-    assert report["cv"]["master_lines"] == 2
-    assert report["cv"]["estimated_lines"] == 5
-    assert report["cv"]["over_master_lines"] == 3
-    assert report["cover_letter"]["over_master_lines"] == 0
-
-
-def test_preflight_reports_capacity_overrun_as_advisory_only(tmp_path, monkeypatch):
+def test_preflight_passes_measured_one_page_baseline(tmp_path):
     from tools.workflow.materials_vnext.preflight import run_preflight
+
+    from tools.workflow.materials_renderer import _template_paths
 
     ws = build_workspace(tmp_path)
     package = build_package(ws, with_outbound=False)
     bundle, _ = _bundle(ws, package)
-    # Leave the canonical at the baseline seed: capacity identical, no finding.
+    # Leave the canonical at the baseline seed: it renders one page, so the
+    # measured capacity gate has nothing to report.
     seed = json.loads((package / "materials_vnext" / "canonical.json").read_text(encoding="utf-8"))
-    preflight = run_preflight(bundle=bundle, canonical=seed, effective_transform={"original": {}, "repair_patches": []})
-    assert all(item["code"] != "capacity_estimate_over_master" for item in preflight["findings"])
-    assert "capacity_estimate" in preflight
+    preflight = run_preflight(
+        bundle=bundle,
+        canonical=seed,
+        effective_transform={"original": {}, "repair_patches": []},
+        templates=_template_paths(package, ws),
+    )
+    assert all(item["code"] != "capacity_budget_exceeded" for item in preflight["findings"])
+    assert preflight["capacity_pages"] == {"cv": 1, "cover_letter": 1}
+    assert preflight["capacity_gate"]["status"] == "passed"
 
 
 def test_preflight_blocks_over_budget_material_before_render(tmp_path):
-    """A known page-budget overrun must stop before any DOCX/PDF work."""
+    """A known page-count overrun must stop before any DOCX/PDF work."""
 
+    from tools.workflow.materials_renderer import _template_paths
     from tools.workflow.materials_vnext.preflight import run_preflight
 
     ws = build_workspace(tmp_path)
     package = build_package(ws, with_outbound=False)
     bundle, _ = _bundle(ws, package)
     canonical = json.loads((package / "materials_vnext" / "canonical.json").read_text(encoding="utf-8"))
-    target = next(
-        item for item in canonical["cv"]["blocks"]
-        if item.get("type") in {"paragraph", "bullet"} and not item.get("host_managed")
+    # A long single paragraph is not a reliable overflow fixture: its lane
+    # style can still render within one page.  Forty actual bullet paragraphs
+    # exercise the pagination the user sees in LibreOffice.
+    canonical["cv"]["blocks"].extend(
+        {
+            "id": f"overflow-{index}",
+            "type": "bullet",
+            "section": "experience",
+            "source_style": "Resume Bullet",
+            "text": "Reviewed vendor contracts and converted findings into an accurate operations checklist for the payments team.",
+            "host_managed_optional": True,
+        }
+        for index in range(40)
     )
-    target["text"] = str(target["text"]) + " " + ("JD-aligned evidence " * 160)
     preflight = run_preflight(
         bundle=bundle,
         canonical=canonical,
@@ -67,17 +69,18 @@ def test_preflight_blocks_over_budget_material_before_render(tmp_path):
             "original": {"operations": [{"material": "cv", "jd_anchor_ids": ["JD-001"]}]},
             "repair_patches": [],
         },
+        templates=_template_paths(package, ws),
     )
-    capacity = preflight["capacity_estimate"]["cv"]
-    assert capacity["over_master_lines"] >= 4 or capacity["ratio"] > 1.08
+    assert preflight["capacity_pages"]["cv"] > 1
     assert preflight["status"] == "blocked"
     finding = next(item for item in preflight["findings"] if item["code"] == "capacity_budget_exceeded")
     assert finding["severity"] == "P1"
+    assert finding["material"] == "cv"
     assert preflight["capacity_gate"]["status"] == "blocked"
     assert preflight["capacity_gate"]["materials"] == ["cv"]
 
 
-def test_preflight_blocks_when_capacity_estimate_is_unavailable(tmp_path, monkeypatch):
+def test_preflight_blocks_when_page_measurement_is_unavailable(tmp_path, monkeypatch):
     from tools.workflow.materials_vnext import preflight as preflight_module
     from tools.workflow.materials_vnext.preflight import run_preflight
 
@@ -94,16 +97,19 @@ def test_preflight_blocks_when_capacity_estimate_is_unavailable(tmp_path, monkey
     assert any(item["code"] == "capacity_gate_unavailable" for item in result["blocking"])
 
 
-def test_capacity_gate_fails_closed_for_empty_lane_baseline():
+def test_capacity_gate_fails_closed_without_a_measurable_budget():
     from tools.workflow.materials_vnext.preflight import evaluate_capacity
 
     canonical = {"cv": {"blocks": [{"text": "content"}]}, "cover_letter": {"blocks": [{"text": "content"}]}}
+    baseline = {"cv": {"blocks": [{"text": "content"}]}, "cover_letter": {"blocks": [{"text": "content"}]}}
+    # No lane masters: there is nothing to render against, so the gate must
+    # fail closed rather than assume the document fits.
     try:
-        evaluate_capacity(canonical=canonical, baseline={"cv": {"blocks": []}, "cover_letter": {"blocks": []}})
+        evaluate_capacity(canonical=canonical, baseline=baseline, templates=None)
     except ValueError as exc:
-        assert "capacity_baseline_empty" in str(exc)
+        assert "capacity_measure_unavailable" in str(exc)
     else:  # pragma: no cover - the gate must never treat a missing budget as zero
-        raise AssertionError("empty lane baseline must fail closed")
+        raise AssertionError("a missing measurement must fail closed")
 
 
 def test_soffice_lock_serializes_conversions():

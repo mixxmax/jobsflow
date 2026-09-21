@@ -31,55 +31,6 @@ TEMPLATE_STYLES: dict[str, tuple[str, ...]] = {
     "cover_letter": ("Letter Body", "Letter Bullet", "Letter Compact"),
 }
 
-# Calibrated wrapped-line widths (characters per line) of the lane masters.
-# These feed the pre-render capacity estimate.  The estimate is a conservative
-# early budget; the LibreOffice PDF page count remains the authoritative
-# one-page fact, while crossing the budget is stopped before any conversion.
-CAPACITY_CHARS_PER_LINE: dict[str, int] = {
-    "Normal": 92,
-    "Compact Line": 104,
-    "Letter Compact": 104,
-    "Resume Bullet": 94,
-    "Letter Bullet": 94,
-    "Job Heading": 92,
-    "Resume Section": 92,
-}
-
-
-def estimate_canonical_capacity(canonical: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
-    """Estimate wrapped-line growth of the canonical against its lane master.
-
-    The master renders one page by construction, so its estimated line count
-    is the budget.  This is a pure function: no template, no renderer and no
-    PDF conversion is involved, which is exactly what makes it cheap enough to
-    run on every transform instead of after every render.
-    """
-
-    def _lines(blocks: list[dict[str, Any]]) -> int:
-        total = 0
-        for block in blocks:
-            if not isinstance(block, dict) or bool(block.get("host_managed_optional")):
-                continue
-            width = CAPACITY_CHARS_PER_LINE.get(str(block.get("source_style") or "Normal"), 92)
-            chars = len(str(block.get("text") or ""))
-            total += max(1, -(-chars // max(1, width)))
-        return total
-
-    report: dict[str, Any] = {}
-    for material in ("cv", "cover_letter"):
-        master_blocks = [dict(item) for item in ((baseline.get(material) or {}).get("blocks") or []) if isinstance(item, dict)]
-        current_blocks = [dict(item) for item in ((canonical.get(material) or {}).get("blocks") or []) if isinstance(item, dict)]
-        master_lines = _lines(master_blocks)
-        estimated_lines = _lines(current_blocks)
-        report[material] = {
-            "master_lines": master_lines,
-            "estimated_lines": estimated_lines,
-            "over_master_lines": estimated_lines - master_lines,
-            "ratio": round(estimated_lines / max(1, master_lines), 3),
-        }
-    return report
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -444,351 +395,6 @@ def _layout_units(document, *, material: str) -> float:
     return total
 
 
-# A font's natural (single-spaced) line height as a multiple of its em size,
-# measured against LibreOffice: 11pt Caladea renders 12.9pt (1.173x) and 9.5pt
-# Arial renders 10.98pt (1.156x).  The spread between fonts is ~1.5%, so one
-# constant suffices -- but it has to be *multiplied* by the paragraph's own
-# line multiple, never maxed with it.  LibreOffice scales the font's natural
-# line height, not the em size, so a 1.15x paragraph costs
-# ``font_pt * _NATURAL_LEADING * 1.15``.  Taking the max instead (the earlier
-# model) under-measured every proportional-spaced paragraph by ~15% and let a
-# full page of real overflow through to the PDF stage.  Same category as the
-# character-width table above: a layout-engine constant, not a fitted page
-# threshold.  The page budget itself is always read from the template's own
-# section geometry, so the gate self-calibrates per lane master and needs no
-# per-material constants.
-_NATURAL_LEADING = 1.173
-_DEFAULT_FONT_PT = 10.0
-
-
-def _resolve_font_pt(paragraph, document=None) -> float:
-    """Resolve a paragraph's effective font size in points.
-
-    Run-direct formatting wins (the renderer stamps sizes from the lane
-    master), then the style inheritance chain, then the styles-part
-    docDefaults, then a documented fallback.  Skipping docDefaults makes the
-    gate measure a template's paragraphs at ``_DEFAULT_FONT_PT`` while
-    LibreOffice renders them at the template's real default size.
-    """
-
-    for run in paragraph.runs:
-        try:
-            if run.font.size is not None:
-                return float(run.font.size.pt)
-        except (AttributeError, TypeError, ValueError):
-            continue
-    style = paragraph.style
-    seen = set()
-    while style is not None and id(style) not in seen:
-        seen.add(id(style))
-        try:
-            if style.font.size is not None:
-                return float(style.font.size.pt)
-        except (AttributeError, TypeError, ValueError):
-            pass
-        try:
-            style = style.base_style
-        except (AttributeError, ValueError):
-            break
-    if document is not None:
-        default_pt = _document_defaults(document).get("font_pt")
-        if default_pt:
-            return float(default_pt)
-    return _DEFAULT_FONT_PT
-
-
-def _document_defaults(document) -> dict[str, Any]:
-    """Read styles-part docDefaults (default size, spacing), or {}.
-
-    This is the last OOXML fallback after paragraph-direct formatting and
-    the style chain: python-docx's default template carries
-    ``w:after="200"`` (10pt), ``w:line="276"`` (1.15x) and ``w:sz="22"``
-    (11pt) here, and real lane masters carry their own.  Skipping the spacing
-    undercounts every paragraph without explicit spacing by the full default
-    gap, and skipping the size silently substitutes ``_DEFAULT_FONT_PT`` for
-    the template's real default -- both are systematic misses, not rounding.
-    """
-
-    result: dict[str, Any] = {}
-    try:
-        styles_el = document.styles.element
-    except (AttributeError, ValueError):
-        return result
-    try:
-        from docx.oxml.ns import qn as _qn
-
-        defaults = styles_el.find(_qn("w:docDefaults"))
-        if defaults is None:
-            return result
-        for child in defaults:
-            if child.tag.endswith("}pPrDefault"):
-                for spacing_el in child.iter():
-                    if not spacing_el.tag.endswith("}spacing"):
-                        continue
-                    get = spacing_el.get
-                    try:
-                        if get(_qn("w:after")) is not None:
-                            result["after_pt"] = float(get(_qn("w:after"))) / 20.0
-                        if get(_qn("w:before")) is not None:
-                            result["before_pt"] = float(get(_qn("w:before"))) / 20.0
-                        line = get(_qn("w:line"))
-                        rule = get(_qn("w:lineRule"))
-                        if line is not None:
-                            if rule == "exact":
-                                result["exact_pt"] = float(line) / 20.0
-                            else:
-                                result["multiple"] = float(line) / 240.0
-                    except (TypeError, ValueError):
-                        continue
-            elif child.tag.endswith("}rPrDefault"):
-                # ``w:sz`` is in half-points; ``w:szCs`` (complex scripts) is a
-                # different element and must not be read as the latin size.
-                for size_el in child.iter():
-                    if not size_el.tag.endswith("}sz"):
-                        continue
-                    try:
-                        result["font_pt"] = float(size_el.get(_qn("w:val"))) / 2.0
-                    except (TypeError, ValueError):
-                        continue
-    except (AttributeError, ValueError):
-        pass
-    return result
-
-
-def _resolve_spacing(paragraph, document=None) -> tuple[Any, float, float]:
-    """Resolve (line_spacing, space_before_pt, space_after_pt).
-
-    Precedence mirrors OOXML: paragraph-direct formatting, then the style
-    inheritance chain, then the styles-part docDefaults, then zero.  Missing
-    the docDefaults step is a systematic undercount, not a rounding error.
-    ``line_spacing`` is returned as-is: a float multiple, an absolute Length
-    for exact spacing, or None.
-    """
-
-    direct = paragraph.paragraph_format
-    spacing: Any = direct.line_spacing
-    before = direct.space_before
-    after = direct.space_after
-    style = paragraph.style
-    seen = set()
-    while style is not None and id(style) not in seen and (spacing is None or before is None or after is None):
-        seen.add(id(style))
-        try:
-            inherited = style.paragraph_format
-            if spacing is None and inherited.line_spacing is not None:
-                spacing = inherited.line_spacing
-            if before is None and inherited.space_before is not None:
-                before = inherited.space_before
-            if after is None and inherited.space_after is not None:
-                after = inherited.space_after
-        except (AttributeError, ValueError):
-            pass
-        try:
-            style = style.base_style
-        except (AttributeError, ValueError):
-            break
-    if (spacing is None or before is None or after is None) and document is not None:
-        defaults = _document_defaults(document)
-        if spacing is None:
-            if "exact_pt" in defaults:
-                from docx.shared import Pt as _Pt
-
-                spacing = _Pt(defaults["exact_pt"])
-            elif "multiple" in defaults:
-                spacing = defaults["multiple"]
-        if before is None and "before_pt" in defaults:
-            from docx.shared import Pt as _Pt
-
-            before = _Pt(defaults["before_pt"])
-        if after is None and "after_pt" in defaults:
-            from docx.shared import Pt as _Pt
-
-            after = _Pt(defaults["after_pt"])
-
-    def _points(value: Any) -> float:
-        try:
-            return float(value.pt) if value is not None else 0.0
-        except (AttributeError, TypeError, ValueError):
-            return 0.0
-
-    return spacing, _points(before), _points(after)
-
-
-def _content_width_pt(document) -> float | None:
-    """Writable line width of the first section in points, None if unreadable."""
-
-    try:
-        section = list(document.sections)[0]
-    except (AttributeError, ValueError, IndexError):
-        return None
-
-    def _emu(value: Any) -> float:
-        try:
-            return float(value) / 12700.0 if value else 0.0
-        except (AttributeError, TypeError, ValueError):
-            return 0.0
-
-    try:
-        width = _emu(section.page_width) - _emu(section.left_margin) - _emu(section.right_margin)
-    except (AttributeError, TypeError, ValueError):
-        return None
-    return width if width > 0 else None
-
-
-def _tab_wraps(paragraph, *, width: int, content_width_pt: float | None, font_pt: float) -> int:
-    """Extra visual lines forced by tab stops pushing trailing text off the line.
-
-    A Job Heading writes ``role\\tdate`` with a right-aligned tab stop; when
-    the stop sits past (content width - trailing text width) the date drops
-    to its own line.  The units model sees no ``\\n`` and counts one line.
-    Everything here is measured from the document: tab stops from the
-    paragraph properties, trailing width from the style's calibrated
-    characters-per-line.
-    """
-
-    text = str(paragraph.text or "")
-    if "\t" not in text or content_width_pt is None:
-        return 0
-    try:
-        from docx.oxml.ns import qn as _qn
-
-        ppr = paragraph._p.pPr
-        stops = []
-        if ppr is not None:
-            for tabs in ppr.findall(_qn("w:tabs")):
-                for tab in tabs:
-                    pos = tab.get(_qn("w:pos"))
-                    if pos is not None:
-                        stops.append(float(pos) / 20.0)
-    except (AttributeError, TypeError, ValueError):
-        return 0
-    if not stops:
-        return 0
-    trailing = text.split("\t")[-1]
-    if not trailing.strip():
-        return 0
-    trailing_pt = len(trailing) / max(1, width) * content_width_pt
-    if max(stops) + trailing_pt <= content_width_pt:
-        return 0
-    # The trailing run takes its own line(s).
-    return max(1, ceil(len(trailing) / width))
-
-
-def _paragraph_points(paragraph, *, material: str, document=None) -> float:
-    """Vertical cost of one paragraph in points.
-
-    Wrapped lines (existing width model) times the resolved line height, plus
-    paragraph spacing.  An empty paragraph costs one full line: LibreOffice
-    gives it a full line height, which the 0.25 routing weight would miss.
-    The line height is ``font * natural leading * line multiple``: LibreOffice
-    scales the font's natural line height by the multiple rather than the em
-    size, so the two factors multiply.  An absolute (``lineRule="exact"``)
-    spacing is used verbatim.
-    """
-
-    widths = _LAYOUT_WIDTHS[material]
-    text = str(paragraph.text or "")
-    width = widths.get(str(paragraph.style.name), 90)
-    lines = 1 if not text else sum(max(1, ceil(len(part) / width)) for part in text.split("\n"))
-    font_pt = _resolve_font_pt(paragraph, document)
-    if text and "\t" in text and document is not None:
-        lines += _tab_wraps(paragraph, width=width, content_width_pt=_content_width_pt(document), font_pt=font_pt)
-    spacing, before_pt, after_pt = _resolve_spacing(paragraph, document)
-    try:
-        from docx.shared import Length as _Length
-
-        if isinstance(spacing, _Length):
-            line_height = float(spacing.pt)
-        else:
-            multiple = float(spacing) if spacing is not None else 1.0
-            line_height = font_pt * _NATURAL_LEADING * multiple
-    except (TypeError, ValueError):
-        line_height = font_pt * _NATURAL_LEADING
-    return lines * line_height + before_pt + after_pt
-
-
-def _usable_points(document) -> float | None:
-    """Writable body height of the first section in points, None if unreadable.
-
-    A missing/unreadable section geometry means the gate cannot measure, so
-    the caller must let the document through and leave the verdict to the
-    format gate's PDF page count.  Never invent a fallback page size here: a
-    guessed budget is exactly the per-fixture-constant failure mode.
-    """
-
-    try:
-        sections = list(document.sections)
-    except (AttributeError, ValueError):
-        return None
-    if not sections:
-        return None
-
-    def _emu(value: Any) -> float:
-        try:
-            return float(value) / 12700.0 if value else 0.0
-        except (AttributeError, TypeError, ValueError):
-            return 0.0
-
-    section = sections[0]
-    try:
-        usable = _emu(section.page_height) - _emu(section.top_margin) - _emu(section.bottom_margin)
-    except (AttributeError, TypeError, ValueError):
-        return None
-    return usable if usable > 0 else None
-
-
-class PageBudgetExceeded(ValueError):
-    """A rendered DOCX exceeds its one-page layout budget.
-
-    Raised before any file is written so the caller can ask for a narrow
-    revision instead of failing a whole generation after PDF conversion.
-    Carries the measurement in ``report``.
-    """
-
-    def __init__(self, report: dict[str, Any]) -> None:
-        self.report = report
-        super().__init__(
-            "page_budget_exceeded:{material}:points={points:.0f}:budget={budget_points:.0f}:over_by={over_by_points:.0f}".format(**report)
-        )
-
-
-def _page_budget_report(document, *, material: str) -> dict[str, Any] | None:
-    """Measure a built (unsaved) document against its own template geometry.
-
-    The gate blocks only on physics-certain overflow: measured content points
-    strictly above measured usable points.  Content at or below budget always
-    passes, even though keep-together/widow rules can still push a borderline
-    page over in LibreOffice — those cases fall through to the format gate's
-    PDF page count exactly as before, so the gate can delay a failure but
-    never manufacture one.  Returns None when the section geometry is
-    unreadable: without a measured budget there is nothing sound to compare
-    against.
-    """
-
-    budget = _usable_points(document)
-    if budget is None:
-        return None
-    scored = []
-    for index, paragraph in enumerate(document.paragraphs):
-        points = _paragraph_points(paragraph, material=material, document=document)
-        text = str(paragraph.text or "")
-        scored.append({
-            "index": index,
-            "style": str(paragraph.style.name),
-            "points": round(points, 1),
-            "preview": text[:60] or "(empty paragraph)",
-        })
-    scored.sort(key=lambda item: item["points"], reverse=True)
-    points = round(sum(item["points"] for item in scored), 1)
-    return {
-        "material": material,
-        "points": points,
-        "budget_points": round(budget, 1),
-        "over_by_points": round(points - budget, 1),
-        "top_paragraphs": scored[:3],
-    }
-
-
 def _apply_visual_balance(
     document,
     *,
@@ -1030,30 +636,56 @@ def _template_paths(package: Path, workspace: Path) -> dict[str, Path]:
     return {"cv": cv.resolve(), "cover_letter": cl.resolve()}
 
 
-def measure_page_budget(
+def _measure_document_pages(document, *, material: str, author: str = "Candidate") -> int | None:
+    """Render one built document through LibreOffice and count its pages.
+
+    Returns ``None`` when the count cannot be taken: no soffice on the host, a
+    failed conversion, or an unreadable result.  That is a missing measurement,
+    not a passing one, and callers must treat it as fail-closed.
+    """
+
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="jobsflow-pagemeasure-") as scratch:
+            work = Path(scratch)
+            docx = work / f"{material}.docx"
+            _save_document(document, docx, material=material, title=material, author=author)
+            pdf = work / f"{material}.pdf"
+            from tools.fresh_24h.docx_to_pdf import convert
+
+            convert(docx, pdf, engine="libreoffice", force=True, sanitize_metadata=False)
+            pages, _text = _pdf_stats(pdf)
+            return pages if pages > 0 else None
+    except Exception:
+        # A host without LibreOffice, a conversion that fails, or an
+        # unreadable PDF all mean "unknown", never "fits".
+        return None
+
+
+def measure_page_count(
     canonical: dict[str, Any],
     templates: dict[str, Path],
     materials: list[str] | None = None,
-) -> dict[str, dict[str, Any] | None]:
-    """Measure the named materials' built documents against their own geometry.
+) -> dict[str, int | None]:
+    """Count the pages each named material really renders to.
 
-    Builds in memory through ``_build_document`` and measures through
-    ``_page_budget_report``: no file is written, so a caller may measure a
-    canonical it has not committed to rendering.  The report is the same one
-    the render gate raises ``PageBudgetExceeded`` with, which is the point --
-    preflight and render must not be able to disagree about what fits.
-
-    ``materials`` selects what to measure, because building a document is not
-    free; a caller with a cheap suspicion filter should pass it and keep the
-    clean path cheap.  An unreadable template yields ``None``: an absent
-    measurement, not a passing one.
+    The page budget used to be a character/geometry estimate of the built
+    document.  It was 15-25% off against real lane masters, which meant it
+    could both block a material that fits and admit one that overflows.  This
+    measures the artifact the format gate measures instead: build the document,
+    write it to a temporary DOCX, convert it through the same LibreOffice
+    engine, and count the pages of the result.  The scratch directory is
+    removed afterwards, so nothing is written into the package and a canonical
+    that is never rendered leaves no trace.
     """
 
     wanted = list(templates) if materials is None else list(materials)
-    reports: dict[str, dict[str, Any] | None] = {}
+    pages: dict[str, int | None] = {}
     for material in wanted:
         template = (templates or {}).get(material)
         if template is None:
+            pages[material] = None
             continue
         try:
             document, _ = _build_document(
@@ -1061,11 +693,13 @@ def measure_page_budget(
                 material=material,
                 template=Path(template),
             )
-        except (OSError, ValueError, TypeError, KeyError):
-            reports[material] = None
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            # Any build failure is "unmeasurable" → caller fail-closes. Do not
+            # let a narrower except turn a capacity gate into a crash.
+            pages[material] = None
             continue
-        reports[material] = _page_budget_report(document, material=material)
-    return reports
+        pages[material] = _measure_document_pages(document, material=material)
+    return pages
 
 
 def _receipt_current(
@@ -1129,41 +763,21 @@ def render_canonical_docx(package: Path, workspace: Path, *, force: bool = False
         raise ValueError("content_audit_not_current")
     # Defend the renderer itself as well as the workflow engine.  A direct
     # caller or a late retry must not start a DOCX/PDF cycle when the current
-    # canonical already exceeds its lane master's cheap one-page budget.
-    try:
-        from tools.workflow.materials_baseline import load_content_baseline
-        from tools.workflow.materials_vnext.preflight import evaluate_capacity
-
-        capacity_gate = evaluate_capacity(
-            canonical=draft,
-            baseline=load_content_baseline(package),
-        )
-    except (ImportError, OSError, ValueError, TypeError, KeyError) as exc:
-        raise ValueError("capacity_gate_unavailable") from exc
-    if capacity_gate.get("status") == "blocked":
-        materials = ",".join(str(item) for item in capacity_gate.get("materials") or [])
-        raise ValueError(f"capacity_budget_exceeded:{materials}")
+    # canonical renders past one page.  The gate is the real page count below,
+    # taken on the documents that are about to be written; preflight runs the
+    # same measurement earlier so the two cannot disagree.
     names = expected_filenames(package, workspace)
     templates = _template_paths(package, workspace)
     digest = str(draft.get("canonical_sha256") or canonical_digest(draft))
     if not force and _receipt_current(package, names, digest, templates):
         return {"status": "cached", "filenames": names, "receipt": _load(package / RENDER_RECEIPT_NAME)}
-    _archive_previous_outputs(package, names)
-    # The frozen outbound manifest belongs to the previous derived-artifact
-    # generation.  Canonical text + independent audit are the source of truth;
-    # the final validator freezes the newly rendered generation after PDF and
-    # format gates pass.  Keeping legacy hashes here creates a permanent
-    # stale_artifact loop.
-    old_manifest = package / "artifact_hashes.json"
-    if old_manifest.is_file():
-        old_manifest.unlink()
     candidate = _candidate_name(Path(workspace))
     cv = package / names["cv_docx"]
     cl = package / names["cl_docx"]
-    # Build both documents in memory first and measure them against the
-    # fitted one-page budget BEFORE archiving previous outputs or writing
-    # anything.  A block here leaves the package exactly as it was: no DOCX
-    # overwritten, no receipt rewritten, no PDF attempted, so the producer
+    # Build both documents in memory first and render each one through
+    # LibreOffice to count its real pages BEFORE archiving previous outputs or
+    # writing anything.  A block here leaves the package exactly as it was: no
+    # DOCX overwritten, no receipt rewritten, no PDF attempted, so the producer
     # revises one material instead of resetting the whole generation.
     cv_document, cv_layout = _build_document(
         list((draft.get("cv") or {}).get("blocks") or []),
@@ -1176,9 +790,19 @@ def render_canonical_docx(package: Path, workspace: Path, *, force: bool = False
         template=templates["cover_letter"],
     )
     for material, document in (("cv", cv_document), ("cover_letter", cl_document)):
-        report = _page_budget_report(document, material=material)
-        if report is not None and report["over_by_points"] > 0:
-            raise PageBudgetExceeded(report)
+        pages = _measure_document_pages(document, material=material, author=candidate)
+        if pages is None:
+            raise ValueError(f"capacity_measure_unavailable:{material}")
+        if pages > 1:
+            raise ValueError(f"capacity_budget_exceeded:{material}:{pages}pages")
+    # Only a measured, fitting pair may retire the preceding generation.
+    # No package file or receipt changes while either measurement can fail.
+    _archive_previous_outputs(package, names)
+    # The prior artifact hash manifest belongs to the retired render; the
+    # final validator freezes hashes for this generation after format passes.
+    old_manifest = package / "artifact_hashes.json"
+    if old_manifest.is_file():
+        old_manifest.unlink()
     _save_document(cv_document, cv, material="cv", title=cv.stem, author=candidate)
     _save_document(cl_document, cl, material="cover_letter", title=cl.stem, author=candidate)
     receipt = {

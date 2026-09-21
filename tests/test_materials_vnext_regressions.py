@@ -7,13 +7,9 @@ import json
 from docx import Document
 
 from tools.workflow.materials_renderer import (
-    PageBudgetExceeded,
     _add_block,
     _job_heading_parts,
-    _page_budget_report,
-    _paragraph_points,
     _template_prototypes,
-    _usable_points,
     mechanical_format_gate,
     render_canonical_docx,
 )
@@ -346,8 +342,8 @@ def _bloat_canonical_cv(package, *, count=25, host_managed_optional=True):
         blocks.append({
             "id": f"overflow-{index}",
             "type": "bullet",
-            # ~130 chars = 2 wrapped lines each: 25 bullets ≈ 50 units plus
-            # the 8-unit base, well over the 46-unit CV budget.
+            # Twenty-five rendered bullets on top of the master: enough real
+            # paragraphs to push the document onto a second page.
             "text": "Reviewed vendor contracts and converted findings into an accurate operations checklist for the payments team.",
             "section": "experience",
             "source_style": "Resume Bullet",
@@ -386,20 +382,21 @@ def _bind_passing_audit_to_canonical(package):
     save_run(package, run)
 
 
-def test_paragraph_points_counts_empty_paragraph_as_full_line():
-    from docx.shared import Pt
+def test_an_empty_paragraph_costs_a_real_line(tmp_path):
+    """Empty paragraphs are not free: LibreOffice gives them a full line.
+
+    The page budget is a measurement now, so this is asserted by rendering
+    rather than by modelling.  A document of blank paragraphs that still fits
+    one page is fine; one that overflows must be caught.
+    """
+
+    from tools.workflow.materials_renderer import _measure_document_pages
 
     document = Document()
-    line = document.add_paragraph()
-    run = line.add_run("Short line.")
-    run.font.size = Pt(10)
-    empty = document.add_paragraph()
-    empty_run = empty.add_run("")
-    empty_run.font.size = Pt(10)
-    line_cost = _paragraph_points(line, material="cv")
-    empty_cost = _paragraph_points(empty, material="cv")
-    assert empty_cost == line_cost
-    assert line_cost > 10.0
+    for _ in range(45):
+        document.add_paragraph()
+    pages = _measure_document_pages(document, material="cv")
+    assert pages is not None and pages > 1
 
 
 def test_render_blocks_over_budget_before_writing_anything(tmp_path):
@@ -414,6 +411,12 @@ def test_render_blocks_over_budget_before_writing_anything(tmp_path):
         key: container_hash(package / names[key]) for key in ("cv_docx", "cl_docx")
     }
     before_receipt = (package / "materials_render_receipt.json").read_bytes()
+    # A previous generation may carry a frozen artifact receipt.  A rejected
+    # render must not discard it before the new page count is known.
+    (package / "artifact_hashes.json").write_text('{"previous_generation":"intact"}', encoding="utf-8")
+    before_hashes = (package / "artifact_hashes.json").read_bytes()
+    old_cv = package / "Old CV.pdf"
+    old_cv.write_bytes(b"prior generation; must not be archived by a failed render")
     before_pdfs = sorted(path.name for path in package.glob("*.pdf"))
 
     _bloat_canonical_cv(package)
@@ -421,18 +424,18 @@ def test_render_blocks_over_budget_before_writing_anything(tmp_path):
 
     try:
         render_canonical_docx(package, ws, force=True)
-    except PageBudgetExceeded as exc:
-        report = exc.report
+    except ValueError as exc:
+        message = str(exc)
     else:
-        raise AssertionError("expected PageBudgetExceeded for a 25-bullet overflow")
-    assert report["material"] == "cv"
-    assert report["over_by_points"] > 0
-    assert report["points"] > report["budget_points"]
-    assert len(report["top_paragraphs"]) == 3
+        raise AssertionError("expected a capacity block for a 25-bullet overflow")
+    assert message.startswith("capacity_budget_exceeded:cv:")
+    assert message.endswith("pages")
     # Nothing was written: previous DOCX, receipt and PDF set are untouched.
     assert {key: container_hash(package / names[key]) for key in ("cv_docx", "cl_docx")} == before_docx
     assert (package / "materials_render_receipt.json").read_bytes() == before_receipt
+    assert (package / "artifact_hashes.json").read_bytes() == before_hashes
     assert sorted(path.name for path in package.glob("*.pdf")) == before_pdfs
+    assert old_cv.read_bytes() == b"prior generation; must not be archived by a failed render"
 
 
 def test_render_stage_reports_page_budget_with_revision_scope(tmp_path):
@@ -457,82 +460,8 @@ def test_render_stage_reports_page_budget_with_revision_scope(tmp_path):
 
     out = dispatch("materials", workspace=ws, payload={"job_id": "C0-001", "stage": "render"})
     assert out["status"] == "blocked"
-    assert out["blockers"] == ["page_budget_exceeded"]
+    assert out["blockers"] == ["capacity_budget_exceeded"]
     assert out["next_action"] == "revise_only_over_budget_materials"
-    assert out["page_budget"]["material"] == "cv"
-    assert out["page_budget"]["over_by_points"] > 0
+    assert out["capacity_gate"]["materials"] == ["cv"]
+    assert "capacity_budget_exceeded:cv:" in out["error"]
     assert load_run(package)["phase"] == "content_passed"
-
-
-def _styled_template(tmp_path, name, *, size, spacing, after, top_margin_cm=2.54, bottom_margin_cm=2.54):
-    """Build a template with vertically-differentiated styles.
-
-    Same character widths for every style (fallback 90), so two documents
-    with identical text measure identical units but different points.
-    """
-    from docx.enum.style import WD_STYLE_TYPE
-    from docx.shared import Cm, Pt
-
-    document = Document()
-    section = document.sections[0]
-    section.top_margin = Cm(top_margin_cm)
-    section.bottom_margin = Cm(bottom_margin_cm)
-    style = document.styles.add_style("Uniform", WD_STYLE_TYPE.PARAGRAPH)
-    style.base_style = document.styles["Normal"]
-    style.font.size = Pt(size)
-    style.paragraph_format.line_spacing = spacing
-    style.paragraph_format.space_after = Pt(after)
-    path = tmp_path / name
-    document.save(str(path))
-    return path
-
-
-def _uniform_doc(template, *, count, text):
-    document = Document(str(template))
-    for paragraph in list(document.paragraphs):
-        paragraph.style = document.styles["Uniform"]
-    for _ in range(count):
-        paragraph = document.add_paragraph(style="Uniform")
-        paragraph.add_run(text)
-    return document
-
-
-def test_budget_reads_template_geometry_not_material_constants(tmp_path):
-    """Same content passes on a roomy template and blocks on a tight one."""
-    from docx.shared import Cm
-
-    text = "x" * 90
-    roomy = _styled_template(tmp_path, "roomy_tpl.docx", size=9, spacing=1.0, after=0)
-    roomy_report = _page_budget_report(_uniform_doc(roomy, count=30, text=text), material="cv")
-    assert roomy_report["over_by_points"] <= 0
-    # Same style metrics as roomy — only the body geometry shrinks.
-    tight = _styled_template(tmp_path, "tight_tpl.docx", size=9, spacing=1.0, after=0)
-    # shrink the tight template's body so the same 30 paragraphs overflow it
-    from tools.workflow.materials_renderer import _layout_units
-
-    tight_doc = Document(str(tight))
-    tight_doc.sections[0].top_margin = Cm(10.0)
-    tight_doc.sections[0].bottom_margin = Cm(10.0)
-    tight_doc.save(str(tight))
-    tight_doc = _uniform_doc(tight, count=30, text=text)
-    roomy_doc = _uniform_doc(roomy, count=30, text=text)
-    # Same text, same units — but the tight template's body is shorter.
-    assert _layout_units(tight_doc, material="cv") == _layout_units(roomy_doc, material="cv")
-    tight_report = _page_budget_report(tight_doc, material="cv")
-    assert tight_report["over_by_points"] > 0
-
-
-def test_same_units_different_styles_get_different_verdicts(tmp_path):
-    """The units model's blind spot: identical units, Tall blocks, Flat passes."""
-    from tools.workflow.materials_renderer import _layout_units
-
-    text = "x" * 90
-    tall = _styled_template(tmp_path, "tall_tpl.docx", size=11, spacing=1.5, after=9)
-    flat = _styled_template(tmp_path, "flat_tpl.docx", size=9, spacing=1.0, after=0)
-    tall_doc = _uniform_doc(tall, count=30, text=text)
-    flat_doc = _uniform_doc(flat, count=30, text=text)
-    assert _layout_units(tall_doc, material="cv") == _layout_units(flat_doc, material="cv")
-    tall_report = _page_budget_report(tall_doc, material="cv")
-    flat_report = _page_budget_report(flat_doc, material="cv")
-    assert tall_report["over_by_points"] > 0
-    assert flat_report["over_by_points"] <= 0

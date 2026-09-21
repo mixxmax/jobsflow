@@ -105,22 +105,23 @@ def _metric(
         return
 
 
-def _page_budget_error() -> type[BaseException] | None:
-    """Resolve the renderer's optional pre-render page-budget exception.
+def _page_budget_error(exc: BaseException) -> list[str] | None:
+    """Return the over-budget materials a renderer refused to write, if any.
 
-    Resolved before the render call rather than imported inside the ``try``:
-    a name imported there is function-local, so a renderer that does not
-    export it turns the ``except`` clause itself into an ``UnboundLocalError``
-    instead of the intended ``ImportError``.  The engine therefore works with
-    either renderer, and narrows the response to a targeted revision as soon
-    as the renderer enforces the budget itself.
+    The renderer raises a plain ``ValueError`` prefixed with
+    ``capacity_budget_exceeded`` once it has counted the real pages of a built
+    document.  There is no dedicated exception type any more: the budget is a
+    measurement, not a model, and the message carries the material and the page
+    count that produced it.  Returning the materials lets the engine narrow the
+    response to a targeted revision instead of a whole-generation failure.
     """
 
-    try:
-        from tools.workflow import materials_renderer
-    except ImportError:  # pragma: no cover - renderer is a hard dependency
+    message = str(exc)
+    if not message.startswith("capacity_budget_exceeded:"):
         return None
-    return getattr(materials_renderer, "PageBudgetExceeded", None)
+    parts = message.split(":")
+    materials = [item for item in parts[1].split(",") if item] if len(parts) > 1 else []
+    return materials or ["cv"]
 
 
 def _write_email(package: Path, bundle: dict[str, Any]) -> Path:
@@ -217,23 +218,27 @@ def _capacity_blocker(
     *,
     bundle: dict[str, Any],
     package: Path,
+    workspace: Path,
 ) -> dict[str, Any] | None:
     """Return a precise render blocker for a canonical over the page budget.
 
-    This second, cheap check protects late render/PDF retries from a canonical
-    edit that happened after content preflight.  It deliberately reports only
-    the material(s) over budget so the producer can revise a narrow scope.
+    This second check protects late render/PDF retries from a canonical edit
+    that happened after content preflight.  It deliberately reports only the
+    material(s) over budget so the producer can revise a narrow scope.
     """
 
     canonical = load_canonical(package)
     if not canonical:
         return {"blockers": ["canonical_missing"], "next_action": "submit_bounded_baseline_transform"}
     try:
-        gate = evaluate_capacity(canonical=canonical, baseline=bundle.get("baseline") or {})
+        from tools.workflow.materials_renderer import _template_paths
+
+        templates = _template_paths(package, Path(workspace))
+        gate = evaluate_capacity(canonical=canonical, baseline=bundle.get("baseline") or {}, templates=templates)
     except (ImportError, OSError, ValueError, TypeError, KeyError) as exc:
         return {
             "blockers": ["capacity_gate_unavailable"],
-            "error": str(exc) or "capacity_estimate_unavailable",
+            "error": str(exc) or "capacity_measure_unavailable",
             "next_action": "stop_and_check_lane_master",
         }
     if gate.get("status") != "blocked":
@@ -988,7 +993,7 @@ class MaterialsEngine:
                     "idempotent": True,
                     "engine": "materials-vnext",
                 }
-            capacity_blocker = _capacity_blocker(bundle=bundle, package=package)
+            capacity_blocker = _capacity_blocker(bundle=bundle, package=package, workspace=Path(workspace))
             if capacity_blocker is not None:
                 _metric(
                     package,
@@ -1004,20 +1009,27 @@ class MaterialsEngine:
                     **capacity_blocker,
                     "engine": "materials-vnext",
                 }
-            budget_error = _page_budget_error()
             try:
                 from tools.workflow.materials_renderer import render_canonical_docx
 
                 rendered = render_canonical_docx(package, Path(workspace), force=bool(payload.get("force")))
             except (OSError, ValueError, RuntimeError) as exc:
-                if budget_error is not None and isinstance(exc, budget_error):
-                    _metric(package, stage="render", status="blocked", started=render_started, error=str(exc)[:160])
+                budget_error = _page_budget_error(exc)
+                if budget_error is not None:
+                    _metric(
+                        package,
+                        stage="render",
+                        status="blocked",
+                        started=render_started,
+                        error=str(exc)[:160],
+                        over_budget_materials=budget_error,
+                    )
                     return {
                         "status": "blocked",
-                        "blockers": ["page_budget_exceeded"],
+                        "blockers": ["capacity_budget_exceeded"],
                         "error": str(exc),
                         "next_action": "revise_only_over_budget_materials",
-                        "page_budget": getattr(exc, "report", None),
+                        "capacity_gate": {"status": "blocked", "materials": budget_error},
                         "engine": "materials-vnext",
                     }
                 _metric(package, stage="render", status="failed", started=render_started, error=str(exc)[:160])
@@ -1079,7 +1091,7 @@ class MaterialsEngine:
                     "blockers": ["pdf_rebuild_requires_reset"],
                     "engine": "materials-vnext",
                 }
-            capacity_blocker = _capacity_blocker(bundle=bundle, package=package)
+            capacity_blocker = _capacity_blocker(bundle=bundle, package=package, workspace=Path(workspace))
             if capacity_blocker is not None:
                 _metric(
                     package,
@@ -1095,7 +1107,6 @@ class MaterialsEngine:
                     **capacity_blocker,
                     "engine": "materials-vnext",
                 }
-            budget_error = _page_budget_error()
             try:
                 from tools.workflow.materials_renderer import convert_rendered_pdfs
 
@@ -1107,14 +1118,22 @@ class MaterialsEngine:
                     parallel=bool(payload.get("parallel", True)),
                 )
             except (OSError, ValueError, RuntimeError) as exc:
-                if budget_error is not None and isinstance(exc, budget_error):
-                    _metric(package, stage="pdf", status="blocked", started=pdf_started, error=str(exc)[:160])
+                budget_error = _page_budget_error(exc)
+                if budget_error is not None:
+                    _metric(
+                        package,
+                        stage="pdf",
+                        status="blocked",
+                        started=pdf_started,
+                        error=str(exc)[:160],
+                        over_budget_materials=budget_error,
+                    )
                     return {
                         "status": "blocked",
-                        "blockers": ["page_budget_exceeded"],
+                        "blockers": ["capacity_budget_exceeded"],
                         "error": str(exc),
                         "next_action": "revise_only_over_budget_materials",
-                        "page_budget": getattr(exc, "report", None),
+                        "capacity_gate": {"status": "blocked", "materials": budget_error},
                         "engine": "materials-vnext",
                     }
                 _metric(package, stage="pdf", status="failed", started=pdf_started, error=str(exc)[:160])
@@ -1578,9 +1597,9 @@ class MaterialsEngine:
         save_run(package, run)
         preflight_started = perf_counter()
         # The lane masters are resolved once here so the pre-render capacity
-        # gate can measure the built documents exactly instead of trusting a
-        # character count.  Without them it degrades to that count, which is
-        # what the render gate catches later.
+        # gate can count the real pages of each built document instead of
+        # trusting a character estimate.  Without them the gate fails closed:
+        # an unmeasurable budget is not a passing one.
         try:
             from tools.workflow.materials_renderer import _template_paths
 
