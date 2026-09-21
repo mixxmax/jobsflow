@@ -1053,13 +1053,23 @@ def _safe(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)[:80]
 
 
+def _is_internal_column(name: Any) -> bool:
+    return str(name).startswith("_")
+
+
 def _headers_for_rows(rows: list[dict[str, Any]], existing: list[str] | None = None) -> list[str]:
-    base = list(existing or [])
+    # Scorer bookkeeping keys (``_below_final``, ``_deep_jd_full``, …) are
+    # transient in-memory state; letting one define a projection column both
+    # leaks it to the user's tracker and changes the schema on every run.
+    # Filter ``existing`` too, so a tab already polluted by a leaked column
+    # heals instead of re-inheriting it from ``read_active``.
+    base = [header for header in (existing or []) if not _is_internal_column(header)]
     for key in ("岗位编号", "职位", "公司", "链接"):
         if key not in base:
             base.append(key)
     for row in rows:
         for key in row:
-            if key not in base:
-                base.append(str(key))
+            if _is_internal_column(key) or key in base:
+                continue
+            base.append(str(key))
     return base

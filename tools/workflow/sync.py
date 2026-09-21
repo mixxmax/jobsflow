@@ -662,6 +662,16 @@ class SyncCoordinator:
             if any("行号" in row for row in merged_rows):
                 for row_number, row in enumerate(merged_rows, start=2):
                     row["行号"] = str(row_number)
+        merged_headers = _headers_for_rows(
+            merged_rows,
+            list(target_before.headers)
+            + [header for header in local_before.headers if header not in target_before.headers],
+        )
+        merged = FreshSnapshot(
+            title=title,
+            headers=merged_headers,
+            rows=[{header: row.get(header, "") for header in merged_headers} for row in merged_rows],
+        )
         # The fast Sheets projection is safe only when the confirmed batch is
         # purely additive and the schema is unchanged.  Any update, duplicate,
         # or header migration keeps the guarded full-replacement path.
@@ -675,6 +685,10 @@ class SyncCoordinator:
             and stats["updated"] == 0
             and _headers_for_rows(local_before.rows, local_before.headers)
             == _headers_for_rows(merged_rows, local_before.headers)
+            # The append adapter refuses a header mismatch *after* the ledger
+            # has already been written, so the remote schema has to be checked
+            # here rather than delegated to ``gsheet_headers_changed``.
+            and merged_headers == list(target_before.headers)
             and callable(appender)
         )
         if append_only:
@@ -682,16 +696,6 @@ class SyncCoordinator:
             # the local ledger in the same order so its digest remains the
             # projection's digest.
             pass
-        merged_headers = _headers_for_rows(
-            merged_rows,
-            list(target_before.headers)
-            + [header for header in local_before.headers if header not in target_before.headers],
-        )
-        merged = FreshSnapshot(
-            title=title,
-            headers=merged_headers,
-            rows=[{header: row.get(header, "") for header in merged_headers} for row in merged_rows],
-        )
         op_id = operation_id or f"sync-{uuid4().hex[:12]}"
         existing = None
         try:
