@@ -21,7 +21,7 @@ If no refresh state exists, temp establishes a 24-hour baseline. Failed portal
 runs must not advance the cursor. Use `--no-record` for previews and debugging.
 
 ```bash
-./tools/fresh_24h/fresh_24h_scan.sh --show-state
+python3 -m tools.workflow doctor
 ./tools/fresh_24h/temp_two_pass.sh temp
 ./tools/fresh_24h/temp_two_pass.sh daily
 ```

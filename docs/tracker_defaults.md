@@ -68,14 +68,14 @@ write-free proposal, then confirm its proposal ID.
 
 | Mode | Command | Window |
 |------|---------|--------|
-| Daily | `./tools/fresh_24h/fresh_24h_scan.sh daily` | Last ~24h |
-| **Temp** | `./tools/fresh_24h/fresh_24h_scan.sh temp` | **Since last refresh** |
+| Daily | `python3 -m tools.workflow scan --mode daily` | Last ~24h |
+| **Temp** | `python3 -m tools.workflow scan --mode temp` | **Since last refresh** |
 | **Recommended** (scan + two-pass) | `./tools/fresh_24h/temp_two_pass.sh temp` | Canonical workflow run: scan, score, hash-bound `run.json`, then cursor commit |
 
 State file: `fresh_refresh_state.json`
 
 ```bash
-./tools/fresh_24h/fresh_24h_scan.sh --show-state
+python3 -m tools.workflow doctor
 ./tools/fresh_24h/temp_two_pass.sh temp          # temp + two-pass (default)
 
 # Review-only entry proposal (does not write or assign permanent IDs)
