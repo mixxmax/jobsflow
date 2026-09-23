@@ -494,7 +494,13 @@ def _run_adapter(action, payload, workspace, store, dry_run, now):
     if action == "archive_preview":
         if store is None:
             return result(status="blocked", blockers=["fresh_store_required"], rule_ids=["FRESH-002"])
-        return archive_adapter.handle("archive_preview", store=store, workspace=workspace, now=now)
+        return archive_adapter.handle(
+            "archive_preview",
+            store=store,
+            workspace=workspace,
+            now=now,
+            keep_empty_worksheet=bool(payload.get("keep_empty_worksheet")),
+        )
     if action in {"archive_fresh", "archive_confirm"}:
         if store is None:
             return result(status="blocked", blockers=["fresh_store_required"], rule_ids=["FRESH-002"])
