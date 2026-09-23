@@ -6,6 +6,21 @@ import json
 from pathlib import Path
 from typing import Iterable
 
+# Extra columns for two-pass visibility (appended after SHEET_HEADERS when
+# writing local CSV or promoting into the main trackers).  Lives here rather
+# than in the scorer so consumers that only need the column vocabulary do not
+# import the scoring engine.
+PASS_EXTRA = [
+    "初评分数",
+    "初评等级",
+    "初评理由",
+    "深评分数",
+    "深评等级",
+    "深评理由",
+    "JD深度",  # full | cache | teaser | paste_needed | teaser_unavailable | teaser_capped
+    "评估状态",  # ready | pending | below_current_retention | provisional_needs_jd
+]
+
 
 def merge_tracker_headers(
     base_headers: Iterable[str],

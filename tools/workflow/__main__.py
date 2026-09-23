@@ -49,9 +49,17 @@ def _workspace(ns: argparse.Namespace) -> Path:
     return resolve_workspace(explicit=getattr(ns, "workspace", None))
 
 
-def _load_store(path: Path | None, title: str, workspace: Path):
+def _load_store(path: Path | None, title: str, workspace: Path, backend: str = "auto"):
+    """Resolve the tracker store a command acts on.
+
+    ``--fixture`` is the explicit test path.  Without it the store has to be the
+    backend the workspace actually uses: resolving to ``FileFreshStore`` instead
+    made promote and archive operate on a JSON fixture and still report
+    ``succeeded`` with nothing merged.
+    """
+
     if path is None:
-        return FileFreshStore(workspace, title)
+        return default_fresh_store(workspace, title, {"backend": backend})
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     title = str(data.get("title") or title or path.stem)
     rows = list(data.get("rows") or [])
@@ -250,6 +258,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     promote = sub.add_parser("promote", parents=[common], help="Merge into main; always keeps fresh")
     promote.add_argument("--fresh-title", default="fresh_24h")
+    promote.add_argument("--backend", choices=["auto", "csv", "gsheet", "file"], default="auto")
     promote.add_argument("--fixture", type=Path)
     promote.add_argument("--keep-fresh-rows", action="store_true")
     promote.add_argument("--clear-fresh", action="store_true")
@@ -335,10 +344,17 @@ def build_parser() -> argparse.ArgumentParser:
     archive_sub = archive.add_subparsers(dest="archive_cmd", required=True)
     preview = archive_sub.add_parser("preview", parents=[common])
     preview.add_argument("--fresh-title", required=True)
+    preview.add_argument("--backend", choices=["auto", "csv", "gsheet", "file"], default="auto")
+    preview.add_argument(
+        "--keep-empty-worksheet",
+        action="store_true",
+        help="Preview without the tab-removal effect; confirm then leaves the emptied tab in place",
+    )
     preview.add_argument("--fixture", type=Path)
     confirm = archive_sub.add_parser("confirm", parents=[common])
     confirm.add_argument("--proposal-id", required=True)
     confirm.add_argument("--fresh-title", default="")
+    confirm.add_argument("--backend", choices=["auto", "csv", "gsheet", "file"], default="auto")
     confirm.add_argument("--fixture", type=Path)
 
     sync = sub.add_parser("sync", parents=[common], help="Inspect or reconcile tracker projections")
@@ -678,7 +694,7 @@ def main(argv: list[str] | None = None) -> int:
                 "clear_fresh": args.clear_fresh,
             }
         )
-        store = _load_store(args.fixture, args.fresh_title, workspace)
+        store = _load_store(args.fixture, args.fresh_title, workspace, args.backend)
     elif action == "materials":
         payload["job_id"] = args.job_id
         if args.content and args.materials_cmd not in {"draft", "produce"}:
@@ -821,12 +837,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.archive_cmd == "preview":
             action = "archive_preview"
             payload["target"] = args.fresh_title
-            store = _load_store(args.fixture, args.fresh_title, workspace)
+            payload["keep_empty_worksheet"] = args.keep_empty_worksheet
+            store = _load_store(args.fixture, args.fresh_title, workspace, args.backend)
         else:
             action = "archive_confirm"
             payload["proposal_id"] = args.proposal_id
             payload["target"] = args.fresh_title
-            store = _load_store(args.fixture, args.fresh_title or "fresh", workspace)
+            store = _load_store(
+                args.fixture, args.fresh_title or "fresh", workspace, args.backend
+            )
     elif action == "sync":
         if args.sync_cmd == "status":
             action = "sync_status"
@@ -834,9 +853,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.sync_cmd == "reconcile":
             action = "sync_reconcile"
             payload.update({"fresh_title": args.fresh_title, "backend": args.backend})
-            store = _load_store(args.fixture, args.fresh_title, workspace) if args.fixture else default_fresh_store(
-                workspace, args.fresh_title, {"backend": args.backend}
-            )
+            store = _load_store(args.fixture, args.fresh_title, workspace, args.backend)
         elif args.sync_cmd == "pull":
             action = "sync_pull"
             payload.update(
@@ -847,9 +864,7 @@ def main(argv: list[str] | None = None) -> int:
                     "confirmation_id": "cli-sync-pull" if args.confirm else "",
                 }
             )
-            store = _load_store(args.fixture, args.fresh_title, workspace) if args.fixture else default_fresh_store(
-                workspace, args.fresh_title, {"backend": args.backend}
-            )
+            store = _load_store(args.fixture, args.fresh_title, workspace, args.backend)
         elif args.sync_cmd == "retry":
             action = "sync_retry"
             payload.update(
@@ -860,9 +875,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             if args.fresh_title:
-                store = _load_store(args.fixture, args.fresh_title, workspace) if args.fixture else default_fresh_store(
-                    workspace, args.fresh_title, {"backend": args.backend}
-                )
+                store = _load_store(args.fixture, args.fresh_title, workspace, args.backend)
     elif action == "reset":
         # Reset carries its own explicit-root + proposal binding, which is
         # stricter than the generic runtime gate (see docs/command_scope.md),

@@ -14,6 +14,15 @@ from tools.io_utils import atomic_write_json, atomic_write_stream
 from tools.job_urls import normalize_job_url
 from tools.spreadsheet_safety import neutralize_spreadsheet_formula
 from tools.fresh_24h.batch_mark import BEIGE_RGB, demote_previous_batch
+from tools.workflow.main_tracker_merge import (
+    ALL_TITLE,
+    build_write_headers,
+    merge_main_rows,
+    order_and_number,
+    route_rows,
+    sheet_to_dicts,
+    write_main_tab,
+)
 from tools.workflow.tracker_formats import apply_material_status_formats
 
 
@@ -263,6 +272,7 @@ class FreshStore(Protocol):
     def clear_active(self, expected_digest: str) -> ClearReceipt: ...
     def restore_active(self, snapshot: FreshSnapshot) -> RestoreReceipt: ...
     def read_active(self) -> FreshSnapshot: ...
+    def promote_to_main(self, incoming: "FreshSnapshot | list[dict[str, Any]]") -> int: ...
 
 
 class MemoryFreshStore:
@@ -280,7 +290,7 @@ class MemoryFreshStore:
         self.clear_should_fail = False
         self.postcondition_should_fail = False
         self.restore_should_fail = False
-        self.main_rows: list[dict[str, Any]] = []
+        self.main_rows: dict[str, list[dict[str, Any]]] = {}
 
     def row_count(self) -> int:
         return len(self.rows)
@@ -365,27 +375,67 @@ class MemoryFreshStore:
         return RestoreReceipt(ok=True, digest=self.read_active().digest)
 
     def promote_to_main(self, incoming: Any) -> int:
-        rows = incoming.rows if isinstance(incoming, FreshSnapshot) else incoming
-        known = {(row.get("岗位编号") or "") for row in self.main_rows}
+        rows = incoming.rows if isinstance(incoming, FreshSnapshot) else list(incoming)
         added = 0
-        for row in rows:
-            jid = row.get("岗位编号") or ""
-            if jid and jid in known:
-                continue
-            self.main_rows.append(dict(row))
-            if jid:
-                known.add(jid)
-            added += 1
+        for target, incoming_rows in route_rows(rows).items():
+            merged, new, _updated = merge_main_rows(
+                [dict(row) for row in self.main_rows.get(target, [])], incoming_rows
+            )
+            self.main_rows[target] = order_and_number(merged)
+            if target == ALL_TITLE:
+                added = new
         return added
+
+
+def _promote_local(store: Any, incoming: Any) -> int:
+    """Merge fresh rows into this workspace's main tracker files.
+
+    The destination is the same store class under ``workflow/main/`` so a
+    Sheets-less run has a durable, user-visible target instead of a reported
+    success that writes nothing.
+    """
+
+    snap = incoming if isinstance(incoming, FreshSnapshot) else FreshSnapshot(store.title, list(incoming))
+    targets = route_rows(snap.rows)
+    added = 0
+    for target, incoming_rows in targets.items():
+        destination = type(store)(store.workspace, target, group="main")
+        existing = destination.read_active()
+        # A destination with no rows has nothing of the user's to preserve, so
+        # it starts on the main schema rather than inheriting the fresh tab's
+        # batch columns; a populated one keeps every column it already carries.
+        headers = build_write_headers(existing.headers if existing.rows else None)
+        merged, new, _updated = merge_main_rows(existing.rows, incoming_rows)
+        rows = [
+            {header: row.get(header, "") for header in headers}
+            for row in order_and_number(merged)
+        ]
+        destination.replace_active(FreshSnapshot(title=target, headers=headers, rows=rows))
+        after = destination.read_active()
+        if after.row_count != len(rows):
+            raise SnapshotConflict("promote_readback_row_count_mismatch")
+        if target == ALL_TITLE:
+            # 全部清单 receives every promoted row, so its merge count is the
+            # number of new jobs; a tier tab would double-count them.
+            added = new
+    return added
 
 
 class FileFreshStore:
     """Durable fixture store. Two processes can preview then confirm the same title."""
 
-    def __init__(self, workspace: Path, title: str, rows: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        title: str,
+        rows: list[dict[str, Any]] | None = None,
+        *,
+        group: str = "fresh",
+    ) -> None:
         self.workspace = Path(workspace)
         self.title = title
-        self.root = self.workspace / "02_Tracker" / "workflow" / "fresh" / _safe(title)
+        self.group = group
+        self.root = self.workspace / "02_Tracker" / "workflow" / group / _safe(title)
         self.active_path = self.root / "active.json"
         self.archive_dir = self.root / "archives"
         self.clear_calls = 0
@@ -506,7 +556,7 @@ class FileFreshStore:
         return RestoreReceipt(ok=True, digest=after.digest)
 
     def promote_to_main(self, incoming: Any) -> int:
-        return 0
+        return _promote_local(self, incoming)
 
 
 class LocalCsvFreshStore:
@@ -517,10 +567,18 @@ class LocalCsvFreshStore:
     without Sheets credentials still has a user-visible, durable target.
     """
 
-    def __init__(self, workspace: Path, title: str, rows: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        title: str,
+        rows: list[dict[str, Any]] | None = None,
+        *,
+        group: str = "fresh",
+    ) -> None:
         self.workspace = Path(workspace)
         self.title = title
-        self.root = self.workspace / "02_Tracker" / "workflow" / "fresh" / _safe(title)
+        self.group = group
+        self.root = self.workspace / "02_Tracker" / "workflow" / group / _safe(title)
         self.active_path = self.root / "active.csv"
         self.archive_dir = self.root / "archives"
         self.clear_calls = 0
@@ -670,16 +728,20 @@ class LocalCsvFreshStore:
         return RestoreReceipt(ok=True, digest=after.digest)
 
     def promote_to_main(self, incoming: Any) -> int:
-        return 0
+        return _promote_local(self, incoming)
 
 
 class GSheetFreshStore:
-    """Google Sheets push adapter; archive/clear remains explicitly disabled.
+    """Google Sheets push adapter; every remote write is digest-bound and read back.
 
     The adapter is lazy and only connects when a caller explicitly selects
     ``gsheet`` or both Sheets environment variables are present.  This keeps
     tests and public clones offline while restoring the product's real push
     seam for an authenticated private workspace.
+
+    Archive lives here too, but its durable copy is written to the local
+    ledger tree rather than to the spreadsheet, so clearing or deleting a tab
+    never removes the only copy of the rows.
     """
 
     def __init__(
@@ -914,17 +976,127 @@ class GSheetFreshStore:
         )
         return {"added": added, "kept": len(merged) - added, "total": len(merged)}
 
+    def promote_to_main(self, incoming: Any) -> int:
+        """Merge fresh rows into 核心/一级/二级 + 全部清单; the fresh tab is kept.
+
+        Each destination is read, merged and rewritten, then read back and
+        verified on 岗位编号 order, because a merge that half-applied must not be
+        reported as done.  The write never clears a tab, so the status
+        conditional formatting a main tab already carries survives; only stale
+        trailing rows are cleared after the new values land.
+        """
+
+        snap = (
+            incoming
+            if isinstance(incoming, FreshSnapshot)
+            else FreshSnapshot(self.title, list(incoming))
+        )
+        targets = route_rows(snap.rows)
+        worksheets = {ws.title: ws for ws in self._spreadsheet.worksheets()}
+        missing = sorted(title for title in targets if title not in worksheets)
+        if missing:
+            raise SnapshotConflict("promote_target_missing:" + "|".join(missing))
+        added = 0
+        for target, incoming_rows in targets.items():
+            ws = worksheets[target]
+            existing_header, existing_rows = sheet_to_dicts(ws)
+            merged, new, _updated = merge_main_rows(existing_rows, incoming_rows)
+            headers, written = write_main_tab(
+                ws, merged, existing_header, spreadsheet=self._spreadsheet
+            )
+            read_header, read_rows = sheet_to_dicts(ws)
+            if read_header != headers or [
+                row.get("岗位编号") for row in read_rows
+            ] != [row.get("岗位编号") for row in written]:
+                raise SnapshotConflict("promote_readback_identity_mismatch")
+            if target == ALL_TITLE:
+                # 全部清单 receives every promoted row, so its merge count is
+                # the number of new jobs; a tier tab would double-count them.
+                added = new
+        return added
+
+    def _archive_dir(self) -> Path:
+        return self.workspace / "02_Tracker" / "workflow" / "fresh" / _safe(self.title) / "archives"
+
     def write_archive(self, snapshot: FreshSnapshot, archive_id: str) -> ArchiveReceipt:
-        raise RuntimeError("gsheet_archive_not_authorized")
+        """Keep the archive copy off the spreadsheet that archive is about to clear.
+
+        The remote tab is the projection; a copy written back to it would be
+        deleted together with the rows it is meant to preserve.
+        """
+
+        path = self._archive_dir() / f"{_safe(archive_id)}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            path,
+            {
+                "archive_id": archive_id,
+                "title": snapshot.title,
+                "headers": snapshot.headers,
+                "rows": snapshot.rows,
+                "digest": snapshot.digest,
+            },
+        )
+        return ArchiveReceipt(archive_id=archive_id, digest=snapshot.digest, path=str(path))
 
     def read_archive(self, archive_id: str) -> FreshSnapshot:
-        raise RuntimeError("gsheet_archive_not_authorized")
+        data = json.loads((self._archive_dir() / f"{_safe(archive_id)}.json").read_text(encoding="utf-8"))
+        return FreshSnapshot(
+            title=str(data.get("title") or self.title),
+            headers=list(data.get("headers") or []),
+            rows=[dict(row) for row in (data.get("rows") or [])],
+        )
 
     def clear_active(self, expected_digest: str) -> ClearReceipt:
-        raise RuntimeError("gsheet_archive_not_authorized")
+        """Blank the tab down to its header row, keeping the tab's formatting.
+
+        ``replace_active`` is not used here because it clears the whole grid,
+        which would also drop the status dropdown and row-level rules a kept
+        empty tab still needs.
+        """
+
+        current = self.read_active()
+        if current.digest != expected_digest:
+            return ClearReceipt(ok=False, digest=current.digest, error="digest_mismatch")
+        if self._worksheet is not None and current.row_count:
+            from tools.fresh_24h.push_to_gsheet import replace_sheet_values_safely
+
+            replace_sheet_values_safely(
+                self._worksheet, [current.headers], min_rows=2, min_cols=len(current.headers)
+            )
+        after = self.read_active()
+        if after.row_count:
+            return ClearReceipt(ok=False, digest=after.digest, error="fresh_not_header_only")
+        return ClearReceipt(ok=True, digest=after.digest)
 
     def restore_active(self, snapshot: FreshSnapshot) -> RestoreReceipt:
-        raise RuntimeError("gsheet_archive_not_authorized")
+        self.replace_active(snapshot)
+        after = self.read_active()
+        if after.digest != snapshot.digest:
+            return RestoreReceipt(ok=False, digest=after.digest, error="restore_digest_mismatch")
+        return RestoreReceipt(ok=True, digest=after.digest)
+
+    def delete_empty_worksheet(self) -> bool:
+        """Delete the tab, but only after it has been read back as empty.
+
+        ``push`` already clears a live tab in place under its own capability
+        ticket, so dropping a tab whose rows are durably archived is not a new
+        class of authority.  The non-empty read-back is the part that makes the
+        difference: a concurrent writer turns this into a blocker, never into a
+        silent loss.  ``restore_active`` recreates the tab because
+        ``_ensure_worksheet`` treats a missing worksheet as a first write.
+        """
+
+        ws = self._worksheet
+        if ws is None:
+            return False
+        if self.read_active().row_count:
+            raise SnapshotConflict("worksheet_not_empty")
+        self._spreadsheet.del_worksheet(ws)
+        self._worksheet = None
+        if self.title in {item.title for item in self._spreadsheet.worksheets()}:
+            raise SnapshotConflict("worksheet_delete_unverified")
+        return True
 
 
 def _profile_dir(workspace: Path) -> Path:

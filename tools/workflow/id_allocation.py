@@ -72,11 +72,14 @@ def _counter_ids_from_local_workspace(workspace: Path) -> list[str]:
         except (OSError, UnicodeError, csv.Error):
             continue
 
-    # Workflow ledger/fresh JSON projections are intentionally the only JSON
-    # sources scanned; semantic/task JSON may contain unrelated identifiers.
+    # Workflow ledger/fresh/main JSON projections are intentionally the only
+    # JSON sources scanned; semantic/task JSON may contain unrelated
+    # identifiers.  ``main`` holds the rows promote merged out of a fresh tab,
+    # which archive may later clear, so it has to keep an ID out of reuse.
     json_paths = [
         tracker / "workflow" / "ledger",
         tracker / "workflow" / "fresh",
+        tracker / "workflow" / "main",
     ]
     for root in json_paths:
         if not root.is_dir():

@@ -68,22 +68,10 @@ from tools.fresh_24h.policy import (  # noqa: E402
     parse_scan_depth,
     resolve_workflow_preferences,
 )
-from tools.fresh_24h.tracker_schema import merge_tracker_headers  # noqa: E402
+from tools.fresh_24h.tracker_schema import PASS_EXTRA, merge_tracker_headers  # noqa: E402
 from tools.io_utils import atomic_write_json, atomic_write_stream, atomic_write_text  # noqa: E402
 
 # JD full-text cache imports (imported inline in deep_enrich_hit to keep optional)
-
-# Extra columns for two-pass visibility (appended after SHEET_HEADERS when writing local CSV)
-PASS_EXTRA = [
-    "初评分数",
-    "初评等级",
-    "初评理由",
-    "深评分数",
-    "深评等级",
-    "深评理由",
-    "JD深度",  # full | cache | teaser | paste_needed | teaser_unavailable | teaser_capped
-    "评估状态",  # ready | pending | below_current_retention | provisional_needs_jd
-]
 
 # Internal depth labels used inside run_two_pass / deep_enrich_hit.  The
 # tracker column uses the external vocabulary above; `deep` means "a full JD
