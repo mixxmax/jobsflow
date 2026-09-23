@@ -382,41 +382,6 @@ def main(argv=None) -> int:
         "python3 -m tools.workflow materials --job-id <ID>",
         detail="docx_to_pdf_cli_retired_use_workflow_materials",
     )
-    ap = argparse.ArgumentParser(
-        description="Headless DOCX→PDF (LibreOffice first; explicit Spire fallback). Never launches WPS."
-    )
-    ap.add_argument("docx", nargs="?", type=Path)
-    ap.add_argument("--package-dir", type=Path)
-    ap.add_argument(
-        "--engine",
-        choices=("auto", "libreoffice", "spire"),
-        default="libreoffice",
-        help="libreoffice: documented/default path; use auto or spire only as an explicit fallback.",
-    )
-    ap.add_argument(
-        "--force",
-        action="store_true",
-        help="Rebuild even when DOCX content and conversion policy are unchanged.",
-    )
-    ap.add_argument(
-        "--preserve-metadata",
-        action="store_true",
-        help="Do not normalize DOCX core properties before export (not recommended for outbound materials).",
-    )
-    args = ap.parse_args(argv)
-
-    if args.package_dir:
-        convert_package_dir(
-            args.package_dir,
-            engine=args.engine,
-            force=args.force,
-            sanitize_metadata=not args.preserve_metadata,
-        )
-        return 0
-    if not args.docx:
-        ap.error("docx or --package-dir required")
-    convert(args.docx, engine=args.engine, force=args.force, sanitize_metadata=not args.preserve_metadata)
-    return 0
 
 
 if __name__ == "__main__":

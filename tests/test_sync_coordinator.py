@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.workflow.fresh_store import FreshSnapshot, GSheetFreshStore, MemoryFreshStore
+from tools.workflow.fresh_store import (
+    FreshSnapshot,
+    GSheetFreshStore,
+    MemoryFreshStore,
+    _headers_for_rows,
+)
 from tools.workflow.sync import SyncCoordinator, TrackerLedger
 from tools.workflow.tracker_formats import (
     MATERIAL_STATUS_OPTIONS,
@@ -319,6 +324,78 @@ def test_gsheet_preview_read_does_not_create_empty_tab():
     assert snapshot.rows == []
     assert snapshot.headers[21] == "材料状态"
     assert store._spreadsheet.created is False
+
+
+class SheetsWorksheet:
+    """Stand-in for a gspread worksheet.
+
+    Reproduces the single guarantee that decides whether a written projection
+    can be verified at all: ``get_all_values`` never hands back a non-string.
+    """
+
+    id = 77
+
+    def __init__(self):
+        self._values: list[list[object]] = []
+
+    def get_all_values(self):
+        def as_text(cell):
+            if cell is True:
+                return "TRUE"
+            if cell is False:
+                return "FALSE"
+            if cell is None:
+                return ""
+            return str(cell)
+
+        return [[as_text(cell) for cell in row] for row in self._values]
+
+    def clear(self):
+        self._values = []
+
+    def update(self, values, **kwargs):
+        self._values = [list(row) for row in values]
+
+
+def _store_on(worksheet) -> GSheetFreshStore:
+    store = object.__new__(GSheetFreshStore)
+    store.title = "fresh_24h_2026-09-21"
+    store._worksheet = worksheet
+    store._spreadsheet = None
+    return store
+
+
+def test_scorer_bookkeeping_columns_never_become_projection_columns():
+    # ``_below_final`` and friends are native bool/int in the scoring run.  As
+    # projection columns they both leak into the user's tracker and make the
+    # read-back unverifiable, since a Sheets round trip stringifies them and
+    # ``rows_digest`` is type-sensitive.
+    rows = [{**_row(), "_below_final": True, "_semantic_pending_count": 2, "_deep_jd_full": "JD"}]
+    headers = _headers_for_rows(rows, [])
+
+    assert [header for header in headers if header.startswith("_")] == []
+
+    snapshot = FreshSnapshot(
+        title="fresh_24h_2026-09-21",
+        headers=headers,
+        rows=[{header: row.get(header, "") for header in headers} for row in rows],
+    )
+    assert all(isinstance(value, str) for row in snapshot.rows for value in row.values())
+
+    store = _store_on(SheetsWorksheet())
+    store.replace_active(snapshot)
+    assert store.read_active().digest == snapshot.digest
+
+
+def test_already_polluted_tab_loses_its_leaked_columns_on_the_next_merge():
+    leaked = ["_preview_key", "_deep_jd_full", "_semantic_lane_pending"]
+    worksheet = SheetsWorksheet()
+    worksheet.update([["岗位编号", "职位", "公司", "链接", *leaked]])
+    store = _store_on(worksheet)
+
+    inherited = _headers_for_rows(store.read_active().rows, store.read_active().headers)
+
+    assert [header for header in inherited if header.startswith("_")] == []
 
 
 def test_remote_change_is_not_silently_overwritten(tmp_path):

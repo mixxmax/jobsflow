@@ -20,11 +20,7 @@ import argparse
 import os
 import re
 import sys
-from collections import defaultdict
 from pathlib import Path
-
-import gspread
-from google.oauth2.service_account import Credentials
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
@@ -280,72 +276,7 @@ def main(argv=None) -> int:
         "python3 -m tools.workflow promote",
         detail="promote_fresh_to_main_cli_retired",
     )
-    args = parse_args(argv)
-    if decide_promote_fresh_retention(
-        clear_fresh=bool(args.clear_fresh),
-        keep_fresh_rows=bool(args.keep_fresh_rows),
-    ) == "refuse_clear":
-        print(
-            "ERROR: FRESH-002: clearing fresh is not a promote side-effect. "
-            "Use: python3 -m tools.workflow archive preview --fresh-title "
-            f"{args.fresh_title}",
-            file=sys.stderr,
-        )
-        return 2
-
-    if not args.sheet_id or not args.credentials:
-        print("ERROR: GSHEET_ID and GOOGLE_APPLICATION_CREDENTIALS required", file=sys.stderr)
-        return 2
-
-    creds = Credentials.from_service_account_file(
-        str(Path(args.credentials).expanduser()),
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-        ],
-    )
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(args.sheet_id)
-
-    fresh_ws = sh.worksheet(args.fresh_title)
-    _, fresh_raw = sheet_to_dicts(fresh_ws)
-    fresh_main = [to_main_row(r) for r in fresh_raw]
-    print(f"fresh rows: {len(fresh_main)}")
-
-    by_tier: dict[str, list] = defaultdict(list)
-    unknown = []
-    for r in fresh_main:
-        t = tier_of(r)
-        if t in TIER_SHEETS:
-            by_tier[t].append(r)
-        else:
-            unknown.append(r)
-    print("by_tier", {k: len(v) for k, v in by_tier.items()}, "unknown", len(unknown))
-
-    for tier, title in TIER_SHEETS.items():
-        ws = sh.worksheet(title)
-        hdr, existing = sheet_to_dicts(ws)
-        existing = [to_main_row(r) for r in existing]
-        existing, added, updated = merge_rows(existing, by_tier.get(tier, []))
-        total = rewrite_sheet(sh, ws, existing, existing_header=hdr)
-        print(f"{title}: +{added} status↑{updated} total={total}")
-
-    ws_all = sh.worksheet(ALL_TITLE)
-    hdr_all, all_existing = sheet_to_dicts(ws_all)
-    all_existing = [to_main_row(r) for r in all_existing]
-    all_existing, added_all, upd_all = merge_rows(all_existing, fresh_main)
-    total_all = rewrite_sheet(sh, ws_all, all_existing, existing_header=hdr_all)
-    print(f"{ALL_TITLE}: +{added_all} status↑{upd_all} total={total_all}")
-    print(f"kept {args.fresh_title} ({len(fresh_main)} rows) — archive requires confirmation")
-
-    if unknown:
-        print("unknown tier (not moved):")
-        for r in unknown:
-            print(" ", r.get("岗位编号"), r.get("层级"), r.get("职位"))
-    print("DONE")
-    return 0
 
 
 if __name__ == "__main__":
-    import argparse
-
     raise SystemExit(main())
