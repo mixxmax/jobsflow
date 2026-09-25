@@ -102,10 +102,32 @@ the estimate cannot be computed, the host fails closed with
 None of these checks compares wording similarity; they check fact and
 semantic boundaries only.
 
+## Package preparation
+
+`/push` creates the package and stops. It does not fetch a JD, score the
+posting, or write `application_preflight.json`. Before planning, the gateway
+fills those three inputs with:
+
+```text
+python3 -m tools.workflow materials prepare --job-id C0-005 [--jd-file jd.txt] [--refresh]
+```
+
+The stage is deterministic. It reuses `jd_full.md` unless `--refresh` is set,
+then a user file of at least 400 characters, then the URL-keyed JD cache, then
+`02_Tracker/jds/{job_id}.md`. With `--fetch`, a missing full JD may be retrieved
+through the same gateway Chrome attach used by `push --select` (one URL). No
+source returns `jd_full_unavailable` and writes nothing. A matching assessment is reused; a changed JD is rescored with
+the same deep scorer intake uses, and the tracker is not updated. The same
+JD, profile and known answers make a second run a no-op. `materials` / `materials run`
+and `materials produce` from `idle` or `inputs_frozen` run prepare first only
+when the package blockers are limited to `missing_full_jd`,
+`assessment_missing_or_stale` and `preflight_missing`.
+
 ## Fixed sequence
 
 ```text
-freeze bundle + baseline
+materials prepare (full JD, matching assessment, application preflight)
+  → freeze bundle + baseline
   → plan JD duties/themes/anchors
   → submit bounded CV/CL transform (each op gets a change_class)
   → deterministic content preflight (semantic lint + terminology + capacity)

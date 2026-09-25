@@ -45,17 +45,61 @@ def write_jd(
     return local
 
 
+_SNAPSHOT_JD_HEADING = re.compile(
+    r"(?im)^(?:#{1,3}\s*)?(?:full\s+)?(?:job\s+description|jd|jd\s*全文|职位描述|岗位描述)\s*[:：]?\s*$"
+)
+_SNAPSHOT_PLACEHOLDERS = (
+    "python3 -m tools.job_materials jd set",
+    "python3 -m tools.workflow materials prepare",
+    "paste full jd",
+    "paste the complete jd",
+    "this snapshot was created from a local tracker row",
+)
+
+
+def _full_jd_min_chars() -> int:
+    from tools.workflow.adapters.intake import FULL_JD_MIN_CHARS
+
+    return int(FULL_JD_MIN_CHARS)
+
+
+def _explicit_snapshot_jd(raw: str) -> str:
+    """Return a pasted full-JD section, never the generator hint.
+
+    A skeleton snapshot always contains the word "JD" in its prepare hint.
+    That hint is not a job description. Historical packages that pasted the
+    posting under an explicit JD heading still count when the section itself
+    is long enough and is not the generator placeholder.
+    """
+
+    match = _SNAPSHOT_JD_HEADING.search(raw or "")
+    if not match:
+        return ""
+    body = raw[match.end() :]
+    next_heading = re.search(r"(?m)^#{1,3}\s+\S", body)
+    if next_heading:
+        body = body[: next_heading.start()]
+    text = body.strip()
+    folded = text.casefold()
+    if any(marker in folded for marker in _SNAPSHOT_PLACEHOLDERS):
+        return ""
+    if len(text) < _full_jd_min_chars():
+        return ""
+    return text
+
+
 def read_jd(package: Path, root: Path | None = None) -> str:
-    for p in (package / "jd_full.md", package / "job_snapshot.md"):
-        if p.exists():
-            raw = p.read_text(encoding="utf-8", errors="replace")
-            if p.name == "jd_full.md":
-                if "\n---\n" in raw:
-                    return raw.split("\n---\n", 1)[-1].strip()
-                return raw.strip()
-            # heuristic: pull sections from snapshot
-            if "JD" in raw or "Requirements" in raw or "职责" in raw or "要求" in raw:
-                return raw
+    local = package / "jd_full.md"
+    if local.exists():
+        raw = local.read_text(encoding="utf-8", errors="replace")
+        if "\n---\n" in raw:
+            return raw.split("\n---\n", 1)[-1].strip()
+        return raw.strip()
+    snapshot = package / "job_snapshot.md"
+    if snapshot.exists():
+        explicit = _explicit_snapshot_jd(snapshot.read_text(encoding="utf-8", errors="replace"))
+        if explicit:
+            return explicit
     pid = package_id_from_path(package)
     m = jds_dir(root) / f"{pid}.md"
     if m.exists():

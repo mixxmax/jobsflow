@@ -4,10 +4,30 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from tools.workflow.adapters.archive import confirm_archive, preview_archive
+import pytest
+
+from tools.workflow.adapters.archive import (
+    DELETE_WORKSHEET_EFFECT,
+    confirm_archive,
+    preview_archive,
+)
 from tools.workflow.confirmation import ConfirmationStore
-from tools.workflow.fresh_store import FileFreshStore, MemoryFreshStore
+from tools.workflow.fresh_store import (
+    FileFreshStore,
+    GSheetFreshStore,
+    MemoryFreshStore,
+    SnapshotConflict,
+)
+from tools.workflow.sync import SyncLedger, TrackerLedger
+
+TITLE = "fresh_24h_2026-08-14"
+TAB_HEADER = ["岗位编号", "职位", "公司", "链接"]
+TAB_ROWS = [
+    ["C0-001", "Paralegal", "Acme", "https://example.test/job/1"],
+    ["C1-002", "Analyst", "Beta", "https://example.test/job/2"],
+]
 
 
 def _now() -> datetime:
@@ -179,3 +199,121 @@ def test_non_success_results_preserve_digest_except_critical(tmp_path):
         preview = preview_archive(item, confirmations, now=_now())
         result = confirm_archive(item, confirmations, preview["proposal_id"], now=_now())
         _assert_preserved(result, item, before)
+
+
+class FakeTab:
+    """Duck-typed gspread worksheet: one grid, cleared in place by a header write."""
+
+    id = 7
+
+    def __init__(self, title, header, rows):
+        self.title = title
+        self._values = [list(header), *[list(row) for row in rows]]
+        self.row_count = len(self._values)
+
+    def get_all_values(self):
+        return [list(row) for row in self._values]
+
+    def update(self, values, **kwargs):
+        self._values = [list(row) for row in values]
+        self.row_count = len(self._values)
+
+    def batch_clear(self, ranges, **kwargs):
+        pass
+
+    def resize(self, rows=0, cols=0):
+        pass
+
+
+class FakeSheet:
+    def __init__(self, tabs):
+        self._tabs = {tab.title: tab for tab in tabs}
+
+    def worksheets(self):
+        return list(self._tabs.values())
+
+    def del_worksheet(self, worksheet):
+        self._tabs.pop(worksheet.title, None)
+
+
+def _gsheet_store(workspace, *, rows=None):
+    tab = FakeTab(TITLE, TAB_HEADER, TAB_ROWS if rows is None else rows)
+    sheet = FakeSheet([tab])
+    store = object.__new__(GSheetFreshStore)
+    store.workspace = Path(workspace)
+    store.title = TITLE
+    store._worksheet = tab
+    store._spreadsheet = sheet
+    return store, sheet, tab
+
+
+def test_delete_refuses_a_tab_that_still_has_rows(tmp_path):
+    store, sheet, tab = _gsheet_store(tmp_path)
+
+    with pytest.raises(SnapshotConflict, match="worksheet_not_empty"):
+        store.delete_empty_worksheet()
+
+    assert sheet.worksheets() == [tab]
+    assert tab.get_all_values()[1:] == TAB_ROWS
+
+
+def test_archive_confirm_deletes_the_emptied_tab_and_its_ledger_rows(tmp_path):
+    store, sheet, tab = _gsheet_store(tmp_path)
+    ledger = TrackerLedger(tmp_path, TITLE)
+    ledger.write(store.read_active())
+    confirmations = ConfirmationStore(tmp_path)
+
+    preview = preview_archive(store, confirmations, now=_now())
+    assert DELETE_WORKSHEET_EFFECT in preview["effects"]
+    result = confirm_archive(store, confirmations, preview["proposal_id"], now=_now())
+
+    assert result["status"] == "succeeded"
+    assert result["worksheet_deleted"] is True
+    assert DELETE_WORKSHEET_EFFECT in result["side_effects"]
+    assert sheet.worksheets() == []
+    assert store.read_active().row_count == 0
+    assert ledger.read().rows == []
+    assert SyncLedger(tmp_path).read_projection(TITLE, "gsheet").rows == []
+    assert store.read_archive(preview["proposal_id"]).digest == preview["target_digest"]
+
+
+def test_keep_empty_worksheet_confirms_but_leaves_the_tab_in_place(tmp_path):
+    store, sheet, tab = _gsheet_store(tmp_path)
+    confirmations = ConfirmationStore(tmp_path)
+
+    preview = preview_archive(
+        store, confirmations, now=_now(), keep_empty_worksheet=True
+    )
+    assert DELETE_WORKSHEET_EFFECT not in preview["effects"]
+    result = confirm_archive(store, confirmations, preview["proposal_id"], now=_now())
+
+    assert result["status"] == "succeeded"
+    assert result["worksheet_deleted"] is False
+    assert sheet.worksheets() == [tab]
+    assert tab.get_all_values() == [TAB_HEADER]
+
+
+def test_a_refused_delete_is_reported_and_keeps_the_tab(tmp_path):
+    store, sheet, tab = _gsheet_store(tmp_path)
+    confirmations = ConfirmationStore(tmp_path)
+    preview = preview_archive(store, confirmations, now=_now())
+
+    def racing_delete():
+        # A writer landed between the clear read-back and the delete request.
+        tab.update([TAB_HEADER, TAB_ROWS[0]])
+        raise SnapshotConflict("worksheet_not_empty")
+
+    store.delete_empty_worksheet = racing_delete
+    result = confirm_archive(store, confirmations, preview["proposal_id"], now=_now())
+
+    assert result["status"] == "failed"
+    assert result["blockers"] == ["worksheet_delete_failed"]
+    assert result["error"] == "worksheet_not_empty"
+    assert sheet.worksheets() == [tab]
+    assert store.read_archive(preview["proposal_id"]).row_count == len(TAB_ROWS)
+    saved = json.loads(
+        (tmp_path / "02_Tracker" / "workflow" / "confirmations" / f"{preview['proposal_id']}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert saved["status"] != "applied"

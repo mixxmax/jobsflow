@@ -792,7 +792,8 @@ def test_cdp_connection_url_strips_discovery_resource():
     )
 
 
-def test_cdp_ws_connection_url_supports_chrome_toggle_endpoint():
+def test_cdp_ws_connection_url_supports_chrome_toggle_endpoint(monkeypatch, tmp_path):
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_CHROME_USER_DATA_DIR", str(tmp_path))
     assert browser._cdp_ws_connection_url("http://127.0.0.1:9222") == (
         "ws://127.0.0.1:9222/devtools/browser"
     )
@@ -1468,8 +1469,12 @@ def test_two_pass_circuit_stops_third_url_and_cache_still_wins(monkeypatch, tmp_
             "company": "A",
             "source": "jobsdb",
             "url": "https://hk.jobsdb.com/job/000",
-            # A long teaser keeps this row out of master's thin-teaser rescue.
-            "teaser": "operations workflow automation for legal teams " * 8,
+            # Informative enough to skip thin-teaser rescue, but score 2.0 stays
+            # below the retrieval floor so pass-1 keeps it as low priority.
+            "teaser": (
+                "Review vendor contracts and coordinate stakeholder reporting "
+                "for legal operations teams every week. "
+            ) * 4,
         },
         {
             "title": "Challenge One",
@@ -1522,7 +1527,10 @@ def test_two_pass_circuit_stops_third_url_and_cache_still_wins(monkeypatch, tmp_
     # handoff the rows remain provisional and the inner fetch seam is unused.
     assert calls == []
     by_title = {r.get("职位"): r for r in rows}
-    assert len(rows) == 5  # below-gate row dropped at pass 1
+    # The long-teaser below-gate card stays as pass1_low_priority instead of
+    # disappearing from the scored artifact.
+    assert len(rows) == 6
+    assert by_title["Below Gate"]["评估状态"] == "pass1_low_priority"
     assert by_title["Stopped By Circuit"]["JD深度"] == "paste_needed"
     assert by_title["Cached Hit"]["JD深度"] == "cache"
     # Uncached CT row now goes through the AWS WAF solver; with no private
@@ -1918,3 +1926,73 @@ def test_success_cache_result_names_cache_stage(tmp_path):
     assert result.stage == "cache"
     assert result.attempts == 0
     assert result.content_validated is True
+
+
+def test_cdp_connect_timeout_reads_env_and_clamps(monkeypatch):
+    from tools.fresh_24h.portal_jd_browser import _cdp_connect_timeout_ms
+
+    monkeypatch.delenv("JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT", raising=False)
+    assert _cdp_connect_timeout_ms() == 30000
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT", "30")
+    assert _cdp_connect_timeout_ms() == 30000
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT", "0.5")
+    assert _cdp_connect_timeout_ms() == 1000
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT", "500")
+    assert _cdp_connect_timeout_ms() == 120000
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT", "nan")
+    assert _cdp_connect_timeout_ms() == 30000
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT", "inf")
+    assert _cdp_connect_timeout_ms() == 30000
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT", "abc")
+    assert _cdp_connect_timeout_ms() == 30000
+
+
+def test_connect_uses_configured_attach_budget(monkeypatch):
+    captured = {}
+    context = _FakeContext(
+        page=_FakePage(title="t", selectors={'[data-automation="jobAdDetails"]': "x"})
+    )
+
+    class Remote:
+        def __init__(self):
+            self.contexts = [context]
+
+    remote = Remote()
+
+    class Chromium:
+        def connect_over_cdp(self, endpoint, timeout=None):
+            captured["timeout"] = timeout
+            return remote
+
+    class Playwright:
+        def __init__(self):
+            self.chromium = Chromium()
+
+        def stop(self):
+            pass
+
+    playwright = Playwright()
+    fake_sync_api = SimpleNamespace(
+        sync_playwright=lambda: SimpleNamespace(start=lambda: playwright)
+    )
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync_api)
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT", "45")
+    monkeypatch.setattr(browser, "_read_cdp_version", lambda _e: None)
+    monkeypatch.setattr(browser, "_cdp_local_port_available", lambda _e: True)
+    monkeypatch.setattr(
+        browser, "_cdp_endpoint_owned_by_retired_profile", lambda _e: False
+    )
+    monkeypatch.setattr(browser, "_is_primary_chrome_version", lambda _p: True)
+    monkeypatch.setattr(
+        browser, "_read_attached_cdp_version", lambda *a, **k: {"Browser": "Chrome"}
+    )
+    monkeypatch.setattr(
+        browser, "_JobsdbCdpLease", lambda: SimpleNamespace(acquire=lambda: None)
+    )
+
+    session = browser.JobsdbCdpBatchSession.connect(
+        9222,
+        cdp_endpoint="ws://127.0.0.1:9222/devtools/browser/x",
+    )
+    assert captured["timeout"] == 45000
+    assert session is not None

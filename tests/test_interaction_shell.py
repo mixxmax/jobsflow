@@ -373,6 +373,81 @@ def test_materials_ticket_challenge_includes_prompt_and_retry():
     assert wrapped["assistant_protocol"]["must_not_confirm_for_user"] is True
 
 
+def test_ticket_id_without_secret_uses_handoff_not_a_new_ticket(tmp_path, monkeypatch):
+    from tools.workflow.sopcontrol_adapter import (
+        _redeem_capability_ticket,
+        load_capability_handoff,
+        write_capability_handoff,
+    )
+
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_ALLOW_RELAX", "1")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_TEST", "1")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_MODE", "enforce")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_TICKETS", "on")
+    monkeypatch.setenv("JOBSFLOW_SOPCONTROL_ROOT", str(tmp_path))
+    (tmp_path / ".sopcontrol" / "rules").mkdir(parents=True)
+    write_capability_handoff("tid-1", "sec-1", root=tmp_path, run_id="scan-1", action="scan")
+
+    class Req:
+        action = "scan"
+        confirmation_id = None
+        payload = {"capability_ticket_id": "tid-1", "run_id": "scan-1", "dry_run": False}
+
+    # Redeem will fail closed at sopcontrol ticket store, but the handoff is consumed first.
+    blockers = _redeem_capability_ticket(Req())
+    assert load_capability_handoff("tid-1", root=tmp_path, consume=False) == {}
+    assert "capability_ticket_handoff_missing" not in blockers
+
+    class Missing:
+        action = "scan"
+        confirmation_id = None
+        payload = {"capability_ticket_id": "tid-1", "dry_run": False}
+
+    again = _redeem_capability_ticket(Missing())
+    assert "capability_ticket_handoff_missing" in again
+
+
+def test_produce_rejects_content_when_phase_skips_canonical(tmp_path):
+    from tools.workflow.materials_produce import run_produce
+
+    class Ctx:
+        package = tmp_path
+
+    def fake_load(_package):
+        return {"phase": "content_audit_pending"}
+
+    import tools.workflow.materials_produce as produce
+
+    produce.PackageContextLoader = None  # type: ignore
+    # Patch the imports inside run_produce via the modules it imports.
+    import tools.workflow.package_context as pc
+    import tools.workflow.materials_vnext.store as store
+
+    original_loader = pc.PackageContextLoader
+    original_load = store.load_run
+
+    class Loader:
+        def __init__(self, _workspace):
+            pass
+
+        def load(self, _job_id):
+            return Ctx()
+
+    pc.PackageContextLoader = Loader  # type: ignore
+    store.load_run = fake_load  # type: ignore
+    try:
+        out = run_produce(
+            {"job_id": "C0-001", "model_transform": {"cv": []}, "max_steps": 4},
+            workspace=tmp_path,
+        )
+    finally:
+        pc.PackageContextLoader = original_loader
+        store.load_run = original_load
+    assert out["status"] == "blocked"
+    assert any(str(item).startswith("materials_content_not_applied") for item in out["blockers"])
+    assert out.get("side_effects") == []
+
+
 def test_next_produce_stages_for_transformed_and_complete():
     from tools.workflow.interaction_shell import next_produce_stages
 

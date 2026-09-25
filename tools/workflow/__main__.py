@@ -146,12 +146,18 @@ def build_parser() -> argparse.ArgumentParser:
     intent.add_argument(
         "intent_cmd",
         nargs="?",
-        choices=["show", "add", "replace", "set", "scan-depth", "retention", "confirm", "cancel"],
+        choices=["show", "add", "replace", "set", "scan-depth", "retention", "review-first", "confirm", "cancel"],
         default="show",
     )
     intent.add_argument("text", nargs="?", default="", help="New or replacement intent text")
     intent.add_argument("--bucket", default="", help="Existing query bucket for an added query")
     intent.add_argument("--track", default="", help="Personalized A-F direction for an added query")
+    intent.add_argument("--set", dest="intent_set", default="", help="review-first on|off")
+    intent.add_argument("--preview-floor", type=float, default=None, help="review-first display floor (2.0–3.3)")
+
+    reconcile = sub.add_parser("reconcile", parents=[common], help="Read-only package and ledger comparison")
+    reconcile_sub = reconcile.add_subparsers(dest="reconcile_cmd", required=True)
+    reconcile_sub.add_parser("packages", parents=[common], help="List package/ledger mismatches without writing")
 
     doctor = sub.add_parser("doctor", parents=[common], help="Read-only environment and base readiness check")
     doctor.add_argument("--strict-materials", action="store_true", help="Return non-zero until every configured lane has an active base pair")
@@ -220,6 +226,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="入表策略：standard=深评达到默认线才入表；all=明确覆盖并纳入已展示候选",
     )
+    push.add_argument(
+        "--expand-low-priority",
+        action="store_true",
+        help="在预览里展开初评偏低的行；默认只显示数量，仍可用 --select 点名",
+    )
     push.add_argument("--backend", choices=["auto", "csv", "gsheet", "file"], default="auto")
     push.add_argument(
         "--confirm",
@@ -246,6 +257,11 @@ def build_parser() -> argparse.ArgumentParser:
     intake.add_argument("--platform", default="", help="Portal/source; otherwise derived from the URL")
     intake.add_argument("--lane", default="", help="Lane letter for a JD-incomplete posting")
     intake.add_argument("--jd-file", type=Path, help="Full JD text for a single URL")
+    intake.add_argument(
+        "--fetch-jd",
+        action="store_true",
+        help="Fetch missing full JD through the gateway Chrome attach (max 3 URLs)",
+    )
     intake.add_argument("--page-file", type=Path, help="Page text/metadata file for a single URL")
     intake.add_argument("--fresh-title", default="", help="Fresh tracker projection title")
     intake.add_argument("--backend", choices=["auto", "csv", "gsheet", "file"], default="auto")
@@ -280,6 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
             "batch",
             "check",
             "produce",
+            "prepare",
             "role-choose",
             "typesafe",
         ],
@@ -320,7 +337,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-action",
         choices=["status", "prepare", "audit", "render", "pdf", "format"],
         default="status",
-        help="Batch stage: prepare freezes job inputs; audit groups no-provider review; other stages run per-job in parallel",
+        help="Batch stage: prepare fills JD/assessment/preflight then plans; audit groups no-provider review; other stages run per-job in parallel",
+    )
+    materials.add_argument("--jd-file", type=Path, help="Full JD text for materials prepare")
+    materials.add_argument("--refresh", action="store_true", help="Replace an existing jd_full.md during materials prepare")
+    materials.add_argument(
+        "--fetch",
+        action="store_true",
+        help="During materials prepare, fetch a missing full JD through the gateway Chrome attach",
     )
     materials.add_argument("--max-workers", type=int, default=3)
 
@@ -544,6 +568,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(cli_public_envelope(wrap_result(out, action="bind-runtime")), ensure_ascii=False, indent=2))
         return 0
 
+    if action == "reconcile" and getattr(args, "reconcile_cmd", "") == "packages":
+        from tools.workflow.package_reconcile import reconcile_packages
+
+        report = reconcile_packages(workspace)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
     if action == "doctor":
         import setup as setup_module
         from tools.workflow.base_onboarding import status as base_status
@@ -574,6 +605,12 @@ def main(argv: list[str] | None = None) -> int:
         out["ready"] = not out["failed"]
         out["workflow_ready"] = out["ready"]
         out["materials_base"] = runtime_base
+        try:
+            from tools.fresh_24h.portal_jd_browser import devtools_active_port_report
+
+            out["devtools_active_port"] = devtools_active_port_report()
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            out["devtools_active_port"] = {"found": False, "error": type(exc).__name__}
         out["materials_ready"] = bool(runtime_base.get("ready"))
         # JobsDB detail transport is a private-runtime capability.  Product
         # doctor must never probe or take over a user's browser; the private
@@ -634,8 +671,11 @@ def main(argv: list[str] | None = None) -> int:
                 "text": args.text or "",
                 "bucket": args.bucket or None,
                 "track": args.track or None,
+                "set": getattr(args, "intent_set", "") or "",
             }
         )
+        if getattr(args, "preview_floor", None) is not None:
+            payload["preview_floor"] = args.preview_floor
     elif action == "scan":
         payload["mode"] = args.mode
         if args.run_id:
@@ -654,6 +694,7 @@ def main(argv: list[str] | None = None) -> int:
                 "allow_pending_semantic": args.allow_pending_semantic,
                 "fresh_title": args.fresh_title,
                 "selected_keys": [value.strip() for value in args.select.split(",") if value.strip()],
+                "expand_low_priority": bool(args.expand_low_priority),
                 "entry_policy": args.entry_policy,
                 "backend": "csv" if args.local_only else args.backend,
                 "confirmation_id": args.confirmation_id,
@@ -671,6 +712,7 @@ def main(argv: list[str] | None = None) -> int:
                 "fresh_title": args.fresh_title,
                 "backend": args.backend,
                 "confirmation_id": args.confirmation_id,
+                "fetch_jd": bool(args.fetch_jd),
             }
         )
         if args.metadata_file:
@@ -732,6 +774,11 @@ def main(argv: list[str] | None = None) -> int:
             payload["materials_shell"] = "check"
             if args.plan:
                 payload["model_plan"] = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+        elif args.materials_cmd == "run":
+            payload["stage"] = "plan"
+            payload["auto_prepare"] = True
+        elif args.materials_cmd == "prepare":
+            payload["stage"] = "prepare"
         elif args.materials_cmd == "produce":
             payload["materials_shell"] = "produce"
             payload["max_steps"] = max(1, int(args.max_steps or 4))
@@ -805,6 +852,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.stage:
             payload["stage"] = args.stage
+        if args.jd_file:
+            payload["jd_file"] = str(args.jd_file)
+        if args.refresh:
+            payload["refresh"] = True
+        if getattr(args, "fetch", False):
+            payload["fetch"] = True
+            payload["fetch_jd"] = True
         if args.strict_audit:
             payload["strict_audit"] = True
         if args.plan:
@@ -980,49 +1034,9 @@ def main(argv: list[str] | None = None) -> int:
         runner = default_scan_runner
 
     if action == "materials" and payload.get("materials_shell") == "produce":
-        from tools.workflow.interaction_shell import next_produce_stages, produce_should_stop
-        from tools.workflow.package_context import PackageContextLoader
-        from tools.workflow.materials_vnext.store import load_run
+        from tools.workflow.materials_produce import run_produce
 
-        steps = []
-        out = {"status": "blocked", "blockers": ["produce_no_progress"]}
-        max_steps = max(1, int(payload.get("max_steps") or 4))
-        phase = ""
-        ctx = PackageContextLoader(workspace).load(str(payload.get("job_id") or ""))
-        if ctx.package:
-            phase = str((load_run(Path(ctx.package)) or {}).get("phase") or "")
-        stages = next_produce_stages(phase)[:max_steps]
-        if not stages:
-            out = {
-                "status": "succeeded",
-                "job_id": payload.get("job_id"),
-                "after_state": phase,
-                "produce_steps": [],
-                "message": "materials_already_complete",
-            }
-        else:
-            for stage in stages:
-                step_payload = dict(payload)
-                step_payload["stage"] = stage
-                if stage == "plan" and payload.get("model_plan") is not None:
-                    step_payload["model_plan"] = payload.get("model_plan")
-                if stage == "canonical" and payload.get("model_transform") is not None:
-                    step_payload["model_transform"] = payload.get("model_transform")
-                out = dispatch(action, workspace=workspace, store=store, payload=step_payload, runner=runner)
-                steps.append(
-                    {
-                        "stage": stage,
-                        "status": out.get("status"),
-                        "blockers": out.get("blockers") or [],
-                        "after_state": out.get("after_state"),
-                    }
-                )
-                if produce_should_stop(out):
-                    break
-                phase = str(out.get("after_state") or phase)
-            out = dict(out)
-            out["produce_steps"] = steps
-            out["produce_from_phase"] = phase
+        out = run_produce(payload, workspace=workspace, store=store, runner=runner)
     else:
         out = dispatch(action, workspace=workspace, store=store, payload=payload, runner=runner)
 

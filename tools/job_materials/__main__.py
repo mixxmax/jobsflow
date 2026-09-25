@@ -93,7 +93,7 @@ from tools.job_materials.resume_parse import (  # noqa: E402
 )
 from tools.job_materials.requirements_engine import (  # noqa: E402
     build_application_preflight,
-    load_preflight_answers,
+    known_application_answers,
     save_preflight_answer,
     write_application_preflight,
 )
@@ -278,37 +278,11 @@ def _ensure_material_manifest(
 
 
 def _known_application_answers(package: Path) -> dict[str, str]:
-    known = {}
-    config_paths = [
-        jobsearch_root() / "00_Profile" / "config.personal.json",
-        REPO / "config.personal.json",
-    ]
-    for config_path in config_paths:
-        try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            continue
-        for key in (
-            "current_salary",
-            "expected_salary",
-            "notice_period",
-            "availability",
-            "work_authorization",
-            "language",
-            "license",
-            "experience_years",
-        ):
-            if config.get(key):
-                known[key] = str(config[key])
-        break
-    known.update(
-        {
-            key: str(value)
-            for key, value in load_preflight_answers(package).items()
-            if str(value).strip()
-        }
+    return known_application_answers(
+        package,
+        jobsearch_root(),
+        extra_config_paths=[REPO / "config.personal.json"],
     )
-    return known
 
 
 def _print_pdf_next_steps(package: Path) -> None:

@@ -18,7 +18,8 @@ PASS_EXTRA = [
     "深评等级",
     "深评理由",
     "JD深度",  # full | cache | teaser | paste_needed | teaser_unavailable | teaser_capped
-    "评估状态",  # ready | pending | below_current_retention | provisional_needs_jd
+    "评估状态",  # ready | pending | below_current_retention | provisional_needs_jd | pass1_low_priority
+    "possible_repost_of",
 ]
 
 

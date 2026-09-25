@@ -133,14 +133,42 @@ def _singular(word: str) -> str:
     return word[:-1] if word.endswith("s") and len(word) > 3 else word
 
 
-def _finding(code: str, material: str, block_id: str, evidence: str, *, severity: str = "P0") -> dict[str, Any]:
-    return {
+_FUNCTION_WORDS = {
+    "a", "an", "and", "as", "at", "for", "in", "my", "of", "on", "or", "the", "to", "with",
+}
+
+
+def _finding(
+    code: str,
+    material: str,
+    block_id: str,
+    evidence: str,
+    *,
+    severity: str = "P0",
+    **extra: Any,
+) -> dict[str, Any]:
+    found = {
         "code": code,
         "severity": severity,
         "material": material,
         "block_id": block_id,
         "evidence": str(evidence)[:300],
     }
+    for key, value in extra.items():
+        if value is not None:
+            found[key] = value
+    return found
+
+
+def _verb_family(verbs: set[str]) -> set[str]:
+    """Treat the irregular pair lead/led as one verb for JD anchoring."""
+
+    family = set(verbs)
+    if "led" in family:
+        family.add("lead")
+    if "lead" in family:
+        family.add("led")
+    return family
 
 
 def high_risk_verbs(value: Any) -> set[str]:
@@ -333,11 +361,19 @@ def run_semantic_lint(
                 ))
             else:
                 experience_verbs = all_baseline_verbs[material]
-            escalated = high_risk_verbs(after_text) - experience_verbs
+            allowed_verbs = set(experience_verbs) | _confirmed_fact_verbs(bundle, experience_id)
+            escalated = high_risk_verbs(after_text) - allowed_verbs
             if escalated:
+                jd_verbs = _verb_family(high_risk_verbs(_jd_text(bundle)))
                 findings.append(_finding(
                     "verb_escalation", material, block_id,
                     f"evidence verbs introduced without baseline basis: {sorted(escalated)}",
+                    jd_anchored=bool(_verb_family(escalated) & jd_verbs),
+                    required_action=(
+                        "Rewrite with a verb already supported by the baseline or a confirmed fact "
+                        "for this experience, or confirm through materials resolve that you did this "
+                        "work. The confirmation is stored only in the private fact file."
+                    ),
                 ))
             # 5. Employer/experience attribution inside the CV.
             if material == "cv" and experience_id:
@@ -423,6 +459,75 @@ def _number_object_drift(before: str, after: str, token: str) -> bool:
     return not (before_heads & after_heads)
 
 
+def _adjacent_language_levels(words: list[str]) -> dict[str, set[str]]:
+    """Level words count only when they sit next to the language name.
+
+    ``business teams … English`` does not make ``business`` a language level.
+    ``Business English`` and ``fluent in English`` do.
+    """
+
+    found: dict[str, set[str]] = {}
+    for index, word in enumerate(words):
+        if word not in _LANGUAGES:
+            continue
+        for pos, other in enumerate(words):
+            if other not in _LANGUAGE_LEVELS:
+                continue
+            distance = abs(pos - index)
+            if distance == 0 or distance > 2:
+                continue
+            if distance == 2:
+                middle = words[min(pos, index) + 1]
+                if middle not in _FUNCTION_WORDS and middle not in _LANGUAGES and middle not in _LANGUAGE_LEVELS:
+                    continue
+            found.setdefault(word, set()).add(other)
+    return found
+
+
+def _jd_text(bundle: dict[str, Any]) -> str:
+    raw = bundle.get("jd")
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        return str(raw.get("text") or raw.get("full") or raw.get("body") or "")
+    return str(bundle.get("jd_text") or "")
+
+
+def _fact_items(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    containers = [bundle]
+    for key in ("candidate_profile", "profile"):
+        value = bundle.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+    for container in containers:
+        for key in ("profile_facts", "facts", "evidence_nodes", "nodes"):
+            value = container.get(key)
+            if isinstance(value, list):
+                items.extend(item for item in value if isinstance(item, dict))
+    return items
+
+
+def _fact_is_confirmed(item: dict[str, Any]) -> bool:
+    if item.get("confirmed") is True:
+        return True
+    return str(item.get("status") or "").casefold() in {"confirmed", "user_confirmed", "user_imported"}
+
+
+def _confirmed_fact_verbs(bundle: dict[str, Any], experience_id: str) -> set[str]:
+    """Verified evidence verbs. JD wording is never added to this set."""
+
+    verbs: set[str] = set()
+    for item in _fact_items(bundle):
+        if not _fact_is_confirmed(item):
+            continue
+        linked = str(item.get("experience_id") or item.get("experience") or "").strip()
+        if experience_id and linked != experience_id:
+            continue
+        verbs |= high_risk_verbs(item.get("text") or item.get("claim") or "")
+    return verbs
+
+
 def _language_level_findings(canonical: dict[str, Any]) -> list[dict[str, Any]]:
     # Track which material side was actually touched: a level inconsistency
     # that already exists inside untouched baseline text belongs to the lane
@@ -432,14 +537,11 @@ def _language_level_findings(canonical: dict[str, Any]) -> list[dict[str, Any]]:
     for material in MATERIALS:
         for block in _blocks(canonical, material):
             words = re.findall(r"[a-z]+", text(block.get("text")).casefold())
-            for language in _LANGUAGES:
-                if language not in words:
-                    continue
-                for level in _LANGUAGE_LEVELS:
-                    if level in words:
-                        observed.setdefault(language, {}).setdefault(material, set()).add(level)
-                        if bool(block.get("customized")):
-                            customized_sides.add(language)
+            adjacent = _adjacent_language_levels(words)
+            if bool(block.get("customized")):
+                customized_sides.update(adjacent)
+            for language, levels in adjacent.items():
+                observed.setdefault(language, {}).setdefault(material, set()).update(levels)
     findings: list[dict[str, Any]] = []
     for language, per_material in sorted(observed.items()):
         if language not in customized_sides:

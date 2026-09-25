@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from tools.workflow.confirmation import ConfirmationStore
 from tools.workflow.engine import dispatch
@@ -80,6 +81,10 @@ def test_manual_intake_confirm_allocates_id_only_at_confirmation(tmp_path):
     assert store.row_count() == 1
     assert re.fullmatch(r"C[0-3]-\d{3}", store.read_active().rows[0]["岗位编号"])
     assert store.read_active().rows[0]["链接"] == "https://www.linkedin.com/jobs/view/789/"
+    assert len(confirmed["package_paths"]) == 1
+    package = Path(confirmed["package_paths"][0])
+    assert package.is_dir()
+    assert (package / "package_binding.json").is_file()
 
 
 def test_manual_intake_without_full_jd_is_explicitly_provisional_and_unscored(tmp_path):

@@ -325,6 +325,7 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
                 "input",
                 "pass1_kept",
                 "pass1_dropped",
+                "pass1_low_priority",
                 "provisional_needs_jd",
                 "final_kept",
                 "deep_attempted",

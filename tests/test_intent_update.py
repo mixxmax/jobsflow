@@ -153,3 +153,52 @@ def test_unknown_workflow_preference_is_rejected_instead_of_silently_reset(tmp_p
         create_preference_proposal(
             tmp_path, preference="scan_depth", value="超级模式"
         )
+
+
+def test_review_first_is_preview_only_until_confirmation(tmp_path):
+    profile = _write_private_profile(tmp_path)
+    before = (profile / "queries.json").read_text(encoding="utf-8")
+
+    proposal = create_preference_proposal(
+        tmp_path, preference="review_first", value="on", preview_floor=2.8
+    )
+    assert proposal["status"] == "pending_confirmation"
+    assert proposal["diff"]["workflow_preferences"]["before"]["defer_deep_until_selection"] is False
+    assert proposal["diff"]["workflow_preferences"]["after"]["defer_deep_until_selection"] is True
+    assert proposal["diff"]["workflow_preferences"]["after"]["preview_floor"] == 2.8
+    assert (profile / "queries.json").read_text(encoding="utf-8") == before
+
+    save_proposal(tmp_path, proposal)
+    apply_proposal(tmp_path)
+    saved = json.loads((profile / "queries.json").read_text(encoding="utf-8"))
+    assert saved["workflow_preferences"]["defer_deep_until_selection"] is True
+    assert saved["workflow_preferences"]["preview_floor"] == 2.8
+    assert saved["workflow_preferences"]["scan_depth"] == "balanced"
+    assert saved["workflow_preferences"]["retention_preference"] == "standard"
+
+
+def test_review_first_rejects_out_of_range_floor(tmp_path):
+    _write_private_profile(tmp_path)
+    with pytest.raises(ValueError, match="preview_floor"):
+        create_preference_proposal(
+            tmp_path, preference="review_first", value="on", preview_floor=9.9
+        )
+
+
+def test_scan_depth_preserves_review_first_keys(tmp_path):
+    profile = _write_private_profile(tmp_path)
+    config = json.loads((profile / "queries.json").read_text(encoding="utf-8"))
+    config["workflow_preferences"] = {
+        "scan_depth": "balanced",
+        "retention_preference": "standard",
+        "defer_deep_until_selection": True,
+        "preview_floor": 2.8,
+    }
+    (profile / "queries.json").write_text(json.dumps(config), encoding="utf-8")
+    proposal = create_preference_proposal(tmp_path, preference="scan_depth", value="节能")
+    save_proposal(tmp_path, proposal)
+    apply_proposal(tmp_path)
+    saved = json.loads((profile / "queries.json").read_text(encoding="utf-8"))
+    assert saved["workflow_preferences"]["scan_depth"] == "economy"
+    assert saved["workflow_preferences"]["defer_deep_until_selection"] is True
+    assert saved["workflow_preferences"]["preview_floor"] == 2.8

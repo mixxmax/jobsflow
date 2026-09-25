@@ -108,6 +108,7 @@ CANDIDATE_COLS = [
     "teaser",
     "first_seen_at",
     "in_tracker",
+    "possible_repost_of",
 ]
 
 
@@ -133,6 +134,7 @@ class JobHit:
     soft_flags: list[str] = field(default_factory=list)
     reject_reason: str = ""
     in_tracker: bool = False
+    possible_repost_of: str = ""
 
 
 def now_utc() -> datetime:
@@ -169,6 +171,8 @@ def scan_dedupe_keys(hit: "JobHit") -> list[str]:
     company_title = company_title_key(hit.company, hit.title)
     if company_title and company_title != "—||":
         keys.append(f"ct:{company_title}")
+        if url:
+            keys.append(f"ctref:{company_title}|{url}")
     return keys
 
 
@@ -228,6 +232,35 @@ def normalize_url(url: str) -> str:
         return clean
     except Exception:
         return u.split("?")[0].rstrip("/")
+
+
+def history_match(
+    *,
+    url: str,
+    bare_id: str,
+    company: str,
+    title: str,
+    url_keys: set[str],
+    ct_keys: set[str],
+    ct_refs: dict[str, str],
+) -> tuple[str, str]:
+    """Classify a card against recent scan history.
+
+    The same URL or portal id is a duplicate. The same company and title with
+    a different URL is only a repost hint. A card with no URL still uses
+    company+title as its identity, because there is nothing else to tell two
+    cards apart.
+    """
+
+    key = company_title_key(company, title)
+    normalized = normalize_url(url)
+    if (normalized and normalized in url_keys) or (bare_id and bare_id in url_keys):
+        return "duplicate", ""
+    if key and key != "—||" and key in ct_keys:
+        if not normalized:
+            return "duplicate", ""
+        return "repost", ct_refs.get(key) or key
+    return "new", ""
 
 
 def company_title_key(company: str, title: str) -> str:
@@ -837,24 +870,26 @@ def load_tracker_keys(tracker_path: Path) -> tuple[set[str], set[str], list[str]
             ct.add(company_title_key(row.get("公司") or "", row.get("职位") or ""))
             if row.get("岗位编号"):
                 ids.append(row["岗位编号"])
-    # 并入 push 入表注册表（entered_ids.json）：今天入表但尚未写回主表 CSV
-    # 的职位也属"已入表"，扫描不得重复报新（与主表 CSV 同等去重）。
-    reg_path = tracker_path.parent / "entered_ids.json"
-    if reg_path.exists():
-        try:
-            reg = json.loads(reg_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            reg = None
-        entries = (reg or {}).get("entries") or {}
-        for _jid, entry in entries.items():
-            if not isinstance(entry, dict):
+    # Ledger rows are already-entered identities. entered_ids.json is not an authority.
+    ledger = tracker_path.parent / "workflow" / "ledger"
+    if ledger.is_dir():
+        for path in ledger.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
                 continue
-            u = normalize_url(str(entry.get("url") or ""))
-            if u:
-                urls.add(u)
-                m = re.search(r"/(\d{8,})(?:/|$)", u)
-                if m:
-                    urls.add(m.group(1))
+            for row in payload.get("rows") or []:
+                if not isinstance(row, dict):
+                    continue
+                u = normalize_url(str(row.get("链接") or row.get("url") or ""))
+                if u:
+                    urls.add(u)
+                    match = re.search(r"/(\d{8,})(?:/|$)", u)
+                    if match:
+                        urls.add(match.group(1))
+                ct.add(company_title_key(str(row.get("公司") or ""), str(row.get("职位") or "")))
+                if row.get("岗位编号"):
+                    ids.append(str(row.get("岗位编号")))
     return urls, ct, ids, rows
 
 
@@ -906,6 +941,7 @@ def write_candidates_csv(path: Path, hits: list[JobHit]) -> None:
                     "teaser": h.teaser,
                     "first_seen_at": iso_now(),
                     "in_tracker": "yes" if h.in_tracker else "no",
+                    "possible_repost_of": h.possible_repost_of,
                 }
             w.writerow(
                 {
@@ -1203,7 +1239,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     url_keys = {key[4:] for key in history_keys if key.startswith("url:")}
     url_keys |= {key[3:] for key in history_keys if key.startswith("id:")}
-    ct_keys = {key[3:] for key in history_keys if key.startswith("ct:")}
+    ct_keys = {key[3:] for key in history_keys if key.startswith("ct:") and not key.startswith("ctref:")}
+    ct_refs: dict[str, str] = {}
+    for key in history_keys:
+        if not key.startswith("ctref:"):
+            continue
+        body = key[6:]
+        company_title, _, prior = body.partition("|")
+        if company_title and prior and company_title not in ct_refs:
+            ct_refs[company_title] = prior
 
     all_hits: list[JobHit] = []
     errors: list[dict[str, str]] = []
@@ -1416,11 +1460,22 @@ def main(argv: list[str] | None = None) -> int:
             # only a fallback for cards that genuinely have no URL; using it
             # as an unconditional key would hide two distinct requisitions
             # from the same employer with the same title.
-            if hit.url in url_keys or bare in url_keys or (not hit.url and ck in ct_keys):
+            kind, prior = history_match(
+                url=hit.url,
+                bare_id=bare,
+                company=hit.company,
+                title=hit.title,
+                url_keys=url_keys,
+                ct_keys=ct_keys,
+                ct_refs=ct_refs,
+            )
+            if kind == "duplicate":
                 hit.in_tracker = True
                 if hit.decision == "new":
                     hit.decision = "duplicate"
                     hit.reject_reason = "already_in_recent_scan"
+            elif kind == "repost":
+                hit.possible_repost_of = prior
 
             counters[hit.decision] = counters.get(hit.decision, 0) + 1
             all_hits.append(hit)

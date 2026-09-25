@@ -156,6 +156,55 @@ def test_plain_wording_rewrite_passes_all_semantic_checks():
     assert findings == []
 
 
+def test_business_teams_is_not_a_language_level_and_business_english_is():
+    quiet = run_semantic_lint(
+        bundle=_bundle(),
+        canonical=_canonical({
+            "cv-lang": "Worked with business teams. English is used for written records.",
+            "cl-b1": "I write English for the role.",
+        }),
+    )
+    assert "language_level_conflict" not in _codes(quiet)
+    flagged = run_semantic_lint(
+        bundle=_bundle(),
+        canonical=_canonical({
+            "cv-lang": "Languages: Business English.",
+            "cl-b1": "I am a native English speaker.",
+        }),
+    )
+    assert "language_level_conflict" in _codes(flagged)
+
+
+def test_jd_verb_stays_blocked_and_a_confirmed_fact_allows_it():
+    bundle = _bundle()
+    bundle["jd"] = {"text": "The role will lead contract reviews and draft advice."}
+    escalated = run_semantic_lint(
+        bundle=bundle,
+        canonical=_canonical({
+            "cv-exp1-b1": "Led creditor recovery involving RMB 12 million and reviewed 100+ commercial contracts across civil, commercial and labour disputes.",
+        }),
+    )
+    verbs = [item for item in escalated if item["code"] == "verb_escalation"]
+    assert verbs
+    assert verbs[0]["jd_anchored"] is True
+    assert "materials resolve" in verbs[0]["required_action"]
+    bundle["profile_facts"] = [
+        {
+            "id": "EVID-1",
+            "text": "Led creditor recovery work.",
+            "confirmed": True,
+            "experience_id": "experience-01",
+        }
+    ]
+    cleared = run_semantic_lint(
+        bundle=bundle,
+        canonical=_canonical({
+            "cv-exp1-b1": "Led creditor recovery involving RMB 12 million and reviewed 100+ commercial contracts across civil, commercial and labour disputes.",
+        }),
+    )
+    assert "verb_escalation" not in _codes(cleared)
+
+
 def test_language_level_conflict_across_materials_is_flagged():
     findings = run_semantic_lint(
         bundle=_bundle(),

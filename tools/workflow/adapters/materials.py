@@ -76,10 +76,29 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
             out.setdefault("engine", "materials-vnext")
             out.setdefault("engine_version", "materials-vnext-1")
             return out
+        prepare_note = None
+        if stage == "prepare" or (stage in {"", "plan"} and payload.get("auto_prepare")):
+            from tools.workflow.materials_prepare import prepare_package, should_auto_prepare
+
+            run_prepare = stage == "prepare" or should_auto_prepare(Path(workspace), str(payload.get("job_id") or ""))
+            if run_prepare:
+                prepared = prepare_package(payload, workspace=Path(workspace))
+                prepared.setdefault("rule_ids", ["MAT-VNEXT-001"])
+                prepared.setdefault("engine", "materials-vnext")
+                prepared.setdefault("engine_version", "materials-vnext-1")
+                if stage == "prepare" or prepared.get("status") != "succeeded":
+                    return prepared
+                prepare_note = {
+                    "status": prepared.get("status"),
+                    "noop": bool(prepared.get("noop")),
+                    "blockers": list(prepared.get("blockers") or []),
+                }
         out = MaterialsEngine().handle(payload, workspace=workspace, dry_run=dry_run)
         out.setdefault("rule_ids", ["MAT-VNEXT-001"])
         out.setdefault("engine", "materials-vnext")
         out.setdefault("engine_version", "materials-vnext-1")
+        if prepare_note is not None:
+            out["prepare"] = prepare_note
         return out
     # Frozen compatibility body below is intentionally unreachable from the
     # product gateway.  It remains in this module only so historical private

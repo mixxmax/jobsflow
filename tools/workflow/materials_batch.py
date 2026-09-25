@@ -177,12 +177,45 @@ def _one(workspace: Path, job_id: str, action: str, engine: str) -> dict[str, An
         else:
             out = {"status": "blocked", "blockers": ["package_missing"]}
     elif action == "render":
-        out = dispatch("materials", workspace=workspace, payload={"job_id": job_id, "stage": "render", "materials_engine": "vnext"})
+        from tools.workflow.materials_produce import dispatch_with_relay
+
+        out = dispatch_with_relay(
+            "materials",
+            {"job_id": job_id, "stage": "render", "materials_engine": "vnext"},
+            workspace=workspace,
+            relay_allowed=True,
+        )
     elif action == "prepare":
-        # Preparation freezes the current-job bundle and creates the model
-        # planning/tailoring handoff.  It does not submit a plan or write a
-        # canonical document, so independent jobs can do this concurrently.
-        out = dispatch("materials", workspace=workspace, payload={"job_id": job_id, "stage": "plan", "materials_engine": "vnext"})
+        # Fill JD, assessment and preflight, then freeze the planning bundle.
+        # Each stage redeems its own in-process ticket. A failed prepare does
+        # not continue into plan.
+        from tools.workflow.materials_produce import dispatch_with_relay
+
+        prepared = dispatch_with_relay(
+            "materials",
+            {"job_id": job_id, "stage": "prepare", "materials_engine": "vnext"},
+            workspace=workspace,
+            relay_allowed=True,
+        )
+        stopped = (
+            prepared.get("status") in {"blocked", "failed", "planned"}
+            or prepared.get("requires_capability_ticket")
+        )
+        if stopped or "capability_ticket_required" in (prepared.get("blockers") or []):
+            out = prepared
+        else:
+            planned = dispatch_with_relay(
+                "materials",
+                {"job_id": job_id, "stage": "plan", "materials_engine": "vnext"},
+                workspace=workspace,
+                relay_allowed=True,
+            )
+            out = dict(planned)
+            out["prepare"] = {
+                "status": prepared.get("status"),
+                "noop": prepared.get("noop"),
+                "blockers": list(prepared.get("blockers") or []),
+            }
     elif action == "audit":
         out = dispatch("materials", workspace=workspace, payload={"job_id": job_id, "stage": "audit", "materials_engine": "vnext"})
     elif action == "pdf":
@@ -226,7 +259,13 @@ def run_batch(
             except Exception as exc:  # one package must not cancel the batch
                 results.append({"job_id": futures[future], "status": "failed", "blockers": ["batch_worker_error"], "error": str(exc), "batch_context_id": batch_id})
     results.sort(key=lambda item: ids.index(str(item.get("job_id") or "")))
-    failed = [item for item in results if item.get("status") in {"blocked", "failed"}]
+    failed = [
+        item
+        for item in results
+        if item.get("status") in {"blocked", "failed", "planned"}
+        or item.get("requires_capability_ticket")
+        or "capability_ticket_required" in (item.get("blockers") or [])
+    ]
     return {
         "status": "succeeded" if not failed else "partial",
         "action": action,

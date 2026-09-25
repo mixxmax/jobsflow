@@ -91,6 +91,40 @@ def handle(payload: dict[str, Any], *, workspace: Path, dry_run: bool = False) -
             "side_effects": [],
         }
 
+    if command in {"review-first", "review_first"}:
+        set_value = str(payload.get("set") or text or "").strip()
+        if not set_value:
+            return {
+                "status": "blocked",
+                "blockers": ["review_first_set_required"],
+                "next_action": "intent review-first --set on|off [--preview-floor X]",
+            }
+        try:
+            proposal = create_preference_proposal(
+                repo,
+                preference="review_first",
+                value=set_value,
+                preview_floor=payload.get("preview_floor"),
+            )
+        except ValueError as exc:
+            return {
+                "status": "blocked",
+                "blockers": ["review_first_invalid"],
+                "error": str(exc),
+                "next_action": "intent review-first --set on|off [--preview-floor 2.0-3.3]",
+            }
+        save_proposal(repo, proposal)
+        return {
+            "status": "planned",
+            "action": "intent",
+            "intent_cmd": "review-first",
+            "proposal_id": proposal.get("proposal_id"),
+            "diff": proposal.get("diff"),
+            "side_effects": ["intent_proposal_created"],
+            "next_action": "intent_confirm",
+            "requires_confirmation": True,
+        }
+
     if not text:
         return {
             "status": "blocked",

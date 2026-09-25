@@ -10,6 +10,8 @@
 /intent replace 数据分析岗位       # 生成“替换”预览，不写配置
 /intent scan-depth 节能           # 预览扫描成本：节能/平衡/广覆盖
 /intent retention 宽松            # 预览最终清单：宽松/标准/精选
+/intent review-first --set on [--preview-floor 2.8]
+                                  # 预览 review-first：扫描只做人审，深评等 push --select
 /intent confirm                 # 用户确认后写入上一份预览
 /intent cancel                  # 放弃上一份预览
 ```
@@ -28,6 +30,7 @@
 
 - `scan-depth` 只控制 cache-miss 网络深取预算：节能约 10、平衡约 20、广覆盖约 40；
 - `retention` 只控制完整 JD 评分后的清单线：宽松 3.0、标准 3.3、精选 3.5；
+- `review-first` 写 `defer_deep_until_selection`，可选 `preview_floor`（2.0–3.3）；开启后扫描只做人审，深评等用户 `push --select`；
 - 修改 `retention` 不得重新抓取 JD，只对已保存的深评分数重新筛选。
 
 涉及地点、薪资、工作时间、工作权或资格限制时，先在预览中单独列出这些限制，并向用户确认；不要把限制词当作岗位关键词。
@@ -43,6 +46,7 @@ python3 -m tools.workflow intent replace "用户确认后的完整新意向"
 # 或工作流偏好
 python3 -m tools.workflow intent scan-depth 节能
 python3 -m tools.workflow intent retention 宽松
+python3 -m tools.workflow intent review-first --set on --preview-floor 2.8
 ```
 
 兼容 facade（内部同样 `dispatch("intent")`，不得当作旁路）：

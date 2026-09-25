@@ -17,8 +17,9 @@ canonical 产物），入口会返回 `legacy_material_state_requires_vnext_rese
 reset preview/confirm 命令。模型不得自行删除文件或绕过状态机；所有 reset scope（包括
 破坏性最大的 `all`）都必须先 preview，只有明确带 `--confirm-reset` 才能执行。
 
-缺完整 JD、事实、assessment、preflight 或正式岗位编号时必须停止。扫描阶段不生成材料，用户
-明确入表后才可按永久编号制作。
+缺事实或正式岗位编号时必须停止。缺完整 JD、与 JD 哈希一致的评估或 `application_preflight.json`
+时，先走 `materials prepare`（确定性，不调用模型），不要手写这三个文件，也不要调用已封禁的
+`tools.job_materials`。`/push` 只入表，不自动 prepare。扫描阶段不生成材料。
 
 ## 两个不可替代的硬门
 
@@ -76,7 +77,8 @@ CL 的候选人、职位、收件人和公司行是当前岗位实体契约的**
 ## 固定流程
 
 ```text
-冻结 current_job_bundle 与 lane CV/CL 基础版
+materials prepare：写入 JD 全文、匹配评估、application_preflight
+  → 冻结 current_job_bundle 与 lane CV/CL 基础版
   → 主模型提交并通过结构化 plan
   → 主模型只提交 JD 定制 delta（rewrite/reorder/append_after）
   → 系统保留未修改内容并编译完整 canonical CV/CL
@@ -90,7 +92,11 @@ CL 的候选人、职位、收件人和公司行是当前岗位实体契约的**
 ```
 
 ```bash
-# 第一次调用冻结当前岗位输入并返回 plan task；模型只提交 JSON，不直接写文档
+# 骨架包先补齐 JD / 评估 / preflight。没有缓存时用 --jd-file。/push 不会代做这一步。
+python3 -m tools.workflow materials prepare --job-id C0-005
+python3 -m tools.workflow materials prepare --job-id C0-005 --jd-file jd.txt
+# 第一次调用冻结当前岗位输入并返回 plan task；模型只提交 JSON，不直接写文档。
+# idle 且只缺上述三项时，这一步会先 prepare 再 plan。
 python3 -m tools.workflow materials --job-id C0-005
 python3 -m tools.workflow materials --job-id C0-005 --plan plan.json
 # 仅提交 bounded transform，不能提交完整 CV/CL
@@ -105,8 +111,10 @@ python3 -m tools.workflow apply --job-id C0-005
 `--plan` 必须先于 `--content`；没有 plan 的 transform 会被硬门拒绝。模型只需指出
 要改的 block、动作、JD anchor 与新文字，不需要复制整份简历、手工生成 canonical 哈希或重建
 未变化内容。系统将 delta 与基础版合成为完整 canonical CV/CL；P0/P1 后，
-`materials_repair_task.json` 给出 `finding_id + material + target_id`；repair 只能改这些 block，
-必须携带精确 `before_text`，不能用整篇重写绕过审计。P2 只作建议，不触发返工。
+`materials_repair_task.json` 给出 `finding_id + material + target_id`；repair 以改这些 block 为主，
+`before_text` 为空时按目标 id 从当前 canonical 自动填充。受控 `append_after` 允许：带
+`new_id`、锚定同 section 已有块、类型已在该 section 基线出现、引用 `finding_id`、每次最多 2 条。
+不能用整篇重写绕过审计。P2 只作建议，不触发返工。
 
 ## 速度、熔断和恢复
 

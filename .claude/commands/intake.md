@@ -29,7 +29,9 @@ python3 -m tools.workflow intake --confirm <proposal-id>
 
 有完整 JD 时调用既有评分器；没有完整 JD 时只保留 `JD深度=missing`、
 `评估状态=待审-JD不足`，评分字段留空。缺少完整 JD 的岗位必须在页面信息或命令中
-提供 lane，系统不会用中性分数冒充评分。
+提供 lane，系统不会用中性分数冒充评分。JobsDB 缺全文时可自动经 gateway 附接主
+Chrome 抓取；其他门户用 `--fetch-jd`（单次最多 3 个 URL）。已入表 URL 不再另开
+更新链，改为 `materials prepare --job-id X [--jd-file F] [--fetch]`。
 
 预览是完全无写入、无永久编号的 proposal，只列本次 URL 中的新岗位；重复项单独
 报告。确认时才在同一条统一同步链上分配三位序号、写入本地 ledger/CSV/Sheets，

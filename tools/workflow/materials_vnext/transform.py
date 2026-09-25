@@ -361,11 +361,17 @@ def validate_transform(
                 # Reachable only when target resolved (see the missing-target
                 # guard above); the fallback keeps this None-safe regardless.
                 before = text((target or {}).get("text"))
+            if repair and not before and target is not None:
+                before = text(target.get("text"))
+                operation["before_text"] = before
+            expected = text((target or {}).get("text"))
             if not before or not after:
                 errors.append(f"operation_replace_text_missing:{index}")
-            elif before != text((target or {}).get("text")):
+            elif repair and _norm_ws(before) != _norm_ws(expected):
                 errors.append(f"operation_before_text_mismatch:{index}:{target_id}")
-            elif after == before:
+            elif not repair and before != expected:
+                errors.append(f"operation_before_text_mismatch:{index}:{target_id}")
+            elif after == before or (repair and _norm_ws(after) == _norm_ws(before)):
                 errors.append(f"operation_noop:{index}:{target_id}")
             else:
                 derived = _apply_change_class(operation, before=before, after=after, errors=errors, index=index)
@@ -388,8 +394,28 @@ def validate_transform(
             elif new_id in lookup:
                 errors.append(f"operation_append_duplicate_id:{index}:{new_id}")
             else:
-                if text(block.get("type") or "bullet") not in BLOCK_TYPES:
+                new_type = text(block.get("type") or "bullet")
+                if new_type not in BLOCK_TYPES:
                     errors.append(f"operation_append_type_invalid:{index}")
+                if repair:
+                    finding_id = text(operation.get("finding_id") or block.get("finding_id"))
+                    if not finding_id:
+                        errors.append(f"repair_append_finding_required:{index}")
+                    anchor = lookup.get(after_id)
+                    if anchor is not None:
+                        section = text(anchor.get("section"))
+                        block_section = text(block.get("section") or section)
+                        if section and block_section != section:
+                            errors.append(f"repair_append_section_mismatch:{index}")
+                        allowed_types = {
+                            text(item.get("type") or "bullet")
+                            for item in _blocks(baseline, material)
+                            if text(item.get("section")) == section
+                        }
+                        if section and new_type not in allowed_types:
+                            errors.append(f"repair_append_type_not_in_baseline:{index}")
+                        if section and not text(block.get("section")):
+                            block["section"] = section
                 _apply_change_class(
                     operation,
                     before="",
@@ -419,12 +445,13 @@ def validate_transform(
             errors.append("transform_too_many_added_blocks")
         if baseline_chars and added_chars / baseline_chars > MAX_ADDED_CHARS_RATIO:
             errors.append("transform_added_text_too_large")
-    else:
-        # A repair is even narrower: it must name one existing target per
-        # operation and cannot introduce a new section or delete content.
-        if additions:
-            errors.append("repair_cannot_add_unbounded_block")
+    elif additions > 2:
+        errors.append("repair_too_many_appended_blocks")
     return sorted(set(errors))
+
+
+def _norm_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def stamp_derived_change_classes(transform: dict[str, Any]) -> None:
