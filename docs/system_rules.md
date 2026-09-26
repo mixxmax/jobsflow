@@ -174,16 +174,18 @@ Their actual queries and relevance rules are candidate- and profession-specific.
 
 An optional runtime may enable a review-first mode with
 `workflow_preferences.preview_floor` (for example `2.8`) and
-`defer_deep_until_selection=true`. In that mode the scan is a human review
-surface: it shows pass-1 candidates at or above the configured display floor
-and labels teaser-only rows `provisional_needs_jd`; it does not spend deep-fetch
-budget for the whole window. A plain `/push` returns the review list and an
-estimated cost. Only explicitly selected keys trigger deep review. The default
-`standard` entry policy then admits only full-JD rows at or above the configured
-final line (3.3 by default). An explicit `entry_policy=all` is a user override
-for the displayed selection, recorded in the proposal together with provisional
-status and deep-review cost; it is never inferred from ordinary model prose.
-Hard safety markers such as a language-gate failure remain visible and are not
+`defer_deep_until_selection=true`. Change that policy only through
+`python3 -m tools.workflow intent review-first --set on|off [--preview-floor X]`
+(preview then confirm). In that mode the scan is a human review surface: it
+shows pass-1 candidates at or above the configured display floor and labels
+teaser-only rows `provisional_needs_jd`; it does not spend deep-fetch budget for
+the whole window. A plain `/push` returns the review list and an estimated cost.
+Only explicitly selected keys trigger deep review. The default `standard` entry
+policy then admits only full-JD rows at or above the configured final line
+(3.3 by default). An explicit `entry_policy=all` is a user override for the
+displayed selection, recorded in the proposal together with provisional status
+and deep-review cost; it is never inferred from ordinary model prose. Hard
+safety markers such as a language-gate failure remain visible and are not
 silently converted into a normal match.
 
 The supported scan boundary is the workflow gateway; the compatibility shell
@@ -237,6 +239,10 @@ show the same successful-portal rows again.
 - Never hard-reject an information-poor card solely because its title-only
   pass-1 score is below 3.3. If deep text cannot be obtained within policy or
   budget, retain it as an explicit provisional review item instead.
+- A low pass-1 score does not remove the row. It is kept as
+  `pass1_low_priority` / `待审-初评偏低`, omitted from the default push batch,
+  and still selectable with `push --select`. Selection is what schedules the
+  deep review.
 - Scan depth limits cache-miss network retrievals, not valid cache reads.
 - Raw deep scores are persisted before retention filtering. Changing retention
   must reuse that artifact and must not trigger another portal request.
@@ -634,7 +640,22 @@ runs deterministic semantic checks: invented numbers, number-object drift,
 scope narrowing near a retained number, verb escalation, cross-employer
 attribution, employer-heading attribution loss, cross-material language-level
 conflicts, internal marker/prompt leakage, and JD duty coverage (themes are
-exempt; coverage dispositions are honoured). The host runs a per-material
+exempt; coverage dispositions are honoured).
+
+Evidence verbs follow two layers. First, the model copies the baseline's verbs
+as written. Second, a drift is tolerated only when it stays inside the role:
+a *function* verb (`draft`) that already appears anywhere in the lane baseline
+or in this job's JD is a non-blocking P2 `verb_wording_drift`. An *inflation*
+verb (`lead`, `own`, `manage`, `advise`, `deliver`, `recover`) that the
+experience's baseline does not support is a P0 `verb_escalation`; the default
+fix is to return to the baseline wording. If the user really did the work,
+the user may confirm it with `materials confirm-claim`, which records the
+confirmation for this job only (until a draft reset or a JD change) and
+re-runs the preflight. A confirmation is never written to the lane baseline or
+the shared profile fact file, and the model must not confirm on the user's
+behalf.
+
+The host runs a per-material
 wrapped-line capacity estimate (`estimate_canonical_capacity`) before any
 DOCX/PDF cycle. An over-budget CV or Cover Letter is a deterministic P1
 `capacity_budget_exceeded` block naming only the affected material; the model

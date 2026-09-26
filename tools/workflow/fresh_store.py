@@ -24,6 +24,9 @@ from tools.workflow.main_tracker_merge import (
     write_main_tab,
 )
 from tools.workflow.tracker_formats import apply_material_status_formats
+from tools.fresh_24h.tracker_schema import SCORED_ARTIFACT_EXTRA
+
+_SCORED_ARTIFACT_EXTRA = frozenset(SCORED_ARTIFACT_EXTRA)
 
 
 def rows_digest(rows: list[dict[str, Any]], *, title: str = "", headers: list[str] | None = None) -> str:
@@ -1226,15 +1229,20 @@ def _safe(value: str) -> str:
 
 
 def _is_internal_column(name: Any) -> bool:
-    return str(name).startswith("_")
+    text = str(name)
+    # Underscore keys are in-memory scorer bookkeeping.  SCORED_ARTIFACT_EXTRA
+    # names are persisted on scored CSVs for push preview, but must never grow
+    # tracker / Sheets projection headers.
+    return text.startswith("_") or text in _SCORED_ARTIFACT_EXTRA
 
 
 def _headers_for_rows(rows: list[dict[str, Any]], existing: list[str] | None = None) -> list[str]:
-    # Scorer bookkeeping keys (``_below_final``, ``_deep_jd_full``, …) are
-    # transient in-memory state; letting one define a projection column both
-    # leaks it to the user's tracker and changes the schema on every run.
-    # Filter ``existing`` too, so a tab already polluted by a leaked column
-    # heals instead of re-inheriting it from ``read_active``.
+    # Scorer bookkeeping keys (``_below_final``, ``_deep_jd_full``, …) and
+    # scored-artifact-only columns (``possible_repost_of``, …) must not define
+    # projection headers: that both leaks them to the user's tracker and
+    # changes the schema on every run.  Filter ``existing`` too, so a tab
+    # already polluted by a leaked column heals instead of re-inheriting it
+    # from ``read_active``.
     base = [header for header in (existing or []) if not _is_internal_column(header)]
     for key in ("岗位编号", "职位", "公司", "链接"):
         if key not in base:

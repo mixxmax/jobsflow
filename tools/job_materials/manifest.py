@@ -516,6 +516,7 @@ def build_job_manifest(
             "company_out": company_out,
             "url": url,
             "source": source,
+            "deep_score_source": "entry_row" if _row_value(row, "深评分数", "deep_score") else "not_deep_scored",
             "salary": _row_value(row, "薪资", "salary"),
         },
         "outbound": {

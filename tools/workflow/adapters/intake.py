@@ -23,12 +23,20 @@ from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from tools.fresh_24h.batch_mark import hkt_now_str, make_batch_id, mark_new_rows, sort_fresh_rows
+from tools.job_materials.packages import create_package_from_entry_row
 from tools.fresh_24h.careerops_quickscore import (
     SHEET_HEADERS,
     build_tracker_row,
     score_job,
 )
-from tools.job_urls import normalize_job_url
+from tools.job_urls import (
+    host_matches,
+    is_ctgoodjobs_url,
+    is_jobsdb_url,
+    is_linkedin_url_host,
+    normalize_job_url,
+    safe_jobsdb_job_url,
+)
 from tools.workflow.confirmation import (
     ConfirmationStore,
     build_proposal,
@@ -64,14 +72,14 @@ def _safe_text(value: Any) -> str:
 
 
 def _platform_for_url(url: str) -> str:
-    lowered = str(url or "").casefold()
-    if "linkedin.com" in lowered:
+    if is_linkedin_url_host(url):
         return "linkedin"
-    if "jobsdb.com" in lowered:
+    if is_jobsdb_url(url):
         return "jobsdb"
-    if "ctgoodjobs.hk" in lowered or "ctjobs" in lowered:
+    if is_ctgoodjobs_url(url):
         return "ctgoodjobs"
-    if "freehire" in lowered:
+    lowered = str(url or "").casefold()
+    if "freehire" in lowered and host_matches(url, "freehire.dev"):
         return "freehire"
     match = re.search(r"https?://([^/]+)", lowered)
     return match.group(1).split(":", 1)[0] if match else "manual"
@@ -87,8 +95,11 @@ def _canonical_intake_url(url: str, *, source: str = "") -> str:
     # Existing portal normalizers already define the identity spelling (for
     # example LinkedIn's trailing slash).  Preserve it so manual intake and
     # scan/push share exactly the same row key.
-    known_host = parts.netloc.casefold()
-    if any(token in known_host for token in ("linkedin.com", "jobsdb.com", "ctgoodjobs.hk")):
+    if (
+        is_linkedin_url_host(normalized)
+        or is_jobsdb_url(normalized)
+        or is_ctgoodjobs_url(normalized)
+    ):
         return normalized
     query = [
         (key, value)
@@ -251,6 +262,85 @@ def _normalize_items(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], lis
             continue
         normalized.append({"url": canonical, **fields})
     return normalized, errors
+
+
+def _maybe_fetch_missing_jds(
+    fields: list[dict[str, Any]],
+    workspace: Path,
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, str]]]:
+    """Fetch missing full JD text through the gateway Chrome attach.
+
+    Only JobsDB hosts are fetched here. JobsDB URLs with missing JD fetch by
+    default; ``fetch_jd`` on a non-JobsDB URL is ignored for browser attach.
+    At most three URLs are fetched per call; extra JobsDB rows stay as
+    JD-incomplete provisional candidates instead of blocking the whole intake.
+    """
+
+    # JobsDB missing JD fetches by default. Non-JobsDB hosts are never opened
+    # here, even when fetch_jd is set (those portals need a different path).
+    # Navigation uses safe_jobsdb_job_url only; classification is_jobsdb_url is
+    # not enough to open Chrome.
+    import os
+
+    _ = bool(payload.get("fetch_jd") or payload.get("fetch"))
+    to_fetch: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for item in fields:
+        if _full_jd(item):
+            continue
+        url = str(item.get("url") or "")
+        safe = safe_jobsdb_job_url(url)
+        if safe:
+            copy = dict(item)
+            copy["url"] = safe
+            to_fetch.append(copy)
+        elif is_jobsdb_url(url):
+            errors.append({"url": url, "error": "jd_fetch_url_not_allowed"})
+    if not to_fetch:
+        return fields, {}, errors
+    if os.environ.get("PORTAL_JD_BROWSER", "1").strip() == "0":
+        return (
+            fields,
+            {"fetched": 0, "skipped": "portal_jd_browser_disabled", "input": len(to_fetch)},
+            errors,
+        )
+    from tools.workflow.adapters.push import _jobsdb_gateway_context
+    from tools.workflow.jd_fetch import MAX_FETCH_URLS, fetch_full_jds, lookup_fetched
+
+    # Cap the attach budget; remaining rows stay provisional without failing intake.
+    capped = to_fetch[:MAX_FETCH_URLS]
+    skipped = to_fetch[MAX_FETCH_URLS:]
+    try:
+        with _jobsdb_gateway_context(Path(workspace)):
+            fetched, meta = fetch_full_jds(Path(workspace), capped)
+    except Exception as exc:  # surface attach failures as structured errors
+        fetch_errors = [{"url": str(item.get("url") or ""), "error": str(exc)} for item in capped]
+        meta = {"fetched": 0, "error": type(exc).__name__, "error_detail": str(exc)}
+        if skipped:
+            meta["skipped_over_cap"] = len(skipped)
+        return fields, meta, errors + fetch_errors
+    updated: list[dict[str, Any]] = []
+    fetched_ok = 0
+    for item in fields:
+        copy = dict(item)
+        if not _full_jd(copy):
+            body = lookup_fetched(fetched, str(copy.get("url") or ""))
+            if body:
+                copy["jd_text"] = body
+                copy["jd_complete"] = True
+                fetched_ok += 1
+            elif any(
+                safe_jobsdb_job_url(str(copy.get("url") or "")) == str(candidate.get("url") or "")
+                for candidate in capped
+            ):
+                errors.append({"url": str(copy.get("url") or ""), "error": "jd_fetch_empty"})
+        updated.append(copy)
+    summary = dict(meta or {})
+    summary["fetched_ok"] = fetched_ok
+    if skipped:
+        summary["skipped_over_cap"] = len(skipped)
+    return updated, summary, errors
 
 
 def _full_jd(fields: dict[str, Any]) -> bool:
@@ -434,28 +524,85 @@ def handle(
             )
         if not fields:
             return result(status="blocked", rule_ids=INTAKE_RULE_IDS, blockers=["manual_intake_url_required"])
-        rows, provisional = _build_rows(fields, workspace)
+        # Dedup before any Chrome attach so duplicate JobsDB URLs never spend
+        # the fetch budget and never open the user's browser.
         local_rows = _authoritative_rows(workspace, title)
         existing = [*local_rows, *target_before.rows]
-        existing_keys = _identity_set(existing)
-        duplicate_rows: list[dict[str, Any]] = []
-        unique_rows: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for row in rows:
-            identity = row_identity(row)
-            if identity in existing_keys or identity in seen:
-                duplicate_rows.append(_public_row(row))
+        existing_by_identity = {
+            row_identity({"链接": item.get("链接") or item.get("url") or "", **item}): item
+            for item in existing
+        }
+        existing_keys = set(existing_by_identity)
+        # Also key by canonical URL for field-level filtering before row build.
+        existing_urls = {
+            str(item.get("链接") or item.get("url") or "").casefold()
+            for item in existing
+            if str(item.get("链接") or item.get("url") or "").strip()
+        }
+        duplicate_fields: list[dict[str, Any]] = []
+        unique_fields: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for item in fields:
+            url_key = str(item.get("url") or "").casefold()
+            identity = row_identity({"链接": item.get("url") or "", "职位": item.get("title") or "", "公司": item.get("employer") or ""})
+            if url_key in existing_urls or url_key in seen_urls or identity in existing_keys:
+                prior = existing_by_identity.get(identity) or {}
+                public = {
+                    "链接": item.get("url") or "",
+                    "职位": item.get("title") or "",
+                    "公司": item.get("employer") or "",
+                }
+                prior_id = str(prior.get("岗位编号") or prior.get("job_id") or "").strip()
+                if prior_id:
+                    public["existing_job_id"] = prior_id
+                duplicate_fields.append(public)
             else:
-                seen.add(identity)
-                unique_rows.append(row)
-        if not unique_rows:
+                seen_urls.add(url_key)
+                unique_fields.append(item)
+        if not unique_fields:
+            prior_ids = [
+                str(item.get("existing_job_id") or "").strip()
+                for item in duplicate_fields
+                if item.get("existing_job_id")
+            ]
+            prepare_hint = (
+                f"python3 -m tools.workflow materials prepare --job-id {prior_ids[0]} [--jd-file F] [--fetch]"
+                if prior_ids
+                else "python3 -m tools.workflow materials prepare --job-id <id> [--jd-file F] [--fetch]"
+            )
             return result(
                 status="blocked",
                 rule_ids=INTAKE_RULE_IDS,
                 blockers=["manual_intake_duplicates_only"],
-                duplicate_rows=duplicate_rows,
+                duplicate_rows=duplicate_fields,
                 proposed_rows=[],
+                next_action=prepare_hint,
             )
+        unique_fields, fetch_meta, fetch_errors = _maybe_fetch_missing_jds(
+            unique_fields, workspace, payload
+        )
+        # Block only when fetching gained nothing: a failed attach, or every
+        # attempted URL refused or empty.  A partial success keeps the fetched
+        # JDs; the rest stay JD-incomplete provisional rows and the errors ride
+        # along on the proposal as warnings.
+        attach_failed = bool(fetch_meta.get("error")) and fetch_meta.get("skipped") != "portal_jd_browser_disabled"
+        nothing_fetched = bool(fetch_errors) and not int(fetch_meta.get("fetched_ok") or 0)
+        if attach_failed or nothing_fetched:
+            return result(
+                status="blocked",
+                rule_ids=INTAKE_RULE_IDS,
+                blockers=["jd_fetch_failed"],
+                jd_fetch_errors=fetch_errors,
+                jd_fetch=fetch_meta,
+                next_action=(
+                    "retry_intake_after_chrome_attach_or_pass_jd_text; "
+                    "or materials prepare --job-id <id> --jd-file <full-jd.txt>"
+                ),
+                duplicate_rows=duplicate_fields,
+            )
+        rows, provisional = _build_rows(unique_fields, workspace)
+        duplicate_rows = duplicate_fields
+        unique_rows = rows
         for row in unique_rows:
             if row.get("评估状态") == "待审-JD不足" and not str(row.get("简历版本") or "").strip():
                 return result(
@@ -481,13 +628,12 @@ def handle(
                         "text": item["jd_text"],
                         "source": "manual_intake",
                     }
-                    for item in fields
-                    if _full_jd(item) and row_identity(_base_row(item, status="ready", depth="full")) in {
-                        row_identity(row) for row in unique_rows
-                    }
+                    for item in unique_fields
+                    if _full_jd(item)
                 ],
                 "duplicate_rows": duplicate_rows,
                 "provisional_needs_jd": provisional,
+                "jd_fetch": fetch_meta,
                 "backend": target.__class__.__name__,
                 "backend_resolution": fresh_backend_resolution(workspace, payload),
             },
@@ -504,6 +650,8 @@ def handle(
             duplicate_rows=duplicate_rows,
             row_count=len(unique_rows),
             provisional_needs_jd=provisional,
+            jd_fetch=fetch_meta,
+            jd_fetch_errors=fetch_errors,
             backend_resolution=proposal.get("backend_resolution") or {},
             message="仅生成提案；尚未分配永久编号，也未写入本地或 Google Sheet。",
         )
@@ -548,6 +696,24 @@ def handle(
     except IdCounterConflict as exc:
         _retire(confirmations, proposal, str(exc))
         return result(status="blocked", after_state="proposal_created", rule_ids=INTAKE_RULE_IDS, blockers=[str(exc)], proposal_id=proposal_id)
+    # A confirmed manual intake has the same materials boundary as /push.
+    # Create bound packages before projecting rows; otherwise /materials sees
+    # a durable tracker ID with no legal output directory.
+    ledger_hint = workspace / "02_Tracker" / "workflow" / "ledger" / f"{title}.json"
+    try:
+        package_paths = [
+            str(create_package_from_entry_row(workspace, row, tracker_path=ledger_hint))
+            for row in prepared
+        ]
+    except (OSError, ValueError, LookupError) as exc:
+        _retire(confirmations, proposal, f"entry_package_creation_failed:{exc}")
+        return result(
+            status="blocked",
+            after_state="proposal_created",
+            rule_ids=INTAKE_RULE_IDS,
+            blockers=["entry_package_creation_failed", str(exc)],
+            proposal_id=proposal_id,
+        )
     sync = SyncCoordinator(workspace).push_rows(
         title=title,
         incoming=prepared,
@@ -584,6 +750,7 @@ def handle(
         rule_ids=INTAKE_RULE_IDS,
         proposal_id=proposal_id,
         allocated_rows=[_public_row(row) | {"岗位编号": row.get("岗位编号") or ""} for row in prepared],
+        package_paths=package_paths,
         sync=sync,
         jd_cache_warnings=cache_warnings,
         message="已在确认边界分配永久编号并写入 tracker 投影。",

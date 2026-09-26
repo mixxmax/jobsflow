@@ -35,6 +35,7 @@ from tools.workflow.materials_vnext.store import (
     load_acceptance,
     load_audit_task,
     load_canonical,
+    load_claim_confirmations,
     load_dispositions,
     load_plan,
     load_run,
@@ -44,6 +45,7 @@ from tools.workflow.materials_vnext.store import (
     reset,
     save_acceptance,
     save_canonical,
+    save_content_preflight,
     save_dispositions,
     save_effective,
     save_plan,
@@ -454,6 +456,7 @@ def _plan_packet(
             "Return only a bounded transform JSON; do not write DOCX/PDF/email or assemble a full replacement CV/CL.",
             "CV and Cover Letter are parallel materials; each starts from its own lane baseline.",
             "Do not delete baseline blocks. Replace or reorder only a small number, and add concise blocks only when truthful and JD-relevant.",
+            "Copy the baseline's verbs and key phrasing as written; do not re-word them for style. Never upgrade an experience to led, owned, managed, advised, delivered or recovered unless that experience's baseline already says so.",
             "Use the one primary role supplied by the host. Slash order inside an acronym compound (ECM/IPO or IPO/ECM) is non-substantive; preserve the supplied source order and do not investigate another package. Never expose a missing qualification or recruiter as employer.",
         ],
         "transform_schema": {
@@ -809,6 +812,29 @@ class MaterialsEngine:
         # never involve new content.
         # User-ruling and acceptance stages operate on the recorded audit
         # state (see stage_rulings); they never involve new content.
+        if stage in {"confirm_claim", "confirm-claim"}:
+            from tools.workflow.materials_vnext.claims import stage_confirm_claim
+
+            confirmed = stage_confirm_claim(
+                package=package, job_id=job_id, bundle=bundle, run=run, payload=payload, dry_run=dry_run
+            )
+            if confirmed.get("status") != "succeeded":
+                return confirmed
+            # Re-run the content preflight on the saved transform at once, so
+            # the confirmation is one user step rather than confirm-then-redraft.
+            rerun = {
+                key: value
+                for key, value in payload.items()
+                if key not in {"stage", "block_id", "verbs", "model_transform", "transform", "canonical_draft"}
+            }
+            rerun["stage"] = "canonical"
+            # This body already runs under the package lock; say so, or the
+            # nested call would wait on the lock it is holding.
+            rerun["_package_lock_held"] = True
+            out = dict(self.handle(rerun, workspace=workspace, dry_run=dry_run))
+            out["claim_confirmation"] = confirmed
+            return out
+
         ruling = stage_rulings(
             package=package, run=run, payload=payload, workspace=Path(workspace), stage=stage
         )
@@ -1429,7 +1455,32 @@ class MaterialsEngine:
             submitted_fingerprint = text(raw_patch.get("audit_input_fingerprint"))
             if submitted_fingerprint and submitted_fingerprint != text(task.get("audit_input_fingerprint")):
                 return {"status": "blocked", "blockers": ["repair_audit_input_stale"], "engine": "materials-vnext"}
-            patch_errors = validate_transform(patch, current_canonical, current=current_canonical, repair=True)
+            content_baseline = bundle.get("baseline") if isinstance(bundle.get("baseline"), dict) else {}
+            if not content_baseline:
+                try:
+                    from tools.workflow.materials_baseline import load_content_baseline
+
+                    content_baseline = load_content_baseline(package)
+                except Exception:
+                    content_baseline = current_canonical
+            open_finding_ids = {
+                text(item.get("finding_id") or item.get("fingerprint") or item.get("block_id"))
+                for item in (load_audit_result(package).get("findings") or [])
+                if isinstance(item, dict)
+                and text(item.get("disposition")).casefold() not in {"user_accepted", "user_rejected", "not_actionable", "fixed"}
+            }
+            open_finding_ids = {item for item in open_finding_ids if item}
+            # Type allow-list binds to the frozen content baseline; current draft
+            # supplies before_text / after_id resolution only.
+            patch_errors = validate_transform(
+                patch,
+                content_baseline or current_canonical,
+                current=current_canonical,
+                repair=True,
+                # An empty set is meaningful: with no open finding, no append
+                # can cite one.  ``None`` is reserved for patch replay.
+                open_finding_ids=open_finding_ids,
+            )
             if patch_errors:
                 return {"status": "blocked", "blockers": ["repair_patch_invalid"], "errors": patch_errors, "engine": "materials-vnext"}
             from tools.workflow.materials_vnext.transform import stamp_derived_change_classes
@@ -1606,12 +1657,32 @@ class MaterialsEngine:
             lane_templates = _template_paths(package, Path(workspace))
         except (ImportError, OSError, ValueError):
             lane_templates = None
+        from tools.workflow.materials_vnext.claims import (
+            bundle_jd_sha256,
+            claim_confirmation_options,
+            verb_escalations,
+        )
+
         preflight = run_preflight(
             bundle=bundle,
             canonical=canonical,
             effective_transform=effective,
             plan=load_plan(package) or {},
             templates=lane_templates,
+            claim_confirmations=load_claim_confirmations(package, jd_sha256=bundle_jd_sha256(bundle)),
+        )
+        escalations = verb_escalations(preflight)
+        # A compact record of what this preflight blocked, so a per-job claim
+        # confirmation can only answer a verb the current generation raised.
+        save_content_preflight(
+            package,
+            {
+                "generation_id": run.get("generation_id"),
+                "canonical_sha256": run.get("canonical_sha256"),
+                "jd_sha256": bundle_jd_sha256(bundle),
+                "status": preflight.get("status"),
+                "verb_escalations": escalations,
+            },
         )
         _metric(
             package,
@@ -1624,7 +1695,13 @@ class MaterialsEngine:
         if preflight.get("status") != "passed":
             run.update({"phase": "blocked", "last_error": "content_preflight_failed"})
             save_run(package, run)
-            return {"status": "blocked", "after_state": "blocked", "blockers": [item.get("code") for item in preflight.get("blocking") or []], "preflight": preflight, "engine": "materials-vnext"}
+            blocked = {"status": "blocked", "after_state": "blocked", "blockers": [item.get("code") for item in preflight.get("blocking") or []], "preflight": preflight, "engine": "materials-vnext"}
+            if escalations:
+                # Layer 1 is the default: go back to the baseline wording.  The
+                # per-job confirmation is the user's alternative, not the model's.
+                blocked["next_action"] = "repair_to_baseline_wording_or_user_confirms_claim_for_this_job"
+                blocked["claim_confirmation_options"] = claim_confirmation_options(job_id, escalations)
+            return blocked
         run.update({"phase": "content_audit_pending", "producer_context_id": text(payload.get("producer_context_id") or run.get("producer_context_id"))})
         save_run(package, run)
 

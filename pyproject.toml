@@ -31,6 +31,8 @@ addopts = "-ra -m 'not legacy and not retired_legacy'"
 markers = [
   "legacy: frozen tests for the retired materials adapter; run explicitly with -m legacy",
   "retired_legacy: historical tests for the removed materials contract; excluded from release validation",
+  "allows_chrome_launch_method: rebind the real Chrome settings launcher while subprocess.Popen stays stubbed",
+  "allow_live_jd_fetch: opt out of the suite-wide jd_fetch stub",
 ]
 
 [tool.coverage.run]

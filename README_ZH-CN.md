@@ -34,52 +34,18 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 
 ---
 
-## 🆕 最新更新 · 2026-09-20 · 可选接入 TypeSafe / Jev 咨询式判断
+## 🆕 最新更新 · 2026-09-26 · 大批稳定性修复
 
-JobsFlow 现在可以接入 **TypeSafe（System One / Jev）** 对当前岗位的材料行做语义判断：这行是否真的支撑该 JD 要求、这两行是否重复、删掉这行会损失多少证据，输出一份排序好的 advisory 报告。
+这一轮把一个岗位从检索到投递材料的全流程完整走了一遍，逐一修掉沿途暴露的 bug，并经过独立质检与全量测试（964 项全部通过）。主要变化：
 
-它的定位是一条**只读旁路**：不参与扫描、入表、材料、渲染、格式门或 apply 的任何判定，永远不是门禁。
+- **材料链打通**：入表后的岗位可以直接做材料。新增 `materials prepare`，自动补齐 JD 全文、匹配评估和申请预检；`materials produce` 一次授权就能走完生成全链，不必每一步都人工接力。
+- **不再悄悄漏掉岗位**：初评分偏低的岗位保留为「待审-初评偏低」，可在 `/push` 点名深评；「先给我看再深挖」有了正式开关 `intent review-first`；同一岗位换编号重发时会给出提示。
+- **自己找到的岗位也能补全 JD**：`/intake` 可经网关抓取 JobsDB 全文；只会打开 https 的真实 JobsDB 职位网址，并按职位编号重建，仿冒网址一律拒绝。
+- **Chrome 授权不再来不及点**：附接等待改为默认 30 秒、可配置，`doctor` 会显示实际值。
+- **简历用词更省心**：优先照抄基础版用词；职能范围内的合理换词直接放行，只有夸大用词才需要你确认，且确认只对本岗位有效（`materials confirm-claim`）。
+- **其他**：改稿和重跑时多处静默失败改为明确提示；新增只读对账 `reconcile packages`；测试不会再触碰你的真实浏览器。
 
-**接入只有一个事实：给了 `TYPESAFE_API_KEY` 就自动启用，不给就完全不启用。** 不需要改配置、不需要改代码、不需要设 flag，也不需要为了 JobsFlow 和 TypeSafe 的衔接做任何适配——适配已经在产品线内完成了。
-
-### 安装（两步，一次性）
-
-```bash
-bash tools/setup_env.sh --advisory     # 只装这一个附加项，走哈希锁，不污染运行依赖
-export TYPESAFE_API_KEY="ts-你的key"   # 你自己的 key
-```
-
-想让 key 长期生效，写进 `~/.zshenv`（所有 zsh 都读它，比 `~/.zshrc` 可靠）：
-
-```bash
-echo 'export TYPESAFE_API_KEY="ts-你的key"' >> ~/.zshenv
-```
-
-**key 只要放在你自己机器的环境变量里。** 产品只在发起调用的那一刻从 `os.environ` 读它，不写入任何文件、不进 git、不进 CI。不要把它贴给任何对话方，也不要提交进仓库。
-
-### 用起来
-
-先确认开没开（只读，不花 API 费用）：
-
-```bash
-python3 -m tools.workflow materials status --job-id <id>
-```
-
-看返回里的 `result.typesafe`：`enabled: true` 就是通了；没通会告诉你差哪一半（`key_present` / `sdk_present`）和还差什么命令。
-
-跑一次：
-
-```bash
-python3 -m tools.workflow materials typesafe --job-id <id>
-```
-
-报告写在该岗位包的 `materials_vnext/typesafe_advisory.json`。不想花费就用 `--dry-run`，它连请求都不发。
-
-### 不装会怎样
-
-完全不受影响。扫描、入表、材料、渲染、格式门、apply 全部照常；`materials typesafe` 照样返回 `succeeded`，只是不写文件、不发请求。没有 key 的机器上产品行为与有 key 的机器完全一致——这一条有用例守着。
-
-细节见 [`docs/typesafe_advisory_judgments.md`](docs/typesafe_advisory_judgments.md)。
+完整修复记录见 [技术手册](docs/JobsFlow_岗位全流程缺陷修复技术手册_2026-09-25.md) 与 [返工清单](docs/JobsFlow_岗位全流程缺陷修复_返工清单_2026-09-25.md)。上一版更新（可选接入 TypeSafe / Jev 咨询式判断）已并入下方「快速开始」。
 
 ---
 ## 🎯 解决什么问题？
@@ -243,6 +209,53 @@ python3 setup.py --doctor
 - 选 **先检索** → 直接扫新职位
 
 > 没有 AI 助手？终端运行 `python3 setup.py --resume-folder ~/Documents/my-cv` 也可以。
+
+### 可选：TypeSafe 咨询式判断（给了 API key 就自动启用）
+
+JobsFlow 现在可以接入 **TypeSafe（System One / Jev）** 对当前岗位的材料行做语义判断：这行是否真的支撑该 JD 要求、这两行是否重复、删掉这行会损失多少证据，输出一份排序好的 advisory 报告。
+
+它的定位是一条**只读旁路**：不参与扫描、入表、材料、渲染、格式门或 apply 的任何判定，永远不是门禁。
+
+**接入只有一个事实：给了 `TYPESAFE_API_KEY` 就自动启用，不给就完全不启用。** 不需要改配置、不需要改代码、不需要设 flag，也不需要为了 JobsFlow 和 TypeSafe 的衔接做任何适配——适配已经在产品线内完成了。
+
+#### 安装（两步，一次性）
+
+```bash
+bash tools/setup_env.sh --advisory     # 只装这一个附加项，走哈希锁，不污染运行依赖
+export TYPESAFE_API_KEY="ts-你的key"   # 你自己的 key
+```
+
+想让 key 长期生效，写进 `~/.zshenv`（所有 zsh 都读它，比 `~/.zshrc` 可靠）：
+
+```bash
+echo 'export TYPESAFE_API_KEY="ts-你的key"' >> ~/.zshenv
+```
+
+**key 只要放在你自己机器的环境变量里。** 产品只在发起调用的那一刻从 `os.environ` 读它，不写入任何文件、不进 git、不进 CI。不要把它贴给任何对话方，也不要提交进仓库。
+
+#### 用起来
+
+先确认开没开（只读，不花 API 费用）：
+
+```bash
+python3 -m tools.workflow materials status --job-id <id>
+```
+
+看返回里的 `result.typesafe`：`enabled: true` 就是通了；没通会告诉你差哪一半（`key_present` / `sdk_present`）和还差什么命令。
+
+跑一次：
+
+```bash
+python3 -m tools.workflow materials typesafe --job-id <id>
+```
+
+报告写在该岗位包的 `materials_vnext/typesafe_advisory.json`。不想花费就用 `--dry-run`，它连请求都不发。
+
+#### 不装会怎样
+
+完全不受影响。扫描、入表、材料、渲染、格式门、apply 全部照常；`materials typesafe` 照样返回 `succeeded`，只是不写文件、不发请求。没有 key 的机器上产品行为与有 key 的机器完全一致——这一条有用例守着。
+
+细节见 [`docs/typesafe_advisory_judgments.md`](docs/typesafe_advisory_judgments.md)。
 
 ### 基础版是材料链的质量地基
 

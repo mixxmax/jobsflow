@@ -432,7 +432,9 @@ def _latest_assessment(
     company: str = "",
     source: str = "",
 ) -> dict[str, Any] | None:
-    folder = root / "02_Tracker" / "job_assessments"
+    from tools.fresh_24h.job_assessment import _workspace_root
+
+    folder = _workspace_root(Path(root)) / "02_Tracker" / "job_assessments"
     if not folder.is_dir():
         return None
     expected_key, _ = assessment_identity(

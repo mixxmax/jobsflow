@@ -31,12 +31,19 @@ SCOPE_TERMS = {
     "asset", "procedure", "matter", "mandate",
 }
 
-# High-risk action verbs: upgrading supported/reviewed work into led/owned/
-# recovered/drafted claims is the most damaging fabrication class.  Matching
-# is stem-based so inflections (leads/leading, recovered, delivers) are caught.
-HIGH_RISK_VERB_STEMS = {
-    "lead", "led", "own", "recover", "deliver", "draft", "manage", "advise",
-}
+# High-risk action verbs come in two tiers.  Matching is stem-based so
+# inflections (leads/leading, recovered, drafting) count as the same verb.
+#
+# Inflation verbs claim leadership, ownership, outcomes or advisory authority.
+# Upgrading supported/reviewed work into one of these is the most damaging
+# fabrication class: without baseline support it blocks until the user either
+# returns to the baseline wording or confirms the claim for this one job.
+INFLATION_VERB_STEMS = {"lead", "led", "own", "recover", "deliver", "manage", "advise"}
+# Function verbs describe ordinary work inside the candidate's role.  A drift
+# from the baseline wording is tolerated when the verb is plausible for the
+# role: it already appears somewhere in the lane baseline, or in this job's JD.
+FUNCTION_VERB_STEMS = {"draft"}
+HIGH_RISK_VERB_STEMS = INFLATION_VERB_STEMS | FUNCTION_VERB_STEMS
 _POSSESSIVES = {"my", "our", "your", "their", "his", "her", "its"}
 
 _LANGUAGES = ("english", "cantonese", "mandarin", "putonghua", "chinese")
@@ -133,18 +140,51 @@ def _singular(word: str) -> str:
     return word[:-1] if word.endswith("s") and len(word) > 3 else word
 
 
-def _finding(code: str, material: str, block_id: str, evidence: str, *, severity: str = "P0") -> dict[str, Any]:
-    return {
+_FUNCTION_WORDS = {
+    "a", "an", "and", "as", "at", "for", "in", "my", "of", "on", "or", "the", "to", "with",
+}
+
+
+def _finding(
+    code: str,
+    material: str,
+    block_id: str,
+    evidence: str,
+    *,
+    severity: str = "P0",
+    **extra: Any,
+) -> dict[str, Any]:
+    found = {
         "code": code,
         "severity": severity,
         "material": material,
         "block_id": block_id,
         "evidence": str(evidence)[:300],
     }
+    for key, value in extra.items():
+        if value is not None:
+            found[key] = value
+    return found
 
 
 def high_risk_verbs(value: Any) -> set[str]:
-    """High-risk evidence verbs, skipping possessive 'own' false positives.
+    """High-risk evidence verbs as written, skipping possessive 'own'."""
+
+    return {word for word, _stem in _high_risk_matches(value)}
+
+
+def high_risk_verb_stems(value: Any) -> set[str]:
+    """High-risk evidence verbs reduced to their stem (``led`` → ``lead``).
+
+    Comparing stems, not surface words, keeps ``drafted`` in the baseline and
+    ``drafting`` in the draft from reading as a new verb.
+    """
+
+    return {"lead" if stem == "led" else stem for _word, stem in _high_risk_matches(value)}
+
+
+def _high_risk_matches(value: Any) -> list[tuple[str, str]]:
+    """(word, stem) pairs for high-risk verbs.
 
     Only participial/inflection suffixes are stripped, so the noun
     ``recovery`` is never treated as the verb ``recover`` while every
@@ -153,7 +193,7 @@ def high_risk_verbs(value: Any) -> set[str]:
     """
 
     words = re.findall(r"[a-z]+", str(value or "").casefold())
-    found: set[str] = set()
+    found: list[tuple[str, str]] = []
     for index, word in enumerate(words):
         candidates = {word}
         if word.endswith("ed"):
@@ -167,7 +207,7 @@ def high_risk_verbs(value: Any) -> set[str]:
             continue
         if stem == "own" and index > 0 and words[index - 1] in _POSSESSIVES:
             continue
-        found.add(word)
+        found.append((word, stem))
     return found
 
 
@@ -240,23 +280,41 @@ def sentence_scope_terms(value: str) -> set[str]:
     return {_singular(word) for word in re.findall(r"[a-z]+", str(value or "").casefold())} & SCOPE_TERMS
 
 
+def claim_scope(material: str, block_id: str, experience_id: str | None) -> str:
+    """Key a per-job claim confirmation: one experience, else one block."""
+
+    return f"experience:{experience_id}" if experience_id else f"block:{material}:{block_id}"
+
+
 def run_semantic_lint(
     *,
     bundle: dict[str, Any],
     canonical: dict[str, Any],
     plan: dict[str, Any] | None = None,
+    claim_confirmations: dict[str, set[str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return deterministic semantic findings; wording similarity is not a check."""
+    """Return deterministic semantic findings; wording similarity is not a check.
+
+    ``claim_confirmations`` maps a :func:`claim_scope` key to verb stems the
+    user confirmed for this job only.  It is loaded from the job package, never
+    from the lane baseline or the shared fact file.
+    """
 
     findings: list[dict[str, Any]] = []
+    confirmed_claims = claim_confirmations or {}
     employer_map = _experience_employer_map(_baseline_blocks(bundle, "cv"))
     allowed_numbers = {material: _allowed_numbers(bundle, material) for material in MATERIALS}
-    all_baseline_verbs = {
-        material: high_risk_verbs(
+    all_baseline_stems = {
+        material: high_risk_verb_stems(
             "\n".join(text(block.get("text")) for block in _baseline_blocks(bundle, material))
         )
         for material in MATERIALS
     }
+    # "Plausible for the role": the verb appears anywhere in this lane's
+    # baseline (either material) or in this job's JD.
+    role_function_stems = (
+        set().union(*all_baseline_stems.values()) | high_risk_verb_stems(_jd_text(bundle))
+    ) & FUNCTION_VERB_STEMS
 
     for material in MATERIALS:
         baseline_by_id = {
@@ -326,18 +384,44 @@ def run_semantic_lint(
             # only against their own experience; summary/core lines and the
             # Cover Letter may reference any evidence the candidate really has.
             if material == "cv" and experience_id:
-                experience_verbs = high_risk_verbs("\n".join(
+                baseline_stems = high_risk_verb_stems("\n".join(
                     text(item.get("text"))
                     for item in _baseline_blocks(bundle, material)
                     if text(item.get("experience_id")) == experience_id
                 ))
             else:
-                experience_verbs = all_baseline_verbs[material]
-            escalated = high_risk_verbs(after_text) - experience_verbs
+                baseline_stems = all_baseline_stems[material]
+            new_stems = high_risk_verb_stems(after_text) - baseline_stems
+            # Layer 2: a function verb that is plausible for the role is only
+            # a wording drift.  It is recorded, never blocks and never starts a
+            # repair round.
+            drift = new_stems & role_function_stems
+            if drift:
+                findings.append(_finding(
+                    "verb_wording_drift", material, block_id,
+                    f"wording differs from the baseline but stays within the role: {sorted(drift)}",
+                    severity="P2",
+                    experience_id=experience_id or None,
+                    target_id=block_id,
+                ))
+            scope = claim_scope(material, block_id, experience_id)
+            escalated = (new_stems - drift) - set(confirmed_claims.get(scope) or ())
             if escalated:
                 findings.append(_finding(
                     "verb_escalation", material, block_id,
                     f"evidence verbs introduced without baseline basis: {sorted(escalated)}",
+                    escalated_verbs=sorted(escalated),
+                    claim_scope=scope,
+                    jd_anchored=bool(escalated & high_risk_verb_stems(_jd_text(bundle))),
+                    experience_id=experience_id or None,
+                    target_id=block_id,
+                    required_action=(
+                        "Prefer the baseline wording for this experience. If the user really did "
+                        "this work, the user may confirm it for this job only with "
+                        "`materials confirm-claim --job-id <id> --block-id "
+                        f"{block_id}`; the confirmation is kept in this job package and "
+                        "is never copied to the lane baseline or the shared fact file."
+                    ),
                 ))
             # 5. Employer/experience attribution inside the CV.
             if material == "cv" and experience_id:
@@ -423,6 +507,40 @@ def _number_object_drift(before: str, after: str, token: str) -> bool:
     return not (before_heads & after_heads)
 
 
+def _adjacent_language_levels(words: list[str]) -> dict[str, set[str]]:
+    """Level words count only when they sit next to the language name.
+
+    ``business teams … English`` does not make ``business`` a language level.
+    ``Business English`` and ``fluent in English`` do.
+    """
+
+    found: dict[str, set[str]] = {}
+    for index, word in enumerate(words):
+        if word not in _LANGUAGES:
+            continue
+        for pos, other in enumerate(words):
+            if other not in _LANGUAGE_LEVELS:
+                continue
+            distance = abs(pos - index)
+            if distance == 0 or distance > 2:
+                continue
+            if distance == 2:
+                middle = words[min(pos, index) + 1]
+                if middle not in _FUNCTION_WORDS and middle not in _LANGUAGES and middle not in _LANGUAGE_LEVELS:
+                    continue
+            found.setdefault(word, set()).add(other)
+    return found
+
+
+def _jd_text(bundle: dict[str, Any]) -> str:
+    raw = bundle.get("jd")
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        return str(raw.get("text") or raw.get("full") or raw.get("body") or "")
+    return str(bundle.get("jd_text") or "")
+
+
 def _language_level_findings(canonical: dict[str, Any]) -> list[dict[str, Any]]:
     # Track which material side was actually touched: a level inconsistency
     # that already exists inside untouched baseline text belongs to the lane
@@ -432,14 +550,11 @@ def _language_level_findings(canonical: dict[str, Any]) -> list[dict[str, Any]]:
     for material in MATERIALS:
         for block in _blocks(canonical, material):
             words = re.findall(r"[a-z]+", text(block.get("text")).casefold())
-            for language in _LANGUAGES:
-                if language not in words:
-                    continue
-                for level in _LANGUAGE_LEVELS:
-                    if level in words:
-                        observed.setdefault(language, {}).setdefault(material, set()).add(level)
-                        if bool(block.get("customized")):
-                            customized_sides.add(language)
+            adjacent = _adjacent_language_levels(words)
+            if bool(block.get("customized")):
+                customized_sides.update(adjacent)
+            for language, levels in adjacent.items():
+                observed.setdefault(language, {}).setdefault(material, set()).update(levels)
     findings: list[dict[str, Any]] = []
     for language, per_material in sorted(observed.items()):
         if language not in customized_sides:

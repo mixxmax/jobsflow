@@ -324,6 +324,7 @@ def validate_transform(
     *,
     current: dict[str, Any] | None = None,
     repair: bool = False,
+    open_finding_ids: set[str] | frozenset[str] | None = None,
 ) -> list[str]:
     if not isinstance(transform, dict):
         return ["transform_not_object"]
@@ -336,6 +337,7 @@ def validate_transform(
     changed: dict[str, int] = {material: 0 for material in MATERIALS}
     additions = 0
     added_chars = 0
+    allowed_findings = {str(item) for item in (open_finding_ids or set()) if str(item)}
     for index, operation in enumerate(operations):
         material = text(operation.get("material")).casefold()
         action = text(operation.get("action")).casefold()
@@ -361,11 +363,17 @@ def validate_transform(
                 # Reachable only when target resolved (see the missing-target
                 # guard above); the fallback keeps this None-safe regardless.
                 before = text((target or {}).get("text"))
+            if repair and not before and target is not None:
+                before = text(target.get("text"))
+                operation["before_text"] = before
+            expected = text((target or {}).get("text"))
             if not before or not after:
                 errors.append(f"operation_replace_text_missing:{index}")
-            elif before != text((target or {}).get("text")):
+            elif repair and _norm_ws(before) != _norm_ws(expected):
                 errors.append(f"operation_before_text_mismatch:{index}:{target_id}")
-            elif after == before:
+            elif not repair and before != expected:
+                errors.append(f"operation_before_text_mismatch:{index}:{target_id}")
+            elif after == before or (repair and _norm_ws(after) == _norm_ws(before)):
                 errors.append(f"operation_noop:{index}:{target_id}")
             else:
                 derived = _apply_change_class(operation, before=before, after=after, errors=errors, index=index)
@@ -388,8 +396,34 @@ def validate_transform(
             elif new_id in lookup:
                 errors.append(f"operation_append_duplicate_id:{index}:{new_id}")
             else:
-                if text(block.get("type") or "bullet") not in BLOCK_TYPES:
+                new_type = text(block.get("type") or "bullet")
+                if new_type not in BLOCK_TYPES:
                     errors.append(f"operation_append_type_invalid:{index}")
+                if repair:
+                    finding_id = text(operation.get("finding_id") or block.get("finding_id"))
+                    if not finding_id:
+                        errors.append(f"repair_append_finding_required:{index}")
+                    elif open_finding_ids is not None and finding_id not in allowed_findings:
+                        errors.append(f"repair_append_finding_unknown:{index}:{finding_id}")
+                    anchor = lookup.get(after_id)
+                    if anchor is not None:
+                        section = text(anchor.get("section"))
+                        block_section = text(block.get("section") or section)
+                        if section and block_section != section:
+                            errors.append(f"repair_append_section_mismatch:{index}")
+                        # Type allow-list always comes from the frozen content
+                        # baseline, never from the evolving draft state.
+                        allowed_types = {
+                            text(item.get("type") or "bullet")
+                            for item in _blocks(baseline, material)
+                            if text(item.get("section")) == section
+                        }
+                        if section and new_type not in allowed_types:
+                            errors.append(f"repair_append_type_not_in_baseline:{index}")
+                        if section and not text(block.get("section")):
+                            block["section"] = section
+                        if section and isinstance(operation.get("block"), dict):
+                            operation["block"]["section"] = text(operation["block"].get("section") or section)
                 _apply_change_class(
                     operation,
                     before="",
@@ -419,12 +453,13 @@ def validate_transform(
             errors.append("transform_too_many_added_blocks")
         if baseline_chars and added_chars / baseline_chars > MAX_ADDED_CHARS_RATIO:
             errors.append("transform_added_text_too_large")
-    else:
-        # A repair is even narrower: it must name one existing target per
-        # operation and cannot introduce a new section or delete content.
-        if additions:
-            errors.append("repair_cannot_add_unbounded_block")
+    elif additions > 2:
+        errors.append("repair_too_many_appended_blocks")
     return sorted(set(errors))
+
+
+def _norm_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def stamp_derived_change_classes(transform: dict[str, Any]) -> None:
@@ -500,7 +535,11 @@ def _apply_operations(base: dict[str, Any], transform: dict[str, Any], *, repair
         elif action == "append_after":
             raw_block = operation.get("block")
             block: dict[str, Any] = raw_block if isinstance(raw_block, dict) else operation
-            section = text(block.get("section")) or ("summary" if material == "cv" else "body")
+            after_id = text(operation.get("after_id") or operation.get("target_id"))
+            anchor = lookup.get(after_id) or {}
+            section = text(block.get("section")) or text(anchor.get("section")) or (
+                "summary" if material == "cv" else "body"
+            )
             block_type = text(block.get("type") or "bullet")
             if material == "cv" and section == "core":
                 source_style, presentation_role = "Compact Line", "core_line"
@@ -515,7 +554,7 @@ def _apply_operations(base: dict[str, Any], transform: dict[str, Any], *, repair
                 "type": text(block.get("type") or "bullet"),
                 "text": text(block.get("text") or block.get("after_text")),
                 "section": section,
-                "experience_id": text(block.get("experience_id")),
+                "experience_id": text(block.get("experience_id") or anchor.get("experience_id")),
                 "priority": block.get("priority", 999),
                 "jd_anchor_ids": list(block.get("jd_anchor_ids") or operation.get("jd_anchor_ids") or []),
                 "host_managed": False,
@@ -527,7 +566,6 @@ def _apply_operations(base: dict[str, Any], transform: dict[str, Any], *, repair
                 "source_style": source_style,
                 "presentation_role": presentation_role,
             }
-            after_id = text(operation.get("after_id") or operation.get("target_id"))
             position = next(index for index, item in enumerate(blocks) if text(item.get("id")) == after_id)
             blocks.insert(position + 1, new_block)
         elif action == "reorder":
@@ -560,7 +598,8 @@ def compile_canonical(
     state = _apply_operations(baseline, original_transform)
     patch_rows: list[dict[str, Any]] = []
     for patch in patches or []:
-        errors = validate_transform(patch, state, current=state, repair=True)
+        # Type allow-list and section rules bind to the frozen content baseline.
+        errors = validate_transform(patch, baseline, current=state, repair=True)
         if errors:
             raise ValueError("invalid_repair_patch: " + ", ".join(errors))
         state = _apply_operations(state, patch, repair=True)

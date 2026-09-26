@@ -10,6 +10,7 @@ records a synthetic pass.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextvars
 import json
 import os
 from pathlib import Path
@@ -158,8 +159,13 @@ def _prepare_manual_audit_batch(workspace: Path, job_ids: list[str], batch_id: s
     }
 
 
-def _one(workspace: Path, job_id: str, action: str, engine: str) -> dict[str, Any]:
+def _one(workspace: Path, job_id: str, action: str, engine: str, *, dry_run: bool = False) -> dict[str, Any]:
+    from tools.workflow.materials_produce import dispatch_with_relay
+
     started = perf_counter()
+    base = {"job_id": job_id, "materials_engine": "vnext"}
+    if dry_run:
+        base["dry_run"] = True
     if action == "status":
         package = PackageContextLoader(workspace).load(job_id).package
         if package:
@@ -177,22 +183,60 @@ def _one(workspace: Path, job_id: str, action: str, engine: str) -> dict[str, An
         else:
             out = {"status": "blocked", "blockers": ["package_missing"]}
     elif action == "render":
-        out = dispatch("materials", workspace=workspace, payload={"job_id": job_id, "stage": "render", "materials_engine": "vnext"})
-    elif action == "prepare":
-        # Preparation freezes the current-job bundle and creates the model
-        # planning/tailoring handoff.  It does not submit a plan or write a
-        # canonical document, so independent jobs can do this concurrently.
-        out = dispatch("materials", workspace=workspace, payload={"job_id": job_id, "stage": "plan", "materials_engine": "vnext"})
-    elif action == "audit":
-        out = dispatch("materials", workspace=workspace, payload={"job_id": job_id, "stage": "audit", "materials_engine": "vnext"})
-    elif action == "pdf":
-        out = dispatch(
+        out = dispatch_with_relay(
             "materials",
+            {**base, "stage": "render"},
             workspace=workspace,
-            payload={"job_id": job_id, "stage": "pdf", "engine": engine, "parallel": True, "materials_engine": "vnext"},
+            relay_allowed=True,
+        )
+    elif action == "prepare":
+        # Fill JD, assessment and preflight, then freeze the planning bundle.
+        prepared = dispatch_with_relay(
+            "materials",
+            {**base, "stage": "prepare"},
+            workspace=workspace,
+            relay_allowed=True,
+        )
+        stopped = (
+            prepared.get("status") in {"blocked", "failed", "planned", "needs_user"}
+            or prepared.get("requires_capability_ticket")
+        )
+        if stopped or "capability_ticket_required" in (prepared.get("blockers") or []):
+            out = prepared
+        else:
+            planned = dispatch_with_relay(
+                "materials",
+                {**base, "stage": "plan"},
+                workspace=workspace,
+                relay_allowed=True,
+            )
+            out = dict(planned)
+            out["prepare"] = {
+                "status": prepared.get("status"),
+                "noop": prepared.get("noop"),
+                "blockers": list(prepared.get("blockers") or []),
+            }
+    elif action == "audit":
+        out = dispatch_with_relay(
+            "materials",
+            {**base, "stage": "audit"},
+            workspace=workspace,
+            relay_allowed=True,
+        )
+    elif action == "pdf":
+        out = dispatch_with_relay(
+            "materials",
+            {**base, "stage": "pdf", "engine": engine, "parallel": True},
+            workspace=workspace,
+            relay_allowed=True,
         )
     elif action == "format":
-        out = dispatch("format", workspace=workspace, payload={"job_id": job_id, "materials_engine": "vnext"})
+        out = dispatch_with_relay(
+            "format",
+            {**base},
+            workspace=workspace,
+            relay_allowed=True,
+        )
     else:  # pragma: no cover - caller validates
         out = {"status": "blocked", "blockers": ["unknown_batch_action"]}
     return {"job_id": job_id, "duration_ms": int((perf_counter() - started) * 1000), **out}
@@ -205,28 +249,64 @@ def run_batch(
     action: str,
     max_workers: int = 3,
     engine: str = "libreoffice",
+    dry_run: bool = False,
 ) -> dict[str, Any]:
+    from tools.workflow.materials_produce import _HostTicketRelay
+
     ids = list(dict.fromkeys(str(item).strip() for item in job_ids if str(item).strip()))
     if not ids:
         return {"status": "blocked", "blockers": ["job_ids_required"], "results": []}
+    workers = max(1, min(int(max_workers or 3), 3, len(ids)))
+    if dry_run:
+        # A dry run describes the batch only: no context file, no manual
+        # audit queue, and no package loads (which can reconcile metadata).
+        return {
+            "status": "planned",
+            "dry_run": True,
+            "action": action,
+            "job_ids": ids,
+            "max_workers": workers,
+            "parallel": workers > 1,
+            "results": [],
+            "side_effects": [],
+        }
     batch_id = f"batch-{uuid4().hex[:12]}"
     context = _batch_context_summary(Path(workspace), ids)
     context_path = _write_batch_context(Path(workspace), batch_id, context)
     if action == "audit" and not _audit_provider_available():
         return _prepare_manual_audit_batch(Path(workspace), ids, batch_id, context_path)
-    workers = max(1, min(int(max_workers or 3), 3, len(ids)))
     results: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="jobsflow-materials") as pool:
-        futures = {pool.submit(_one, Path(workspace), job_id, action, engine): job_id for job_id in ids}
-        for future in as_completed(futures):
-            try:
-                value = future.result()
-                value.setdefault("batch_context_id", batch_id)
-                results.append(value)
-            except Exception as exc:  # one package must not cancel the batch
-                results.append({"job_id": futures[future], "status": "failed", "blockers": ["batch_worker_error"], "error": str(exc), "batch_context_id": batch_id})
+    with _HostTicketRelay():
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="jobsflow-materials") as pool:
+            # Each worker runs in a copy of this context so the relay scope,
+            # which is a context variable rather than process state, reaches it.
+            futures = {
+                pool.submit(
+                    contextvars.copy_context().run,
+                    _one,
+                    Path(workspace),
+                    job_id,
+                    action,
+                    engine,
+                    dry_run=dry_run,
+                ): job_id
+                for job_id in ids
+            }
+            for future in as_completed(futures):
+                try:
+                    value = future.result()
+                    value.setdefault("batch_context_id", batch_id)
+                    results.append(value)
+                except Exception as exc:  # one package must not cancel the batch
+                    results.append({"job_id": futures[future], "status": "failed", "blockers": ["batch_worker_error"], "error": str(exc), "batch_context_id": batch_id})
     results.sort(key=lambda item: ids.index(str(item.get("job_id") or "")))
-    failed = [item for item in results if item.get("status") in {"blocked", "failed"}]
+    failed = [
+        item
+        for item in results
+        if item.get("status") in {"blocked", "failed", "planned", "needs_user"}
+        or item.get("requires_capability_ticket")
+        or "capability_ticket_required" in (item.get("blockers") or [])
+    ]
     return {
         "status": "succeeded" if not failed else "partial",
         "action": action,

@@ -29,6 +29,8 @@ from tools.workflow.materials_vnext.store import (
 
 
 RESOLUTION_STATUSES = {"open", "fixed", "user_accepted", "user_rejected", "not_actionable", "reopened"}
+
+
 USER_RULING_STATUSES = {"user_accepted", "user_rejected", "not_actionable"}
 
 

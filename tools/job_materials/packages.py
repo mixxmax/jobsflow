@@ -50,53 +50,47 @@ def _tracker_files(root: Path) -> list[Path]:
     return sorted(paths, key=key)
 
 
-def _registry_row(root: Path, job_id: str) -> dict[str, str] | None:
-    """Fallback lookup in the push-written entered_ids registry.
+def _ledger_row(root: Path, job_id: str) -> tuple[dict[str, str], Path] | None:
+    """Return the ledger row for a durable job id.
 
-    Google Sheets is the authoritative source for IDs allocated on push; the
-    scored CSVs only carry pre-push prefix IDs (e.g. TMP).  This registry lets
-    material tooling resolve a pushed row even before the next scan writes it
-    locally.
+    The workflow ledger is the authority. ``entered_ids.json`` is not read.
     """
+
     wanted = str(job_id or "").strip()
     if not wanted:
         return None
-    reg = root / "02_Tracker" / "entered_ids.json"
-    try:
-        raw = json.loads(reg.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    folder = Path(root) / "02_Tracker" / "workflow" / "ledger"
+    if not folder.is_dir():
         return None
-    entries = raw.get("entries") if isinstance(raw, dict) else None
-    if not isinstance(entries, dict):
-        return None
-    entry = entries.get(wanted)
-    if not isinstance(entry, dict):
-        return None
-    return {
-        "岗位编号": str(entry.get("id") or wanted),
-        "职位": str(entry.get("title") or ""),
-        "公司": str(entry.get("company") or ""),
-        "链接": str(entry.get("url") or ""),
-        "简历版本": str(entry.get("lane") or "").strip()[:1].upper(),
-        "批次": str(entry.get("batch") or ""),
-        "入表时间": str(entry.get("entered_at") or ""),
-    }
+    for path in sorted(folder.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        rows = payload.get("rows") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            current = str(row.get("岗位编号") or row.get("job_id") or "").strip()
+            if current == wanted:
+                return {str(key): str(value or "") for key, value in row.items()}, path
+    return None
 
 
 def find_tracker_row(root: Path, job_id: str) -> tuple[dict[str, str], Path] | None:
-    """Return the newest exact tracker row for ``job_id``.
+    """Return the ledger row for ``job_id``, then a local CSV row.
 
-    The push-written entered_ids registry is consulted FIRST: it holds the
-    officially allocated IDs (e.g. D0-020 -> current job) and is authoritative
-    over historical CSVs, where the same ID may have been reused by an older,
-    unrelated posting.  CSV files remain the fallback for pre-push rows.
+    The ledger wins when both exist. A missing ``entered_ids.json`` does not
+    change the result.
     """
     wanted = str(job_id or "").strip()
     if not wanted:
         return None
-    reg_row = _registry_row(root, wanted)
-    if reg_row:
-        return reg_row, root / "02_Tracker" / "entered_ids.json"
+    ledger = _ledger_row(root, wanted)
+    if ledger:
+        return ledger
     for path in _tracker_files(root):
         try:
             with path.open(encoding="utf-8-sig", newline="") as handle:
@@ -244,7 +238,7 @@ def _snapshot(job_id: str, row: dict[str, str], *, tracker_path: Path, lane: str
         f"Tracker: {tracker_path.as_posix()}",
         "",
         "This snapshot was created from a local tracker row. Verify the URL and paste",
-        "the complete JD with `python3 -m tools.job_materials jd set` before tailoring.",
+        "the complete JD with `python3 -m tools.workflow materials prepare` before tailoring.",
         "",
     ]
     return "\n".join(lines)

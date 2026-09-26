@@ -26,6 +26,9 @@ FORMAT_NAME = "format_report.json"
 PLAN_NAME = "plan.json"
 DISPOSITIONS_NAME = "dispositions.json"
 ACCEPTANCE_NAME = "audit_acceptance.json"
+# Per-job claim confirmations and the latest content preflight they answer.
+CLAIM_CONFIRMATIONS_NAME = "claim_confirmations.json"
+CONTENT_PREFLIGHT_NAME = "content_preflight.json"
 
 
 def now() -> str:
@@ -292,6 +295,68 @@ def save_dispositions(package: Path, value: dict[str, Any]) -> None:
     atomic_write_json(state_dir(package) / DISPOSITIONS_NAME, value)
 
 
+def load_claim_confirmations(package: Path, *, jd_sha256: str) -> dict[str, set[str]]:
+    """Verb stems the user confirmed for this job, keyed by claim scope.
+
+    A confirmation belongs to the job and the JD it was made against: a
+    different JD hash makes the whole file inert, and a draft/all reset
+    archives it.  Nothing here is shared with other jobs or the lane baseline.
+    """
+
+    value = load(state_dir(package) / CLAIM_CONFIRMATIONS_NAME)
+    if not value or str(value.get("jd_sha256") or "") != str(jd_sha256 or ""):
+        return {}
+    confirmed: dict[str, set[str]] = {}
+    for item in value.get("confirmations") or []:
+        if isinstance(item, dict) and item.get("scope") and item.get("verb"):
+            confirmed.setdefault(str(item["scope"]), set()).add(str(item["verb"]))
+    return confirmed
+
+
+def save_claim_confirmation(
+    package: Path,
+    *,
+    job_id: str,
+    jd_sha256: str,
+    scope: str,
+    verbs: list[str],
+    block_id: str,
+    material: str,
+) -> dict[str, Any]:
+    path = state_dir(package) / CLAIM_CONFIRMATIONS_NAME
+    value = load(path)
+    if not value or str(value.get("jd_sha256") or "") != str(jd_sha256 or ""):
+        value = {"schema_version": 1, "job_id": job_id, "jd_sha256": jd_sha256, "confirmations": []}
+    entries = [item for item in value.get("confirmations") or [] if isinstance(item, dict)]
+    known = {(str(item.get("scope")), str(item.get("verb"))) for item in entries}
+    confirmed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    added = []
+    for verb in verbs:
+        if (scope, verb) in known:
+            continue
+        entry = {
+            "scope": scope,
+            "verb": verb,
+            "block_id": block_id,
+            "material": material,
+            "source": "user_confirmed_for_this_job",
+            "confirmed_at": confirmed_at,
+        }
+        entries.append(entry)
+        added.append(entry)
+    value["confirmations"] = entries
+    atomic_write_json(path, value)
+    return {"added": added, "path": str(path)}
+
+
+def load_content_preflight(package: Path) -> dict[str, Any]:
+    return load(state_dir(package) / CONTENT_PREFLIGHT_NAME)
+
+
+def save_content_preflight(package: Path, value: dict[str, Any]) -> None:
+    atomic_write_json(state_dir(package) / CONTENT_PREFLIGHT_NAME, value)
+
+
 def load_acceptance(package: Path) -> dict[str, Any]:
     return load(state_dir(package) / ACCEPTANCE_NAME)
 
@@ -365,7 +430,7 @@ def archive_known_outputs(
     state = package / STATE_DIR_NAME
     state_names = {
         "audit": {AUDIT_TASK_NAME, AUDIT_RESULT_NAME, PATCHES_NAME, ACCEPTANCE_NAME},
-        "draft": {TRANSFORM_NAME, EFFECTIVE_NAME, CANONICAL_NAME, AUDIT_TASK_NAME, AUDIT_RESULT_NAME, PATCHES_NAME, FORMAT_NAME, "artifact_hashes.json", DISPOSITIONS_NAME, ACCEPTANCE_NAME},
+        "draft": {TRANSFORM_NAME, EFFECTIVE_NAME, CANONICAL_NAME, AUDIT_TASK_NAME, AUDIT_RESULT_NAME, PATCHES_NAME, FORMAT_NAME, "artifact_hashes.json", DISPOSITIONS_NAME, ACCEPTANCE_NAME, CLAIM_CONFIRMATIONS_NAME, CONTENT_PREFLIGHT_NAME},
         "render": {FORMAT_NAME, "artifact_hashes.json"},
         "all": set(),
     }[scope]

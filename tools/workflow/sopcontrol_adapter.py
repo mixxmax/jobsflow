@@ -495,8 +495,9 @@ def _write_path_requested(request: Any) -> bool:
         return not bool(payload.get("fixture"))
     if action == "materials":
         stage = str(payload.get("stage") or payload.get("materials_cmd") or "").casefold()
+        batch_action = str(payload.get("batch_action") or "").casefold()
         # Read-only status must not demand a capability ticket.
-        if stage in {"status"}:
+        if stage in {"status"} or (stage == "batch" and batch_action == "status"):
             return False
         return True
     if action in {"audit", "format", "apply", "promote", "sync_retry"}:
@@ -585,6 +586,41 @@ def write_capability_handoff(
     return str(path)
 
 
+def load_capability_handoff(
+    ticket_id: str,
+    *,
+    root: Path | None = None,
+    consume: bool = True,
+) -> dict[str, str]:
+    """Load a one-shot handoff record. Missing or unreadable → empty dict."""
+
+    import json
+
+    if not ticket_id:
+        return {}
+    path = _capability_handoff_dir(root) / f"{ticket_id}.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    record = {
+        "ticket_id": str(data.get("ticket_id") or ticket_id).strip(),
+        "secret": str(data.get("secret") or "").strip(),
+        "run_id": str(data.get("run_id") or "").strip(),
+        "action": str(data.get("action") or "").strip(),
+    }
+    if consume:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return record
+
+
 def load_capability_handoff_secret(
     ticket_id: str,
     *,
@@ -593,24 +629,7 @@ def load_capability_handoff_secret(
 ) -> str:
     """Load secret from handoff; optionally delete after read (one-shot)."""
 
-    import json
-
-    if not ticket_id:
-        return ""
-    path = _capability_handoff_dir(root) / f"{ticket_id}.json"
-    if not path.is_file():
-        return ""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        secret = str(data.get("secret") or "").strip()
-    except (OSError, TypeError, ValueError):
-        return ""
-    if consume:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-    return secret
+    return load_capability_handoff(ticket_id, root=root, consume=consume).get("secret") or ""
 
 
 def issue_capability_ticket(
@@ -696,15 +715,28 @@ def _redeem_capability_ticket(request: Any) -> list[str]:
     payload = dict(getattr(request, "payload", {}) or {})
     ticket_id = str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
     secret = str(payload.get("capability_ticket_secret") or payload.get("ticket_secret") or "").strip()
+    action = str(getattr(request, "action", "") or "")
     if ticket_id and not secret:
-        # SEC：CLI 脱敏后可通过 0600 handoff 兑换，不要求 stdout 回传明文 secret。
-        secret = load_capability_handoff_secret(ticket_id, root=product_root(), consume=True)
-        if secret:
-            payload["capability_ticket_secret"] = secret
-            try:
-                request.payload = payload
-            except (AttributeError, TypeError):
-                pass
+        # CLI redacts the secret. Redeem from the 0600 handoff instead of minting again.
+        record = load_capability_handoff(ticket_id, root=product_root(), consume=True)
+        secret = str(record.get("secret") or "").strip()
+        if not secret:
+            return ["capability_ticket_handoff_missing"]
+        expected_action = str(record.get("action") or "").strip()
+        expected_run = str(record.get("run_id") or "").strip()
+        request_run = str(payload.get("run_id") or "").strip()
+        if expected_action and expected_action != action:
+            return ["capability_ticket_invalid"]
+        if expected_run and request_run and expected_run != request_run:
+            return ["capability_ticket_invalid"]
+        # Do not inject handoff run_id into the payload before fingerprinting.
+        # Issue fingerprints use payload["run_id"] (often empty) while the
+        # ticket record may still store entity_id as run_id metadata.
+        payload["capability_ticket_secret"] = secret
+        try:
+            request.payload = payload
+        except (AttributeError, TypeError):
+            pass
     if not ticket_id or not secret:
         return ["capability_ticket_required"]
     try:
@@ -823,10 +855,8 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
     issued_ticket: dict[str, Any] | None = None
     if not blockers and writing and tickets_enabled() and package_available:
         ticket_id = str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
-        secret = str(payload.get("capability_ticket_secret") or payload.get("ticket_secret") or "").strip()
-        if not ticket_id or not secret:
-            # Two-phase: mint a ticket and stop before the business adapter so
-            # the caller must present it on the real write. Zero side effects.
+        if not ticket_id:
+            # No ticket yet: mint one and stop. Zero side effects.
             issued_ticket = issue_capability_ticket(action=action, payload=payload, run_id=run_id)
             if issued_ticket is None:
                 blockers.append("capability_ticket_required")
@@ -835,6 +865,8 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
                 ticket_challenge = True
                 blockers.append("capability_ticket_required")
         else:
+            # An id means the caller is redeeming. Missing secret uses the
+            # 0600 handoff. Do not mint a replacement ticket.
             blockers.extend(_redeem_capability_ticket(request))
     blockers = sorted(set(blockers))
     report: dict[str, Any] = {

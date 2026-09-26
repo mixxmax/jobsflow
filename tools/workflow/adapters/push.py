@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import re
 import json
 import os
 from contextlib import contextmanager
@@ -140,6 +141,52 @@ def _review_entry_result(
         rejected_rows=[_review_row_summary(row) for row in (rejected or [])],
         deep_review=deep_meta or {},
     )
+
+
+def _is_pass1_low(row: dict[str, Any]) -> bool:
+    return str(row.get("评估状态") or "") == "pass1_low_priority" or str(row.get("层级") or "") == "待审-初评偏低"
+
+
+def _company_title_key(row: dict[str, Any]) -> str:
+    company = re.sub(r"\s+", " ", str(row.get("公司") or row.get("company") or "").strip().casefold())
+    title = re.sub(r"\s+", " ", str(row.get("职位") or row.get("title") or "").strip().casefold())
+    if not company and not title:
+        return ""
+    return f"{company}||{title}"
+
+
+def _possible_duplicates(
+    rows: list[dict[str, Any]],
+    authoritative_rows: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Warn when the ledger already has the same company and title.
+
+    The warning does not remove the row. A repeated title can still be a
+    different requisition, so the user decides at confirmation.
+    """
+
+    known: dict[str, str] = {}
+    for row in authoritative_rows:
+        key = _company_title_key(row)
+        job_id = str(row.get("岗位编号") or row.get("job_id") or "").strip()
+        if key and job_id and key not in known:
+            known[key] = job_id
+    warnings: list[dict[str, str]] = []
+    for row in rows:
+        key = _company_title_key(row)
+        job_id = known.get(key) or ""
+        own_id = str(row.get("岗位编号") or "").strip()
+        if not job_id or job_id == own_id:
+            continue
+        warnings.append(
+            {
+                "职位": str(row.get("职位") or row.get("title") or ""),
+                "公司": str(row.get("公司") or row.get("company") or ""),
+                "链接": str(row.get("链接") or row.get("url") or ""),
+                "possible_duplicate_of": job_id,
+            }
+        )
+    return warnings
 
 
 def _standard_entry_rows(
@@ -443,6 +490,8 @@ def handle(
         return result(status="blocked", blockers=[error or "scored_artifact_missing"], rule_ids=["PUSH-001", "FRESH-001"])
     source_row_count = len(rows)
     selection_keys = _selection_keys(payload)
+    expand_low = bool(payload.get("expand_low_priority"))
+    low_count = sum(1 for row in rows if _is_pass1_low(row))
     preferences = load_workflow_preferences(_repo_for_workspace(workspace))
     entry_policy = normalize_entry_policy(
         payload.get("entry_policy") or preferences.get("default_entry_policy", "standard")
@@ -456,12 +505,20 @@ def handle(
         # explicit ``all`` policy is the only way to select the complete
         # displayed review pool, and it remains visible in the proposal.
         if defer_deep and not selection_keys and entry_policy != "all":
-            return _review_entry_result(
-                rows,
+            shown = rows if expand_low else [row for row in rows if not _is_pass1_low(row)]
+            review = _review_entry_result(
+                shown,
                 entry_policy=entry_policy,
                 final_gate=float(preferences["final_gate"]),
                 source_row_count=source_row_count,
             )
+            review["pass1_low_priority_count"] = low_count
+            review["pass1_low_priority_folded"] = bool(low_count) and not expand_low
+            return review
+        if not selection_keys:
+            # Default preview does not offer low pass-1 rows for automatic entry.
+            # They remain selectable by key.
+            rows = [row for row in rows if not _is_pass1_low(row)]
         rows, selection_error = _select_scored_rows(rows, selection_keys)
         if selection_error:
             return result(
@@ -471,7 +528,8 @@ def handle(
                 blockers=[selection_error],
                 selection_keys=selection_keys,
             )
-        if defer_deep:
+        deepen_low = [row for row in rows if _is_pass1_low(row)]
+        if defer_deep or deepen_low:
             try:
                 from tools.fresh_24h.two_pass_score import deepen_scored_rows
 
@@ -480,9 +538,11 @@ def handle(
                 # the same narrowly scoped attestation marker for the duration
                 # of the selected deep review so JobsDB can use the approved
                 # primary-Chrome handoff without opening a compatibility path.
+                deepen_input = rows if defer_deep else deepen_low
+                kept_rows = [] if defer_deep else [row for row in rows if not _is_pass1_low(row)]
                 with _jobsdb_gateway_context(workspace):
                     deep_rows, deep_review_meta = deepen_scored_rows(
-                        rows,
+                        deepen_input,
                         repo=_repo_for_workspace(workspace),
                         min_final=float(preferences["final_gate"]),
                     )
@@ -504,8 +564,8 @@ def handle(
                 "deep_score_distribution": deep_review_meta.get("deep_score_distribution") or {},
                 "jobsdb_detail_status": deep_review_meta.get("jobsdb_detail_status"),
             }
-            rows = deep_rows
-            if entry_policy == "standard":
+            rows = deep_rows if defer_deep else kept_rows + deep_rows
+            if entry_policy == "standard" and defer_deep:
                 rows, rejected_rows = _standard_entry_rows(
                     rows, final_gate=float(preferences["final_gate"])
                 )
@@ -565,12 +625,38 @@ def handle(
                 rule_ids=ENTRY_RULE_IDS,
                 blockers=[str(exc)],
             )
-        return _preview_result(
+        preview = _preview_result(
             proposal,
             target_digest=target_before.digest,
             rule_ids=ENTRY_RULE_IDS,
             backend_resolution=backend_resolution,
         )
+        preview["pass1_low_priority_count"] = low_count
+        preview["pass1_low_priority_folded"] = bool(low_count) and not expand_low and not selection_keys
+        duplicates = _possible_duplicates(list(proposal.get("prepared_rows") or []), authoritative_rows)
+        if duplicates:
+            preview["possible_duplicates"] = duplicates
+        prepared_rows = list(proposal.get("prepared_rows") or [])
+        reposts = [
+            {
+                "职位": row.get("职位") or "",
+                "公司": row.get("公司") or "",
+                "链接": row.get("链接") or "",
+                "possible_repost_of": row.get("possible_repost_of") or "",
+            }
+            for row in prepared_rows
+            if str(row.get("possible_repost_of") or "").strip()
+        ]
+        if reposts:
+            preview["possible_reposts"] = reposts
+            preview.setdefault("review_hints", []).append(
+                "same_company_title_different_url_possible_repost"
+            )
+        if low_count and (expand_low or selection_keys):
+            preview.setdefault("review_hints", []).append(
+                "pass1_low_priority_kept_selectable_not_auto_entered"
+            )
+        return preview
 
     proposal = proposal_hint or confirmations.load(proposal_id)
     prepared = [dict(row) for row in (proposal or {}).get("prepared_rows") or []]

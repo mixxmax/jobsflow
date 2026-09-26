@@ -84,7 +84,8 @@ experience block without a `change_reason` (≥ 12 chars) is rejected with
 Before the independent auditor is involved, the host runs deterministic
 checks: protected numbers survive and new numbers need a baseline or
 confirmed-profile basis; counted objects may not drift; scope terms may not be
-narrowed near a retained number; evidence verbs may not escalate; employer
+narrowed near a retained number; evidence verbs may not escalate (see
+below); employer
 attribution may not move between experiences; language levels must agree
 across CV and Cover Letter; placeholders, fragments, negative disclosures,
 recruiter leakage and internal markers (severity tags, rule IDs, prompts) are
@@ -102,10 +103,32 @@ the estimate cannot be computed, the host fails closed with
 None of these checks compares wording similarity; they check fact and
 semantic boundaries only.
 
+## Package preparation
+
+`/push` creates the package and stops. It does not fetch a JD, score the
+posting, or write `application_preflight.json`. Before planning, the gateway
+fills those three inputs with:
+
+```text
+python3 -m tools.workflow materials prepare --job-id C0-005 [--jd-file jd.txt] [--refresh]
+```
+
+The stage is deterministic. It reuses `jd_full.md` unless `--refresh` is set,
+then a user file of at least 400 characters, then the URL-keyed JD cache, then
+`02_Tracker/jds/{job_id}.md`. With `--fetch`, a missing full JD may be retrieved
+through the same gateway Chrome attach used by `push --select` (one URL). No
+source returns `jd_full_unavailable` and writes nothing. A matching assessment is reused; a changed JD is rescored with
+the same deep scorer intake uses, and the tracker is not updated. The same
+JD, profile and known answers make a second run a no-op. `materials` / `materials run`
+and `materials produce` from `idle` or `inputs_frozen` run prepare first only
+when the package blockers are limited to `missing_full_jd`,
+`assessment_missing_or_stale` and `preflight_missing`.
+
 ## Fixed sequence
 
 ```text
-freeze bundle + baseline
+materials prepare (full JD, matching assessment, application preflight)
+  → freeze bundle + baseline
   → plan JD duties/themes/anchors
   → submit bounded CV/CL transform (each op gets a change_class)
   → deterministic content preflight (semantic lint + terminology + capacity)
@@ -167,6 +190,35 @@ never a passed status, never self-recorded zero findings. The apply report
 keeps `apply_ready` and `independent_audit_passed` as two separate fields and
 shows `user_accepted_without_audit` explicitly. `--strict-audit` makes apply
 refuse anything whose gate was opened without a real independent audit.
+
+## Evidence verbs: baseline first, role-plausible drift, per-job confirmation
+
+The model copies the baseline's verbs as written. A drift is judged in two
+tiers, by verb stem (``drafted`` and ``drafting`` are the same verb):
+
+- **Function verbs** (`draft`) describe ordinary work in the role. When the
+  verb already appears anywhere in the lane baseline or in this job's JD, the
+  drift is a P2 `verb_wording_drift`: recorded, never blocking, no repair.
+  Without that basis it is treated like an inflation verb.
+- **Inflation verbs** (`lead`, `own`, `manage`, `advise`, `deliver`,
+  `recover`) claim leadership, ownership, outcomes or advisory authority. When
+  the experience's baseline does not use the verb, preflight blocks with P0
+  `verb_escalation` and returns `claim_confirmation_options`.
+
+The recommended answer is to return to the baseline wording. If the user
+really did the work:
+
+```bash
+python3 -m tools.workflow materials confirm-claim --job-id <JOB-ID> --block-id <BLOCK-ID> [--verb lead]
+```
+
+This records the confirmation in the job package
+(`materials_vnext/claim_confirmations.json`) and re-runs the preflight on the
+saved transform in the same call. Only a verb the current generation's
+preflight actually blocked can be confirmed. The confirmation is valid for
+this job until a draft reset or a JD change; it is never copied to the lane
+baseline or the shared profile fact file, and another job starts again from
+the baseline. The model must not confirm on the user's behalf.
 
 ## User rulings on findings
 

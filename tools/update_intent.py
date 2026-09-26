@@ -418,8 +418,11 @@ def create_preference_proposal(
     *,
     preference: str,
     value: str,
+    preview_floor: float | None = None,
 ) -> dict[str, Any]:
-    """Preview a scan-cost or final-retention preference without writing it."""
+    """Preview a scan-cost, retention, or review-first preference without writing it."""
+    from tools.fresh_24h.policy import SCORE_GATE, _as_bool
+
     profile_dir = private_profile_dir(repo)
     config = _load(profile_dir / "queries.json")
     if not config or config.get("setup_required"):
@@ -432,20 +435,54 @@ def create_preference_proposal(
         "retention_preference": before["retention_preference"],
     }
     # Preference updates must not silently disable a separately confirmed
-    # review-first policy. Preserve only the machine-owned optional controls;
-    # the user is still required to change them through their own policy path.
+    # review-first policy. Preserve those keys unless this proposal is the
+    # explicit ``intent review-first`` command.
     if isinstance(existing_workflow, dict):
         for key in ("preview_floor", "defer_deep_until_selection", "default_entry_policy"):
             if key in existing_workflow:
                 workflow[key] = existing_workflow[key]
     if preference == "scan_depth":
         workflow["scan_depth"] = parse_scan_depth(value)
+        before_slice = {
+            "scan_depth": before["scan_depth"],
+            "retention_preference": before["retention_preference"],
+        }
     elif preference == "retention_preference":
         workflow["retention_preference"] = parse_retention_preference(value)
+        before_slice = {
+            "scan_depth": before["scan_depth"],
+            "retention_preference": before["retention_preference"],
+        }
+    elif preference == "review_first":
+        raw = str(value or "").strip().casefold()
+        if raw not in {"on", "off", "1", "0", "true", "false", "yes", "no", "是", "否", "开启", "关闭"}:
+            raise ValueError("review-first 必须是 on 或 off")
+        workflow["defer_deep_until_selection"] = _as_bool(value, default=False)
+        if preview_floor is not None:
+            try:
+                floor = float(preview_floor)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("preview_floor 必须是数字") from exc
+            if floor < 2.0 or floor > float(SCORE_GATE):
+                raise ValueError(f"preview_floor 必须在 2.0 与 {SCORE_GATE} 之间")
+            workflow["preview_floor"] = round(floor, 2)
+        else:
+            workflow["preview_floor"] = before["preview_floor"]
+        before_slice = {
+            "defer_deep_until_selection": before["defer_deep_until_selection"],
+            "preview_floor": before["preview_floor"],
+        }
     else:
         raise ValueError(f"未知工作流偏好：{preference}")
     next_config["workflow_preferences"] = workflow
     after = resolve_workflow_preferences(next_config)
+    if preference == "review_first":
+        after_slice = {
+            "defer_deep_until_selection": bool(workflow.get("defer_deep_until_selection")),
+            "preview_floor": workflow.get("preview_floor"),
+        }
+    else:
+        after_slice = workflow
     current = _current_intent(profile_dir, config)
     return {
         "schema_version": 1,
@@ -459,11 +496,8 @@ def create_preference_proposal(
         "base_digest": _base_digest(profile_dir),
         "diff": {
             "workflow_preferences": {
-                "before": {
-                    "scan_depth": before["scan_depth"],
-                    "retention_preference": before["retention_preference"],
-                },
-                "after": workflow,
+                "before": before_slice,
+                "after": after_slice,
                 "resolved_after": after,
             }
         },
@@ -548,6 +582,7 @@ def main(argv: list[str] | None = None) -> int:
             "set",
             "scan-depth",
             "retention",
+            "review-first",
             "confirm",
             "cancel",
         ),
@@ -556,6 +591,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=".", help="repository root / private workspace")
     parser.add_argument("--bucket", help="existing query bucket for an added query")
     parser.add_argument("--track", help="personalized A-F direction for an added query")
+    parser.add_argument("--set", dest="intent_set", default="", help="review-first on|off")
+    parser.add_argument("--preview-floor", type=float, default=None, help="review-first display floor")
     args = parser.parse_args(argv)
     repo = Path(args.repo).expanduser().resolve()
     profile_dir = private_profile_dir(repo)
@@ -572,6 +609,8 @@ def main(argv: list[str] | None = None) -> int:
                 "text": args.text or "",
                 "bucket": args.bucket,
                 "track": args.track,
+                "set": args.intent_set or "",
+                **({"preview_floor": args.preview_floor} if args.preview_floor is not None else {}),
             },
         )
         status = str(out.get("status") or "")

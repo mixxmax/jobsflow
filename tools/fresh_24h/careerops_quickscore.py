@@ -1114,7 +1114,9 @@ def build_tracker_row(
         salary=hit.get("salary") or "",
         source=src_zh,
     )
-    # 列顺序与 SHEET_HEADERS（35 列 = 28 + PASS_EXTRA 7）严格一致；
+    # 列顺序与 SHEET_HEADERS（28 列）严格一致；tracker 投影另附 PASS_EXTRA 8 列
+    # （初评*/深评*/JD深度/评估状态），合计 36。scored CSV 还可再附
+    # SCORED_ARTIFACT_EXTRA（如 possible_repost_of），但不进表头投影。
     # 已删除列（匹配分/领域背景/主要缺口/工作时间风险/语义待处理数/语义待处理任务）不再产出。
     return [
         job_id,

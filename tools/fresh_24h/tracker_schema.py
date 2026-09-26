@@ -18,7 +18,14 @@ PASS_EXTRA = [
     "深评等级",
     "深评理由",
     "JD深度",  # full | cache | teaser | paste_needed | teaser_unavailable | teaser_capped
-    "评估状态",  # ready | pending | below_current_retention | provisional_needs_jd
+    "评估状态",  # ready | pending | below_current_retention | provisional_needs_jd | pass1_low_priority
+]
+
+# Written into scored CSV artifacts (and therefore visible to push preview),
+# but excluded from tracker / Google Sheet projections.  ``fresh_store``
+# treats these names as internal the same way it treats underscore keys.
+SCORED_ARTIFACT_EXTRA = [
+    "possible_repost_of",
 ]
 
 

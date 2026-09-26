@@ -347,6 +347,20 @@ def action_allowed_from(
         and phase in {"pdf_generated", "format_passed", "apply_ready"}
     ):
         return True
+    # Reset scopes from a generated PDF must have a compliant path back to an
+    # editable phase.  The targets mirror store.reset() exactly: draft →
+    # plan_ready, audit → content_audit_pending, render → content_passed,
+    # all → idle.  This carve-out is scoped to the reset/restart stages only;
+    # ENTITY_TRANSITIONS is intentionally untouched so normal forward actions
+    # (e.g. legacy render from pdf_generated) keep their existing verdicts.
+    if (
+        action == "materials"
+        and entity_type == "materials"
+        and stage in {"reset", "restart"}
+        and phase == "pdf_generated"
+        and str(payload.get("scope") or "all").casefold() in {"audit", "draft", "render", "all"}
+    ):
+        return True
     possible = ACTION_DESTINATIONS.get(action) or set()
     allowed = direct_successors(entity_type, phase)
     return bool(possible & allowed)

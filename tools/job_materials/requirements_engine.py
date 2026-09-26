@@ -256,6 +256,54 @@ def build_application_preflight(
     }
 
 
+def known_application_answers(
+    package: Path,
+    workspace: Path | None = None,
+    *,
+    extra_config_paths: list[Path] | None = None,
+) -> dict[str, str]:
+    """Known application answers from the runtime profile, then package overrides.
+
+    The workspace argument is the private runtime. Callers must not point this
+    at a second global config when a runtime was already resolved.
+    """
+
+    known: dict[str, str] = {}
+    paths: list[Path] = []
+    if workspace is not None:
+        paths.append(Path(workspace) / "00_Profile" / "config.personal.json")
+    paths.extend(Path(item) for item in (extra_config_paths or []))
+    answer_keys = (
+        "current_salary",
+        "expected_salary",
+        "notice_period",
+        "availability",
+        "work_authorization",
+        "language",
+        "license",
+        "experience_years",
+    )
+    for config_path in paths:
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(config, dict):
+            continue
+        for key in answer_keys:
+            if config.get(key):
+                known[key] = str(config[key])
+        break
+    known.update(
+        {
+            key: str(value)
+            for key, value in load_preflight_answers(package).items()
+            if str(value).strip()
+        }
+    )
+    return known
+
+
 def load_preflight_answers(package: Path) -> dict[str, Any]:
     path = Path(package) / "application_answers.json"
     if not path.exists():

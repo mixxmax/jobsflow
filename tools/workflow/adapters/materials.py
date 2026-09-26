@@ -71,15 +71,68 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
                 action=str(payload.get("batch_action") or "prepare"),
                 max_workers=int(payload.get("max_workers") or 3),
                 engine=str(payload.get("engine") or "libreoffice"),
+                dry_run=bool(dry_run or payload.get("dry_run")),
             )
             out.setdefault("rule_ids", ["MAT-VNEXT-001", "JF-MAT-105"])
             out.setdefault("engine", "materials-vnext")
             out.setdefault("engine_version", "materials-vnext-1")
             return out
+        prepare_note = None
+        if stage == "prepare" or (stage in {"", "plan"} and payload.get("auto_prepare")):
+            from tools.workflow.materials_prepare import (
+                has_prepare_blocker,
+                prepare_command,
+                prepare_package,
+                should_auto_prepare,
+            )
+
+            job_id = str(payload.get("job_id") or "")
+            if dry_run and stage != "prepare":
+                # dry-run must not load package context or write; surface the
+                # prepare command when the caller asked for auto-prepare.
+                return result(
+                    status="planned",
+                    dry_run=True,
+                    job_id=job_id,
+                    side_effects=[],
+                    blockers=[],
+                    next_action=prepare_command(job_id),
+                    rule_ids=["MAT-VNEXT-001"],
+                    engine="materials-vnext",
+                    engine_version="materials-vnext-1",
+                    message="materials_auto_prepare_dry_run",
+                )
+            run_prepare = stage == "prepare" or should_auto_prepare(Path(workspace), job_id)
+            if run_prepare:
+                prepare_payload = dict(payload)
+                if dry_run:
+                    prepare_payload["dry_run"] = True
+                prepared = prepare_package(prepare_payload, workspace=Path(workspace))
+                prepared.setdefault("rule_ids", ["MAT-VNEXT-001"])
+                prepared.setdefault("engine", "materials-vnext")
+                prepared.setdefault("engine_version", "materials-vnext-1")
+                if stage == "prepare" or prepared.get("status") != "succeeded":
+                    blockers = list(prepared.get("blockers") or [])
+                    if has_prepare_blocker(blockers) and not prepared.get("next_action"):
+                        prepared["next_action"] = prepare_command(job_id)
+                    return prepared
+                prepare_note = {
+                    "status": prepared.get("status"),
+                    "noop": bool(prepared.get("noop")),
+                    "blockers": list(prepared.get("blockers") or []),
+                }
         out = MaterialsEngine().handle(payload, workspace=workspace, dry_run=dry_run)
         out.setdefault("rule_ids", ["MAT-VNEXT-001"])
         out.setdefault("engine", "materials-vnext")
         out.setdefault("engine_version", "materials-vnext-1")
+        if prepare_note is not None:
+            out["prepare"] = prepare_note
+        blockers = list(out.get("blockers") or [])
+        if blockers:
+            from tools.workflow.materials_prepare import has_prepare_blocker, prepare_command
+
+            if has_prepare_blocker(blockers) and not out.get("next_action"):
+                out["next_action"] = prepare_command(str(payload.get("job_id") or ""))
         return out
     # Frozen compatibility body below is intentionally unreachable from the
     # product gateway.  It remains in this module only so historical private

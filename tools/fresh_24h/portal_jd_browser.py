@@ -52,7 +52,7 @@ from urllib.parse import urlparse, urlunsplit
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from tools.job_urls import normalize_job_url  # noqa: E402
+from tools.job_urls import normalize_job_url, safe_jobsdb_job_url  # noqa: E402
 
 # Prefer longer body for pass-2 / materials
 MAX_CHARS = 14000
@@ -195,12 +195,13 @@ class JdFetchResult:
 
 
 def detect_portal(url: str) -> str:
-    u = (url or "").lower()
-    if "jobsdb.com" in u:
+    from tools.job_urls import is_ctgoodjobs_url, is_jobsdb_url, is_linkedin_url_host
+
+    if is_jobsdb_url(url):
         return "jobsdb"
-    if "ctgoodjobs.hk" in u:
+    if is_ctgoodjobs_url(url):
         return "ctgoodjobs"
-    if "linkedin.com" in u:
+    if is_linkedin_url_host(url):
         return "linkedin"
     return "generic"
 
@@ -865,7 +866,18 @@ class JdBrowserSession:
     ) -> JdFetchResult:
         raw = (url or "").strip()
         portal = detect_portal(raw)
-        canon = normalize_job_url(raw, source=portal if portal != "generic" else "")
+        if portal == "jobsdb":
+            canon = safe_jobsdb_job_url(raw)
+            if not canon:
+                return JdFetchResult(
+                    ok=False,
+                    url=raw,
+                    portal=portal,
+                    fail_reason="error",
+                    detail_reason="jd_fetch_url_not_allowed",
+                )
+        else:
+            canon = normalize_job_url(raw, source=portal if portal != "generic" else "")
         if not canon:
             return JdFetchResult(ok=False, url=raw, portal=portal, fail_reason="empty")
         # Do not let a caller disguise a JobsDB URL as a generic/LinkedIn
@@ -1276,6 +1288,99 @@ def _cdp_connection_url(endpoint: str) -> str:
     return endpoint
 
 
+def devtools_active_port_path(user_data_dir: Path | None = None) -> Path:
+    """Default DevToolsActivePort location. Never creates the file."""
+
+    override = os.environ.get("JOBSFLOW_JOBSDB_CHROME_USER_DATA_DIR", "").strip()
+    if user_data_dir is not None:
+        root = Path(user_data_dir)
+    elif override:
+        root = Path(override).expanduser()
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    elif sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", "")
+        root = Path(local) / "Google" / "Chrome" / "User Data" if local else Path("Google/Chrome/User Data")
+    else:
+        root = Path.home() / ".config" / "google-chrome"
+    return root / "DevToolsActivePort"
+
+
+def read_devtools_active_port(
+    path: Path | None = None,
+    *,
+    expected_port: int,
+) -> dict[str, Any]:
+    """Read Chrome's DevToolsActivePort file. Does not launch a browser or open a socket.
+
+    Line 1 is the port. Line 2 is ``/devtools/browser/<guid>``. The path is
+    used only when that port equals ``expected_port`` and the resulting
+    websocket URL is a local ``/devtools/browser`` endpoint.
+    """
+
+    target = Path(path) if path is not None else devtools_active_port_path()
+    report: dict[str, Any] = {
+        "found": False,
+        "path_checked": str(target),
+        "port": None,
+        "browser_path": "",
+        "port_matches": False,
+        "endpoint": "",
+    }
+    if not target.is_file():
+        report["error"] = "missing"
+        return report
+    try:
+        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        report["error"] = type(exc).__name__
+        return report
+    report["found"] = True
+    if len(lines) < 2 or not lines[0].strip().isdigit():
+        report["error"] = "malformed"
+        return report
+    port = int(lines[0].strip())
+    browser_path = lines[1].strip()
+    report["port"] = port
+    report["browser_path"] = browser_path
+    report["port_matches"] = port == int(expected_port)
+    if not report["port_matches"]:
+        report["error"] = "port_mismatch"
+        return report
+    if not browser_path.startswith("/devtools/browser"):
+        report["error"] = "path_rejected"
+        return report
+    candidate = f"ws://127.0.0.1:{port}{browser_path}"
+    validated = _validate_local_cdp_endpoint(candidate)
+    if not str(validated).startswith("ws") or "/devtools/browser" not in str(validated):
+        report["error"] = "non_local"
+        return report
+    report["endpoint"] = validated
+    return report
+
+
+def devtools_active_port_report(endpoint: str | None = None) -> dict[str, Any]:
+    """Doctor view: file presence, port match and attach budget. No websocket is opened.
+
+    Without an explicit endpoint the configured JobsDB endpoint is used, so a
+    ``JOBSFLOW_JOBSDB_CDP_PORT``/``_URL`` setting is compared rather than 9222.
+    """
+
+    parsed = urlparse(endpoint or _configured_jobsdb_cdp_endpoint())
+    port = parsed.port or 9222
+    report = read_devtools_active_port(expected_port=port)
+    return {
+        "found": bool(report.get("found")),
+        "port": report.get("port"),
+        "expected_port": port,
+        "port_matches": bool(report.get("port_matches")),
+        "error": report.get("error") or "",
+        # Effective per-attach approval budget, so a too-short setting is
+        # visible before a human misses Chrome's prompt.
+        "connect_timeout_seconds": _cdp_connect_timeout_ms() / 1000,
+    }
+
+
 def _cdp_ws_connection_url(endpoint: str) -> str:
     """Return the browser-level WebSocket URL for a local CDP endpoint.
 
@@ -1293,9 +1398,9 @@ def _cdp_ws_connection_url(endpoint: str) -> str:
             path = "/devtools/browser"
         if not path.startswith("/devtools/browser"):
             raise RuntimeError("cdp_websocket_path_invalid")
-        return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
-    if parsed.scheme in {"http", "https"}:
-        return urlunsplit(
+        bare = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    elif parsed.scheme in {"http", "https"}:
+        bare = urlunsplit(
             (
                 "wss" if parsed.scheme == "https" else "ws",
                 parsed.netloc,
@@ -1304,7 +1409,18 @@ def _cdp_ws_connection_url(endpoint: str) -> str:
                 "",
             )
         )
-    raise RuntimeError("cdp_endpoint_scheme_invalid")
+        path = "/devtools/browser"
+    else:
+        raise RuntimeError("cdp_endpoint_scheme_invalid")
+    # An explicit GUID path is already the browser endpoint. A bare path
+    # upgrades to DevToolsActivePort when that file names the same local port.
+    if path.rstrip("/") != "/devtools/browser":
+        return bare
+    port = parsed.port or 9222
+    active = read_devtools_active_port(expected_port=port)
+    if active.get("endpoint"):
+        return str(active["endpoint"])
+    return bare
 
 
 def _cdp_local_port_available(endpoint: str, *, timeout: float = 0.5) -> bool:
@@ -1437,7 +1553,33 @@ def _read_attached_cdp_version(remote: Any, context: Any) -> dict[str, Any] | No
     return None
 
 
-def _connect_over_cdp(chromium: Any, endpoint: str, *, timeout_ms: int = 5000) -> Any:
+def _cdp_connect_timeout_ms() -> int:
+    """Budget for one CDP attach against the user's primary Chrome.
+
+    Chrome's ``Allow remote debugging`` toggle shows a per-connection approval
+    prompt before the DevTools handshake completes, and the approval is not
+    remembered for the next connection.  A 5s budget routinely expires before
+    a human can react to the prompt, so the default is 30s and operators can
+    tune it through the environment. The value is in seconds (default 30,
+    clamped to 1–120) and converted to milliseconds internally.
+    """
+    import math
+
+    # Seconds, matching JOBSFLOW_JOBSDB_CDP_STARTUP_TIMEOUT. Default 30s.
+    raw = os.environ.get("JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT", "").strip()
+    if not raw:
+        return 30000
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 30000
+    if not math.isfinite(value):
+        return 30000
+    seconds = max(1.0, min(120.0, value))
+    return int(seconds * 1000)
+
+
+def _connect_over_cdp(chromium: Any, endpoint: str, *, timeout_ms: int) -> Any:
     """Attach with a bounded timeout while tolerating tiny test doubles."""
     connect = getattr(chromium, "connect_over_cdp")
     try:
@@ -1808,7 +1950,7 @@ class JobsdbCdpBatchSession:
                 remote = _connect_over_cdp(
                     playwright.chromium,
                     connection_url,
-                    timeout_ms=5000,
+                    timeout_ms=_cdp_connect_timeout_ms(),
                 )
             except RuntimeError:
                 raise
@@ -1906,11 +2048,16 @@ class JobsdbCdpBatchSession:
                 headless=False,
                 browser_channel=self.channel,
             )
-        canon = normalize_job_url(raw, source="jobsdb")
+        canon = safe_jobsdb_job_url(raw)
         if not canon:
             return JdFetchResult(
-                ok=False, url=raw, portal="jobsdb", fail_reason="empty",
-                session_mode=self._session_mode_label(), headless=False,
+                ok=False,
+                url=raw,
+                portal="jobsdb",
+                fail_reason="error",
+                detail_reason="jd_fetch_url_not_allowed",
+                session_mode=self._session_mode_label(),
+                headless=False,
                 browser_channel=self.channel,
             )
         if self.context is None or self._closed:

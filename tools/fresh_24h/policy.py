@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -163,3 +164,117 @@ def load_workflow_preferences(repo: Path) -> dict[str, Any]:
 def default_retrieval_floor(final_gate: float) -> float:
     """Lower pass-1 triage floor; the final quality gate stays unchanged."""
     return round(max(1.0, float(final_gate) - PASS1_RESCUE_MARGIN), 2)
+
+
+# Generic recruitment boilerplate. These phrases are not duties. Private
+# profile keywords are never listed here.
+_TEASER_BOILERPLATE = (
+    "competitive remuneration",
+    "attractive package",
+    "we offer",
+    "fringe benefits",
+    "interested parties",
+    "apply now",
+    "5-day work",
+    "five-day work",
+    "medical insurance",
+    "career development",
+    "salary review",
+    "performance bonus",
+    "annual leave",
+    "work-life balance",
+    "待遇优厚",
+    "五天工作",
+    "有意者",
+    "欢迎申请",
+    "薪金面议",
+)
+_GENERIC_DUTY_SIGNALS = (
+    "review",
+    "draft",
+    "manage",
+    "analy",
+    "coordinat",
+    "develop",
+    "implement",
+    "research",
+    "negotiat",
+    "compli",
+    "audit",
+    "report",
+    "support",
+    "design",
+    "operate",
+    "monitor",
+    "负责",
+    "审查",
+    "起草",
+    "协调",
+    "分析",
+    "管理",
+    "研究",
+    "支持",
+    "设计",
+    "执行",
+    "维护",
+)
+
+
+def teaser_is_informative(
+    teaser: str,
+    title: str = "",
+    *,
+    profile: dict[str, Any] | None = None,
+    min_signals: int = 2,
+) -> bool:
+    """True when a card states duties, not only a benefits advertisement.
+
+    Length alone is not enough. Boilerplate is removed first. The remaining
+    text must still be long enough and contain duty or skill signals. Signals
+    come from the caller's scoring profile plus a generic duty list. No
+    candidate-specific keyword is hardcoded.
+    """
+
+    raw = f"{title or ''}\n{teaser or ''}"
+    cleaned = raw
+    for phrase in _TEASER_BOILERPLATE:
+        cleaned = re.sub(re.escape(phrase), " ", cleaned, flags=re.IGNORECASE)
+    if len(re.sub(r"\s+", "", cleaned)) < MIN_INFORMATIVE_TEASER_CHARS:
+        return False
+    haystack = cleaned.casefold()
+    signals: set[str] = set()
+
+    def _has_signal(token: str) -> bool:
+        needle = token.casefold().strip()
+        if not needle:
+            return False
+        # Duty signals are stems ("coordinat", "report"). Match at a word
+        # start so "review" inside "preview" does not count, while
+        # "coordinate"/"reporting" still match their stems.
+        if re.fullmatch(r"[a-z0-9][a-z0-9\s\-/+.&]*", needle):
+            return re.search(rf"(?<![a-z0-9]){re.escape(needle)}", haystack) is not None
+        # CJK / mixed tokens have no ASCII word boundaries.
+        return needle in haystack
+
+    for token in _GENERIC_DUTY_SIGNALS:
+        if _has_signal(token):
+            signals.add(token.casefold())
+    data = profile if isinstance(profile, dict) else {}
+    for key in (
+        "core_keywords",
+        "adjacent_keywords",
+        "evidence_keywords",
+        "preferred_industry_keywords",
+    ):
+        values = data.get(key) or []
+        if isinstance(values, str):
+            values = [part.strip() for part in values.split(",") if part.strip()]
+        if not isinstance(values, (list, tuple)):
+            continue
+        for item in values:
+            token = str(item or "").strip()
+            if len(token) < 3:
+                continue
+            if _has_signal(token):
+                signals.add(token.casefold())
+    return len(signals) >= int(min_signals)

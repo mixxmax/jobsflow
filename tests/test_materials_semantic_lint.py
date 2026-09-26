@@ -156,6 +156,108 @@ def test_plain_wording_rewrite_passes_all_semantic_checks():
     assert findings == []
 
 
+def test_business_teams_is_not_a_language_level_and_business_english_is():
+    quiet = run_semantic_lint(
+        bundle=_bundle(),
+        canonical=_canonical({
+            "cv-lang": "Worked with business teams. English is used for written records.",
+            "cl-b1": "I write English for the role.",
+        }),
+    )
+    assert "language_level_conflict" not in _codes(quiet)
+    flagged = run_semantic_lint(
+        bundle=_bundle(),
+        canonical=_canonical({
+            "cv-lang": "Languages: Business English.",
+            "cl-b1": "I am a native English speaker.",
+        }),
+    )
+    assert "language_level_conflict" in _codes(flagged)
+
+
+_LED_EXP1 = "Led creditor recovery involving RMB 12 million and reviewed 100+ commercial contracts across civil, commercial and labour disputes."
+_DRAFTED_EXP1 = "Supported creditor recovery involving RMB 12 million and drafted and reviewed 100+ commercial contracts across civil, commercial and labour disputes."
+
+
+def _verb_findings(findings, code="verb_escalation"):
+    return [item for item in findings if item["code"] == code]
+
+
+def test_inflation_verb_blocks_even_when_the_jd_uses_it():
+    bundle = _bundle()
+    bundle["jd"] = {"text": "The role will lead contract reviews."}
+    escalated = _verb_findings(run_semantic_lint(bundle=bundle, canonical=_canonical({"cv-exp1-b1": _LED_EXP1})))
+    assert len(escalated) == 1
+    assert escalated[0]["severity"] == "P0"
+    assert escalated[0]["escalated_verbs"] == ["lead"]
+    assert escalated[0]["claim_scope"] == "experience:experience-01"
+    assert escalated[0]["jd_anchored"] is True
+    assert "materials confirm-claim" in escalated[0]["required_action"]
+
+
+def test_shared_profile_facts_no_longer_unlock_an_inflation_verb():
+    # Confirmations are per job; a fact in the shared profile is not a licence
+    # to upgrade wording in every future package.
+    bundle = _bundle()
+    bundle["profile_facts"] = [
+        {"id": "EVID-1", "text": "Led creditor recovery work.", "confirmed": True, "experience_id": "experience-01"}
+    ]
+    findings = run_semantic_lint(bundle=bundle, canonical=_canonical({"cv-exp1-b1": _LED_EXP1}))
+    assert _verb_findings(findings)
+
+
+def test_per_job_confirmation_clears_only_its_own_experience():
+    canonical = _canonical({"cv-exp1-b1": _LED_EXP1})
+    cleared = run_semantic_lint(
+        bundle=_bundle(), canonical=canonical, claim_confirmations={"experience:experience-01": {"lead"}}
+    )
+    assert not _verb_findings(cleared)
+    elsewhere = run_semantic_lint(
+        bundle=_bundle(), canonical=canonical, claim_confirmations={"experience:experience-02": {"lead"}}
+    )
+    assert _verb_findings(elsewhere)
+
+
+def test_manage_is_an_inflation_verb_and_inflections_match_the_baseline():
+    # experience-02's baseline says "Managed"; experience-01's does not.
+    upgraded = run_semantic_lint(
+        bundle=_bundle(),
+        canonical=_canonical({
+            "cv-exp1-b1": "Managed creditor recovery involving RMB 12 million and reviewed 100+ commercial contracts across civil, commercial and labour disputes.",
+        }),
+    )
+    assert _verb_findings(upgraded)[0]["escalated_verbs"] == ["manage"]
+    reworded = run_semantic_lint(
+        bundle=_bundle(),
+        canonical=_canonical({"cv-exp2-b1": "Managing five critical assets and handled 30+ internal procedures."}),
+    )
+    assert not _verb_findings(reworded)
+
+
+def test_function_verb_drift_passes_when_the_jd_uses_it():
+    bundle = _bundle()
+    bundle["jd"] = {"text": "Reviewing and drafting legal documents for the litigation team."}
+    findings = run_semantic_lint(bundle=bundle, canonical=_canonical({"cv-exp1-b1": _DRAFTED_EXP1}))
+    assert not _verb_findings(findings)
+    drift = _verb_findings(findings, "verb_wording_drift")
+    assert drift and drift[0]["severity"] == "P2"
+
+
+def test_function_verb_drift_passes_when_the_lane_baseline_uses_it_elsewhere():
+    bundle = _bundle()
+    bundle["baseline"]["cover_letter"]["blocks"][1]["text"] = "I drafted client correspondence in fluent English."
+    findings = run_semantic_lint(bundle=bundle, canonical=_canonical({"cv-exp1-b1": _DRAFTED_EXP1}))
+    assert not _verb_findings(findings)
+    assert _verb_findings(findings, "verb_wording_drift")
+
+
+def test_function_verb_with_no_role_basis_still_blocks():
+    findings = run_semantic_lint(bundle=_bundle(), canonical=_canonical({"cv-exp1-b1": _DRAFTED_EXP1}))
+    escalated = _verb_findings(findings)
+    assert escalated and escalated[0]["escalated_verbs"] == ["draft"]
+    assert not _verb_findings(findings, "verb_wording_drift")
+
+
 def test_language_level_conflict_across_materials_is_flagged():
     findings = run_semantic_lint(
         bundle=_bundle(),

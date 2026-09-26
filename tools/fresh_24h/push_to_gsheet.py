@@ -747,11 +747,15 @@ def setup_status_formats(ws, n_data_rows: int, headers: list[str], sh=None) -> N
 def _persist_deep_jds(rows: list[dict], repo: Path) -> None:
     """Write deep JD text fetched during two-pass scoring to jds/{id}.md.
 
-    Reuses jd_store's jds/ mirror convention so read_jd() finds it with zero
-    changes.  Only writes when full JD text is present and a job ID was
-    allocated.
+    The directory follows the passed workspace. A product root that contains
+    ``JobSearch_2026`` still lands in that runtime; a runtime passed directly
+    is not nested again. Each URL is also stored in the URL-keyed cache so
+    materials prepare can find it after the row receives a durable id.
     """
-    cache_dir = repo / "JobSearch_2026" / "02_Tracker" / "jds"
+    from tools.fresh_24h.jd_cache import _workspace_root, save_jd_cache
+
+    root = _workspace_root(repo)
+    cache_dir = root / "02_Tracker" / "jds"
     cache_dir.mkdir(parents=True, exist_ok=True)
     n = 0
     for r in rows:
@@ -766,7 +770,10 @@ def _persist_deep_jds(rows: list[dict], repo: Path) -> None:
         if url:
             header += f"- url: {url}\n"
         header += f"- source: two_pass_deep\n\n---\n\n"
-        atomic_write_text(cache_dir / f"{pid}.md", header + jd_full.strip() + "\n")
+        body = jd_full.strip()
+        atomic_write_text(cache_dir / f"{pid}.md", header + body + "\n")
+        if url:
+            save_jd_cache(url, body, source="two_pass_deep", root=root)
         n += 1
     if n:
         print(f"JD cache: wrote {n} deep JD(s) to {cache_dir}")

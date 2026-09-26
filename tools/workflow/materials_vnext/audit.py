@@ -457,6 +457,12 @@ def record_result(package, report: dict[str, Any], *, task: dict[str, Any], run:
         fp = str(item.get("fingerprint") or _finding_fingerprint(item))
         item["fingerprint"] = fp
         item.setdefault("finding_id", f"finding-{fp.split('-', 1)[-1]}")
+        target = text(item.get("target_id"))
+        action = text(item.get("required_action"))
+        if target and target not in action:
+            item["required_action"] = (
+                f"{action} (target_id={target})" if action else f"repair target_id={target}"
+            )
         history[fp] = int(history.get(fp) or 0) + 1
         ruling = str((dispositions.get(fp) or {}).get("status") or "")
         if ruling in SUPPRESSING_DISPOSITIONS:

@@ -30,9 +30,22 @@ ASSESSMENT_DIR = ("02_Tracker", "job_assessments")
 
 
 def _workspace_root(repo: Path) -> Path:
-    """Accept either the repository root or an already-resolved private root."""
+    """Accept either the repository root or an already-resolved private root.
+
+    Prefer an existing tracker layout on the given path. Only nest into
+    ``JobSearch_2026`` when that directory already exists or the path is a bare
+    repository root without profile/tracker folders.
+    """
+
     root = Path(repo).expanduser().resolve()
-    return root if root.name == "JobSearch_2026" else root / "JobSearch_2026"
+    if root.name == "JobSearch_2026":
+        return root
+    nested = root / "JobSearch_2026"
+    if nested.is_dir():
+        return nested
+    if (root / "02_Tracker").is_dir() or (root / "00_Profile").is_dir():
+        return root
+    return nested
 
 
 def assessment_dir(repo: Path) -> Path:

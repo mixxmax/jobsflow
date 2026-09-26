@@ -57,18 +57,23 @@ from linkedin_enrich import (  # noqa: E402
     fetch_linkedin_details_batch,
     is_linkedin_url,
 )
-from tools.job_urls import normalize_job_url  # noqa: E402
+from tools.job_urls import is_jobsdb_url, normalize_job_url  # noqa: E402
 from tools.fresh_24h.policy import (  # noqa: E402
     DEFAULT_MAX_DEEP_FETCHES,
     MIN_INFORMATIVE_TEASER_CHARS,
     SCORE_GATE,
     default_retrieval_floor,
     load_workflow_preferences,
+    teaser_is_informative,
     parse_retention_preference,
     parse_scan_depth,
     resolve_workflow_preferences,
 )
-from tools.fresh_24h.tracker_schema import PASS_EXTRA, merge_tracker_headers  # noqa: E402
+from tools.fresh_24h.tracker_schema import (  # noqa: E402
+    PASS_EXTRA,
+    SCORED_ARTIFACT_EXTRA,
+    merge_tracker_headers,
+)
 from tools.io_utils import atomic_write_json, atomic_write_stream, atomic_write_text  # noqa: E402
 
 # JD full-text cache imports (imported inline in deep_enrich_hit to keep optional)
@@ -84,7 +89,9 @@ _INTERNAL_TO_EXTERNAL_DEPTH = {
     "paste_needed": "paste_needed",
 }
 
-SCORED_ARTIFACT_SCHEMA_VERSION = 3
+# 4: artifacts keep pass1_low_priority rows, judge teasers semantically and
+# carry possible_repost_of; a v3 artifact must be rescored, not reused.
+SCORED_ARTIFACT_SCHEMA_VERSION = 4
 
 
 def _workspace_root(repo: Path) -> Path:
@@ -274,9 +281,15 @@ def select_rows_for_retention(
     Provisional rows remain visible in their own review tier.
     """
     selected: list[dict] = []
-    meta = {"final_selected": 0, "final_filtered": 0, "provisional": 0}
+    meta = {"final_selected": 0, "final_filtered": 0, "provisional": 0, "pass1_low_priority": 0}
     for raw in rows:
         row = dict(raw)
+        if str(row.get("评估状态") or "") == "pass1_low_priority":
+            # Low pass-1 rows are review-only: they enter only through an
+            # explicit ``push --select``, never through a retention view that
+            # a batch push could consume (JF-SCAN-001).
+            meta["pass1_low_priority"] += 1
+            continue
         depth = str(row.get("JD深度") or "")
         # External depth vocabulary: full/cache = a real JD was obtained;
         # everything else is teaser-level and stays in the review tier.
@@ -426,6 +439,7 @@ def load_hits(csv_path: Path) -> list[dict]:
                     # scan_id is the partial-rerun key emitted by the scan stage;
                     # it must survive so --only-keys SCAN-xxx can select rows.
                     "scan_id": r.get("scan_id") or "",
+                    "possible_repost_of": r.get("possible_repost_of") or "",
                 }
             )
         normalize_hits_urls(hits)
@@ -659,6 +673,7 @@ def deep_enrich_hit(
                 "mode": "fetched",
             }
             h["_deep_jd_full"] = ct_text
+            _save_cache(url, ct_text, source=ct_source, repo=repo)
             return ct_text[:DEEP_DESC_CHARS], "deep"
         h["_enrich"] = {
             "mode": "ctgoodjobs_skip_browser",
@@ -698,7 +713,7 @@ def deep_enrich_hit(
     # itself is CDP-only; the helper below will fail closed before any
     # Playwright launch if the validated user-Chrome context is absent.
     needs_browser = use_browser and (
-        "jobsdb.com" in portal_host
+        is_jobsdb_url(portal_host)
         or (is_linkedin_url(url) and not (h.get("_enrich") or {}).get("ok"))
     )
     if needs_browser:
@@ -723,7 +738,7 @@ def deep_enrich_hit(
 
         fetch_kwargs: dict[str, Any] = {"cache_root": repo}
         recovery = h.get("_jobsdb_human_recovery")
-        is_jobsdb = "jobsdb.com" in portal_host
+        is_jobsdb = is_jobsdb_url(portal_host)
         browser_session = h.get("_browser_session")
         # A JobsDB detail session is valid only when it is the retained,
         # user-visible CDP context.  Drop any stale/headless object supplied
@@ -954,7 +969,10 @@ def _tracker_row_from_scores(
         str(item).split(":", 1)[0] == "semantic_resume_match"
         for item in pending_tasks
     )
-    row["_provisional_needs_jd"] = True
+    row["_provisional_needs_jd"] = status != "pass1_low_priority"
+    repost = str(hit.get("possible_repost_of") or "").strip()
+    if repost:
+        row["possible_repost_of"] = repost
     return row
 
 
@@ -1008,6 +1026,7 @@ def run_two_pass(
         "pass1_kept": 0,
         "pass1_rescued": 0,
         "pass1_dropped": 0,
+        "pass1_low_priority": 0,
         "pass1_rescue_samples": [],
         "pass1_score_distribution": _empty_score_distribution(),
         "deep_attempted": 0,
@@ -1104,6 +1123,7 @@ def run_two_pass(
             meta["assessment_errors"].append(str(exc))
 
     gated: list[tuple[dict, Any]] = []
+    low_priority_rows: list[dict] = []
     for h in hits:
         h.setdefault("_preview_key", preview_key(h))
         # Pass 1 — teaser / card only (no deep fetch)
@@ -1148,7 +1168,11 @@ def run_two_pass(
         if cached_text:
             h["_pass1_cache_hit"] = True
         teaser_chars = len(re.sub(r"\s+", "", teaser1))
-        thin_teaser = teaser_chars < MIN_INFORMATIVE_TEASER_CHARS
+        thin_teaser = not teaser_is_informative(
+            teaser1,
+            str(h.get("title") or ""),
+            profile=scoring_profile,
+        )
         rescue_reason = ""
         if sc1.score < routing_gate:
             if cached_text:
@@ -1158,14 +1182,17 @@ def run_two_pass(
             elif sc1.score >= retrieval_floor:
                 rescue_reason = "gray_band"
         if sc1.score < routing_gate and not rescue_reason:
+            # A low pass-1 score schedules no deep fetch. The row stays in the
+            # scored artifact so the user can name it with push --select.
             record_assessment(
                 h,
                 score=sc1,
                 pass1=sc1,
                 depth="teaser",
-                status="pass1_filtered",
+                status="pass1_low_priority",
             )
-            meta["pass1_dropped"] += 1
+            meta["pass1_low_priority"] += 1
+            meta["pass1_dropped"] = meta["pass1_low_priority"]
             if len(meta["pass1_drop_samples"]) < 15:
                 meta["pass1_drop_samples"].append(
                     {
@@ -1175,6 +1202,16 @@ def run_two_pass(
                         "grade": sc1.grade,
                     }
                 )
+            low_row = _tracker_row_from_scores(
+                h,
+                sc1,
+                sc1,
+                depth="teaser",
+                status="pass1_low_priority",
+            )
+            low_row["层级"] = "待审-初评偏低"
+            low_row["评估状态"] = "pass1_low_priority"
+            low_priority_rows.append(low_row)
             continue
         if sc1.score < routing_gate:
             meta["pass1_rescued"] += 1
@@ -1218,6 +1255,7 @@ def run_two_pass(
             meta["deep_deferred_count"] += 1
             draft_rows.append(row)
         draft_rows.sort(key=lambda r: -float(r.get("初评分数") or 0))
+        draft_rows.extend(low_priority_rows)
         pending_rows = pending_semantic_rows(draft_rows)
         meta["semantic_pending_rows"] = len(pending_rows)
         meta["semantic_pending_tasks"] = pending_semantic_tasks(draft_rows)
@@ -1240,10 +1278,14 @@ def run_two_pass(
     # per-scan budget (and zero while a persisted token is valid).
     def network_priority(item: tuple[dict, Any]) -> float:
         candidate, score = item
-        teaser_chars = len(re.sub(r"\s+", "", str(candidate.get("teaser") or "")))
-        if teaser_chars == 0:
+        teaser = str(candidate.get("teaser") or "")
+        if not teaser.strip():
             uncertainty_bonus = 0.50
-        elif teaser_chars < MIN_INFORMATIVE_TEASER_CHARS:
+        elif not teaser_is_informative(
+            teaser,
+            str(candidate.get("title") or ""),
+            profile=scoring_profile,
+        ):
             uncertainty_bonus = 0.35
         else:
             uncertainty_bonus = 0.0
@@ -1430,15 +1472,15 @@ def run_two_pass(
                     h["_linkedin_batch_used"] = True
                 if browser_pool is not None:
                     session = None
-                    if "jobsdb.com" in portal_host and jobsdb_recovery is not None:
+                    if is_jobsdb_url(portal_host) and jobsdb_recovery is not None:
                         session = getattr(jobsdb_recovery, "session", None)
                     if session is None:
                         session = browser_pool.session_for(str(h.get("url") or ""))
                     if session is not None:
                         h["_browser_session"] = session
-                if jobsdb_circuit is not None and "jobsdb.com" in portal_host:
+                if jobsdb_circuit is not None and is_jobsdb_url(portal_host):
                     h["_browser_fetch_circuit"] = jobsdb_circuit
-                if jobsdb_recovery is not None and "jobsdb.com" in portal_host:
+                if jobsdb_recovery is not None and is_jobsdb_url(portal_host):
                     h["_jobsdb_human_recovery"] = jobsdb_recovery
                 try:
                     text2, depth = _run_deep_enrich(
@@ -1482,7 +1524,7 @@ def run_two_pass(
                     meta["jobsdb_cdp_detail_requests"] += 1
                 if enrich_mode == "cache":
                     meta["deep_cache_hits"] += 1
-                if "jobsdb.com" in portal_host:
+                if is_jobsdb_url(portal_host):
                     if enrich_mode == "cache":
                         meta["jobsdb_cache_hits"] += 1
                     else:
@@ -1627,6 +1669,9 @@ def run_two_pass(
                 # Labels already in the external vocabulary pass through.
                 row["JD深度"] = _INTERNAL_TO_EXTERNAL_DEPTH.get(depth, depth)
             row["评估状态"] = row_status
+            repost = str(h.get("possible_repost_of") or "").strip()
+            if repost:
+                row["possible_repost_of"] = repost
             pending_tasks_for_row = list(getattr(sc2, "semantic_pending_tasks", ()) or ())
             row["_semantic_pending_count"] = len(pending_tasks_for_row)
             row["_semantic_pending_tasks"] = ";".join(str(item) for item in pending_tasks_for_row)
@@ -1694,6 +1739,7 @@ def run_two_pass(
     draft_rows.sort(
         key=lambda r: -float(r.get("深评分数") or r.get("CareerOps分数") or 0)
     )
+    draft_rows.extend(low_priority_rows)
     pending_rows = pending_semantic_rows(draft_rows)
     meta["semantic_pending_rows"] = len(pending_rows)
     meta["semantic_pending_tasks"] = pending_semantic_tasks(draft_rows)
@@ -1756,7 +1802,11 @@ def deepen_scored_rows(
 
 
 def write_csv(path: Path, rows: list[dict], *, repo: Path = REPO) -> None:
-    headers = merge_tracker_headers(SHEET_HEADERS, repo, additional=PASS_EXTRA)
+    headers = merge_tracker_headers(
+        SHEET_HEADERS,
+        repo,
+        additional=list(PASS_EXTRA) + list(SCORED_ARTIFACT_EXTRA),
+    )
     # also keep any extra keys
     path.parent.mkdir(parents=True, exist_ok=True)
     def write_rows(f):
@@ -1768,8 +1818,13 @@ def write_csv(path: Path, rows: list[dict], *, repo: Path = REPO) -> None:
 
 
 def _persist_deep_jds(rows: list[dict], repo: Path) -> None:
-    """Write deep JD text fetched during two-pass scoring to jds/{id}.md."""
-    cache_dir = repo / "JobSearch_2026" / "02_Tracker" / "jds"
+    """Write deep JD text into the workspace JD dir and the URL cache.
+
+    ``repo`` is either the private runtime or the product root that contains it.
+    Preview keys stay preview keys; prepare finds the text by URL.
+    """
+    root = _workspace_root(repo)
+    cache_dir = root / "02_Tracker" / "jds"
     cache_dir.mkdir(parents=True, exist_ok=True)
     n = 0
     for r in rows:
@@ -1788,7 +1843,10 @@ def _persist_deep_jds(rows: list[dict], repo: Path) -> None:
         if url:
             header += f"- url: {url}\n"
         header += f"- source: two_pass_deep\n\n---\n\n"
-        atomic_write_text(cache_dir / f"{pid}.md", header + jd_full.strip() + "\n")
+        body = jd_full.strip()
+        atomic_write_text(cache_dir / f"{pid}.md", header + body + "\n")
+        if url:
+            _save_cache(url, body, source="two_pass_deep", repo=root)
         n += 1
     if n:
         print(f"JD cache: wrote {n} deep JD(s) to {cache_dir}")
@@ -1989,9 +2047,10 @@ def main(argv: list[str] | None = None) -> int:
             f"  review_only=true preview_floor={preview_floor}; "
             "deep review waits for explicit push selection"
         )
+    displayed_routing_gate = preview_floor if defer_deep else gate_pass1
     print(
-        f"  retrieval_floor={default_retrieval_floor(gate_pass1)} "
-        f"or teaser<{MIN_INFORMATIVE_TEASER_CHARS} chars (uncertainty rescue)"
+        f"  retrieval_floor={default_retrieval_floor(displayed_routing_gate)} "
+        f"or uninformative teaser (uncertainty rescue)"
     )
     print(
         f"  scored_preview_keeps_below_final={not args.hide_below_final} "
@@ -2021,6 +2080,11 @@ def main(argv: list[str] | None = None) -> int:
         r["岗位编号"] = ""
     # After ID alloc (which sets 层级 from score), flag pass-2 soft drops for review
     for r in rows:
+        if str(r.get("评估状态") or "") == "pass1_low_priority":
+            r["层级"] = "待审-初评偏低"
+            r.pop("_below_final", None)
+            r.pop("_provisional_needs_jd", None)
+            continue
         if r.pop("_below_final", False):
             r["层级"] = "待审-深评偏低"
         if (
