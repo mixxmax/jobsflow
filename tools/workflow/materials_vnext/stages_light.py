@@ -31,58 +31,6 @@ from tools.workflow.materials_vnext.store import (
 RESOLUTION_STATUSES = {"open", "fixed", "user_accepted", "user_rejected", "not_actionable", "reopened"}
 
 
-def _store_confirmed_verb_facts(workspace: Path, findings: list[dict[str, Any]], decisions: list[Any]) -> None:
-    """A resolve confirmation of a verb escalation is stored only in the private fact file."""
-
-    accepted: list[dict[str, Any]] = []
-    for raw in decisions:
-        if not isinstance(raw, dict) or text(raw.get("status")).casefold() != "user_accepted":
-            continue
-        ident = text(raw.get("fingerprint")) or text(raw.get("finding_id"))
-        finding = next(
-            (
-                item for item in findings
-                if ident and ident in {text(item.get("fingerprint")), text(item.get("finding_id"))}
-            ),
-            None,
-        )
-        if finding is None:
-            continue
-        code = text(finding.get("code") or finding.get("rule_id"))
-        if code != "verb_escalation":
-            continue
-        evidence = text(raw.get("evidence") or raw.get("reason"))
-        if evidence:
-            accepted.append(
-                {
-                    "id": f"EVID-RESOLVE-{text(finding.get('fingerprint') or finding.get('finding_id'))[:12]}",
-                    "text": evidence,
-                    "claim": evidence,
-                    "confirmed": True,
-                    "status": "user_confirmed",
-                    "experience_id": text(finding.get("experience_id") or finding.get("target_id")),
-                    "source": "materials_resolve",
-                }
-            )
-    if not accepted:
-        return
-    path = Path(workspace) / "00_Profile" / "fact_evidence.json"
-    try:
-        current = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        current = {}
-    if not isinstance(current, dict):
-        current = {}
-    nodes = current.get("nodes")
-    if not isinstance(nodes, list):
-        nodes = []
-    seen = {str(item.get("id") or "") for item in nodes if isinstance(item, dict)}
-    for item in accepted:
-        if item["id"] not in seen:
-            nodes.append(item)
-    current["nodes"] = nodes
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, current)
 USER_RULING_STATUSES = {"user_accepted", "user_rejected", "not_actionable"}
 
 
@@ -171,7 +119,6 @@ def _record_resolve(
     # A user ruling never upgrades the audit into an independent pass.
     if gate_open and result.get("produced_by") == "independent_child_audit" and suppressed:
         result["independent_audit_passed"] = False
-    _store_confirmed_verb_facts(workspace, findings, decisions)
     save_dispositions(package, ledger)
     atomic_write_json(state_dir(package) / "audit_result.json", result)
     atomic_write_json(Path(package) / "materials_audit.json", result)

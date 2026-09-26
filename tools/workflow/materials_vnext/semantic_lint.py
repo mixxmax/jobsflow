@@ -31,12 +31,19 @@ SCOPE_TERMS = {
     "asset", "procedure", "matter", "mandate",
 }
 
-# High-risk action verbs: upgrading supported/reviewed work into led/owned/
-# recovered/drafted claims is the most damaging fabrication class.  Matching
-# is stem-based so inflections (leads/leading, recovered, delivers) are caught.
-HIGH_RISK_VERB_STEMS = {
-    "lead", "led", "own", "recover", "deliver", "draft", "manage", "advise",
-}
+# High-risk action verbs come in two tiers.  Matching is stem-based so
+# inflections (leads/leading, recovered, drafting) count as the same verb.
+#
+# Inflation verbs claim leadership, ownership, outcomes or advisory authority.
+# Upgrading supported/reviewed work into one of these is the most damaging
+# fabrication class: without baseline support it blocks until the user either
+# returns to the baseline wording or confirms the claim for this one job.
+INFLATION_VERB_STEMS = {"lead", "led", "own", "recover", "deliver", "manage", "advise"}
+# Function verbs describe ordinary work inside the candidate's role.  A drift
+# from the baseline wording is tolerated when the verb is plausible for the
+# role: it already appears somewhere in the lane baseline, or in this job's JD.
+FUNCTION_VERB_STEMS = {"draft"}
+HIGH_RISK_VERB_STEMS = INFLATION_VERB_STEMS | FUNCTION_VERB_STEMS
 _POSSESSIVES = {"my", "our", "your", "their", "his", "her", "its"}
 
 _LANGUAGES = ("english", "cantonese", "mandarin", "putonghua", "chinese")
@@ -160,19 +167,24 @@ def _finding(
     return found
 
 
-def _verb_family(verbs: set[str]) -> set[str]:
-    """Treat the irregular pair lead/led as one verb for JD anchoring."""
-
-    family = set(verbs)
-    if "led" in family:
-        family.add("lead")
-    if "lead" in family:
-        family.add("led")
-    return family
-
-
 def high_risk_verbs(value: Any) -> set[str]:
-    """High-risk evidence verbs, skipping possessive 'own' false positives.
+    """High-risk evidence verbs as written, skipping possessive 'own'."""
+
+    return {word for word, _stem in _high_risk_matches(value)}
+
+
+def high_risk_verb_stems(value: Any) -> set[str]:
+    """High-risk evidence verbs reduced to their stem (``led`` → ``lead``).
+
+    Comparing stems, not surface words, keeps ``drafted`` in the baseline and
+    ``drafting`` in the draft from reading as a new verb.
+    """
+
+    return {"lead" if stem == "led" else stem for _word, stem in _high_risk_matches(value)}
+
+
+def _high_risk_matches(value: Any) -> list[tuple[str, str]]:
+    """(word, stem) pairs for high-risk verbs.
 
     Only participial/inflection suffixes are stripped, so the noun
     ``recovery`` is never treated as the verb ``recover`` while every
@@ -181,7 +193,7 @@ def high_risk_verbs(value: Any) -> set[str]:
     """
 
     words = re.findall(r"[a-z]+", str(value or "").casefold())
-    found: set[str] = set()
+    found: list[tuple[str, str]] = []
     for index, word in enumerate(words):
         candidates = {word}
         if word.endswith("ed"):
@@ -195,7 +207,7 @@ def high_risk_verbs(value: Any) -> set[str]:
             continue
         if stem == "own" and index > 0 and words[index - 1] in _POSSESSIVES:
             continue
-        found.add(word)
+        found.append((word, stem))
     return found
 
 
@@ -268,23 +280,41 @@ def sentence_scope_terms(value: str) -> set[str]:
     return {_singular(word) for word in re.findall(r"[a-z]+", str(value or "").casefold())} & SCOPE_TERMS
 
 
+def claim_scope(material: str, block_id: str, experience_id: str | None) -> str:
+    """Key a per-job claim confirmation: one experience, else one block."""
+
+    return f"experience:{experience_id}" if experience_id else f"block:{material}:{block_id}"
+
+
 def run_semantic_lint(
     *,
     bundle: dict[str, Any],
     canonical: dict[str, Any],
     plan: dict[str, Any] | None = None,
+    claim_confirmations: dict[str, set[str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return deterministic semantic findings; wording similarity is not a check."""
+    """Return deterministic semantic findings; wording similarity is not a check.
+
+    ``claim_confirmations`` maps a :func:`claim_scope` key to verb stems the
+    user confirmed for this job only.  It is loaded from the job package, never
+    from the lane baseline or the shared fact file.
+    """
 
     findings: list[dict[str, Any]] = []
+    confirmed_claims = claim_confirmations or {}
     employer_map = _experience_employer_map(_baseline_blocks(bundle, "cv"))
     allowed_numbers = {material: _allowed_numbers(bundle, material) for material in MATERIALS}
-    all_baseline_verbs = {
-        material: high_risk_verbs(
+    all_baseline_stems = {
+        material: high_risk_verb_stems(
             "\n".join(text(block.get("text")) for block in _baseline_blocks(bundle, material))
         )
         for material in MATERIALS
     }
+    # "Plausible for the role": the verb appears anywhere in this lane's
+    # baseline (either material) or in this job's JD.
+    role_function_stems = (
+        set().union(*all_baseline_stems.values()) | high_risk_verb_stems(_jd_text(bundle))
+    ) & FUNCTION_VERB_STEMS
 
     for material in MATERIALS:
         baseline_by_id = {
@@ -354,27 +384,43 @@ def run_semantic_lint(
             # only against their own experience; summary/core lines and the
             # Cover Letter may reference any evidence the candidate really has.
             if material == "cv" and experience_id:
-                experience_verbs = high_risk_verbs("\n".join(
+                baseline_stems = high_risk_verb_stems("\n".join(
                     text(item.get("text"))
                     for item in _baseline_blocks(bundle, material)
                     if text(item.get("experience_id")) == experience_id
                 ))
             else:
-                experience_verbs = all_baseline_verbs[material]
-            allowed_verbs = set(experience_verbs) | _confirmed_fact_verbs(bundle, experience_id)
-            escalated = high_risk_verbs(after_text) - allowed_verbs
+                baseline_stems = all_baseline_stems[material]
+            new_stems = high_risk_verb_stems(after_text) - baseline_stems
+            # Layer 2: a function verb that is plausible for the role is only
+            # a wording drift.  It is recorded, never blocks and never starts a
+            # repair round.
+            drift = new_stems & role_function_stems
+            if drift:
+                findings.append(_finding(
+                    "verb_wording_drift", material, block_id,
+                    f"wording differs from the baseline but stays within the role: {sorted(drift)}",
+                    severity="P2",
+                    experience_id=experience_id or None,
+                    target_id=block_id,
+                ))
+            scope = claim_scope(material, block_id, experience_id)
+            escalated = (new_stems - drift) - set(confirmed_claims.get(scope) or ())
             if escalated:
-                jd_verbs = _verb_family(high_risk_verbs(_jd_text(bundle)))
                 findings.append(_finding(
                     "verb_escalation", material, block_id,
                     f"evidence verbs introduced without baseline basis: {sorted(escalated)}",
-                    jd_anchored=bool(_verb_family(escalated) & jd_verbs),
+                    escalated_verbs=sorted(escalated),
+                    claim_scope=scope,
+                    jd_anchored=bool(escalated & high_risk_verb_stems(_jd_text(bundle))),
                     experience_id=experience_id or None,
                     target_id=block_id,
                     required_action=(
-                        "Rewrite with a verb already supported by the baseline or a confirmed fact "
-                        "for this experience, or confirm through materials resolve that you did this "
-                        "work. The confirmation is stored only in the private fact file."
+                        "Prefer the baseline wording for this experience. If the user really did "
+                        "this work, the user may confirm it for this job only with "
+                        "`materials confirm-claim --job-id <id> --block-id "
+                        f"{block_id}`; the confirmation is kept in this job package and "
+                        "is never copied to the lane baseline or the shared fact file."
                     ),
                 ))
             # 5. Employer/experience attribution inside the CV.
@@ -493,47 +539,6 @@ def _jd_text(bundle: dict[str, Any]) -> str:
     if isinstance(raw, dict):
         return str(raw.get("text") or raw.get("full") or raw.get("body") or "")
     return str(bundle.get("jd_text") or "")
-
-
-def _fact_items(bundle: dict[str, Any]) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    containers = [bundle]
-    for key in ("candidate_profile", "profile"):
-        value = bundle.get(key)
-        if isinstance(value, dict):
-            containers.append(value)
-    for container in containers:
-        for key in ("profile_facts", "facts", "evidence_nodes", "nodes"):
-            value = container.get(key)
-            if isinstance(value, list):
-                items.extend(item for item in value if isinstance(item, dict))
-    return items
-
-
-def _fact_is_confirmed(item: dict[str, Any]) -> bool:
-    if item.get("confirmed") is True:
-        return True
-    return str(item.get("status") or "").casefold() in {"confirmed", "user_confirmed", "user_imported"}
-
-
-def _confirmed_fact_verbs(bundle: dict[str, Any], experience_id: str) -> set[str]:
-    """Verified evidence verbs for one experience. JD wording is never added."""
-
-    verbs: set[str] = set()
-    for item in _fact_items(bundle):
-        if not _fact_is_confirmed(item):
-            continue
-        linked = str(item.get("experience_id") or item.get("experience") or "").strip()
-        # Experience-scoped CV bullets only accept facts linked to that experience.
-        if experience_id:
-            if linked != experience_id:
-                continue
-        elif linked:
-            # Summary / CL lines may use any confirmed fact; experience-linked
-            # facts still count here because they are verified work.
-            pass
-        verbs |= high_risk_verbs(item.get("text") or item.get("claim") or "")
-    return verbs
 
 
 def _language_level_findings(canonical: dict[str, Any]) -> list[dict[str, Any]]:

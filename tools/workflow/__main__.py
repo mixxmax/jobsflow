@@ -299,6 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
             "prepare",
             "role-choose",
             "typesafe",
+            "confirm-claim",
         ],
         default="run",
     )
@@ -338,6 +339,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["status", "prepare", "audit", "render", "pdf", "format"],
         default="status",
         help="Batch stage: prepare fills JD/assessment/preflight then plans; audit groups no-provider review; other stages run per-job in parallel",
+    )
+    materials.add_argument(
+        "--block-id",
+        default="",
+        help="Block whose blocked verb the user confirms for this job (materials confirm-claim)",
+    )
+    materials.add_argument(
+        "--verb",
+        action="append",
+        default=[],
+        help="Blocked verb to confirm; repeatable. Default: every verb the preflight blocked in that block",
     )
     materials.add_argument("--jd-file", type=Path, help="Full JD text for materials prepare")
     materials.add_argument("--refresh", action="store_true", help="Replace an existing jd_full.md during materials prepare")
@@ -779,6 +791,11 @@ def main(argv: list[str] | None = None) -> int:
             payload["auto_prepare"] = True
         elif args.materials_cmd == "prepare":
             payload["stage"] = "prepare"
+        elif args.materials_cmd == "confirm-claim":
+            # A user decision about the user's own work, for this job only.
+            payload["stage"] = "confirm_claim"
+            payload["block_id"] = args.block_id
+            payload["verbs"] = list(args.verb or [])
         elif args.materials_cmd == "produce":
             payload["materials_shell"] = "produce"
             payload["max_steps"] = max(1, int(args.max_steps or 4))

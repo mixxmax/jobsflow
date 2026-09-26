@@ -96,17 +96,21 @@ materials prepare：写入 JD 全文、匹配评估、application_preflight
 python3 -m tools.workflow materials prepare --job-id C0-005
 python3 -m tools.workflow materials prepare --job-id C0-005 --jd-file jd.txt
 # 第一次调用冻结当前岗位输入并返回 plan task；模型只提交 JSON，不直接写文档。
-# idle 且只缺上述三项时，这一步会先 prepare 再 plan。
+# idle 时只要缺上述任一项，这一步会先 prepare 再 plan。
 python3 -m tools.workflow materials --job-id C0-005
 python3 -m tools.workflow materials --job-id C0-005 --plan plan.json
 # 仅提交 bounded transform，不能提交完整 CV/CL
 python3 -m tools.workflow materials draft --job-id C0-005 --content transform.json
 python3 -m tools.workflow materials repair --job-id C0-005 --patch repair.json
+# 仅在用户本人确认"这件事我确实做过"时使用；只对本岗位有效，确认后自动重跑 preflight
+python3 -m tools.workflow materials confirm-claim --job-id C0-005 --block-id <block>
 python3 -m tools.workflow materials render --job-id C0-005
 python3 -m tools.workflow materials pdf --job-id C0-005
 python3 -m tools.workflow format --job-id C0-005
 python3 -m tools.workflow apply --job-id C0-005
 ```
+
+**动词两层规则**：改写时优先照抄基线的动词。换成职能类动词（如 draft）时，只要这个词在本车道基线任一段经历或本岗位 JD 里出现过，就只记一条不阻断的 P2 备注；换成夸大类动词（lead、own、manage、advise、deliver、recover）而该段经历的基线没有时，preflight 会拦下并给出两个选项：推荐改回基线用词；或由**用户本人**用 `materials confirm-claim` 确认本岗位属实。确认只存进本岗位材料包，材料重置或 JD 变化即失效，不写入车道基础简历或共享事实文件。模型不得替用户确认。
 
 `--plan` 必须先于 `--content`；没有 plan 的 transform 会被硬门拒绝。模型只需指出
 要改的 block、动作、JD anchor 与新文字，不需要复制整份简历、手工生成 canonical 哈希或重建

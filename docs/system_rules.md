@@ -640,7 +640,22 @@ runs deterministic semantic checks: invented numbers, number-object drift,
 scope narrowing near a retained number, verb escalation, cross-employer
 attribution, employer-heading attribution loss, cross-material language-level
 conflicts, internal marker/prompt leakage, and JD duty coverage (themes are
-exempt; coverage dispositions are honoured). The host runs a per-material
+exempt; coverage dispositions are honoured).
+
+Evidence verbs follow two layers. First, the model copies the baseline's verbs
+as written. Second, a drift is tolerated only when it stays inside the role:
+a *function* verb (`draft`) that already appears anywhere in the lane baseline
+or in this job's JD is a non-blocking P2 `verb_wording_drift`. An *inflation*
+verb (`lead`, `own`, `manage`, `advise`, `deliver`, `recover`) that the
+experience's baseline does not support is a P0 `verb_escalation`; the default
+fix is to return to the baseline wording. If the user really did the work,
+the user may confirm it with `materials confirm-claim`, which records the
+confirmation for this job only (until a draft reset or a JD change) and
+re-runs the preflight. A confirmation is never written to the lane baseline or
+the shared profile fact file, and the model must not confirm on the user's
+behalf.
+
+The host runs a per-material
 wrapped-line capacity estimate (`estimate_canonical_capacity`) before any
 DOCX/PDF cycle. An over-budget CV or Cover Letter is a deterministic P1
 `capacity_budget_exceeded` block naming only the affected material; the model

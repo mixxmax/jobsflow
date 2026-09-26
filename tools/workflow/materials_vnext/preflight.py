@@ -115,6 +115,7 @@ def run_preflight(
     effective_transform: dict[str, Any],
     plan: dict[str, Any] | None = None,
     templates: dict[str, Any] | None = None,
+    claim_confirmations: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     for error in effective_transform.get("baseline_preservation_errors") or []:
@@ -178,7 +179,9 @@ def run_preflight(
     # Deterministic semantic lint: numbers, attribution, scope, evidence
     # verbs, cross-material invariants and internal-marker leakage.  These
     # checks compare semantic anchors, never wording similarity.
-    findings.extend(semantic_lint.run_semantic_lint(bundle=bundle, canonical=canonical, plan=plan))
+    findings.extend(semantic_lint.run_semantic_lint(
+        bundle=bundle, canonical=canonical, plan=plan, claim_confirmations=claim_confirmations
+    ))
 
     # Pre-render capacity gate: the real page count of each material, taken
     # before any DOCX/PDF work is committed to the package.  This runs before
