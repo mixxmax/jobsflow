@@ -9,6 +9,13 @@ cover letters, and application review in one local-first workflow. It is not
 just an AI resume writer: it helps you decide what to apply for, why you fit,
 and how to tailor the application without giving up final control.
 
+<p align="center">
+  <img src="docs/assets/demo-en.gif" alt="60-second demo: the AI tries to turn reviewed into led and a rule blocks it" width="760">
+</p>
+<p align="center">
+  <sub>60-second demo: the AI tries to turn "reviewed" into "led" and a rule stops it; even your confirmation applies to this one job only.<br>Synthetic data, real engine, no model call. Once installed, run it yourself: <code>python3 scripts/demo.py --lang en</code></sub>
+</p>
+
 ---
 
 <h2 align="center">

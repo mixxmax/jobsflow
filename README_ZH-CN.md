@@ -23,6 +23,13 @@ JobsFlow 不是“帮你写一份简历”的工具，而是一个**帮你搜岗
 
 </div>
 
+<p align="center">
+  <img src="docs/assets/demo-zh.gif" alt="60 秒演示：AI 想把「审阅」写成「主导」，被规则拦下" width="760">
+</p>
+<p align="center">
+  <sub>60 秒演示：AI 改简历时想把「审阅」写成「主导」，规则当场拦下；你确认之后，也只对这一个岗位有效。<br>合成数据、真实引擎，不调用模型。装好环境后自己跑一遍：<code>python3 scripts/demo.py</code></sub>
+</p>
+
 ---
 
 <h2 align="center">

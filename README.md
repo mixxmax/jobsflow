@@ -23,6 +23,13 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
 
 </div>
 
+<p align="center">
+  <img src="docs/assets/demo-zh-hant.gif" alt="60 秒演示：AI 想把「審閱」寫成「主導」，被規則攔下" width="760">
+</p>
+<p align="center">
+  <sub>60 秒演示：AI 改簡歷時想把「審閱」寫成「主導」，規則當場攔下；你確認之後，也只對這一個崗位有效。<br>合成數據、真實引擎，不調用模型。裝好環境後自己跑一遍：<code>python3 scripts/demo.py --lang zh-hant</code></sub>
+</p>
+
 ---
 
 <h2 align="center">
