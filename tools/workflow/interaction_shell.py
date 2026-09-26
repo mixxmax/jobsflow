@@ -747,12 +747,11 @@ PRODUCE_STOP_BLOCKERS = {
 def next_produce_stages(phase: str | None, blockers: list[str] | None = None) -> list[str]:
     """Pick legal produce stages from the persisted materials phase.
 
-    From idle or inputs_frozen, prepare runs first when the only blockers are
-    the JD, assessment and preflight inputs it can fill. Other blockers stay
-    on the existing plan path.
+    From idle or inputs_frozen, prepare runs first when any prepare-owned
+    input blocker is open. Other blockers stay for plan after prepare.
     """
 
-    from tools.workflow.materials_prepare import PREPARE_INPUT_BLOCKERS
+    from tools.workflow.materials_prepare import has_prepare_blocker
 
     current = str(phase or "idle").casefold()
     mapping = {
@@ -772,8 +771,7 @@ def next_produce_stages(phase: str | None, blockers: list[str] | None = None) ->
     }
     stages = list(mapping.get(current, PRODUCE_STAGES))
     if current in {"idle", "inputs_frozen"} and blockers is not None and "plan" in stages:
-        found = {str(item) for item in blockers}
-        if found and found <= PREPARE_INPUT_BLOCKERS:
+        if has_prepare_blocker(blockers):
             stages = ["prepare", *stages]
     return stages
 

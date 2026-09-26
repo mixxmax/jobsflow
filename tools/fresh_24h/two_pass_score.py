@@ -57,7 +57,7 @@ from linkedin_enrich import (  # noqa: E402
     fetch_linkedin_details_batch,
     is_linkedin_url,
 )
-from tools.job_urls import normalize_job_url  # noqa: E402
+from tools.job_urls import is_jobsdb_url, normalize_job_url  # noqa: E402
 from tools.fresh_24h.policy import (  # noqa: E402
     DEFAULT_MAX_DEEP_FETCHES,
     MIN_INFORMATIVE_TEASER_CHARS,
@@ -69,7 +69,11 @@ from tools.fresh_24h.policy import (  # noqa: E402
     parse_scan_depth,
     resolve_workflow_preferences,
 )
-from tools.fresh_24h.tracker_schema import PASS_EXTRA, merge_tracker_headers  # noqa: E402
+from tools.fresh_24h.tracker_schema import (  # noqa: E402
+    PASS_EXTRA,
+    SCORED_ARTIFACT_EXTRA,
+    merge_tracker_headers,
+)
 from tools.io_utils import atomic_write_json, atomic_write_stream, atomic_write_text  # noqa: E402
 
 # JD full-text cache imports (imported inline in deep_enrich_hit to keep optional)
@@ -85,7 +89,9 @@ _INTERNAL_TO_EXTERNAL_DEPTH = {
     "paste_needed": "paste_needed",
 }
 
-SCORED_ARTIFACT_SCHEMA_VERSION = 3
+# 4: artifacts keep pass1_low_priority rows, judge teasers semantically and
+# carry possible_repost_of; a v3 artifact must be rescored, not reused.
+SCORED_ARTIFACT_SCHEMA_VERSION = 4
 
 
 def _workspace_root(repo: Path) -> Path:
@@ -275,9 +281,15 @@ def select_rows_for_retention(
     Provisional rows remain visible in their own review tier.
     """
     selected: list[dict] = []
-    meta = {"final_selected": 0, "final_filtered": 0, "provisional": 0}
+    meta = {"final_selected": 0, "final_filtered": 0, "provisional": 0, "pass1_low_priority": 0}
     for raw in rows:
         row = dict(raw)
+        if str(row.get("评估状态") or "") == "pass1_low_priority":
+            # Low pass-1 rows are review-only: they enter only through an
+            # explicit ``push --select``, never through a retention view that
+            # a batch push could consume (JF-SCAN-001).
+            meta["pass1_low_priority"] += 1
+            continue
         depth = str(row.get("JD深度") or "")
         # External depth vocabulary: full/cache = a real JD was obtained;
         # everything else is teaser-level and stays in the review tier.
@@ -701,7 +713,7 @@ def deep_enrich_hit(
     # itself is CDP-only; the helper below will fail closed before any
     # Playwright launch if the validated user-Chrome context is absent.
     needs_browser = use_browser and (
-        "jobsdb.com" in portal_host
+        is_jobsdb_url(portal_host)
         or (is_linkedin_url(url) and not (h.get("_enrich") or {}).get("ok"))
     )
     if needs_browser:
@@ -726,7 +738,7 @@ def deep_enrich_hit(
 
         fetch_kwargs: dict[str, Any] = {"cache_root": repo}
         recovery = h.get("_jobsdb_human_recovery")
-        is_jobsdb = "jobsdb.com" in portal_host
+        is_jobsdb = is_jobsdb_url(portal_host)
         browser_session = h.get("_browser_session")
         # A JobsDB detail session is valid only when it is the retained,
         # user-visible CDP context.  Drop any stale/headless object supplied
@@ -1460,15 +1472,15 @@ def run_two_pass(
                     h["_linkedin_batch_used"] = True
                 if browser_pool is not None:
                     session = None
-                    if "jobsdb.com" in portal_host and jobsdb_recovery is not None:
+                    if is_jobsdb_url(portal_host) and jobsdb_recovery is not None:
                         session = getattr(jobsdb_recovery, "session", None)
                     if session is None:
                         session = browser_pool.session_for(str(h.get("url") or ""))
                     if session is not None:
                         h["_browser_session"] = session
-                if jobsdb_circuit is not None and "jobsdb.com" in portal_host:
+                if jobsdb_circuit is not None and is_jobsdb_url(portal_host):
                     h["_browser_fetch_circuit"] = jobsdb_circuit
-                if jobsdb_recovery is not None and "jobsdb.com" in portal_host:
+                if jobsdb_recovery is not None and is_jobsdb_url(portal_host):
                     h["_jobsdb_human_recovery"] = jobsdb_recovery
                 try:
                     text2, depth = _run_deep_enrich(
@@ -1512,7 +1524,7 @@ def run_two_pass(
                     meta["jobsdb_cdp_detail_requests"] += 1
                 if enrich_mode == "cache":
                     meta["deep_cache_hits"] += 1
-                if "jobsdb.com" in portal_host:
+                if is_jobsdb_url(portal_host):
                     if enrich_mode == "cache":
                         meta["jobsdb_cache_hits"] += 1
                     else:
@@ -1790,7 +1802,11 @@ def deepen_scored_rows(
 
 
 def write_csv(path: Path, rows: list[dict], *, repo: Path = REPO) -> None:
-    headers = merge_tracker_headers(SHEET_HEADERS, repo, additional=PASS_EXTRA)
+    headers = merge_tracker_headers(
+        SHEET_HEADERS,
+        repo,
+        additional=list(PASS_EXTRA) + list(SCORED_ARTIFACT_EXTRA),
+    )
     # also keep any extra keys
     path.parent.mkdir(parents=True, exist_ok=True)
     def write_rows(f):

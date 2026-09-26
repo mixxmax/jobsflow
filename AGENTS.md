@@ -74,10 +74,12 @@ including `--scope all`, is preview-first; only the matching
 
 ## /scan 模式
 
-JobsDB 详情抓取必须走统一 scan gateway。遇到 Cloudflare 时，系统只允许一
-次有界的用户可见 Chrome CDP 恢复：用户完成验证后，已验证的 CDP context
-会在本轮内串行复用给后续 JobsDB 详情，不得切回新的无头实例，也不得把
-cookie 当作详情抓取凭证。若 9222 未监听，系统只会在用户的主 Chrome 中打开
+JobsDB 全文抓取只允许经 `python3 -m tools.workflow` 网关：`scan`、`intake`
+（缺 JD 的 JobsDB URL）、`materials prepare --fetch`，以及 review-first 下的
+`push --select` 深评。遇到 Cloudflare 时，系统只允许一次有界的用户可见
+Chrome CDP 恢复：用户完成验证后，已验证的 CDP context 会在本轮内串行复用给
+后续 JobsDB 详情，不得切回新的无头实例，也不得把 cookie 当作详情抓取凭证。
+若 9222 未监听，系统只会在用户的主 Chrome 中打开
 `chrome://inspect/#remote-debugging`，由用户启用 Allow remote debugging；
 不得启动第二个 Chrome、不得传入新的 `--user-data-dir`，也不得把“已启动进程”
 当成“恢复成功”。只有通过本地 endpoint 检查、CDP 连接和真实 JD 内容校验后，
@@ -89,10 +91,21 @@ Chrome 136+ 的开关模式可能故意让 `/json/version` 等 HTTP 发现路径
 确认主 Chrome。`doctor` 只做端口级提示，不建立 WebSocket，避免重复触发
 “Allow remote debugging”授权框。
 
+相关环境变量（仅运行时/测试隔离，模型不得自行开启 gateway 标记）：
+- `PORTAL_JD_BROWSER=0`：关闭浏览器深取（测试与只读环境推荐）。
+- `JOBSFLOW_JOBSDB_CHROME_USER_DATA_DIR`：覆盖 DevToolsActivePort 查找目录。
+- `JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT`：每次附接等待人工批准的时间（秒，默认 30，
+  范围 1–120）；`doctor` 显示实际生效值和期望端口。
+
+只有 `https`、默认端口的 `*.jobsdb.com` 职位网址会被打开，且一律经
+`tools.job_urls.safe_jobsdb_job_url` 按职位编号重建后再导航。
+
 `tools/fresh_24h/portal_jd_browser.py` 和 `portal_jd_cdp.py` 是网关内部兼容
 实现，不是第二套入口；直接运行 JobsDB 详情 CLI 会 fail-closed 并返回
 `jobsdb_gateway_only`。内部运行标记由 `tools.workflow` 注入，模型或用户不得
-自行设置。JobsDB 的 Bun `detail --teaser-only` 只读结构化摘要，不能升级为全文。
+自行设置；`tools.workflow.jd_fetch` 只在标记已存在时工作，且只接受 https、默认端口、
+`*.jobsdb.com`、并按岗位编号重建后的 URL（`safe_jobsdb_job_url`）。JobsDB 的 Bun
+`detail --teaser-only` 只读结构化摘要，不能升级为全文。
 
 ```
 /scan              # 临时模式：只扫上次刷新之后的新岗（系统自动记忆时间）

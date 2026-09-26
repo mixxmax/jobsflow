@@ -67,14 +67,17 @@ matter). Preserve the JD/source order; do not spend a model turn rewriting or
 checking the order, and never inspect another package for a title example.
 Only materially distinct slash-separated roles need confirmation.
 
-JobsDB full-JD retrieval has one product route only: `python3 -m tools.workflow
-scan`. The `portal_jd_browser.py` and `portal_jd_cdp.py` files are gateway-owned
-compatibility implementations; a direct JobsDB CLI call is rejected with
-`jobsdb_gateway_only`. The gateway is the only process allowed to attach to the
-user's visible primary Chrome CDP session. No model may start a headless or
-second browser, pass a new profile/storage-state, or copy cookies for detail
-pages. The gateway-owned marker is injected into its child processes and must
-never be supplied by a model.
+JobsDB full-JD retrieval goes only through `python3 -m tools.workflow`: `scan`,
+`intake` (JobsDB URLs missing a full JD), `materials prepare --fetch`, and
+review-first `push --select`. The `portal_jd_browser.py` and `portal_jd_cdp.py`
+files are gateway-owned compatibility implementations; a direct JobsDB CLI call
+is rejected with `jobsdb_gateway_only`. The gateway is the only process allowed
+to attach to the user's visible primary Chrome CDP session. No model may start a
+headless or second browser, pass a new profile/storage-state, or copy cookies for
+detail pages. The gateway-owned marker is injected into its child processes and
+must never be supplied by a model; `tools.workflow.jd_fetch` requires that marker
+already set and accepts only https, default-port `*.jobsdb.com` URLs rebuilt by
+job id via `safe_jobsdb_job_url`.
 
 Chrome 136+ toggle mode may return 404 for `/json/version` while exposing only
 `ws://127.0.0.1:<port>/devtools/browser`. This is a supported primary-Chrome

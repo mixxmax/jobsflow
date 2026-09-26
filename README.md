@@ -559,9 +559,16 @@ JobsDB 是當前唯一需要瀏覽器深取兜底的主要門戶，處理順序�
    隔離 profile。驗證未通過、超時、429 或內容未
    驗證都不會關閉熔斷。瀏覽器會話、cookie 和個人 token 永遠不進入 GitHub。
 
-這是唯一的 JobsDB 全文入口：`portal_jd_browser.py`、`portal_jd_cdp.py` 直接運行會被
-`jobsdb_gateway_only` 阻斷；JobsDB Bun `detail --teaser-only` 只提供結構化摘要，不能替代
-全文抓取。新模型或新 harness 不得自行設置內部 gateway 標記，也不得另起瀏覽器。
+JobsDB 全文只經 `python3 -m tools.workflow` 網關（`scan`、缺 JD 的 `intake`、
+`materials prepare --fetch`、以及 review-first 下的 `push --select`）。
+`portal_jd_browser.py`、`portal_jd_cdp.py` 直接運行會被 `jobsdb_gateway_only`
+阻斷；JobsDB Bun `detail --teaser-only` 只提供結構化摘要，不能替代全文抓取。
+新模型或新 harness 不得自行設置內部 gateway 標記，也不得另起瀏覽器。
+測試或只讀環境可設 `PORTAL_JD_BROWSER=0`；需要隔離時可把
+`JOBSFLOW_JOBSDB_CHROME_USER_DATA_DIR` 指到不存在的目錄。
+`JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT` 是每次附接等待人工批准的時間（秒，默認 30，
+範圍 1–120），`doctor` 會顯示實際生效值。只有 `https`、默認端口的 JobsDB 職位網址
+會被打開，並且一律按職位編號重建後再導航。
 
 Chrome 136+ 的遠端調試開關模式可能讓 `/json/version` 返回 404，但仍提供
 `/devtools/browser` 的 WebSocket；這是受支持的主 Chrome 路徑。網關只在正式掃描中

@@ -636,6 +636,26 @@ def handle(
         duplicates = _possible_duplicates(list(proposal.get("prepared_rows") or []), authoritative_rows)
         if duplicates:
             preview["possible_duplicates"] = duplicates
+        prepared_rows = list(proposal.get("prepared_rows") or [])
+        reposts = [
+            {
+                "职位": row.get("职位") or "",
+                "公司": row.get("公司") or "",
+                "链接": row.get("链接") or "",
+                "possible_repost_of": row.get("possible_repost_of") or "",
+            }
+            for row in prepared_rows
+            if str(row.get("possible_repost_of") or "").strip()
+        ]
+        if reposts:
+            preview["possible_reposts"] = reposts
+            preview.setdefault("review_hints", []).append(
+                "same_company_title_different_url_possible_repost"
+            )
+        if low_count and (expand_low or selection_keys):
+            preview.setdefault("review_hints", []).append(
+                "pass1_low_priority_kept_selectable_not_auto_entered"
+            )
         return preview
 
     proposal = proposal_hint or confirmations.load(proposal_id)

@@ -309,7 +309,7 @@ def test_audit_host_binds_job_id_when_child_omits_routing_field(tmp_path):
 
 def test_batch_clamps_parallelism_and_isolates_job_failures(tmp_path, monkeypatch):
     ws = build_workspace(tmp_path)
-    def fake_one(_workspace, job_id, action, engine):
+    def fake_one(_workspace, job_id, action, engine, *, dry_run=False):
         if job_id == "C0-002":
             return {"job_id": job_id, "status": "blocked", "blockers": ["content_not_passed"]}
         return {"job_id": job_id, "status": "succeeded", "action": action, "engine": engine}
@@ -327,7 +327,7 @@ def test_batch_prepare_uses_gateway_and_writes_compact_context(tmp_path, monkeyp
     ws = build_workspace(tmp_path)
     calls = []
 
-    def fake_one(_workspace, job_id, action, engine):
+    def fake_one(_workspace, job_id, action, engine, *, dry_run=False):
         calls.append((job_id, action, engine))
         return {"job_id": job_id, "status": "succeeded", "action": action, "engine": engine}
 

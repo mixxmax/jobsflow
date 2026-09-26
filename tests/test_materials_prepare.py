@@ -188,6 +188,100 @@ def test_produce_from_idle_runs_prepare_before_plan(tmp_path):
     assert (package / "application_preflight.json").is_file()
 
 
+def test_produce_auto_prepares_when_company_research_also_blocks(tmp_path):
+    import json
+
+    from tools.workflow.materials_prepare import should_auto_prepare
+
+    ws, package = _skeleton(tmp_path)
+    save_jd_cache(URL, FULL_JD, source="browser_jobsdb", root=ws)
+    manifest = json.loads((package / "job_manifest.json").read_text(encoding="utf-8"))
+    job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
+    job["publisher_type"] = "unknown"
+    job.pop("employer_name", None)
+    manifest["job"] = job
+    (package / "job_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert should_auto_prepare(ws, JOB_ID) is True
+
+    out = run_produce(
+        {"job_id": JOB_ID, "max_steps": 1, "materials_engine": "vnext"},
+        workspace=ws,
+    )
+    assert out["produce_steps"][0]["stage"] == "prepare"
+    assert out["produce_steps"][0]["status"] == "succeeded"
+    assert (package / "jd_full.md").is_file()
+
+
+def test_plan_without_jd_points_at_prepare_command(tmp_path):
+    ws, package = _skeleton(tmp_path)
+    out = dispatch(
+        "materials",
+        workspace=ws,
+        payload={"job_id": JOB_ID, "stage": "plan", "auto_prepare": True, "materials_engine": "vnext"},
+    )
+    assert "missing_full_jd" in (out.get("blockers") or []) or out.get("status") == "blocked"
+    assert "materials prepare --job-id" in str(out.get("next_action") or "")
+
+
+def test_plain_plan_and_check_point_at_prepare_command(tmp_path):
+    """vNext joins context blockers into one string; the hint must still fire."""
+
+    ws, _package = _skeleton(tmp_path)
+    for extra in ({}, {"materials_shell": "check"}):
+        out = dispatch(
+            "materials",
+            workspace=ws,
+            payload={"job_id": JOB_ID, "stage": "plan", "materials_engine": "vnext", **extra},
+        )
+        assert out["status"] == "blocked"
+        assert any(str(item).startswith("context_blockers:") for item in out.get("blockers") or [])
+        assert "materials prepare --job-id" in str(out.get("next_action") or "")
+
+
+def test_expand_blockers_splits_joined_context_blockers():
+    from tools.workflow.materials_prepare import expand_blockers, has_prepare_blocker
+
+    joined = ["context_blockers:assessment_missing_or_stale,company_research_required"]
+    assert expand_blockers(joined) == {"assessment_missing_or_stale", "company_research_required"}
+    assert has_prepare_blocker(joined) is True
+    assert has_prepare_blocker(["context_blockers:company_research_required"]) is False
+    assert has_prepare_blocker(["preflight_missing"]) is True
+    assert has_prepare_blocker(None) is False
+
+
+def test_jd_file_unreadable_and_conflict_write_nothing(tmp_path):
+    ws, package = _skeleton(tmp_path)
+    save_jd_cache(URL, FULL_JD, source="browser_jobsdb", root=ws)
+    first = prepare_package({"job_id": JOB_ID}, workspace=ws)
+    assert first["status"] == "succeeded"
+    before = {
+        "jd": (package / "jd_full.md").read_bytes(),
+        "preflight": (package / "application_preflight.json").read_bytes(),
+    }
+
+    missing = prepare_package(
+        {"job_id": JOB_ID, "jd_file": str(tmp_path / "missing-jd.txt")},
+        workspace=ws,
+    )
+    assert missing["status"] == "blocked"
+    assert missing["blockers"] == ["jd_file_unreadable"]
+    assert missing["side_effects"] == []
+    assert (package / "jd_full.md").read_bytes() == before["jd"]
+
+    other = tmp_path / "other-jd.txt"
+    other.write_text("Key Responsibilities\n" + ("Different duty text for conflict. " * 20), encoding="utf-8")
+    conflict = prepare_package(
+        {"job_id": JOB_ID, "jd_file": str(other)},
+        workspace=ws,
+    )
+    assert conflict["status"] == "blocked"
+    assert conflict["blockers"] == ["jd_file_conflicts_existing_jd"]
+    assert "--refresh" in str(conflict.get("next_action") or "")
+    assert conflict["side_effects"] == []
+    assert (package / "jd_full.md").read_bytes() == before["jd"]
+    assert (package / "application_preflight.json").read_bytes() == before["preflight"]
+
+
 def test_push_package_creation_does_not_prepare(tmp_path):
     ws, package = _skeleton(tmp_path)
     save_jd_cache(URL, FULL_JD, source="browser_jobsdb", root=ws)
@@ -216,28 +310,55 @@ def test_deep_jd_persist_uses_workspace_and_url_cache(tmp_path):
 
 
 def test_gateway_does_not_import_retired_materials_cli():
-    source = (ROOT / "tools" / "workflow" / "materials_prepare.py").read_text(encoding="utf-8")
-    assert "tools.job_materials.__main__" not in source
+    """Package inputs have one product writer: the gateway prepare stage.
+
+    Any import or call of the writers — plain, attribute (``jd_store.write_jd``)
+    or aliased — outside the allowed modules fails.  ``enrich.py`` is allowed
+    only while the retired materials CLI is its sole importer.
+    """
+
+    writers = {"write_jd", "write_application_preflight"}
+    definitions = {"tools/job_materials/jd_store.py", "tools/job_materials/requirements_engine.py"}
     allowed = {
         "tools/workflow/materials_prepare.py",
         "tools/job_materials/__main__.py",
         "tools/job_materials/enrich.py",
     }
-    callers: list[str] = []
+    source = (ROOT / "tools" / "workflow" / "materials_prepare.py").read_text(encoding="utf-8")
+    assert "tools.job_materials.__main__" not in source
+
+    offenders: dict[str, str] = {}
+    enrich_importers: set[str] = set()
     for path in (ROOT / "tools").rglob("*.py"):
-        text = path.read_text(encoding="utf-8", errors="replace")
         rel = path.relative_to(ROOT).as_posix()
-        if rel in {"tools/job_materials/jd_store.py", "tools/job_materials/requirements_engine.py"}:
-            continue
-        tree = ast.parse(text)
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        aliases = set(writers)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {
-                "write_jd",
-                "write_application_preflight",
-            }:
-                callers.append(rel)
-                break
-    assert set(callers) <= allowed
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if module == "tools.job_materials.enrich" or (
+                    module == "tools.job_materials" and any(alias.name == "enrich" for alias in node.names)
+                ):
+                    enrich_importers.add(rel)
+                for alias in node.names:
+                    if alias.name in writers:
+                        aliases.add(alias.asname or alias.name)
+                        if rel not in definitions and rel not in allowed:
+                            offenders[rel] = f"imports {alias.name}"
+            elif isinstance(node, ast.Import):
+                if any(alias.name == "tools.job_materials.enrich" for alias in node.names):
+                    enrich_importers.add(rel)
+        if rel in definitions:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+            if name in aliases and rel not in allowed:
+                offenders[rel] = f"calls {name}"
+    assert offenders == {}
+    assert enrich_importers <= {"tools/job_materials/__main__.py"}
 
 
 def test_prepare_dispatch_is_a_materials_stage(tmp_path):

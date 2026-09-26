@@ -81,15 +81,23 @@ def test_final_retention_reuses_scores_and_keeps_provisional_rows_separate():
             "JD深度": "teaser_capped",
             "评估状态": "provisional_needs_jd",
         },
+        {
+            "职位": "Low pass-1",
+            "CareerOps分数": "2.10",
+            "JD深度": "teaser",
+            "评估状态": "pass1_low_priority",
+        },
     ]
 
     loose, loose_meta = select_rows_for_retention(scored, final_gate=3.0)
     standard, standard_meta = select_rows_for_retention(scored, final_gate=3.3)
 
+    # The low pass-1 row is review-only: never relabelled provisional and
+    # never part of a retention view that a batch push could consume.
     assert [row["职位"] for row in loose] == ["Exploration", "Core", "Needs JD"]
     assert [row["职位"] for row in standard] == ["Core", "Needs JD"]
-    assert loose_meta == {"final_selected": 2, "final_filtered": 0, "provisional": 1}
-    assert standard_meta == {"final_selected": 1, "final_filtered": 1, "provisional": 1}
+    assert loose_meta == {"final_selected": 2, "final_filtered": 0, "provisional": 1, "pass1_low_priority": 1}
+    assert standard_meta == {"final_selected": 1, "final_filtered": 1, "provisional": 1, "pass1_low_priority": 1}
 
 
 def test_private_review_floor_keeps_uncertain_teaser_without_deep_fetch(tmp_path, monkeypatch):

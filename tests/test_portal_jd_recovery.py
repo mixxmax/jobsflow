@@ -21,6 +21,13 @@ from tools.fresh_24h import portal_jd_cdp
 from tools.fresh_24h import two_pass_score
 
 
+@pytest.fixture(autouse=True)
+def _enable_portal_jd_browser_branch(monkeypatch):
+    """This suite stubs browser seams; it still needs the browser code path."""
+
+    monkeypatch.setenv("PORTAL_JD_BROWSER", "1")
+
+
 def _approve_cdp_fixture(session):
     """Mint the same process-local capability used by ``connect()``."""
     session._jobsflow_approved_cdp_session = True
@@ -664,6 +671,7 @@ def test_direct_recovery_object_cannot_open_jobsdb_chrome(monkeypatch, tmp_path)
     assert recovery.status == "blocked"
 
 
+@pytest.mark.allows_chrome_launch_method
 def test_missing_cdp_opens_primary_chrome_settings_without_second_profile(
     tmp_path, monkeypatch
 ):

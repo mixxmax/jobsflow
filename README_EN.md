@@ -480,11 +480,24 @@ JobsDB is the main portal that may require a browser fallback. Its fixed order i
    Failed verification, timeout, 429 or unvalidated content never closes the breaker.
    Browser profiles, cookies and personal tokens stay outside GitHub.
 
-This is the only JobsDB full-JD route. Direct execution of `portal_jd_browser.py`
+JobsDB full-JD retrieval goes only through `python3 -m tools.workflow` (`scan`,
+`intake` for JobsDB URLs missing a full JD, `materials prepare --fetch`, and
+review-first `push --select`). Direct execution of `portal_jd_browser.py`
 or `portal_jd_cdp.py` is blocked with `jobsdb_gateway_only`; the JobsDB Bun
 `detail --teaser-only` command returns structured listing data only. A new model
 or harness must not set the internal gateway marker, launch another browser or
-copy cookies for detail retrieval.
+copy cookies for detail retrieval. Only `https` JobsDB job URLs on the default
+port are opened, and each is rebuilt from its job id before navigation.
+
+Runtime and test-isolation settings (none of them lets a model supply the
+gateway marker):
+
+- `PORTAL_JD_BROWSER=0` disables browser deep fetch (recommended for tests and
+  read-only environments).
+- `JOBSFLOW_JOBSDB_CHROME_USER_DATA_DIR` overrides where `DevToolsActivePort`
+  is looked up; point it at a missing directory to isolate a test run.
+- `JOBSFLOW_JOBSDB_CDP_CONNECT_TIMEOUT` is the per-attach approval budget in
+  seconds (default 30, clamped to 1–120). `doctor` reports the effective value.
 
 Chrome 136+ toggle mode may return 404 for `/json/version` while exposing only
 the browser WebSocket at `/devtools/browser`; this is a supported primary-Chrome

@@ -1245,7 +1245,11 @@ def main(argv: list[str] | None = None) -> int:
         if not key.startswith("ctref:"):
             continue
         body = key[6:]
-        company_title, _, prior = body.partition("|")
+        # company_title_key is "company||title"; the prior ref follows the
+        # final single "|". partition("|") would split inside the key.
+        if "|" not in body:
+            continue
+        company_title, prior = body.rsplit("|", 1)
         if company_title and prior and company_title not in ct_refs:
             ct_refs[company_title] = prior
 

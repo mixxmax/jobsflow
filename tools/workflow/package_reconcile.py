@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from tools.job_urls import normalize_job_url
+
 
 _JOB_DIR = re.compile(r"^([A-G][0-2]-\d+)_", re.IGNORECASE)
 
@@ -37,6 +39,7 @@ def reconcile_packages(workspace: Path) -> dict[str, Any]:
                 if isinstance(loaded, dict):
                     bindings[relative] = loaded
     ledger_ids: set[str] = set()
+    ledger_urls: dict[str, set[str]] = {}
     ledger_dir = root / "02_Tracker" / "workflow" / "ledger"
     if ledger_dir.is_dir():
         for path in sorted(ledger_dir.glob("*.json")):
@@ -49,6 +52,9 @@ def reconcile_packages(workspace: Path) -> dict[str, Any]:
                     job_id = str(row.get("岗位编号") or row.get("job_id") or "").strip().upper()
                     if job_id:
                         ledger_ids.add(job_id)
+                        url = normalize_job_url(str(row.get("链接") or row.get("url") or "").strip())
+                        if url:
+                            ledger_urls.setdefault(job_id, set()).add(url)
     package_ids = set(packages)
     mismatches: list[dict[str, str]] = []
     for job_id, paths in packages.items():
@@ -62,8 +68,12 @@ def reconcile_packages(workspace: Path) -> dict[str, Any]:
                 mismatches.append({"job_id": job_id, "path": relative, "reason": "binding_job_id"})
             elif expected and expected != relative:
                 mismatches.append({"job_id": job_id, "path": relative, "reason": "binding_path"})
-            elif job_id in ledger_ids and bound_id and bound_id != job_id:
-                mismatches.append({"job_id": job_id, "path": relative, "reason": "ledger_binding"})
+            elif job_id in ledger_urls:
+                # The package recorded the posting it was created for; the
+                # ledger must still hold that posting under the same ID.
+                package_url = normalize_job_url(_package_row_url(root / relative))
+                if package_url and package_url not in ledger_urls[job_id]:
+                    mismatches.append({"job_id": job_id, "path": relative, "reason": "ledger_url"})
     return {
         "status": "succeeded",
         "packages_only": sorted(package_ids - ledger_ids),
@@ -75,3 +85,14 @@ def reconcile_packages(workspace: Path) -> dict[str, Any]:
         "side_effects": [],
         "next_action": "Use archive preview and confirm to move or remove a package. Reconcile does not change files.",
     }
+
+
+def _package_row_url(package: Path) -> str:
+    try:
+        loaded = json.loads((package / "tracker_row.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ""
+    row = loaded.get("row") if isinstance(loaded, dict) and isinstance(loaded.get("row"), dict) else loaded
+    if not isinstance(row, dict):
+        return ""
+    return str(row.get("链接") or row.get("url") or "").strip()

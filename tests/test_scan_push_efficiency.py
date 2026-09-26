@@ -79,7 +79,7 @@ def test_scored_artifact_reuse_requires_source_profile_and_jd_inputs(tmp_path):
     rows, loaded_meta = reused
     assert rows[0]["岗位编号"] == "A0"
     assert loaded_meta["artifact"]["source_csv_sha256"]
-    assert loaded_meta["artifact"]["schema_version"] == 3
+    assert loaded_meta["artifact"]["schema_version"] == 4
     assert loaded_meta["artifact"]["retrieval_floor"] == 2.95
 
     # Final retention is a post-score user choice. Switching from standard

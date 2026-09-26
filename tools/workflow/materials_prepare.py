@@ -43,12 +43,43 @@ PREPARE_INPUT_BLOCKERS = frozenset(
 _RECEIPT = "materials_prepare.json"
 
 
+def expand_blockers(blockers: Any) -> set[str]:
+    """Blocker names, with vNext's joined ``context_blockers:a,b`` split out."""
+
+    found: set[str] = set()
+    for item in blockers or []:
+        raw = str(item)
+        if raw.startswith("context_blockers:"):
+            found.update(part for part in raw.split(":", 1)[1].split(",") if part)
+        else:
+            found.add(raw)
+    return found
+
+
+def has_prepare_blocker(blockers: Any) -> bool:
+    """True when any blocker is one that ``materials prepare`` resolves."""
+
+    return bool(expand_blockers(blockers) & PREPARE_INPUT_BLOCKERS)
+
+
+def prepare_command(job_id: str, *, with_fetch: bool = False) -> str:
+    """Copy-pasteable prepare command for blocked materials stages."""
+
+    base = f"python3 -m tools.workflow materials prepare --job-id {job_id}"
+    if with_fetch:
+        return f"{base} [--jd-file F | --fetch]"
+    return f"{base} [--jd-file F | --fetch]"
+
+
 def should_auto_prepare(workspace: Path, job_id: str) -> bool:
-    """True when the only context blockers are inputs this stage can fill."""
+    """True when any prepare-owned input blocker is still open.
+
+    Other blockers (company research, entity contract, …) stay for plan; prepare
+    is deterministic and idempotent so it still runs first to clear what it can.
+    """
 
     ctx = PackageContextLoader(Path(workspace)).load(job_id)
-    found = {str(item) for item in ctx.blockers}
-    return bool(found) and found <= PREPARE_INPUT_BLOCKERS
+    return has_prepare_blocker(ctx.blockers)
 
 
 def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -> dict[str, Any]:
@@ -62,14 +93,71 @@ def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -
     payload = dict(payload or {})
     workspace = Path(workspace)
     job_id = str(payload.get("job_id") or "").strip()
+    if bool(payload.get("dry_run")):
+        return {
+            "status": "planned",
+            "job_id": job_id,
+            "dry_run": True,
+            "side_effects": [],
+            "blockers": [],
+            "message": "materials_prepare_dry_run",
+        }
     ctx = PackageContextLoader(workspace).load(job_id)
     if not ctx.package:
-        return _blocked(job_id, list(ctx.blockers or ["package_missing"]))
+        return _blocked(
+            job_id,
+            list(ctx.blockers or ["package_missing"]),
+            next_action=prepare_command(job_id) if (set(ctx.blockers or []) & PREPARE_INPUT_BLOCKERS) else "",
+        )
     package = Path(ctx.package)
     manifest = ctx.manifest if isinstance(ctx.manifest, dict) else {}
     url = _job_url(package, manifest)
     identity = _job_identity(package, manifest, url)
+    jd_file_raw = str(payload.get("jd_file") or "").strip()
+    if jd_file_raw:
+        jd_path = Path(jd_file_raw)
+        try:
+            supplied_raw = jd_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return _blocked(
+                job_id,
+                ["jd_file_unreadable"],
+                next_action=prepare_command(job_id),
+                after_state=_phase(package),
+            )
+        existing_body = _stored_jd_body(package)
+        refresh = bool(payload.get("refresh") or payload.get("refresh_jd"))
+        if (
+            existing_body
+            and len(existing_body) >= FULL_JD_MIN_CHARS
+            and not refresh
+            and _body(supplied_raw) != existing_body
+        ):
+            return _blocked(
+                job_id,
+                ["jd_file_conflicts_existing_jd"],
+                next_action=(
+                    f"python3 -m tools.workflow materials prepare --job-id {job_id}"
+                    f" --jd-file {jd_file_raw} --refresh"
+                ),
+                after_state=_phase(package),
+            )
+        if len(supplied_raw) < FULL_JD_MIN_CHARS:
+            return _blocked(
+                job_id,
+                ["jd_file_too_short"],
+                next_action=prepare_command(job_id),
+                after_state=_phase(package),
+            )
     chosen = _choose_jd(package, workspace, job_id, url, payload)
+    supplied = _supplied_text(payload)
+    if jd_file_raw and supplied is not None and len(supplied) < FULL_JD_MIN_CHARS:
+        return _blocked(
+            job_id,
+            ["jd_file_too_short"],
+            next_action=prepare_command(job_id),
+            after_state=_phase(package),
+        )
     fetch_meta: dict[str, Any] = {}
     if chosen is None and bool(payload.get("fetch") or payload.get("fetch_jd")):
         if not url:
@@ -79,21 +167,32 @@ def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -
                 next_action=f"python3 -m tools.workflow materials prepare --job-id {job_id} --jd-file <full-jd.txt>",
                 after_state=_phase(package),
             )
+        from tools.job_urls import safe_jobsdb_job_url
+        from tools.workflow.adapters.push import _jobsdb_gateway_context
         from tools.workflow.jd_fetch import fetch_full_jds, lookup_fetched
 
-        try:
-            fetched, fetch_meta = fetch_full_jds(
-                workspace,
-                [
-                    {
-                        "url": url,
-                        "title": identity["title"],
-                        "employer": identity["company"],
-                        "platform": identity["source"],
-                        "lane": job_id[:1],
-                    }
-                ],
+        safe = safe_jobsdb_job_url(url)
+        if not safe:
+            return _blocked(
+                job_id,
+                ["jd_fetch_url_not_allowed"],
+                next_action=f"python3 -m tools.workflow materials prepare --job-id {job_id} --jd-file <full-jd.txt>",
+                after_state=_phase(package),
             )
+        try:
+            with _jobsdb_gateway_context(workspace):
+                fetched, fetch_meta = fetch_full_jds(
+                    workspace,
+                    [
+                        {
+                            "url": safe,
+                            "title": identity["title"],
+                            "employer": identity["company"],
+                            "platform": identity["source"],
+                            "lane": job_id[:1],
+                        }
+                    ],
+                )
         except ValueError as exc:
             return _blocked(job_id, [str(exc)], after_state=_phase(package))
         except Exception as exc:
@@ -104,17 +203,14 @@ def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -
                 next_action=f"python3 -m tools.workflow materials prepare --job-id {job_id} --jd-file <full-jd.txt>",
                 after_state=_phase(package),
             )
-        body = lookup_fetched(fetched, url)
+        body = lookup_fetched(fetched, safe)
         if body:
             chosen = (body, "gateway_fetch")
     if chosen is None:
         return _blocked(
             job_id,
             ["jd_full_unavailable"],
-            next_action=(
-                f"python3 -m tools.workflow materials prepare --job-id {job_id}"
-                " --jd-file <full-jd.txt>  # or --fetch"
-            ),
+            next_action=prepare_command(job_id),
             after_state=_phase(package),
             jd_fetch=fetch_meta,
         )
@@ -169,13 +265,19 @@ def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -
     remaining = [item for item in reloaded.blockers if item not in PREPARE_INPUT_BLOCKERS]
     input_left = [item for item in reloaded.blockers if item in PREPARE_INPUT_BLOCKERS]
     status = "blocked" if input_left else "succeeded"
-    next_action = "answer_preflight_questions" if "unresolved_hard_requirement" in remaining else ""
+    blockers = remaining + input_left
+    if "unresolved_hard_requirement" in remaining:
+        next_action = "answer_preflight_questions"
+    elif set(blockers) & PREPARE_INPUT_BLOCKERS:
+        next_action = prepare_command(job_id)
+    else:
+        next_action = ""
     return {
         "status": status,
         "job_id": job_id,
         "noop": False,
         "after_state": _phase(package),
-        "blockers": remaining + input_left,
+        "blockers": blockers,
         "next_action": next_action,
         "side_effects": effects,
         "prepare": {

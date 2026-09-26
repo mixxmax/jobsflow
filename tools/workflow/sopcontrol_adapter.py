@@ -729,8 +729,9 @@ def _redeem_capability_ticket(request: Any) -> list[str]:
             return ["capability_ticket_invalid"]
         if expected_run and request_run and expected_run != request_run:
             return ["capability_ticket_invalid"]
-        if expected_run and not request_run:
-            payload["run_id"] = expected_run
+        # Do not inject handoff run_id into the payload before fingerprinting.
+        # Issue fingerprints use payload["run_id"] (often empty) while the
+        # ticket record may still store entity_id as run_id metadata.
         payload["capability_ticket_secret"] = secret
         try:
             request.payload = payload

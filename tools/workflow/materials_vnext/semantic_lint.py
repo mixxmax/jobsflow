@@ -369,6 +369,8 @@ def run_semantic_lint(
                     "verb_escalation", material, block_id,
                     f"evidence verbs introduced without baseline basis: {sorted(escalated)}",
                     jd_anchored=bool(_verb_family(escalated) & jd_verbs),
+                    experience_id=experience_id or None,
+                    target_id=block_id,
                     required_action=(
                         "Rewrite with a verb already supported by the baseline or a confirmed fact "
                         "for this experience, or confirm through materials resolve that you did this "
@@ -515,15 +517,21 @@ def _fact_is_confirmed(item: dict[str, Any]) -> bool:
 
 
 def _confirmed_fact_verbs(bundle: dict[str, Any], experience_id: str) -> set[str]:
-    """Verified evidence verbs. JD wording is never added to this set."""
+    """Verified evidence verbs for one experience. JD wording is never added."""
 
     verbs: set[str] = set()
     for item in _fact_items(bundle):
         if not _fact_is_confirmed(item):
             continue
         linked = str(item.get("experience_id") or item.get("experience") or "").strip()
-        if experience_id and linked != experience_id:
-            continue
+        # Experience-scoped CV bullets only accept facts linked to that experience.
+        if experience_id:
+            if linked != experience_id:
+                continue
+        elif linked:
+            # Summary / CL lines may use any confirmed fact; experience-linked
+            # facts still count here because they are verified work.
+            pass
         verbs |= high_risk_verbs(item.get("text") or item.get("claim") or "")
     return verbs
 

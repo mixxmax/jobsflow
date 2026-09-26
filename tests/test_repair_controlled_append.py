@@ -165,3 +165,35 @@ def test_repair_append_rejects_more_than_two_and_empty_before_is_filled():
         ],
     }
     assert validate_transform(replace, _baseline(), current=_current(), repair=True) == []
+
+
+def _append_citing(finding_id: str) -> dict:
+    return {
+        "schema_version": 1,
+        "operations": [
+            {
+                "material": "cv",
+                "action": "append_after",
+                "after_id": "cv-exp1-b1",
+                "finding_id": finding_id,
+                "new_id": "cv-exp1-b1a",
+                "type": "bullet",
+                "section": "experience",
+                "text": "Documented the recovery timeline for the litigation team.",
+            }
+        ],
+    }
+
+
+def test_repair_append_must_cite_a_currently_open_finding():
+    # The engine passes the open audit findings.  An empty set means there is
+    # nothing an append could answer, so every cited id is unknown.
+    assert "repair_append_finding_unknown:0:finding-add-1" in validate_transform(
+        _append_citing("finding-add-1"), _baseline(), current=_current(), repair=True, open_finding_ids=set()
+    )
+    assert "repair_append_finding_unknown:0:bogus" in validate_transform(
+        _append_citing("bogus"), _baseline(), current=_current(), repair=True, open_finding_ids={"finding-add-1"}
+    )
+    assert validate_transform(
+        _append_citing("finding-add-1"), _baseline(), current=_current(), repair=True, open_finding_ids={"finding-add-1"}
+    ) == []

@@ -179,6 +179,10 @@ _TEASER_BOILERPLATE = (
     "five-day work",
     "medical insurance",
     "career development",
+    "salary review",
+    "performance bonus",
+    "annual leave",
+    "work-life balance",
     "待遇优厚",
     "五天工作",
     "有意者",
@@ -239,8 +243,21 @@ def teaser_is_informative(
         return False
     haystack = cleaned.casefold()
     signals: set[str] = set()
+
+    def _has_signal(token: str) -> bool:
+        needle = token.casefold().strip()
+        if not needle:
+            return False
+        # Duty signals are stems ("coordinat", "report"). Match at a word
+        # start so "review" inside "preview" does not count, while
+        # "coordinate"/"reporting" still match their stems.
+        if re.fullmatch(r"[a-z0-9][a-z0-9\s\-/+.&]*", needle):
+            return re.search(rf"(?<![a-z0-9]){re.escape(needle)}", haystack) is not None
+        # CJK / mixed tokens have no ASCII word boundaries.
+        return needle in haystack
+
     for token in _GENERIC_DUTY_SIGNALS:
-        if token.casefold() in haystack:
+        if _has_signal(token):
             signals.add(token.casefold())
     data = profile if isinstance(profile, dict) else {}
     for key in (
@@ -258,6 +275,6 @@ def teaser_is_informative(
             token = str(item or "").strip()
             if len(token) < 3:
                 continue
-            if token.casefold() in haystack:
+            if _has_signal(token):
                 signals.add(token.casefold())
     return len(signals) >= int(min_signals)

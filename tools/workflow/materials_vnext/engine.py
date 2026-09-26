@@ -1429,7 +1429,32 @@ class MaterialsEngine:
             submitted_fingerprint = text(raw_patch.get("audit_input_fingerprint"))
             if submitted_fingerprint and submitted_fingerprint != text(task.get("audit_input_fingerprint")):
                 return {"status": "blocked", "blockers": ["repair_audit_input_stale"], "engine": "materials-vnext"}
-            patch_errors = validate_transform(patch, current_canonical, current=current_canonical, repair=True)
+            content_baseline = bundle.get("baseline") if isinstance(bundle.get("baseline"), dict) else {}
+            if not content_baseline:
+                try:
+                    from tools.workflow.materials_baseline import load_content_baseline
+
+                    content_baseline = load_content_baseline(package)
+                except Exception:
+                    content_baseline = current_canonical
+            open_finding_ids = {
+                text(item.get("finding_id") or item.get("fingerprint") or item.get("block_id"))
+                for item in (load_audit_result(package).get("findings") or [])
+                if isinstance(item, dict)
+                and text(item.get("disposition")).casefold() not in {"user_accepted", "user_rejected", "not_actionable", "fixed"}
+            }
+            open_finding_ids = {item for item in open_finding_ids if item}
+            # Type allow-list binds to the frozen content baseline; current draft
+            # supplies before_text / after_id resolution only.
+            patch_errors = validate_transform(
+                patch,
+                content_baseline or current_canonical,
+                current=current_canonical,
+                repair=True,
+                # An empty set is meaningful: with no open finding, no append
+                # can cite one.  ``None`` is reserved for patch replay.
+                open_finding_ids=open_finding_ids,
+            )
             if patch_errors:
                 return {"status": "blocked", "blockers": ["repair_patch_invalid"], "errors": patch_errors, "engine": "materials-vnext"}
             from tools.workflow.materials_vnext.transform import stamp_derived_change_classes

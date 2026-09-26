@@ -52,7 +52,7 @@ from urllib.parse import urlparse, urlunsplit
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from tools.job_urls import normalize_job_url  # noqa: E402
+from tools.job_urls import normalize_job_url, safe_jobsdb_job_url  # noqa: E402
 
 # Prefer longer body for pass-2 / materials
 MAX_CHARS = 14000
@@ -195,12 +195,13 @@ class JdFetchResult:
 
 
 def detect_portal(url: str) -> str:
-    u = (url or "").lower()
-    if "jobsdb.com" in u:
+    from tools.job_urls import is_ctgoodjobs_url, is_jobsdb_url, is_linkedin_url_host
+
+    if is_jobsdb_url(url):
         return "jobsdb"
-    if "ctgoodjobs.hk" in u:
+    if is_ctgoodjobs_url(url):
         return "ctgoodjobs"
-    if "linkedin.com" in u:
+    if is_linkedin_url_host(url):
         return "linkedin"
     return "generic"
 
@@ -865,7 +866,18 @@ class JdBrowserSession:
     ) -> JdFetchResult:
         raw = (url or "").strip()
         portal = detect_portal(raw)
-        canon = normalize_job_url(raw, source=portal if portal != "generic" else "")
+        if portal == "jobsdb":
+            canon = safe_jobsdb_job_url(raw)
+            if not canon:
+                return JdFetchResult(
+                    ok=False,
+                    url=raw,
+                    portal=portal,
+                    fail_reason="error",
+                    detail_reason="jd_fetch_url_not_allowed",
+                )
+        else:
+            canon = normalize_job_url(raw, source=portal if portal != "generic" else "")
         if not canon:
             return JdFetchResult(ok=False, url=raw, portal=portal, fail_reason="empty")
         # Do not let a caller disguise a JobsDB URL as a generic/LinkedIn
@@ -1347,17 +1359,25 @@ def read_devtools_active_port(
     return report
 
 
-def devtools_active_port_report(endpoint: str = "http://127.0.0.1:9222") -> dict[str, Any]:
-    """Doctor view: file presence and port match. No websocket is opened."""
+def devtools_active_port_report(endpoint: str | None = None) -> dict[str, Any]:
+    """Doctor view: file presence, port match and attach budget. No websocket is opened.
 
-    parsed = urlparse(endpoint)
+    Without an explicit endpoint the configured JobsDB endpoint is used, so a
+    ``JOBSFLOW_JOBSDB_CDP_PORT``/``_URL`` setting is compared rather than 9222.
+    """
+
+    parsed = urlparse(endpoint or _configured_jobsdb_cdp_endpoint())
     port = parsed.port or 9222
     report = read_devtools_active_port(expected_port=port)
     return {
         "found": bool(report.get("found")),
         "port": report.get("port"),
+        "expected_port": port,
         "port_matches": bool(report.get("port_matches")),
         "error": report.get("error") or "",
+        # Effective per-attach approval budget, so a too-short setting is
+        # visible before a human misses Chrome's prompt.
+        "connect_timeout_seconds": _cdp_connect_timeout_ms() / 1000,
     }
 
 
@@ -2028,11 +2048,16 @@ class JobsdbCdpBatchSession:
                 headless=False,
                 browser_channel=self.channel,
             )
-        canon = normalize_job_url(raw, source="jobsdb")
+        canon = safe_jobsdb_job_url(raw)
         if not canon:
             return JdFetchResult(
-                ok=False, url=raw, portal="jobsdb", fail_reason="empty",
-                session_mode=self._session_mode_label(), headless=False,
+                ok=False,
+                url=raw,
+                portal="jobsdb",
+                fail_reason="error",
+                detail_reason="jd_fetch_url_not_allowed",
+                session_mode=self._session_mode_label(),
+                headless=False,
                 browser_channel=self.channel,
             )
         if self.context is None or self._closed:
