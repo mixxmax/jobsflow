@@ -20,54 +20,22 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-09-20 · Optional TypeSafe / Jev advisory judgments
+## 🆕 Latest update · 2026-09-26 · A large round of stability fixes
 
-JobsFlow can now use **TypeSafe (System One / Jev)** to make semantic judgments about the material lines of the current job: whether a line really supports that JD requirement, whether two lines are redundant, and how much evidence would be lost by cutting a line. The output is a sorted advisory report.
+We walked one job all the way from search to application materials and fixed the bugs that surfaced along the way. The work went through an independent QA pass and the full test suite (964 tests, all passing). Highlights:
 
-It is a **read-only side channel**: it takes no part in any scan, tracker write, material, render, format gate or apply decision. It is never a gate.
+- **The materials chain works end to end.** A job entered into the tracker can go straight to materials. The new `materials prepare` fills in the full JD, the matching assessment and the application preflight, and `materials produce` now runs the whole generation chain on one authorization instead of needing a hand-off at every step.
+- **Jobs no longer disappear quietly.** Cards with a low first-pass score stay visible as low-priority review items and can be selected for deep review in `/push`. "Show me first, then dig deeper" has a proper switch, `intent review-first`, and a job reposted under a new ID is flagged.
+- **Jobs you find yourself can get their full JD.** `/intake` can fetch the JobsDB full text through the gateway. Only real `https` JobsDB job URLs are opened, each rebuilt from its job ID, so lookalike links are refused.
+- **Enough time to approve Chrome.** The attach wait now defaults to 30 seconds and is configurable; `doctor` shows the effective value.
+- **Less fuss over résumé wording.** The baseline wording is copied first; a reasonable change within your role passes, and only an inflated verb needs your confirmation, which applies to that one job (`materials confirm-claim`).
+- **Also:** several silent failures while revising or re-running now report clearly, a read-only `reconcile packages` check was added, and the test suite can no longer touch your real browser.
 
-**There is exactly one fact about enabling it: give it `TYPESAFE_API_KEY` and it turns on; do not, and it stays off.** No config to edit, no code to change, no flag to set — and no adaptation between JobsFlow and TypeSafe for you to write. The integration lives in the product line.
+The full record is in the [fix handbook](docs/JobsFlow_岗位全流程缺陷修复技术手册_2026-09-25.md) and the [rework list](docs/JobsFlow_岗位全流程缺陷修复_返工清单_2026-09-25.md) (Chinese). The previous update, optional TypeSafe / Jev advisory judgments, now lives under Quick start below.
 
-### Install (two steps, once)
+---
 
-```bash
-bash tools/setup_env.sh --advisory     # installs only this extra, hash-locked, runtime deps untouched
-export TYPESAFE_API_KEY="ts-your-key"  # your own key
-```
-
-To make the key permanent, put it in `~/.zshenv` (every zsh reads it; more reliable than `~/.zshrc`):
-
-```bash
-echo 'export TYPESAFE_API_KEY="ts-your-key"' >> ~/.zshenv
-```
-
-**The key only needs to live in your own machine's environment.** The product reads it from `os.environ` at call time and nothing else — it is never written to a file, never committed, never sent to CI. Do not paste it to anyone in a conversation, and never commit it.
-
-### Using it
-
-Check whether it is on first (read-only, costs no API credits):
-
-```bash
-python3 -m tools.workflow materials status --job-id <id>
-```
-
-Look at `result.typesafe`: `enabled: true` means it is on. If not, it tells you which half is missing (`key_present` / `sdk_present`) and the command that fixes it.
-
-Run it once:
-
-```bash
-python3 -m tools.workflow materials typesafe --job-id <id>
-```
-
-The report is written to `materials_vnext/typesafe_advisory.json` inside that job's package. Use `--dry-run` if you do not want to spend credits — it sends no request at all.
-
-### What happens if you do not install it
-
-Nothing changes. Scan, tracker writes, materials, render, format gates and apply all behave exactly as before; `materials typesafe` still returns `succeeded`, it just writes no file and sends no request. The product behaves identically with and without a key — that is covered by tests.
-
-See [`docs/typesafe_advisory_judgments.md`](docs/typesafe_advisory_judgments.md) for details.
-
-### Why JobsFlow?
+## Why JobsFlow?
 
 | Generic AI job tool | JobsFlow |
 |---|---|
@@ -163,7 +131,7 @@ python3 setup.py --install-portals
 dependencies, vendored SOP Control and CI all run the same flow, so there is no
 second "hand-assembled from the README" environment. The script checks Python
 3.10 / 3.11 compatibility, and `--check-only` verifies offline without
-installing. Optional extras — such as the TypeSafe advisory layer above — use the
+installing. Optional extras — such as the TypeSafe advisory layer below — use the
 same script's `--advisory` switch and never bypass the hash lock.
 
 When switching models or harnesses, run the read-only handoff check first:
@@ -240,6 +208,53 @@ CV + intent → setup → search → quick score → JD deep read
            → lane/tier preview → your review → confirmed tracker entry
            → persistent job ID → tailored CV/cover letter → your approval
 ```
+
+### Optional: TypeSafe advisory judgments (on when an API key is present)
+
+JobsFlow can now use **TypeSafe (System One / Jev)** to make semantic judgments about the material lines of the current job: whether a line really supports that JD requirement, whether two lines are redundant, and how much evidence would be lost by cutting a line. The output is a sorted advisory report.
+
+It is a **read-only side channel**: it takes no part in any scan, tracker write, material, render, format gate or apply decision. It is never a gate.
+
+**There is exactly one fact about enabling it: give it `TYPESAFE_API_KEY` and it turns on; do not, and it stays off.** No config to edit, no code to change, no flag to set — and no adaptation between JobsFlow and TypeSafe for you to write. The integration lives in the product line.
+
+#### Install (two steps, once)
+
+```bash
+bash tools/setup_env.sh --advisory     # installs only this extra, hash-locked, runtime deps untouched
+export TYPESAFE_API_KEY="ts-your-key"  # your own key
+```
+
+To make the key permanent, put it in `~/.zshenv` (every zsh reads it; more reliable than `~/.zshrc`):
+
+```bash
+echo 'export TYPESAFE_API_KEY="ts-your-key"' >> ~/.zshenv
+```
+
+**The key only needs to live in your own machine's environment.** The product reads it from `os.environ` at call time and nothing else — it is never written to a file, never committed, never sent to CI. Do not paste it to anyone in a conversation, and never commit it.
+
+#### Using it
+
+Check whether it is on first (read-only, costs no API credits):
+
+```bash
+python3 -m tools.workflow materials status --job-id <id>
+```
+
+Look at `result.typesafe`: `enabled: true` means it is on. If not, it tells you which half is missing (`key_present` / `sdk_present`) and the command that fixes it.
+
+Run it once:
+
+```bash
+python3 -m tools.workflow materials typesafe --job-id <id>
+```
+
+The report is written to `materials_vnext/typesafe_advisory.json` inside that job's package. Use `--dry-run` if you do not want to spend credits — it sends no request at all.
+
+#### What happens if you do not install it
+
+Nothing changes. Scan, tracker writes, materials, render, format gates and apply all behave exactly as before; `materials typesafe` still returns `succeeded`, it just writes no file and sends no request. The product behaves identically with and without a key — that is covered by tests.
+
+See [`docs/typesafe_advisory_judgments.md`](docs/typesafe_advisory_judgments.md) for details.
 
 ### Operational reliability and diagnostics
 
