@@ -9,7 +9,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from tools.workflow.materials_vnext import semantic_lint
-from tools.workflow.materials_vnext.contracts import BLOCK_TYPES, MATERIALS, digest, text
+from tools.workflow.materials_vnext.contracts import BLOCK_TYPES, MATERIALS, content_text, logical_items, digest, text
 
 
 ALLOWED_ACTIONS = {"replace", "append_after", "reorder"}
@@ -140,7 +140,7 @@ def normalize_transform_operations(
         if action == "replace":
             before = text(operation.get("before_text"))
             if not before:
-                operation["before_text"] = text(block.get("text"))
+                operation["before_text"] = content_text(block.get("text"))
             elif before != text(block.get("text")):
                 errors.append(f"operation_before_text_mismatch:{index}:{target_id}")
                 continue
@@ -511,7 +511,7 @@ def _apply_operations(base: dict[str, Any], transform: dict[str, Any], *, repair
     for material in MATERIALS:
         for existing_block in result[material]:
             existing_block.setdefault("baseline_refs", [text(existing_block.get("id"))] if text(existing_block.get("id")) else [])
-            existing_block.setdefault("baseline_before_text", text(existing_block.get("text")))
+            existing_block.setdefault("baseline_before_text", content_text(existing_block.get("text")))
             existing_block.setdefault("baseline_content_floor", bool(existing_block.get("content_floor", not existing_block.get("host_managed"))))
     for operation in _ops(transform):
         material = text(operation.get("material")).casefold()
@@ -521,7 +521,8 @@ def _apply_operations(base: dict[str, Any], transform: dict[str, Any], *, repair
         target_id = text(operation.get("target_id") or operation.get("block_id"))
         if action == "replace":
             target = lookup[target_id]
-            target["text"] = text(operation.get("after_text") or operation.get("text"))
+            target["text"] = content_text(operation.get("after_text") or operation.get("text"))
+            target["logical_items"] = logical_items(target["text"])
             if isinstance(operation.get("jd_anchor_ids"), list):
                 target["jd_anchor_ids"] = list(operation["jd_anchor_ids"])
             target["customized"] = True
@@ -552,7 +553,8 @@ def _apply_operations(base: dict[str, Any], transform: dict[str, Any], *, repair
             new_block = {
                 "id": text(block.get("new_id") or block.get("id")),
                 "type": text(block.get("type") or "bullet"),
-                "text": text(block.get("text") or block.get("after_text")),
+                "text": content_text(block.get("text") or block.get("after_text")),
+                "logical_items": logical_items(block.get("text") or block.get("after_text")),
                 "section": section,
                 "experience_id": text(block.get("experience_id") or anchor.get("experience_id")),
                 "priority": block.get("priority", 999),

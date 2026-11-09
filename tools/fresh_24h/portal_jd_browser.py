@@ -275,6 +275,8 @@ _JD_SEMANTIC_MARKERS = (
     "we offer",
     "experience and skills",
     "skills and experience",
+    # Sparse adverts may state eligibility directly, without section headings.
+    "working experience",
     "what you'll do",
     "what you will do",
     "candidate profile",
@@ -297,7 +299,9 @@ def is_real_jd(
 ) -> bool:
     """C5: a page is a real JD only when structure, length and semantics agree.
 
-    A long body is a weak signal and can never pass on its own.
+    A long body is a weak signal and can never pass on its own. One job-related
+    semantic marker is sufficient once container, length and WAF checks pass;
+    sparse adverts need not contain two section headings.
 
     ``trusted_source``: the body came from the portal's own structured
     output (e.g. schema.org JobPosting JSON-LD) rather than DOM heuristics.
@@ -320,7 +324,7 @@ def is_real_jd(
         return True
     lowered = clean.lower()
     signals = sum(1 for m in _JD_SEMANTIC_MARKERS if m in lowered)
-    if signals < 2:
+    if signals < 1:
         return False
     return True
 

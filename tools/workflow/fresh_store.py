@@ -889,15 +889,18 @@ class GSheetFreshStore:
 
         The local ledger is authoritative.  We still perform one precondition
         read so an obvious concurrent edit is not silently overwritten, but we
-        do not perform a second full-sheet readback after the insert.  If a
+        do not perform a second full-sheet readback after the insert. A bounded
+        read of just the inserted rows verifies the write. If a
         retry finds that the same rows are already present, it is treated as an
         idempotent success; this covers a timeout after Google accepted the
         request.
         """
 
+        self.entry_readback_verified = False
         current = self.read_active()
         if current.digest != expected_digest:
             if _already_inserted(current, rows):
+                self.entry_readback_verified = True
                 return current
             raise SnapshotConflict("remote_snapshot_changed")
 
@@ -948,6 +951,13 @@ class GSheetFreshStore:
             # Values have already been inserted.  Keep the operation
             # idempotent and let a later reconciliation retry formatting.
             pass
+        observed = ws.get(f"A2:{_column_letter(len(current_headers) - 1)}{len(rows) + 1}")
+        def cell(value):
+            return "" if value is None else "TRUE" if value is True else "FALSE" if value is False else str(value)
+        normalized = [list(row) + [""] * max(0, len(current_headers) - len(row)) for row in observed]
+        if [[cell(v) for v in row] for row in normalized] != [[cell(v) for v in row] for row in values]:
+            raise RuntimeError("projection_entry_readback_mismatch")
+        self.entry_readback_verified = True
         return after
 
     def merge_incoming(self, incoming: list[dict[str, Any]]) -> dict[str, int]:

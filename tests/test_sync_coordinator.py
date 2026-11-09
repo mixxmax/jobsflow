@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import json
 from pathlib import Path
 
@@ -67,9 +69,16 @@ class AppendOnlyStore(MemoryFreshStore):
 class FakeWorksheet:
     def __init__(self):
         self.calls = []
+        self.inserted_values = []
+        self.read_ranges = []
 
     def insert_rows(self, values, **kwargs):
         self.calls.append((values, kwargs))
+        self.inserted_values = [list(row) for row in values]
+
+    def get(self, range_name):
+        self.read_ranges.append(range_name)
+        return self.inserted_values
 
 
 class FakeSpreadsheet:
@@ -172,6 +181,18 @@ def test_gsheet_append_path_inserts_rows_without_clear_or_full_update():
     assert after.rows[0]["岗位编号"] == "C0-901"
     assert len(store.worksheet.calls) == 1
     assert store.worksheet.calls[0][1]["row"] == 2
+    assert store.worksheet.read_ranges == ["A2:D2"]
+    assert store.entry_readback_verified
+
+
+def test_gsheet_append_fails_if_inserted_batch_cannot_be_verified():
+    current = FreshSnapshot(title="fresh_test", headers=["岗位编号", "职位"], rows=[])
+    store = FakeGSheetStore(current)
+    store.worksheet.get = lambda _: [["wrong-id", "Wrong row"]]
+    with pytest.raises(RuntimeError, match="projection_entry_readback_mismatch"):
+        store.append_rows_if_digest([{"岗位编号": "C0-001", "职位": "Analyst"}],
+                                    headers=current.headers, expected_digest=current.digest)
+    assert not store.entry_readback_verified
 
 
 def test_gsheet_entry_append_demotes_old_batch_and_formats_new_rows():

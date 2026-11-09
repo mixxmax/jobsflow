@@ -59,6 +59,13 @@ def dispatch_with_relay(
     if not allow:
         return out
     if not (out.get("requires_capability_ticket") or "capability_ticket_required" in (out.get("blockers") or [])):
+        # A generation-bound grant can redeem inside admission, before the
+        # outer produce/batch host sees a challenge. Preserve its receipt.
+        admit = out.get("sop_control_admit") or {}
+        ticket_id = admit.get("relayed_ticket_id")
+        if admit.get("task_authorization_relayed") and ticket_id:
+            out["ticket_relayed"] = True
+            out["ticket_relay"] = [{"stage": body.get("stage") or action, "ticket_id": ticket_id}]
         return out
     ticket_id = str(out.get("capability_ticket_id") or "").strip()
     secret = str(out.get("capability_ticket_secret") or "").strip()

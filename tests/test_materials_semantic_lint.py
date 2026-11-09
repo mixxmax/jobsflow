@@ -146,6 +146,37 @@ def test_cross_employer_attribution_is_flagged():
     assert "cross_employer_attribution" in _codes(findings)
 
 
+def test_generic_team_word_in_another_heading_is_not_an_employer():
+    bundle = _bundle()
+    bundle["baseline"]["cv"]["blocks"][3]["text"] = "Operations Team, Beta Group"
+    findings = run_semantic_lint(
+        bundle=bundle,
+        canonical=_canonical({
+            "cv-exp1-b1": _baseline_blocks()["cv"]["blocks"][2]["text"] + " Supported the team with accurate records."
+        }),
+    )
+    assert "cross_employer_attribution" not in _codes(findings)
+
+
+def test_employer_markers_already_in_the_baseline_are_not_new_leakage():
+    bundle = _bundle()
+    original = bundle["baseline"]["cv"]["blocks"][2]["text"] + " Coordinated with Beta Group."
+    bundle["baseline"]["cv"]["blocks"][2]["text"] = original
+    findings = run_semantic_lint(bundle=bundle, canonical=_canonical({"cv-exp1-b1": original + " Kept accurate records."}))
+    assert "cross_employer_attribution" not in _codes(findings)
+
+
+def test_shared_heading_words_do_not_become_distinctive_employer_markers():
+    from tools.workflow.materials_vnext.semantic_lint import _experience_employer_map
+
+    blocks = [
+        {"presentation_role": "job_heading", "experience_id": str(index), "text": heading}
+        for index, heading in enumerate(("Alpha Office", "Beta Operations Team", "Gamma Operations Team"))
+    ]
+    markers = _experience_employer_map(blocks)["distinctive"]
+    assert not (markers["1"] & markers["2"])
+
+
 def test_plain_wording_rewrite_passes_all_semantic_checks():
     findings = run_semantic_lint(
         bundle=_bundle(),

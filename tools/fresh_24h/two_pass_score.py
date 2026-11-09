@@ -553,10 +553,12 @@ def score_hit(
     )
 
 
-def _save_cache(url: str, text: str, *, source: str, repo: Path) -> dict[str, Any]:
+def _save_cache(url: str, text: str, *, source: str, repo: Path, completeness: dict[str, str] | None = None) -> dict[str, Any]:
     try:
         from jd_cache import save_jd_cache as _sv
-        return _sv(url, text, source=source, root=repo)
+
+        return _sv(url, text, source=source, root=repo,
+                   completeness=completeness)
     except (ImportError, OSError):
         return {}
 
@@ -564,7 +566,9 @@ def _save_cache(url: str, text: str, *, source: str, repo: Path) -> dict[str, An
 def _load_cache(url: str, repo: Path) -> tuple[str | None, dict]:
     try:
         from jd_cache import load_jd_cache as _ld
-        return _ld(url, repo)
+        from tools.jd_quality import FULL_JD_MIN_CHARS
+
+        return _ld(url, repo, min_chars=FULL_JD_MIN_CHARS)
     except ImportError:
         return None, {}
 
@@ -622,6 +626,8 @@ def deep_enrich_hit(
     Set use_browser=False or env PORTAL_JD_BROWSER=0 to skip all browser deep.
     """
     normalize_hit_url(h)
+    h.pop("_deep_jd_full", None)
+    h.pop("_deep_jd_completeness", None)
     url = h.get("url") or ""
     portal_host = (url or "").lower()
     env_browser = os.environ.get("PORTAL_JD_BROWSER", "1").strip() not in {"0", "false", "no"}
@@ -631,7 +637,9 @@ def deep_enrich_hit(
     # must run before the CT browser policy so a user-pasted or previously
     # fetched full JD is still reusable without any new network request.
     cached_text, cached_meta = _load_cache(url, repo) if cache_first else (None, {})
-    if cached_text:
+    from tools.jd_quality import assess_jd
+
+    if cached_text and assess_jd(cached_text, cached_meta.get("completeness"))["eligible"]:
         h["_enrich"] = {
             "mode": "cache",
             "ok": True,
@@ -648,6 +656,8 @@ def deep_enrich_hit(
             "mode": "cache",
         }
         h["_deep_jd_full"] = cached_text
+        cached_proof = cached_meta.get("completeness")
+        h["_deep_jd_completeness"] = dict(cached_proof) if isinstance(cached_proof, dict) else {}
         return cached_text[:DEEP_DESC_CHARS], "deep"
 
     # CT: private 2captcha solver first (key + budget), teaser-only fallback.
@@ -673,7 +683,11 @@ def deep_enrich_hit(
                 "mode": "fetched",
             }
             h["_deep_jd_full"] = ct_text
-            _save_cache(url, ct_text, source=ct_source, repo=repo)
+            from tools.jd_quality import completeness_evidence
+
+            proof = completeness_evidence(ct_text, basis="page_body_verified")
+            h["_deep_jd_completeness"] = proof
+            _save_cache(url, ct_text, source=ct_source, repo=repo, completeness=proof)
             return ct_text[:DEEP_DESC_CHARS], "deep"
         h["_enrich"] = {
             "mode": "ctgoodjobs_skip_browser",
@@ -696,7 +710,11 @@ def deep_enrich_hit(
                 "desc_len": len(res.description),
             }
             h["_deep_jd_full"] = res.description
-            cache_meta = _save_cache(url, res.description, source="linkedin_enrich", repo=repo)
+            from tools.jd_quality import completeness_evidence
+
+            proof = completeness_evidence(res.description, basis="page_body_verified")
+            h["_deep_jd_completeness"] = proof
+            cache_meta = _save_cache(url, res.description, source="linkedin_enrich", repo=repo, completeness=proof)
             h["_jd_cache_meta"] = {
                 "url": url,
                 "source": "linkedin_enrich",
@@ -844,7 +862,11 @@ def deep_enrich_hit(
             }
             h["teaser"] = fres.text[:3000]
             h["_deep_jd_full"] = fres.text
-            cache_meta = _save_cache(url, fres.text, source=f"browser_{fres.portal}", repo=repo)
+            from tools.jd_quality import completeness_evidence
+
+            proof = completeness_evidence(fres.text, basis="page_body_verified") if fres.content_validated else {}
+            h["_deep_jd_completeness"] = proof
+            cache_meta = _save_cache(url, fres.text, source=f"browser_{fres.portal}", repo=repo, completeness=proof)
             h["_jd_cache_meta"] = {
                 "url": url,
                 "source": f"browser_{fres.portal}",
@@ -1652,6 +1674,7 @@ def run_two_pass(
             row["_preview_key"] = h.get("_preview_key") or preview_key(h)
             row["简历版本"] = sc2.resume_ver
             row["_deep_jd_full"] = h.get("_deep_jd_full", "")
+            row["_deep_jd_completeness"] = dict(h.get("_deep_jd_completeness") or {})
             row["_deep_jd_url"] = h.get("url", "")
             row["CareerOps分数"] = f"{sc2.score:.2f}"
             row["CareerOps等级"] = sc2.grade
@@ -1829,6 +1852,7 @@ def _persist_deep_jds(rows: list[dict], repo: Path) -> None:
     n = 0
     for r in rows:
         jd_full = r.pop("_deep_jd_full", "")
+        proof = r.pop("_deep_jd_completeness", {})
         if not jd_full:
             continue
         pid = (r.get("岗位编号") or r.get("_preview_key") or "").strip()
@@ -1842,11 +1866,19 @@ def _persist_deep_jds(rows: list[dict], repo: Path) -> None:
         header = f"# JD - {pid}\n\n"
         if url:
             header += f"- url: {url}\n"
-        header += f"- source: two_pass_deep\n\n---\n\n"
         body = jd_full.strip()
+        from tools.jd_quality import assess_jd
+
+        quality = assess_jd(body, proof)
+        header += "- source: two_pass_deep\n"
+        if quality["completeness"] == "confirmed_complete":
+            header += f"- jd_complete_basis: {proof['basis']}\n- jd_body_sha256: {proof['body_sha256']}\n"
+        else:
+            proof = {}
+        header += "\n---\n\n"
         atomic_write_text(cache_dir / f"{pid}.md", header + body + "\n")
         if url:
-            _save_cache(url, body, source="two_pass_deep", repo=root)
+            _save_cache(url, body, source="two_pass_deep", repo=root, completeness=proof)
         n += 1
     if n:
         print(f"JD cache: wrote {n} deep JD(s) to {cache_dir}")

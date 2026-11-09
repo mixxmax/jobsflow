@@ -15,7 +15,7 @@ from typing import Any
 from tools.fresh_24h.policy import load_workflow_preferences
 from tools.job_materials.url_normalize import normalize_job_url
 from tools.job_urls import safe_jobsdb_job_url
-from tools.workflow.adapters.intake import FULL_JD_MIN_CHARS
+from tools.jd_quality import assess_jd
 
 MAX_FETCH_URLS = 3
 
@@ -76,17 +76,26 @@ def fetch_full_jds(
         min_final=float(preferences["final_gate"]),
     )
     by_url: dict[str, str] = {}
+    proofs: dict[str, dict[str, str]] = {}
     for row in deep_rows:
         url = str(row.get("链接") or row.get("url") or "").strip()
         body = str(row.get("_deep_jd_full") or "").strip()
-        if not url or len(body) < FULL_JD_MIN_CHARS:
+        # Carry the upstream proof; a field name or a cache hit is not page
+        # verification. Short bodies without a bound proof remain incomplete.
+        evidence = row.get("_deep_jd_completeness") or {}
+        quality = assess_jd(body, evidence)
+        if not url or not quality["eligible"]:
             continue
         by_url[url] = body
+        proof = dict(evidence) if quality["completeness"] == "confirmed_complete" else {}
+        proofs[url] = proof
         canon = normalize_job_url(url)
         if canon:
             by_url[canon] = body
+            proofs[canon] = proof
     summary = dict(meta or {})
     summary["fetched"] = len({normalize_job_url(url) or url for url in by_url})
+    summary["jd_completeness"] = proofs
     return by_url, summary
 
 

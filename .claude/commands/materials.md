@@ -35,6 +35,10 @@ reset preview/confirm 命令。模型不得自行删除文件或绕过状态机�
 `cl_master_*.docx` 读取样式和页面设置，在模板样式上填入 canonical CV/CL，再用统一的
 LibreOffice PDF 链转换。缺少基础版模板或样式契约时直接失败，不回退到空白文档。
 
+基础版 Word 的软换行和分项边界必须保留到 canonical、制作任务包及子审计任务包。
+同一 block 含多项时，`logical_items` 给出原有条目；可用一次有界 `replace` 调整完整
+条目的顺序，并在 JSON 字符串中保留 `\n`，不能把多个条目粘成无分隔长句。
+
 基础版同时也是**内容母版和证据下限**，不是只能复制样式的空壳，也不是逐字冻结的成品。
 主模型从完整基础版开始，只提交与当前 JD 有关的有限增量：允许替换、调序和适度追加，
 但未提及的内容由系统自动保留，不能把整份 CV/CL 从头重建或无声删掉稳定经历、教育、数字和
@@ -95,12 +99,14 @@ materials prepare：写入 JD 全文、匹配评估、application_preflight
 # 骨架包先补齐 JD / 评估 / preflight。没有缓存时用 --jd-file。/push 不会代做这一步。
 python3 -m tools.workflow materials prepare --job-id C0-005
 python3 -m tools.workflow materials prepare --job-id C0-005 --jd-file jd.txt
+# 完整短 JD 不靠凑字数放行：先确认确为完整正文，再执行返回的带正文哈希的确认命令。
+# 缺少完整性依据的短文本仍阻断；只查看 jd_sources 列出的当前岗位来源，不翻其他岗位。
 # 第一次调用冻结当前岗位输入并返回 plan task；模型只提交 JSON，不直接写文档。
 # idle 时只要缺上述任一项，这一步会先 prepare 再 plan。
 python3 -m tools.workflow materials --job-id C0-005
-python3 -m tools.workflow materials --job-id C0-005 --plan plan.json
+python3 -m tools.workflow materials --job-id C0-005 --plan <returned_planning_response_path>
 # 仅提交 bounded transform，不能提交完整 CV/CL
-python3 -m tools.workflow materials draft --job-id C0-005 --content transform.json
+python3 -m tools.workflow materials draft --job-id C0-005 --content <returned_tailoring_response_path>
 python3 -m tools.workflow materials repair --job-id C0-005 --patch repair.json
 # 仅在用户本人确认"这件事我确实做过"时使用；只对本岗位有效，确认后自动重跑 preflight
 python3 -m tools.workflow materials confirm-claim --job-id C0-005 --block-id <block>
@@ -109,6 +115,20 @@ python3 -m tools.workflow materials pdf --job-id C0-005
 python3 -m tools.workflow format --job-id C0-005
 python3 -m tools.workflow apply --job-id C0-005
 ```
+
+遇到公司身份不明确时，读取返回的 `recovery.request_path`，仅将核实结果写入
+`recovery.response_path`，执行 `recovery.submit_argv`；正式入口是
+`materials company-research --job-id <编号> --research <返回的响应路径>`。
+核验发布方/雇主身份即可，不要求无关的深度公司研究；未披露的猎头客户保持中性称呼。
+不得翻源码或其他岗位来猜提交格式。
+
+首次材料票据明确授权当前岗位两小时内的常规制作、审计、格式和 apply 验证。
+确认后主机自行交接后续一次性票据；其他岗位、重置、事实确认、用户裁决、浏览器抓取和
+真正投递不在此范围内。过期或 generation 改变后重新授权。
+`audit`/`format` 是顶层正式门，`materials audit`/`materials format` 是同门别名。
+
+独立审计报告里的 P0/P1，即使修复只改几个词，也要把原 finding 和修复块交给子 Agent
+定点复核。主机措辞 lint 不能直接关闭这些问题；首次完整独立审计也不能被 repair 跳过。
 
 **动词两层规则**：改写时优先照抄基线的动词。换成职能类动词（如 draft）时，只要这个词在本车道基线任一段经历或本岗位 JD 里出现过，就只记一条不阻断的 P2 备注；换成夸大类动词（lead、own、manage、advise、deliver、recover）而该段经历的基线没有时，preflight 会拦下并给出两个选项：推荐改回基线用词；或由**用户本人**用 `materials confirm-claim` 确认本岗位属实。确认只存进本岗位材料包，材料重置或 JD 变化即失效，不写入车道基础简历或共享事实文件。模型不得替用户确认。
 

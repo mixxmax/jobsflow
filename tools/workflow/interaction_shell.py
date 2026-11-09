@@ -393,7 +393,7 @@ def _prompt_for_action(action: str, internal: dict[str, Any]) -> dict[str, Any] 
     if action == "push" and str(internal.get("status") or "") in {"planned", "preview"}:
         return build_user_prompt(
             "confirm_push",
-            question="是否将这些岗位写入 fresh 台账？",
+            question="是否将这些岗位写入 fresh 台账？本次确认同时授权这份提案的写入与回读，无需再次处理票据。",
             options=[
                 {"id": "confirm", "label": "确认入表", "recommended": False},
                 {"id": "cancel", "label": "取消", "recommended": False},
@@ -404,7 +404,7 @@ def _prompt_for_action(action: str, internal: dict[str, Any]) -> dict[str, Any] 
     if action == "intake" and str(internal.get("status") or "") in {"planned", "preview"}:
         return build_user_prompt(
             "confirm_manual_intake",
-            question="是否确认将这些用户指定岗位分配永久编号并写入 fresh 台账？",
+            question="是否确认将这些用户指定岗位分配永久编号并写入 fresh 台账？本次确认同时授权这份提案的写入与回读。",
             options=[
                 {"id": "confirm", "label": "确认入表", "recommended": False},
                 {"id": "cancel", "label": "取消", "recommended": False},
@@ -499,9 +499,17 @@ def wrap_result(
             or (internal.get("sop_control") or {}).get("capability_ticket_handoff")
             or ""
         ).strip()
+        authorization_scope = internal.get("authorization_scope") or (internal.get("sop_control") or {}).get("authorization_scope") or {}
+        if not isinstance(authorization_scope, dict):
+            authorization_scope = {}
+        is_material_task = authorization_scope.get("kind") == "materials_task"
+        question = (
+            f"是否授权岗位 {authorization_scope.get('job_id') or ''} 本次两小时内的材料制作、内容审计和投递前验证？不包含重置、事实确认或自动投递。"
+            if is_material_task else "需要一次性能力票据后才能继续此动作。请用 gateway 重试，勿把 secret 写入长期日志。"
+        )
         prompt = build_user_prompt(
             "ask_preflight",
-            question="需要一次性能力票据后才能继续此动作。请用 gateway 重试，勿把 secret 写入长期日志。",
+            question=question,
             options=[{"id": "retry_with_ticket", "label": "携带票据重试", "recommended": True}],
             reply_hint="回传 capability_ticket_id（及 run_id）；secret 经 0600 handoff 兑换，勿写入日志",
             reply_contract={
@@ -535,6 +543,10 @@ def wrap_result(
         status = "needs_user"
 
     message = str(internal.get("message") or "")
+    if not message and "capability_ticket_expired" in blockers:
+        message = "本次操作授权已过期，请重新预览并确认；这不是 Google Sheets 凭据缺失。"
+    if not message and "gsheet_credentials_missing" in blockers:
+        message = "Google Sheets 凭据缺失或不可用，请修复 Sheets 连接；重复确认票据不能解决此问题。"
     if not message:
         if status == "needs_user":
             message = "需要用户确认后才能继续"

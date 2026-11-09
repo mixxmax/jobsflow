@@ -748,7 +748,7 @@ class SyncCoordinator:
                     expected_digest=target_before.digest,
                 )
                 postconditions = [
-                    "projection_write_issued",
+                    "projection_entry_read_back" if getattr(store, "entry_readback_verified", False) else "projection_write_issued",
                     "source_ledger_committed",
                 ]
             else:

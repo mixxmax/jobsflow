@@ -119,6 +119,21 @@ existing application materials are not rewritten by an intent update.
 
 ### 4.0 SOP Control capability tickets
 
+Confirmed tracker entry is a single-consent operation for both `/push` and
+`/intake`. The gateway reserves a proposal-digest-bound ticket at preview,
+then records the formal confirmation callback and redeems that ticket at the
+validated write boundary, without a second ticket prompt. The harness must
+forward a real user choice; a model-supplied boolean/actor label is not consent.
+Receipts say `authority=gateway_proposal_callback, human_presence=unproven`:
+they prove the recorded business callback and its scope, not independent human
+identity. This is platform-neutral and does not disable SOP Control.
+
+Scope includes the actual projection target, immutable proposal content,
+action, workspace and run. Network retry replays the same durable sync operation
+and IDs; it never redeems a consumed ticket again or broadens the approved batch.
+Expired authorization and missing Sheets credentials have distinct errors.
+Sheets append verifies only the inserted row range, without full-sheet rewriting.
+
 When the product is running in SOP Control `enforce` mode, a real scan or
 other governed side effect may first return `capability_ticket_required`. This
 is an intentional two-step authorization: the first request is side-effect
@@ -417,6 +432,13 @@ python3 -m tools.workflow materials --job-id <JOB-ID>
 
 - Require a full JD for high-quality tailoring. If it cannot be retrieved, ask the
   user to paste it.
+- Completeness is not a minimum word count: a verified full-page body or an
+  explicitly user-confirmed short JD carries body-hash-bound evidence through
+  cache, package and mirror. Unknown short text stays blocked; title/company/
+  salary headers must not be added to satisfy a length heuristic. Confirmation
+  uses the returned `materials prepare --confirm-jd-complete` command and stays
+  outside delegated ordinary-stage authorization. Preserve the lane master's
+  soft breaks and logical item boundaries through drafting, audit and render.
 - Prefer researching the company's nature, main business and role context. Store
   claims with source URLs and distinguish sourced facts from inference; if no
   reliable source is available, use JD-only/role context rather than guessing.
@@ -625,8 +647,10 @@ character-ratio content floor.
 
 Every validated operation carries a deterministic `change_class`:
 
-- `wording_only` — light wording edit; the host semantic lint closes the
-  round and no independent re-audit runs;
+- `wording_only` — light wording edit; the host semantic lint may close the
+  round only after a prior content pass and with no independent P0/P1 open.
+  Open independent findings require a scoped child re-audit regardless of
+  text similarity; a repair before the first audit still receives full review;
 - `jd_alignment` — JD-driven rewrite keeping all evidence; audited with the
   delta;
 - `fact_sensitive` — touches a number, evidence verb or scope term;

@@ -24,7 +24,7 @@ from tools.workflow.materials_metadata import metadata_violations, sanitize_docx
 
 RENDER_RECEIPT_NAME = "materials_render_receipt.json"
 FORMAT_REPORT_NAME = "materials_format_report.json"
-RENDERER_VERSION = "canonical-template-docx-v5"
+RENDERER_VERSION = "canonical-template-docx-v6"
 
 TEMPLATE_STYLES: dict[str, tuple[str, ...]] = {
     "cv": ("Resume Section", "Job Heading", "Resume Bullet", "Compact Line"),
@@ -501,12 +501,15 @@ def _add_block(
                 _add_run(paragraph, "\t" + date, prototypes["job_heading"], 1)
         elif (presentation_role == "core_line" or (source_style == "Compact Line" and section == "core")):
             paragraph = _new_paragraph(document, prototypes["core"])
-            label_body = _split_label(text)
-            if label_body:
-                _add_run(paragraph, label_body[0], prototypes["core"], 0)
-                _add_run(paragraph, label_body[1], prototypes["core"], 1)
-            else:
-                _add_run(paragraph, text, prototypes["core"], 1)
+            for line_index, line in enumerate(text.split("\n")):
+                if line_index:
+                    paragraph.runs[-1].add_break()
+                label_body = _split_label(line)
+                if label_body:
+                    _add_run(paragraph, label_body[0], prototypes["core"], 0)
+                    _add_run(paragraph, label_body[1], prototypes["core"], 1)
+                else:
+                    _add_run(paragraph, line, prototypes["core"], 1)
         # Education and Qualifications are compact master lines, not
         # experience bullets.  This branch deliberately precedes the generic
         # bullet branch so a baseline block cannot lose its section styling
@@ -1082,6 +1085,12 @@ def _template_style_findings(package: Path, names: dict[str, str]) -> list[dict[
                 run_format_errors = []
                 for run_index, run in enumerate(paragraph.runs):
                     expected_index = expected_run_index(prototype_name, run_index, len(paragraph.runs))
+                    if prototype_name == "core":
+                        # A multi-line core paragraph repeats the label/body
+                        # pair on every logical item, not just on its first run.
+                        indices = [index for line in str(block.get("text") or "").split("\n")
+                                   for index in ([0, 1] if _split_label(line) else [1])]
+                        expected_index = indices[min(run_index, len(indices) - 1)]
                     if rpr_signature(run) != prototype_rpr_signature(prototype_name, expected_index):
                         run_format_errors.append(str(run_index))
                 if run_format_errors:

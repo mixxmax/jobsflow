@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from time import perf_counter
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from tools.fresh_24h.job_assessment import (
     profile_fingerprint,
 )
 from tools.io_utils import atomic_write_json
+from tools.jd_quality import assess_jd, completeness_evidence, header_evidence, jd_body
 from tools.job_materials.jd_store import extract_url_from_snapshot, write_jd
 from tools.job_materials.publisher import snapshot_context
 from tools.job_materials.requirements_engine import (
@@ -29,7 +31,6 @@ from tools.job_materials.requirements_engine import (
     write_application_preflight,
 )
 from tools.job_materials.url_normalize import normalize_job_url
-from tools.workflow.adapters.intake import FULL_JD_MIN_CHARS
 from tools.workflow.package_context import PackageContextLoader, _latest_assessment
 
 
@@ -83,11 +84,26 @@ def should_auto_prepare(workspace: Path, job_id: str) -> bool:
 
 
 def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -> dict[str, Any]:
+    started = perf_counter()
+    out = _prepare_package(payload, workspace=workspace)
+    if not (payload or {}).get("dry_run"):
+        from tools.workflow.materials_preparation_metrics import record_preparation
+
+        try:
+            record_preparation(workspace, str((payload or {}).get("job_id") or ""), stage="prepare",
+                               duration_ms=int((perf_counter() - started) * 1000), out=out)
+        except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+            pass  # Observability can never open or close a business gate.
+    return out
+
+
+def _prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -> dict[str, Any]:
     """Write JD, assessment and preflight for one confirmed package.
 
     A second call with the same JD, profile and known answers does not rewrite
-    those files. Missing JD text returns ``jd_full_unavailable`` and writes
-    nothing.
+    those files. Missing JD text returns ``jd_full_unavailable`` without
+    writing JD, assessment or preflight. Separate observational counters may
+    still record the failed preparation attempt.
     """
 
     payload = dict(payload or {})
@@ -129,7 +145,7 @@ def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -
         refresh = bool(payload.get("refresh") or payload.get("refresh_jd"))
         if (
             existing_body
-            and len(existing_body) >= FULL_JD_MIN_CHARS
+            and assess_jd(existing_body, header_evidence((package / "jd_full.md").read_text(encoding="utf-8")))["eligible"]
             and not refresh
             and _body(supplied_raw) != existing_body
         ):
@@ -142,22 +158,8 @@ def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -
                 ),
                 after_state=_phase(package),
             )
-        if len(supplied_raw) < FULL_JD_MIN_CHARS:
-            return _blocked(
-                job_id,
-                ["jd_file_too_short"],
-                next_action=prepare_command(job_id),
-                after_state=_phase(package),
-            )
-    chosen = _choose_jd(package, workspace, job_id, url, payload)
-    supplied = _supplied_text(payload)
-    if jd_file_raw and supplied is not None and len(supplied) < FULL_JD_MIN_CHARS:
-        return _blocked(
-            job_id,
-            ["jd_file_too_short"],
-            next_action=prepare_command(job_id),
-            after_state=_phase(package),
-        )
+    candidates = _jd_candidates(package, workspace, job_id, url, payload)
+    chosen = next((item for item in candidates if item["quality"]["eligible"]), None)
     fetch_meta: dict[str, Any] = {}
     if chosen is None and bool(payload.get("fetch") or payload.get("fetch_jd")):
         if not url:
@@ -205,16 +207,33 @@ def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -
             )
         body = lookup_fetched(fetched, safe)
         if body:
-            chosen = (body, "gateway_fetch")
+            evidence = (fetch_meta.get("jd_completeness") or {}).get(safe, {})
+            quality = assess_jd(body, evidence)
+            if quality["eligible"]:
+                chosen = {"text": body, "source": "gateway_fetch", "evidence": evidence, "quality": quality}
     if chosen is None:
+        sources = [{"source": item["source"], "path": item["path"], "available": item["available"], **item["quality"]} for item in candidates]
+        short = next((item for item in candidates if item["available"] and item["quality"]["chars"] >= 40), None)
+        next_action = prepare_command(job_id)
+        if short:
+            import shlex
+
+            next_action = (
+                f"python3 -m tools.workflow materials prepare --workspace {shlex.quote(str(workspace))} --job-id {job_id}"
+                + (f" --jd-file {shlex.quote(short['path'])}" if short.get("file_body") else "")
+                + f" --confirm-jd-complete --jd-body-sha256 {short['quality']['body_sha256']}"
+            )
         return _blocked(
             job_id,
             ["jd_full_unavailable"],
-            next_action=prepare_command(job_id),
+            next_action=next_action,
             after_state=_phase(package),
             jd_fetch=fetch_meta,
+            jd_sources=sources,
+            confirmation_notice="Only confirm after the user or the source page establishes this is the complete JD body; never pad with posting metadata.",
         )
-    text, source = chosen
+    text, source = chosen["text"], chosen["source"]
+    evidence = chosen["evidence"]
     profile = load_scoring_profile(workspace)
     answers = known_application_answers(package, workspace)
     fingerprint = jd_fingerprint(text)
@@ -224,6 +243,7 @@ def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -
         "profile_sha256": profile_fingerprint(profile),
         "answers_sha256": _digest(answers),
         "source": source,
+        "completeness": evidence,
     }
     if _unchanged(package, workspace, job_id, identity, fingerprint, receipt):
         reloaded = PackageContextLoader(workspace).load(job_id)
@@ -238,8 +258,10 @@ def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -
         }
 
     effects: list[str] = []
-    if _stored_jd_body(package) != text:
-        write_jd(workspace, package, text, url=url, source=source)
+    local = package / "jd_full.md"
+    current_evidence = header_evidence(local.read_text(encoding="utf-8")) if local.is_file() else {}
+    if _stored_jd_body(package) != text or current_evidence != evidence:
+        write_jd(workspace, package, text, url=url, source=source, completeness=evidence)
         effects.append("write_jd")
     assessment, reused, previous_score, current_score = _ensure_assessment(
         workspace,
@@ -292,29 +314,62 @@ def prepare_package(payload: dict[str, Any] | None = None, *, workspace: Path) -
     }
 
 
-def _choose_jd(
+def _jd_candidates(
     package: Path,
     workspace: Path,
     job_id: str,
     url: str,
     payload: dict[str, Any],
-) -> tuple[str, str] | None:
+) -> list[dict[str, Any]]:
+    """Inspect only the current package, its URL cache and its ID mirror once.
+
+    The public result contains provenance/hashes, never these raw text values.
+    """
+    candidates: list[dict[str, Any]] = []
+
+    def add(raw: str, source: str, path: str, *, evidence=None, available=True, file_body=True):
+        body = jd_body(raw)
+        if not body:
+            return
+        proof = evidence or header_evidence(raw)
+        expected = str(payload.get("jd_body_sha256") or "")
+        matches = not expected or assess_jd(body)["body_sha256"] == expected
+        if payload.get("confirm_jd_complete") is True and matches and available and not any(c["quality"]["eligible"] for c in candidates):
+            proof = completeness_evidence(body, basis="user_confirmed")
+        quality = assess_jd(body, proof)
+        if quality["completeness"] != "confirmed_complete":
+            proof = {}
+        quality["eligible"] = bool(matches and available and quality["eligible"])
+        if not matches:
+            quality["reason"] = "jd_confirmation_body_changed"
+        candidates.append({"text": body, "source": source, "path": path, "evidence": proof,
+                           "quality": quality, "available": available, "file_body": file_body})
+
     refresh = bool(payload.get("refresh") or payload.get("refresh_jd"))
-    if not refresh:
-        existing = _stored_jd_body(package)
-        if len(existing) >= FULL_JD_MIN_CHARS:
-            return existing, _header_source(package / "jd_full.md") or "existing"
     supplied = _supplied_text(payload)
-    if supplied is not None and len(supplied) >= FULL_JD_MIN_CHARS:
-        return supplied, "user_file"
-    cached = _cached_text(url, workspace)
-    if cached is not None:
-        text, origin = cached
-        return text, f"jd_cache:{origin or 'cache'}"
-    mirrored = _mirrored_jd(workspace, job_id)
-    if mirrored:
-        return mirrored, "jd_mirror"
-    return None
+    local = package / "jd_full.md"
+    if not refresh and local.is_file() and supplied is None:
+        add(local.read_text(encoding="utf-8", errors="replace"), _header_source(local) or "existing", str(local))
+    if supplied is not None:
+        add(supplied, "user_file", str(payload.get("jd_file") or ""))
+        # An explicit file is authoritative: do not silently ignore a short
+        # supplied body and substitute a different cached JD.
+        return candidates
+    seen: set[str] = set()
+    for candidate in (url, normalize_job_url(url) if url else ""):
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        path = _cache_path(workspace, candidate)
+        if not path.is_file():
+            continue
+        cached, meta = load_jd_cache(candidate, workspace, min_chars=40)
+        add(str(meta.get("text") or ""), f"jd_cache:{meta.get('source') or 'cache'}", str(path),
+            evidence=meta.get("completeness"), available=cached is not None, file_body=False)
+    mirror = workspace / "02_Tracker" / "jds" / f"{job_id}.md"
+    if mirror.is_file():
+        add(mirror.read_text(encoding="utf-8", errors="replace"), "jd_mirror", str(mirror))
+    return candidates
 
 
 def _supplied_text(payload: dict[str, Any]) -> str | None:
@@ -330,22 +385,6 @@ def _supplied_text(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _cached_text(url: str, workspace: Path) -> tuple[str, str] | None:
-    seen: set[str] = set()
-    for candidate in (url, normalize_job_url(url) if url else ""):
-        candidate = str(candidate or "").strip()
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        path = _cache_path(workspace, candidate)
-        if not path.is_file():
-            continue
-        text, meta = load_jd_cache(candidate, workspace, min_chars=FULL_JD_MIN_CHARS)
-        if text and len(text.strip()) >= FULL_JD_MIN_CHARS:
-            return text.strip(), str((meta or {}).get("source") or "")
-    return None
-
-
 def _cache_path(workspace: Path, url: str) -> Path:
     """Cache file path without creating the directory on a miss."""
 
@@ -357,13 +396,6 @@ def _cache_path(workspace: Path, url: str) -> Path:
     return root / "02_Tracker" / "jds" / "cache" / f"{jd_cache_key(url)}.json"
 
 
-def _mirrored_jd(workspace: Path, job_id: str) -> str:
-    path = Path(workspace) / "02_Tracker" / "jds" / f"{job_id}.md"
-    if not path.is_file():
-        return ""
-    return _long_body(path.read_text(encoding="utf-8", errors="replace"))
-
-
 def _stored_jd_body(package: Path) -> str:
     path = package / "jd_full.md"
     if not path.is_file():
@@ -371,15 +403,8 @@ def _stored_jd_body(package: Path) -> str:
     return _body(path.read_text(encoding="utf-8", errors="replace"))
 
 
-def _long_body(raw: str) -> str:
-    body = _body(raw)
-    return body if len(body) >= FULL_JD_MIN_CHARS else ""
-
-
 def _body(raw: str) -> str:
-    if "\n---\n" in raw:
-        return raw.split("\n---\n", 1)[-1].strip()
-    return raw.strip()
+    return jd_body(raw)
 
 
 def _header_source(path: Path) -> str:
@@ -524,6 +549,8 @@ def _unchanged(
     if any(stored.get(key) != receipt.get(key) for key in ("jd_sha256", "profile_sha256", "answers_sha256")):
         return False
     if not (package / "jd_full.md").is_file() or not (package / "application_preflight.json").is_file():
+        return False
+    if header_evidence((package / "jd_full.md").read_text(encoding="utf-8")) != receipt.get("completeness", {}):
         return False
     matched = _latest_assessment(
         workspace,

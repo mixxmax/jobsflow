@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.job_materials.paths import find_latest_cl_master_docx, find_latest_master_docx
-from tools.workflow.materials_vnext.contracts import BLOCK_TYPES, MATERIALS, digest, text
+from tools.workflow.materials_vnext.contracts import BLOCK_TYPES, MATERIALS, content_text, logical_items, digest, text
 
 
 def _file_sha(path: Path) -> str:
@@ -90,7 +90,7 @@ def _replace_entities(value: str, *, role: str, employer: str, candidate_name: s
     }
     for old, new in replacements.items():
         value = value.replace(old, new)
-    return re.sub(r"\s+", " ", value).strip()
+    return content_text(value)
 
 
 def baseline_digest(value: dict[str, Any]) -> str:
@@ -120,7 +120,7 @@ def _extract(path: Path, *, material: str, role: str, employer: str, candidate_n
     current_section = "summary" if material == "cv" else "body"
     current_experience = ""
     for index, paragraph in enumerate(paragraphs):
-        original_text = text(paragraph.text)
+        original_text = content_text(paragraph.text)
         raw = _replace_entities(original_text, role=role, employer=employer, candidate_name=candidate_name)
         if not raw:
             continue
@@ -173,6 +173,7 @@ def _extract(path: Path, *, material: str, role: str, employer: str, candidate_n
                 "id": block_id,
                 "type": block_type if block_type in BLOCK_TYPES else "paragraph",
                 "text": raw,
+                "logical_items": logical_items(raw),
                 "section": section,
                 "experience_id": current_experience,
                 "priority": index + 1,
@@ -301,6 +302,6 @@ def compile_baseline(*, workspace: Path, lane: str, role: str, employer: str = "
 
 def baseline_texts(baseline: dict[str, Any]) -> dict[str, str]:
     return {
-        material: "\n".join(text(block.get("text")) for block in ((baseline.get(material) or {}).get("blocks") or []) if text(block.get("text")))
+        material: "\n".join(content_text(block.get("text")) for block in ((baseline.get(material) or {}).get("blocks") or []) if text(block.get("text")))
         for material in MATERIALS
     }

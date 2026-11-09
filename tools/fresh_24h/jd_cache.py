@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.io_utils import atomic_write_json
+from tools.jd_quality import assess_jd
 
 
 def _workspace_root(root: Path) -> Path:
@@ -47,6 +48,7 @@ def save_jd_cache(
     *,
     source: str,
     root: Path,
+    completeness: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     entry = {
         "url": url,
@@ -56,6 +58,8 @@ def save_jd_cache(
         "chars": len(text),
         "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if completeness and assess_jd(text, completeness)["completeness"] == "confirmed_complete":
+        entry["completeness"] = dict(completeness)
     path = jd_cache_path(url, root)
     atomic_write_json(path, entry)
     return entry
@@ -76,9 +80,11 @@ def load_jd_cache(
         entry = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, ValueError):
         return None, {}
+    if not isinstance(entry, dict):
+        return None, {}
 
-    text = entry.get("text") or ""
-    if len(text.strip()) < min_chars:
+    text = str(entry.get("text") or "")
+    if not assess_jd(text, entry.get("completeness"), min_chars=min_chars)["eligible"]:
         return None, entry
 
     fetched_raw = entry.get("fetched_at", "")

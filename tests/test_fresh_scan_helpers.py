@@ -275,11 +275,13 @@ def test_generic_scorer_uses_profile_keywords_and_generic_headers():
 
 
 def test_jobsdb_deep_enrichment_reuses_url_cache(monkeypatch, tmp_path):
+    from tools.jd_quality import completeness_evidence
+
     cached = "Full JobsDB description with enough detail for deep scoring."
     monkeypatch.setattr(
         two_pass_score,
         "_load_cache",
-        lambda url, repo: (cached, {"source": "browser_jobsdb"}),
+        lambda url, repo: (cached, {"source": "browser_jobsdb", "completeness": completeness_evidence(cached, basis="page_body_verified")}),
     )
     hit = {
         "url": "https://hk.jobsdb.com/job/93660409",
@@ -316,11 +318,13 @@ def test_jd_cache_is_url_keyed_and_accepts_repo_or_private_root(tmp_path):
 
 
 def test_ct_cache_is_checked_before_browser_policy(monkeypatch, tmp_path):
+    from tools.jd_quality import completeness_evidence
+
     cached = "Cached CT full JD text with enough content for a deep pass." * 3
     monkeypatch.setattr(
         two_pass_score,
         "_load_cache",
-        lambda url, repo: (cached, {"source": "user_paste", "cache_key": "ct-key"}),
+        lambda url, repo: (cached, {"source": "user_paste", "cache_key": "ct-key", "completeness": completeness_evidence(cached, basis="user_confirmed")}),
     )
     hit = {
         "url": "https://hk.ctgoodjobs.hk/job/12345",
