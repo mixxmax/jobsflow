@@ -189,7 +189,7 @@ def test_vnext_automatic_child_route_and_repair_budget(tmp_path):
     assert any(path.name.endswith(" Cover Letter.docx") for path in package.iterdir())
 
 
-def test_wording_only_repair_skips_independent_audit(tmp_path):
+def test_small_repair_of_semantic_finding_requires_incremental_audit(tmp_path):
     ws = build_workspace(tmp_path)
     package = build_package(ws, with_outbound=False)
     bundle, _ = _bundle(ws, package)
@@ -237,17 +237,25 @@ def test_wording_only_repair_skips_independent_audit(tmp_path):
         ],
     }
     repaired = MaterialsEngine().handle({"job_id": "C0-001", "stage": "repair", "repair_patch": repair}, workspace=ws)
-    # A pure wording repair never reaches the child auditor: the host lint
-    # closes the round and says so explicitly.
+    # The unresolved semantic finding determines the review requirement,
+    # even when the text classifier considers the repair wording-only.
     assert repaired["status"] == "succeeded"
-    assert repaired["after_state"] == "content_passed"
-    assert repaired["audit_skipped_reason"] == "wording_only_change_class"
-    assert repaired["audit"]["audit_mode"] == "wording_only_lint"
-    assert repaired["audit"]["produced_by"] == "host_deterministic_lint"
-    assert repaired["audit"]["independent_audit_passed"] is False
-    assert load_run(package)["phase"] == "content_passed"
+    assert repaired["after_state"] == "content_audit_pending"
+    assert "audit_skipped_reason" not in repaired
+    task_after = repaired["audit_task_packet"]
+    assert task_after["audit_mode"] == "incremental_repair"
+    assert task_after["repair_scope"]["target_ids"] == [target["target_id"]]
+    assert task_after["repair_scope"]["focus_rule_ids"] == ["MAP-001"]
+    assert load_run(package)["phase"] == "content_audit_pending"
     assert load_run(package)["audit_attempts"] == 1
-    assert json.loads((package / "materials_vnext" / "audit_task.json").read_text(encoding="utf-8"))["audit_input_fingerprint"] == fingerprint_before
+    assert task_after["audit_input_fingerprint"] != fingerprint_before
+    assert json.loads((package / "materials_vnext" / "audit_result.json").read_text())["open_counts"]["P1"] == 1
+    verified = MaterialsEngine().handle(
+        {"job_id": "C0-001", "stage": "audit_result", "audit_result": _audit_report(task_after)},
+        workspace=ws,
+    )
+    assert verified["status"] == "succeeded"
+    assert verified["audit"]["independent_audit_passed"] is True
 
 
 def test_fact_sensitive_repair_routes_incremental_audit(tmp_path):
@@ -307,6 +315,22 @@ def test_fact_sensitive_repair_routes_incremental_audit(tmp_path):
     assert reaudit["repair_scope"]["target_ids"] == [target["target_id"]]
     assert load_run(package)["audit_attempts"] == 1
     assert load_run(package)["generation"] == 2
+
+
+def test_repair_before_first_audit_cannot_skip_the_full_review(tmp_path):
+    ws = build_workspace(tmp_path)
+    package = build_package(ws, with_outbound=False)
+    bundle, _ = _bundle(ws, package)
+    transform = _transform(bundle)
+    first = MaterialsEngine().handle({"job_id": "C0-001", "transform": transform}, workspace=ws)
+    assert first["after_state"] == "content_audit_pending"
+    target = transform["operations"][0]
+    patch = {"schema_version": 1, "operations": [{
+        **target, "before_text": target["after_text"], "after_text": target["after_text"] + " Revised."
+    }]}
+    repaired = MaterialsEngine().handle({"job_id": "C0-001", "stage": "repair", "repair_patch": patch}, workspace=ws)
+    assert repaired["after_state"] == "content_audit_pending"
+    assert repaired["audit_task_packet"]["audit_mode"] == "full_generation"
 
 
 def test_change_class_conflict_is_rejected(tmp_path):

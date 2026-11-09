@@ -31,6 +31,7 @@ from tools.workflow.entity_state import (
 )
 from tools.workflow.policy import decide
 from tools.workflow.state import IllegalTransition
+from tools.workflow.entry_authorization import EntryAuthorizationError
 
 _MATERIALS_ACTIONS = {"materials", "audit", "format", "apply"}
 
@@ -65,6 +66,39 @@ def _legacy_materials_blocker(workspace: Path, payload: dict[str, Any], entity_i
 
 class WorkflowEngine:
     def execute(self, request: ActionRequest, *, workspace: Path, store=None, now: datetime | None = None) -> dict[str, Any]:
+        from tools.workflow.entry_authorization import EntryAuthorizationError, entry_flow, seal_preview
+
+        try:
+            if request.action in {"push", "intake"}:
+                payload = dict(request.payload or {})
+                ids = {str(value) for value in (request.confirmation_id, payload.get("confirmation_id"), payload.get("proposal_id")) if value}
+                if len(ids) > 1:
+                    raise EntryAuthorizationError("confirmation_binding_mismatch")
+                if ids:
+                    request.confirmation_id = ids.pop()
+                    request.payload = {**payload, "confirmation_id": request.confirmation_id}
+            with entry_flow(request, workspace) as entry:
+                out = self._execute(request, workspace=workspace, store=store, now=now)
+                if entry is not None and not request.payload.get("dry_run"):
+                    seal_preview(workspace, request.action, out)
+                    if entry.authorization:
+                        out["entry_authorization"] = entry.authorization
+                return out
+        except EntryAuthorizationError as exc:
+            messages = {
+                "capability_ticket_expired": "这份入表预览的授权已过期，请重新预览并确认；不是 Google Sheets 凭据缺失。",
+                "entry_preview_refresh_required": "旧预览尚未绑定本次入表授权，请重新预览后确认。",
+                "entry_preview_changed": "预览内容已改变，原确认不能用于写入，请重新预览。",
+            }
+            out = result(status="blocked", blockers=[exc.code],
+                         message=messages.get(exc.code, "入表授权与当前提案不匹配，未执行新的写入。"),
+                         next_action="preview_entry_again", confirmation_id=request.confirmation_id)
+            append_workflow_event(workspace, {"action": request.action, "status": "blocked",
+                                            "actor": request.actor, "blockers": [exc.code],
+                                            "confirmation_id": request.confirmation_id})
+            return out
+
+    def _execute(self, request: ActionRequest, *, workspace: Path, store=None, now: datetime | None = None) -> dict[str, Any]:
         started = perf_counter()
         payload = dict(request.payload or {})
         # The product line has one materials implementation.  Normalize even
@@ -73,6 +107,10 @@ class WorkflowEngine:
         # alternate engine name.
         if request.action in _MATERIALS_ACTIONS:
             payload["materials_engine"] = "vnext"
+            if payload.get("job_id"):
+                from tools.workflow.materials_authorization import task_binding
+
+                payload["capability_binding"] = task_binding(Path(workspace), str(payload["job_id"]))
         # A live scan challenge binds its one-shot ticket to the generated
         # run_id.  If a retry carries the ticket but omits --run-id, recover
         # the original run before entity lookup/admission; otherwise a fresh
@@ -169,7 +207,12 @@ class WorkflowEngine:
                 _audit(workspace, request, out, entity, event_id, duration_ms=_elapsed_ms(started))
                 return out
 
-        if not dry_run and not action_allowed_from(request.action, entity_type, entity.phase, payload):
+        completed_entry_readback = False
+        if request.action == "push" and entity.phase == "pushed_to_fresh":
+            proposal = ConfirmationStore(workspace).load(request.confirmation_id)
+            completed_entry_readback = bool(proposal and proposal.get("status") == "applied"
+                                            and proposal.get("action") == "push_fresh")
+        if not dry_run and not completed_entry_readback and not action_allowed_from(request.action, entity_type, entity.phase, payload):
             out = result(
                 status="blocked",
                 before_state=entity.phase,
@@ -291,6 +334,7 @@ class WorkflowEngine:
                 capability_ticket_id=sop_admit_report.get("capability_ticket_id"),
                 capability_ticket_secret=sop_admit_report.get("capability_ticket_secret"),
                 capability_ticket_handoff=sop_admit_report.get("capability_ticket_handoff"),
+                authorization_scope=sop_admit_report.get("authorization_scope"),
                 run_id=sop_admit_report.get("run_id") or payload.get("run_id"),
                 side_effects=[],
             )
@@ -299,6 +343,8 @@ class WorkflowEngine:
 
         try:
             out = _run_adapter(request.action, payload, workspace, store, dry_run, now)
+        except EntryAuthorizationError:
+            raise
         except Exception as exc:
             out = result(
                 status="failed",
@@ -373,6 +419,10 @@ def dispatch(
     runner=None,
 ) -> dict[str, Any]:
     payload = dict(payload or {})
+    if action in _MATERIALS_ACTIONS and payload.get("job_id"):
+        from tools.workflow.materials_authorization import task_binding
+
+        payload["capability_binding"] = task_binding(Path(workspace), str(payload["job_id"]))
     if action in {
         "private_write", "outcome_status", "profile_preview", "profile_confirm",
         "template_preview", "template_list", "template_confirm", "template_select", "template_clear",

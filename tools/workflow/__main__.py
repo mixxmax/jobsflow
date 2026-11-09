@@ -7,6 +7,11 @@ import json
 import os
 from pathlib import Path
 
+if __name__ == "__main__":
+    from tools.workflow.python_runtime import bootstrap
+
+    bootstrap()
+
 from tools.workflow.adapters.scan import default_scan_runner
 from tools.workflow.engine import dispatch
 from tools.workflow.fresh_store import FileFreshStore, default_fresh_store
@@ -300,6 +305,9 @@ def build_parser() -> argparse.ArgumentParser:
             "role-choose",
             "typesafe",
             "confirm-claim",
+            "company-research",
+            "audit",
+            "format",
         ],
         default="run",
     )
@@ -313,6 +321,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     materials.add_argument("--plan", type=Path, help="JSON planning response for the current frozen job bundle")
     materials.add_argument("--content", type=Path, help="Bounded baseline transform JSON (not a full CV/CL replacement)")
+    materials.add_argument("--research", type=Path, help="Fixed current-package company_research.response.json")
+    materials.add_argument("--result", type=Path, default=None, help="Alias: independent audit result JSON")
+    materials.add_argument("--strict", action="store_true", help="Alias: require independent audit")
+    materials.add_argument("--auto-audit", action="store_true")
+    materials.add_argument("--audit-timeout", type=int, default=900)
+    materials.add_argument("--producer-context-id", default="")
+    materials.set_defaults(suspend_audit=False, resume_audit=False)
     materials.add_argument("--patch", type=Path, help="Finding-scoped canonical repair JSON")
     materials.add_argument("--resolution", type=Path, help="Accept/dispute decisions for current audit findings")
     materials.add_argument(
@@ -352,6 +367,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Blocked verb to confirm; repeatable. Default: every verb the preflight blocked in that block",
     )
     materials.add_argument("--jd-file", type=Path, help="Full JD text for materials prepare")
+    materials.add_argument("--confirm-jd-complete", action="store_true", help="Record an explicit user/source confirmation that the current JD body is complete, even when short; never use merely to bypass a length check")
+    materials.add_argument("--jd-body-sha256", default="", help="Body hash from the current JD recovery response; rejects a changed confirmation target")
     materials.add_argument("--refresh", action="store_true", help="Replace an existing jd_full.md during materials prepare")
     materials.add_argument(
         "--fetch",
@@ -456,6 +473,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.action == "materials" and args.materials_cmd in {"audit", "format"}:
+        args.action = args.materials_cmd
     workspace = _workspace(args)
     store = None
     action = args.action
@@ -791,6 +810,9 @@ def main(argv: list[str] | None = None) -> int:
             payload["auto_prepare"] = True
         elif args.materials_cmd == "prepare":
             payload["stage"] = "prepare"
+        elif args.materials_cmd == "company-research":
+            payload["stage"] = "company-research"
+            payload["research_file"] = str(args.research or "")
         elif args.materials_cmd == "confirm-claim":
             # A user decision about the user's own work, for this job only.
             payload["stage"] = "confirm_claim"
@@ -871,6 +893,10 @@ def main(argv: list[str] | None = None) -> int:
             payload["stage"] = args.stage
         if args.jd_file:
             payload["jd_file"] = str(args.jd_file)
+        if args.confirm_jd_complete:
+            payload["confirm_jd_complete"] = True
+        if args.jd_body_sha256:
+            payload["jd_body_sha256"] = args.jd_body_sha256
         if args.refresh:
             payload["refresh"] = True
         if getattr(args, "fetch", False):

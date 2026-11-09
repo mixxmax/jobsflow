@@ -43,6 +43,19 @@ def text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
 
 
+def content_text(value: Any) -> str:
+    """Normalize horizontal whitespace without destroying Word soft breaks.
+
+    ``text`` remains the flat identifier/metadata normalizer. Material body
+    text must instead retain logical lines for ordering, auditing and render.
+    """
+    return "\n".join(" ".join(line.split()) for line in str(value or "").splitlines()).strip()
+
+
+def logical_items(value: Any) -> list[str]:
+    return [line for line in content_text(value).splitlines() if line]
+
+
 def sha_text(value: Any) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
 

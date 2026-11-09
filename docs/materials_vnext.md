@@ -68,7 +68,7 @@ by the host and overridable only toward *more* caution:
 
 | class | meaning | audit routing |
 |-------|---------|---------------|
-| `wording_only` | light wording edit, no fact-anchored change | host semantic lint only; no independent re-audit |
+| `wording_only` | light wording edit, no fact-anchored change | host lint only after a prior content pass with no independent P0/P1 left open; otherwise independent review |
 | `jd_alignment` | JD-driven rewrite that keeps all evidence | audited with the delta |
 | `fact_sensitive` | touches a number, evidence verb or scope term | incremental audit required |
 | `structure_change` | block-level reorganisation or heavy rewrite | incremental audit required; key-experience edits need `change_reason` |
@@ -105,6 +105,20 @@ semantic boundaries only.
 
 ## Package preparation
 
+The documented `python3 -m tools.workflow` CLI selects the installed project
+`.venv` before loading product dependencies when it starts in system Python.
+A supported, already active virtualenv is respected. No install is performed
+by this selection, and a missing supported environment returns a repair hint.
+
+In SOP Control enforce mode, the first materials ticket explicitly authorizes
+one job's normal materials/audit/format/apply stages for two hours. After the
+user redeems it, the host relays fresh one-shot stage tickets internally. The
+authorization is bound to workspace, package and generation; it expires or
+becomes invalid after reset/generation changes. Reset, fact confirmation,
+accept/dispute rulings, browser fetching, other jobs and application submission
+are outside this scope. Secrets stay in the controller handoff; the runtime
+authorization stores only its consumed parent-ticket reference and bindings.
+
 `/push` creates the package and stops. It does not fetch a JD, score the
 posting, or write `application_preflight.json`. Before planning, the gateway
 fills those three inputs with:
@@ -113,16 +127,50 @@ fills those three inputs with:
 python3 -m tools.workflow materials prepare --job-id C0-005 [--jd-file jd.txt] [--refresh]
 ```
 
-The stage is deterministic. It reuses `jd_full.md` unless `--refresh` is set,
-then a user file of at least 400 characters, then the URL-keyed JD cache, then
-`02_Tracker/jds/{job_id}.md`. With `--fetch`, a missing full JD may be retrieved
+The stage is deterministic. An explicit `--jd-file` is authoritative (a conflicting
+existing complete JD still needs `--refresh`); otherwise it reuses `jd_full.md`,
+the URL-keyed JD cache, then `02_Tracker/jds/{job_id}.md`. A complete short JD is
+not rejected just for being under 400 characters. A verified full-page fetch or
+an explicit user confirmation is stored as body-hash-bound completeness evidence
+and preserved through the cache and tracker mirror. Unconfirmed short text still
+blocks; a portal name is not proof, and posting title/company/salary headers do
+not count toward the body-length heuristic. Never pad a JD to pass a gate.
+
+`jd_sources` lists only this package's local body, its URL cache and its ID mirror:
+path, character count, hash, availability and admission status, without dumping
+their text or searching other packages. When the source is genuinely complete,
+ask the user to confirm and use the returned command, for example:
+
+```text
+python3 -m tools.workflow materials prepare --job-id C0-005 --confirm-jd-complete --jd-body-sha256 <returned-body-hash>
+```
+
+Do not treat this confirmation command as an automatic retry. It is outside the
+ordinary materials task's delegated authorization. A changed body invalidates the
+confirmation target; stale cache entries remain stale even if explicitly marked
+complete. With `--fetch`, a missing full JD may be retrieved
 through the same gateway Chrome attach used by `push --select` (one URL). No
-source returns `jd_full_unavailable` and writes nothing. A matching assessment is reused; a changed JD is rescored with
+source returns `jd_full_unavailable` and writes no JD/assessment/preflight. A matching assessment is reused; a changed JD is rescored with
 the same deep scorer intake uses, and the tracker is not updated. The same
 JD, profile and known answers make a second run a no-op. `materials` / `materials run`
 and `materials produce` from `idle` or `inputs_frozen` run prepare first only
 when the package blockers are limited to `missing_full_jd`,
 `assessment_missing_or_stale` and `preflight_missing`.
+
+An unknown publisher returns a `recovery` object containing the current job's
+research request, fixed `company_research.response.json` path, required fields
+and exact `submit_argv`. Supply source-backed publisher/employer classification
+there, then run that command (`materials company-research --research ...`).
+The gateway validates the response and writes `company_research.json`; never
+guess the path or read another job as an example. Identity verification needs
+source-backed classification, not a lengthy company report. An undisclosed
+recruiter client remains unnamed. A frozen bundle cannot have its company
+identity overwritten through this entry; it requires an explicit scoped reset.
+
+`audit --result ...` and `format --job-id ...` remain the canonical gates.
+`materials audit` and `materials format` are accepted aliases to those same
+gates. A planning anchor marked `awaiting_plan` is a schema seed; derive the
+actual duties from the frozen JD. The validated plan freezes the real anchors.
 
 ## Fixed sequence
 
@@ -134,7 +182,9 @@ materials prepare (full JD, matching assessment, application preflight)
   → deterministic content preflight (semantic lint + terminology + capacity)
   → automatic independent child audit (CV/CL text only)
   → main model repairs only finding targets
-      · all-wording repairs: host lint closes the round, no child re-audit
+      · wording-only edits after an independent pass, with no open P0/P1:
+        host lint may close the edit without a new child audit
+      · repairs of an independent auditor's open P0/P1: independent recheck
       · fact-sensitive/structural repairs: one incremental audit scoped to
         the repaired targets and the same finding categories
   → host renders DOCX from the lane master
@@ -148,7 +198,14 @@ files, claim contracts, company research or other job packages. Its packet
 contains the frozen JD, the compact anchor map, the current CV/CL, the changed
 blocks with their change classes, the deterministic lint results and the
 baseline semantic anchors of the changed blocks — never the full manuals, the
-full fact base, company research, email, PDFs or another job's materials. It
+full fact base, company research, email, PDFs or another job's materials. Word
+soft breaks are preserved in the frozen baseline, canonical, drafting packet
+and audit packet. Multi-item blocks also expose `logical_items`; reorder their
+complete lines using one bounded replacement with JSON `\n`, rather than
+merging several evidence items into a run-on sentence. The renderer retains
+these boundaries and repeats the master label/body styling per item. Punctuation
+repairs at an old fused boundary are not treated as changing a number's object;
+actual object substitutions remain blocking. It
 checks JD mapping, STAR evidence, LLMO placement, role/entity hygiene,
 cross-material consistency, domain terminology normalization, fragments and
 Cover Letter differentiation. Severity means: **P0** fabricated facts, wrong
@@ -182,8 +239,15 @@ The content gate can only be opened by exactly one of:
    "..."`) that records `independent_audit_passed=false`,
    `user_accepted=true`, the acceptance reason and the accepted material
    hash, and suspends further automatic audit dispatch;
-3. the host wording lint for `wording_only` repairs, recorded with
+3. the host wording lint for `wording_only` repairs of previously passed
+   content with no open independent P0/P1, recorded with
    `produced_by=host_deterministic_lint` and `independent_audit_passed=false`.
+
+An independent P0/P1 finding cannot be closed by a high before/after text
+similarity. Repairs carry the original findings and affected block IDs to an
+incremental child review, limited to those issues and necessary CV/CL context.
+A repair submitted before the first independent audit still requires a full
+first review. The three-attempt and repeated-finding stops are unchanged.
 
 Timeouts, crashes, EOF or a missing provider produce `audit_unavailable` —
 never a passed status, never self-recorded zero findings. The apply report
@@ -311,6 +375,15 @@ records compact stage telemetry: attempts, actual runs, cache hits, duration,
 rerender count and failure reasons. Telemetry is observational and can never
 open or close a gate; it replaces reconstructing elapsed time from verbose
 event logs.
+
+Preparation begins before `generation_created`, so the host separately records
+bounded, per-job preparation counters in
+`02_Tracker/workflow/materials_preparation/<job_id>.json`. The gateway projects
+this summary into `materials_run.json.preparation` when planning starts. It
+tracks preparation/identity/planning calls and host duration, not document text
+or secrets. `observed_elapsed_ms` is the span between observed calls, which can
+include human waits and model thinking; it is not host execution time or a claim
+about a model's token usage. Nested auto-prepare time is not counted twice.
 
 Company research is tiered. A verified brief is reused when present; an
 explicit research request receives a targeted brief; otherwise a known

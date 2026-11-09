@@ -52,10 +52,10 @@ from tools.workflow.fresh_store import (
 from tools.workflow.id_allocation import IdCounterConflict, LocalIdCounterStore, prepare_rows_for_entry, row_identity
 from tools.workflow.sync import SyncCoordinator, TrackerLedger
 from tools.fresh_24h.jd_cache import save_jd_cache
+from tools.jd_quality import FULL_JD_MIN_CHARS, assess_jd, completeness_evidence
 
 
 INTAKE_RULE_IDS = ["INTAKE-001", "PUSH-002", "SYNC-001", "SYNC-004", "SYNC-005"]
-FULL_JD_MIN_CHARS = 400
 _TRACKING_QUERY_KEYS = {
     "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "trk",
     "ref", "referrer", "campaign", "campaign_id",
@@ -179,7 +179,7 @@ def _metadata_from_item(item: dict[str, Any], defaults: dict[str, Any]) -> dict[
         "salary": salary,
         "location": location,
         "posted_at": posted_at,
-        "jd_complete": bool(item.get("jd_complete") or item.get("full_jd_complete") or page.get("jd_complete")),
+        "jd_complete": any(value is True for value in (item.get("jd_complete"), item.get("full_jd_complete"), page.get("jd_complete"))),
     }
 
 
@@ -329,6 +329,8 @@ def _maybe_fetch_missing_jds(
             if body:
                 copy["jd_text"] = body
                 copy["jd_complete"] = True
+                proof = (meta.get("jd_completeness") or {}).get(str(copy.get("url") or ""), {})
+                copy["_jd_complete_basis"] = str(proof.get("basis") or "length_heuristic")
                 fetched_ok += 1
             elif any(
                 safe_jobsdb_job_url(str(copy.get("url") or "")) == str(candidate.get("url") or "")
@@ -343,9 +345,18 @@ def _maybe_fetch_missing_jds(
     return updated, summary, errors
 
 
+def _jd_evidence(fields: dict[str, Any]) -> dict[str, str]:
+    if fields.get("jd_complete") is not True:
+        return {}
+    basis = str(fields.get("_jd_complete_basis") or "user_confirmed")
+    if basis not in {"user_confirmed", "page_body_verified"}:
+        return {}
+    return completeness_evidence(str(fields.get("jd_text") or ""), basis=basis)
+
+
 def _full_jd(fields: dict[str, Any]) -> bool:
     text = str(fields.get("jd_text") or "").strip()
-    return bool(fields.get("jd_complete")) or len(text) >= FULL_JD_MIN_CHARS
+    return assess_jd(text, _jd_evidence(fields))["eligible"]
 
 
 def _base_row(fields: dict[str, Any], *, status: str, depth: str) -> dict[str, Any]:
@@ -612,6 +623,8 @@ def handle(
                     url=row.get("链接") or "",
                     message="完整 JD 缺失时请在页面信息或 --lane 中提供归属 lane；系统不会自行猜测。",
                 )
+        from tools.workflow.entry_authorization import target_binding
+
         proposal = build_proposal(
             action="manual_intake",
             target=title,
@@ -627,6 +640,7 @@ def handle(
                         "url": item["url"],
                         "text": item["jd_text"],
                         "source": "manual_intake",
+                        "completeness": _jd_evidence(item),
                     }
                     for item in unique_fields
                     if _full_jd(item)
@@ -635,6 +649,7 @@ def handle(
                 "provisional_needs_jd": provisional,
                 "jd_fetch": fetch_meta,
                 "backend": target.__class__.__name__,
+                "entry_target_binding": target_binding(target),
                 "backend_resolution": fresh_backend_resolution(workspace, payload),
             },
         )
@@ -656,6 +671,13 @@ def handle(
             message="仅生成提案；尚未分配永久编号，也未写入本地或 Google Sheet。",
         )
 
+    from tools.workflow.entry_authorization import resume_entry, require_entry_authorization
+
+    if proposal.get("candidate_digest") != rows_digest(proposal.get("candidate_rows") or []):
+        return result(status="blocked", blockers=["manual_intake_candidate_changed"], proposal_id=proposal_id)
+    resumed = resume_entry(workspace, "intake", proposal, target)
+    if resumed is not None:
+        return resumed
     blockers = validate_proposal(
         proposal,
         action="manual_intake",
@@ -670,6 +692,7 @@ def handle(
     except ValueError as exc:
         return result(status="blocked", after_state="proposal_created", rule_ids=INTAKE_RULE_IDS, blockers=[str(exc)], proposal_id=proposal_id)
     if proposal.get("status") == "applied":
+        require_entry_authorization(workspace, "intake", proposal, store=target, read_only=True)
         return result(status="succeeded", after_state="intake_written", rule_ids=INTAKE_RULE_IDS, proposal_id=proposal_id, idempotent=True)
     candidate_rows = [dict(row) for row in proposal.get("candidate_rows") or []]
     if rows_digest(candidate_rows) != str(proposal.get("candidate_digest") or ""):
@@ -679,6 +702,7 @@ def handle(
     collisions = [_public_row(row) for row in candidate_rows if row_identity(row) in existing_keys]
     if collisions:
         return result(status="blocked", after_state="proposal_created", rule_ids=INTAKE_RULE_IDS, blockers=["manual_intake_duplicate_after_preview"], duplicate_rows=collisions, proposal_id=proposal_id)
+    require_entry_authorization(workspace, "intake", proposal, store=target)
     prepared = prepare_rows_for_entry(
         candidate_rows,
         target_before.rows,
@@ -714,6 +738,9 @@ def handle(
             blockers=["entry_package_creation_failed", str(exc)],
             proposal_id=proposal_id,
         )
+    proposal["allocated_rows"] = prepared
+    proposal["package_paths"] = package_paths
+    confirmations.save(proposal)
     sync = SyncCoordinator(workspace).push_rows(
         title=title,
         incoming=prepared,
@@ -724,7 +751,8 @@ def handle(
         target_snapshot=target_before,
     )
     if sync.get("status") != "succeeded":
-        _retire(confirmations, proposal, ",".join(str(item) for item in sync.get("blockers") or ["sync_projection_failed"]))
+        if sync.get("status") != "failed":
+            _retire(confirmations, proposal, ",".join(str(item) for item in sync.get("blockers") or ["sync_projection_failed"]))
         return result(status=str(sync.get("status") or "failed"), rule_ids=INTAKE_RULE_IDS, blockers=list(sync.get("blockers") or ["sync_projection_failed"]), sync=sync, proposal_id=proposal_id)
     cache_warnings: list[str] = []
     for entry in proposal.get("jd_cache_entries") or []:
@@ -736,6 +764,7 @@ def handle(
                 str(entry.get("text") or ""),
                 source=str(entry.get("source") or "manual_intake"),
                 root=_repo_for_workspace(workspace),
+                completeness=entry.get("completeness"),
             )
         except (OSError, TypeError, ValueError) as exc:
             cache_warnings.append(f"{entry.get('url') or 'unknown'}:{exc}")

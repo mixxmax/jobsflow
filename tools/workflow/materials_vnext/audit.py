@@ -11,7 +11,7 @@ from uuid import uuid4
 from tools.io_utils import atomic_write_json, atomic_write_text
 from tools.workflow.auditor_dispatch import dispatch_configured_auditor
 from tools.workflow.materials_rules import build_rule_pack, render_compact_rules
-from tools.workflow.materials_vnext.contracts import MATERIALS, digest, text
+from tools.workflow.materials_vnext.contracts import MATERIALS, content_text, logical_items, digest, text
 from tools.workflow.materials_vnext.store import (
     AUDIT_RESULT_NAME,
     load_audit_result,
@@ -109,8 +109,8 @@ def _tailoring_delta(bundle: dict[str, Any], canonical: dict[str, Any]) -> dict[
                 omitted.append(f"{material}:{ident}")
                 continue
             current_item = matches[0]
-            before = text(base.get("text"))
-            after = text(current_item.get("text"))
+            before = content_text(base.get("text"))
+            after = content_text(current_item.get("text"))
             if before == after and len(matches) == 1:
                 retained += 1
                 continue
@@ -263,13 +263,14 @@ def build_task(
     for material in MATERIALS:
         blocks = _blocks(canonical, material)
         materials[material] = {
-            "text": "\n".join(text(item.get("text")) for item in blocks),
+            "text": "\n".join(content_text(item.get("text")) for item in blocks),
             "semantic_hash": digest(blocks),
             "blocks": [
                 {
                     "id": text(item.get("id")),
                     "type": text(item.get("type")),
-                    "text": text(item.get("text")),
+                    "text": content_text(item.get("text")),
+                    "logical_items": logical_items(item.get("text")),
                     "section": text(item.get("section")),
                     "experience_id": text(item.get("experience_id")),
                     "priority": item.get("priority", 0),
@@ -338,6 +339,7 @@ def build_task(
             "materials.cover_letter",
             "materials.cover_letter.text",
             "tailoring_delta",
+            "repair_scope",
             "layout_contract",
             "layout_contract.coverage_dispositions",
             "filename_contract",
@@ -564,6 +566,9 @@ def record_wording_only_lint(
     one.
     """
 
+    previous = load_audit_result(package)
+    if previous.get("content_gate") != "passed" or open_blocking_findings(package):
+        raise ValueError("independent_findings_require_reaudit")
     blocking = [item for item in preflight.get("blocking") or []]
     lint_findings = list(preflight.get("findings") or [])
     normalized = {
@@ -599,7 +604,7 @@ def record_wording_only_lint(
     canonical = load_canonical(package)
     normalized["semantic_material_hashes"] = {
         material: sha256_text(normalize_text("\n".join(
-            text(block.get("text"))
+            content_text(block.get("text"))
             for block in ((canonical.get(material) or {}).get("blocks") or [])
             if isinstance(block, dict)
         )))

@@ -25,7 +25,7 @@ from tools.workflow.materials_vnext.audit import (
     suppressed_findings_for,
 )
 from tools.workflow.materials_vnext.bundle import build_bundle, bundle_current, load_json, state_dir
-from tools.workflow.materials_vnext.contracts import MATERIALS, digest, text
+from tools.workflow.materials_vnext.contracts import MATERIALS, content_text, logical_items, digest, text
 from tools.workflow.materials_vnext.preflight import evaluate_capacity, run_preflight
 from tools.workflow.materials_vnext.migration import migration_blocker
 from tools.workflow.materials_vnext.store import (
@@ -261,7 +261,7 @@ def _package(workspace: Path, job_id: str) -> Path:
     return Path(ctx.package)
 
 
-def _run_or_new(package: Path, bundle: dict[str, Any], job_id: str, *, producer_context_id: str = "") -> dict[str, Any]:
+def _run_or_new(package: Path, bundle: dict[str, Any], job_id: str, *, workspace: Path, producer_context_id: str = "") -> dict[str, Any]:
     run = load_run(package)
     if run:
         if run.get("bundle_sha256") != bundle.get("bundle_sha256"):
@@ -274,7 +274,11 @@ def _run_or_new(package: Path, bundle: dict[str, Any], job_id: str, *, producer_
         baseline_sha256=str((bundle.get("baseline") or {}).get("baseline_sha256") or ""),
     )
     run["producer_context_id"] = producer_context_id or f"producer-{uuid4().hex[:10]}"
-    return save_run(package, run)
+    run = save_run(package, run)
+    from tools.workflow.materials_authorization import bind_created_generation
+
+    bind_created_generation(workspace, job_id, run)
+    return run
 
 
 
@@ -373,6 +377,8 @@ def _plan_packet(
     return {
         "schema_version": 1,
         "task_type": "materials_plan_and_bounded_tailoring",
+        "jd_anchor_catalog_status": "frozen_from_plan" if plan else "awaiting_plan",
+        "jd_anchor_catalog_instruction": "During planning, derive duties and anchors from the frozen JD. Any seed anchor is an output-schema example, not an extracted JD requirement.",
         "job_id": bundle.get("job_id"),
         "generation_id": run.get("generation_id"),
         "lane": bundle.get("lane"),
@@ -435,7 +441,8 @@ def _plan_packet(
                     {
                         "id": text(block.get("id")),
                         "type": text(block.get("type")),
-                        "text": text(block.get("text")),
+                        "text": content_text(block.get("text")),
+                        "logical_items": logical_items(block.get("text")),
                         "section": text(block.get("section")),
                         "experience_id": text(block.get("experience_id")),
                         "priority": block.get("priority", 0),
@@ -455,6 +462,7 @@ def _plan_packet(
         "instructions": [
             "Return only a bounded transform JSON; do not write DOCX/PDF/email or assemble a full replacement CV/CL.",
             "CV and Cover Letter are parallel materials; each starts from its own lane baseline.",
+            "Preserve logical line boundaries (JSON \\n) inside a multi-item baseline block. To prioritize JD themes, replace that block with reordered complete lines; do not concatenate them into a run-on sentence. Each logical_items entry is one existing item, not a new evidence claim.",
             "Do not delete baseline blocks. Replace or reorder only a small number, and add concise blocks only when truthful and JD-relevant.",
             "Copy the baseline's verbs and key phrasing as written; do not re-word them for style. Never upgrade an experience to led, owned, managed, advised, delivered or recovered unless that experience's baseline already says so.",
             "Use the one primary role supplied by the host. Slash order inside an acronym compound (ECM/IPO or IPO/ECM) is non-substantive; preserve the supplied source order and do not investigate another package. Never expose a missing qualification or recruiter as employer.",
@@ -663,7 +671,7 @@ def _seed_canonical_from_baseline(
             if bool(raw.get("host_managed_optional")) and not bool(raw.get("content_floor", False)):
                 continue
             block = dict(raw)
-            value = text(block.get("text"))
+            value = content_text(block.get("text"))
             placeholders = re.findall(r"\[[^\]]+\]", value)
             for placeholder in placeholders:
                 key = placeholder.casefold()
@@ -781,14 +789,16 @@ class MaterialsEngine:
                 if stage in {"format", "mechanical_format"}:
                     response["format_passed"] = False
                 return response
-            run = _run_or_new(package, bundle, job_id, producer_context_id=text(payload.get("producer_context_id")))
+            run = _run_or_new(package, bundle, job_id, workspace=Path(workspace), producer_context_id=text(payload.get("producer_context_id")))
         except ValueError as exc:
             response = {"status": "blocked", "blockers": [str(exc)], "error": str(exc), "engine": "materials-vnext", "job_id": job_id}
             if stage in {"apply", "ready"}:
                 response["apply_ready"] = False
             if stage in {"format", "mechanical_format"}:
                 response["format_passed"] = False
-            return response
+            from tools.workflow.materials_recovery import add_company_recovery
+
+            return add_company_recovery(response, workspace=Path(workspace), job_id=job_id)
 
         # The TypeSafe advisory is an optional, auto-enabled side channel.  It
         # is placed here - after the bundle is frozen, before any drafting - so
@@ -1705,11 +1715,17 @@ class MaterialsEngine:
         run.update({"phase": "content_audit_pending", "producer_context_id": text(payload.get("producer_context_id") or run.get("producer_context_id"))})
         save_run(package, run)
 
-        # A repair whose every operation is pure wording never reaches the
-        # independent auditor: the deterministic host semantic lint closes the
-        # round.  The record is explicit that no child audit ran.
+        # A prior independent P0/P1 remains authoritative until child review
+        # closes it. Text similarity alone never certifies that semantic fix.
+        # Host-only wording lint is reserved for already-passed content.
         patch_operations = [item for item in (patch or {}).get("operations") or [] if isinstance(item, dict)]
-        wording_only_repair = bool(patch) and bool(patch_operations) and all(
+        prior_audit = load_audit_result(package)
+        pending_findings = open_blocking_findings(package)
+        wording_only_repair = (
+            bool(patch) and bool(patch_operations)
+            and prior_audit.get("content_gate") == "passed"
+            and not pending_findings
+        ) and all(
             text(item.get("change_class")) == "wording_only" for item in patch_operations
         )
         if wording_only_repair:
@@ -1734,7 +1750,7 @@ class MaterialsEngine:
             # Incremental repair audit: the repaired blocks plus a global
             # rescan of the same problem categories.  User-ruled findings are
             # handed to the child as settled so it cannot re-report them.
-            audit_mode = AUDIT_MODE_INCREMENTAL
+            audit_mode = AUDIT_MODE_INCREMENTAL if int(run.get("audit_attempts") or 0) > 0 else AUDIT_MODE_FULL
             repair_scope = {
                 "target_ids": sorted({
                     text(item.get("target_id"))
@@ -1743,9 +1759,15 @@ class MaterialsEngine:
                 }),
                 "focus_rule_ids": sorted({
                     text(item.get("rule_id"))
-                    for item in open_blocking_findings(package)
+                    for item in pending_findings
                     if text(item.get("rule_id"))
                 }),
+                "findings_to_verify": [
+                    {key: item.get(key) for key in (
+                        "finding_id", "rule_id", "material", "target_id", "quote", "reason", "required_action"
+                    )}
+                    for item in pending_findings
+                ],
             }
         task = build_task(
             bundle=bundle,

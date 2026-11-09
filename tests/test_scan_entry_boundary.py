@@ -671,19 +671,22 @@ def test_stale_entry_preview_cannot_reuse_a_consumed_sequence(tmp_path):
         raise AssertionError("stale proposal reused a consumed ID")
 
 
-def test_failed_confirmation_invalidates_the_proposal(tmp_path):
+def test_network_failure_preserves_the_proposal_for_same_operation_recovery(tmp_path):
     """A confirmation that dies after ID reservation must not look retryable.
 
-    The counters are persisted before the projection write on purpose, so the
-    numbers the proposal holds are already consumed.  Retrying the same
-    proposal_id used to surface id_counter_conflict; it has to ask for a fresh
-    preview instead.
+    Counters are persisted before projection. Recovery must reuse the durable
+    sync operation rather than allocate replacement numbers or demand consent
+    for the same unchanged batch again.
     """
     from tools.workflow.fresh_store import MemoryFreshStore
 
     class ProjectionFailsStore(MemoryFreshStore):
+        fail = True
+
         def replace_active_if_digest(self, snapshot, expected_digest):
-            raise OSError("simulated_projection_failure")
+            if self.fail:
+                raise OSError("simulated_projection_failure")
+            return super().replace_active_if_digest(snapshot, expected_digest)
 
     ws = build_workspace(tmp_path)
     scan = dispatch(
@@ -723,7 +726,9 @@ def test_failed_confirmation_invalidates_the_proposal(tmp_path):
         (ws / "02_Tracker" / "workflow" / "confirmations" / f"{proposal_id}.json")
         .read_text(encoding="utf-8")
     )
-    assert saved["status"] != "pending_confirmation"
+    assert saved["status"] == "pending_confirmation"
+    before_counter = (ws / "02_Tracker/workflow/id_counters.json").read_bytes()
+    store.fail = False
 
     retried = dispatch(
         "push",
@@ -735,5 +740,6 @@ def test_failed_confirmation_invalidates_the_proposal(tmp_path):
             "confirmation_id": proposal_id,
         },
     )
-    assert retried["status"] == "blocked"
-    assert retried["blockers"] == ["confirmation_not_pending"]
+    assert retried["status"] == "succeeded", retried
+    assert store.row_count() == 1
+    assert (ws / "02_Tracker/workflow/id_counters.json").read_bytes() == before_counter

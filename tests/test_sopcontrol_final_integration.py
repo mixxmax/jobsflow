@@ -155,21 +155,20 @@ def test_ticket_challenge_has_zero_side_effects(enforce_root, tmp_path):
     assert preview["status"] == "planned"
     assert preview.get("proposal_id")
     before = list(store.rows) if hasattr(store, "rows") else []
-    challenged = dispatch(
-        "push",
-        workspace=ws,
-        store=store,
-        payload={
-            "run_id": scan["run_id"],
-            "fresh_title": store.title,
-            "confirmation_id": preview["proposal_id"],
-        },
-    )
-    assert challenged["status"] == "planned"
+    # The low-level ticket primitive still challenges without a gateway-owned
+    # entry callback. The official confirmed-entry path is covered separately.
+    from tools.workflow.contracts import ActionRequest
+    from tools.workflow.entity_state import load_entity_state
+    from tools.workflow.sopcontrol_adapter import admit
+
+    challenged = admit(ActionRequest(action="push", autonomy_level="A0", confirmation_id=preview["proposal_id"],
+        payload={"run_id": scan["run_id"], "fresh_title": store.title, "confirmation_id": preview["proposal_id"]}),
+        workspace=ws, entity=load_entity_state(ws, "scan", scan["run_id"]))
+    assert challenged["ticket_challenge"]
     assert "capability_ticket_required" in (challenged.get("blockers") or [])
     assert challenged.get("capability_ticket_id")
     assert challenged.get("capability_ticket_secret")
-    assert challenged.get("side_effects") == []
+    assert challenged.get("zero_side_effects") is True
     after = list(store.rows) if hasattr(store, "rows") else []
     assert after == before
 
@@ -244,19 +243,12 @@ def test_ticket_redeem_allows_confirmed_push(enforce_root, tmp_path):
             "confirmation_id": preview["proposal_id"],
         },
     )
-    pushed = dispatch(
-        "push",
-        workspace=ws,
-        store=store,
-        payload={
-            "run_id": scan["run_id"],
-            "fresh_title": store.title,
-            "confirmation_id": preview["proposal_id"],
-            "capability_ticket_id": challenged["capability_ticket_id"],
-            "capability_ticket_secret": challenged["capability_ticket_secret"],
-        },
-    )
+    pushed = challenged
     assert pushed["status"] == "succeeded"
+    from sopcontrol.tickets import _load_ticket
+
+    assert not pushed.get("requires_capability_ticket")
+    assert _load_ticket(enforce_root, pushed["entry_authorization"]["ticket_id"]).consumed_at
 
 
 def test_ticket_reuse_and_wrong_secret_blocked(enforce_root, tmp_path):
@@ -289,22 +281,19 @@ def test_ticket_reuse_and_wrong_secret_blocked(enforce_root, tmp_path):
             "confirmation_id": preview["proposal_id"],
         },
     )
-    ticket = {
-        "capability_ticket_id": challenged["capability_ticket_id"],
-        "capability_ticket_secret": challenged["capability_ticket_secret"],
-    }
-    first = dispatch(
-        "push",
-        workspace=ws,
-        store=store,
-        payload={
-            "run_id": scan["run_id"],
-            "fresh_title": store.title,
-            "confirmation_id": preview["proposal_id"],
-            **ticket,
-        },
-    )
+    from sopcontrol.tickets import TicketError, _load_ticket, redeem_ticket
+
+    first = challenged
     assert first["status"] == "succeeded"
+    original = _load_ticket(enforce_root, first["entry_authorization"]["ticket_id"])
+    ticket = {"capability_ticket_id": original.ticket_id, "capability_ticket_secret": original.secret}
+    with pytest.raises(TicketError, match="consumed"):
+        redeem_ticket(enforce_root, ticket_id=original.ticket_id, secret=original.secret,
+                      action="push", input_fingerprint=original.input_fingerprint, side_effect="tracker_write")
+    wrong = dispatch("push", workspace=ws, store=store,
+                     payload={"confirmation_id": preview["proposal_id"], **ticket, "capability_ticket_secret": "wrong"})
+    assert wrong["status"] == "blocked"
+    assert "entry_authorization_mismatch" in wrong["blockers"]
     reused = dispatch(
         "push",
         workspace=ws,

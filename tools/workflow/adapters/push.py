@@ -375,6 +375,8 @@ def _entry_preview(
             ),
         )
         prepared = sort_fresh_rows(prepared)
+    from tools.workflow.entry_authorization import target_binding
+
     proposal = build_proposal(
         action="push_fresh",
         target=title,
@@ -388,6 +390,7 @@ def _entry_preview(
             "incoming_digest": rows_digest(prepared),
             "prepared_rows": prepared,
             "backend": store.__class__.__name__,
+            "entry_target_binding": target_binding(store),
             "batch_id": batch_id,
             "selection_keys": list(selection_keys or []),
             "source_row_count": int(source_row_count if source_row_count is not None else len(rows)),
@@ -671,6 +674,25 @@ def handle(
                 blockers=["confirmation_selection_changed"],
                 proposal_id=proposal_id,
             )
+    if proposal:
+        from tools.workflow.entry_authorization import resume_entry
+
+        # These immutable-input checks also precede recovery of a write whose
+        # network acknowledgement was lost. Remote digest may legitimately
+        # have advanced, but the confirmed source and backend may not change.
+        checks = {
+            "confirmation_action_mismatch": proposal.get("action") == "push_fresh",
+            "confirmation_run_mismatch": str(proposal.get("run_id") or "") == str(run.get("run_id") or ""),
+            "confirmation_scored_artifact_changed": str(proposal.get("scored_hash") or "") == str(run.get("scored_hash") or ""),
+            "confirmation_backend_mismatch": proposal.get("backend") == target.__class__.__name__,
+            "confirmation_input_changed": proposal.get("incoming_digest") == rows_digest(prepared),
+        }
+        errors = [code for code, valid in checks.items() if not valid]
+        if errors:
+            return result(status="blocked", blockers=errors, proposal_id=proposal_id)
+        resumed = resume_entry(workspace, "push", proposal, target)
+        if resumed is not None:
+            return resumed
     blockers = validate_proposal(
         proposal,
         action="push_fresh",
@@ -701,6 +723,9 @@ def handle(
             proposal_id=proposal_id,
         )
     if proposal.get("status") == "applied":
+        from tools.workflow.entry_authorization import require_entry_authorization
+
+        require_entry_authorization(workspace, "push", proposal, store=target, read_only=True)
         try:
             package_paths = _ensure_entry_packages(workspace, title, prepared)
         except (OSError, ValueError, LookupError) as exc:
@@ -753,6 +778,9 @@ def handle(
             proposal_id=proposal_id,
         )
 
+    from tools.workflow.entry_authorization import require_entry_authorization
+
+    require_entry_authorization(workspace, "push", proposal, store=target)
     # The proposal is the durable ID reservation preview.  Persist the latest
     # per-lane counters only at the explicit confirmation boundary; a write-
     # free preview never consumes a number.  Persisting before the projection
@@ -793,6 +821,8 @@ def handle(
             package_paths=package_paths,
         )
 
+    proposal["package_paths"] = package_paths
+    confirmations.save(proposal)
     sync = SyncCoordinator(workspace).push_rows(
         title=title,
         incoming=prepared,
@@ -803,11 +833,11 @@ def handle(
         target_snapshot=target_before,
     )
     if sync.get("status") != "succeeded":
-        _retire_proposal(
-            confirmations,
-            proposal,
-            ",".join(str(item) for item in (sync.get("blockers") or ["sync_projection_failed"])),
-        )
+        if sync.get("status") != "failed":
+            _retire_proposal(
+                confirmations, proposal,
+                ",".join(str(item) for item in (sync.get("blockers") or ["sync_projection_failed"])),
+            )
         return result(
             status=str(sync.get("status") or "failed"),
             blockers=list(sync.get("blockers") or ["sync_projection_failed"]),

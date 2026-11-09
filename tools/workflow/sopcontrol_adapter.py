@@ -532,6 +532,8 @@ def _ticket_fingerprint(action: str, payload: dict[str, Any]) -> str:
             "binding": binding,
             "run_id": payload.get("run_id") or "",
             "job_id": payload.get("job_id") or "",
+            **({"entry_scope_digest": payload["entry_scope_digest"]}
+               if action in {"push", "intake"} and payload.get("entry_scope_digest") else {}),
         }
     )
     if api is None:
@@ -649,13 +651,17 @@ def issue_capability_ticket(
     root = product_root()
     fingerprint = _ticket_fingerprint(action, payload)
     side = _side_effect_for_write(action)
+    from tools.workflow.materials_authorization import ISSUER, TTL_SECONDS, eligible
+
+    material_task = action == "materials" and eligible(action, payload)
     ticket = issue_ticket(
         root,
         action=action,
         input_fingerprint=fingerprint,
         allowed_side_effects=[side],
         run_id=run_id,
-        issued_by="jobsflow.workflow",
+        issued_by=ISSUER if material_task else "jobsflow.workflow",
+        ttl_seconds=TTL_SECONDS if material_task else 900,
     )
     view = ticket_public_view(ticket)
     handoff = write_capability_handoff(
@@ -755,6 +761,11 @@ def _redeem_capability_ticket(request: Any) -> list[str]:
             side_effect=_side_effect_for_write(action),
         )
     except TicketError as exc:
+        reason = str(exc).casefold()
+        if "expired" in reason:
+            return ["capability_ticket_expired", "capability_ticket_invalid"]
+        if "consumed" in reason:
+            return ["capability_ticket_consumed", "capability_ticket_invalid"]
         return ["capability_ticket_invalid", type(exc).__name__]
     except (OSError, TypeError, ValueError, RuntimeError):
         return ["capability_ticket_invalid"]
@@ -853,8 +864,27 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
 
     ticket_challenge = False
     issued_ticket: dict[str, Any] | None = None
-    if not blockers and writing and tickets_enabled() and package_available:
+    task_relayed = False
+    from tools.workflow.entry_authorization import boundary_managed
+
+    entry_boundary = action in {"push", "intake"} and boundary_managed(
+        action, workspace, str(getattr(request, "confirmation_id", None) or payload.get("confirmation_id") or payload.get("proposal_id") or ""))
+    # Entry domain checks need the actual current projection. Its bound ticket
+    # is redeemed by the adapter immediately before allocation/writing, not
+    # challenged a second time before those read-only validations can run.
+    if not blockers and writing and tickets_enabled() and package_available and not entry_boundary:
         ticket_id = str(payload.get("capability_ticket_id") or payload.get("ticket_id") or "").strip()
+        if not ticket_id:
+            from tools.workflow.materials_authorization import authorized
+
+            if authorized(Path(workspace), action, payload, root=root):
+                relay_ticket = issue_capability_ticket(action=action, payload=payload, run_id=run_id)
+                if relay_ticket is not None:
+                    ticket_id = relay_ticket["ticket_id"]
+                    payload.update({"capability_ticket_id": ticket_id, "capability_ticket_secret": relay_ticket["secret"]})
+                    request.payload = payload
+                    load_capability_handoff(ticket_id, root=root, consume=True)
+                    task_relayed = True
         if not ticket_id:
             # No ticket yet: mint one and stop. Zero side effects.
             issued_ticket = issue_capability_ticket(action=action, payload=payload, run_id=run_id)
@@ -867,7 +897,12 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         else:
             # An id means the caller is redeeming. Missing secret uses the
             # 0600 handoff. Do not mint a replacement ticket.
-            blockers.extend(_redeem_capability_ticket(request))
+            ticket_errors = _redeem_capability_ticket(request)
+            blockers.extend(ticket_errors)
+            if not ticket_errors and action == "materials" and not task_relayed:
+                from tools.workflow.materials_authorization import remember
+
+                remember(Path(workspace), payload, ticket_id)
     blockers = sorted(set(blockers))
     report: dict[str, Any] = {
         "mode": mode,
@@ -886,6 +921,8 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         # the structured result so a model can also pass it explicitly, while
         # the gateway can recover it automatically from the ticket.
         "run_id": run_id,
+        "task_authorization_relayed": task_relayed and not blockers,
+        "entry_ticket_at_write_boundary": bool(entry_boundary and writing and not blockers),
     }
     if issued_ticket is not None:
         report["capability_ticket_id"] = issued_ticket["ticket_id"]
@@ -893,6 +930,10 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         if issued_ticket.get("handoff"):
             report["capability_ticket_handoff"] = issued_ticket["handoff"]
         report["next_action"] = "retry_with_capability_ticket"
+        from tools.workflow.materials_authorization import eligible, scope_description
+
+        if action == "materials" and eligible(action, payload):
+            report["authorization_scope"] = scope_description(str(payload["job_id"]))
 
     if mode == "warn" and blockers and not ticket_challenge:
         report["blocking"] = False

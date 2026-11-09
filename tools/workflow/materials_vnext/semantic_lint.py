@@ -19,7 +19,7 @@ import json
 import re
 from typing import Any
 
-from tools.workflow.materials_vnext.contracts import MATERIALS, text
+from tools.workflow.materials_vnext.contracts import MATERIALS, content_text, text
 
 # Scope/category words whose silent loss narrows what a number covers.  The
 # retrospective case was "civil, commercial and labour" compressed to
@@ -264,14 +264,23 @@ def _experience_employer_map(baseline_cv: list[dict[str, Any]]) -> dict[str, Any
         if block.get("presentation_role") == "job_heading" and text(block.get("experience_id")):
             headings[text(block.get("experience_id"))] = text(block.get("text"))
     token_owners: dict[str, set[str]] = {}
-    for heading in headings.values():
+    generic = {
+        "team", "office", "group", "company", "firm", "department", "division",
+        "operation", "associate", "assistant", "analyst", "manager", "director",
+        "officer", "intern", "internship", "senior", "junior", "legal", "law",
+        "compliance", "litigation", "support", "counsel", "consultant", "specialist",
+        "present", "current", "limited", "ltd", "llp", "inc", "corporation",
+        "project", "practice", "business", "financial", "finance", "advisory",
+        "commercial", "corporate", "contract", "service", "consulting",
+    }
+    for experience_id, heading in headings.items():
         for word in content_words(heading):
-            token_owners.setdefault(word, set()).add("x")
+            token_owners.setdefault(word, set()).add(experience_id)
     distinctive: dict[str, set[str]] = {}
     for experience_id, heading in headings.items():
         words = content_words(heading)
         distinctive[experience_id] = {
-            word for word in words if len(token_owners.get(word, set())) == 1
+            word for word in words if word not in generic and len(token_owners.get(word, set())) == 1
         }
     return {"headings": headings, "distinctive": distinctive}
 
@@ -326,8 +335,8 @@ def run_semantic_lint(
             block_id = text(block.get("id"))
             refs = _refs(block)
             before_blocks = [baseline_by_id[ref] for ref in refs if ref in baseline_by_id]
-            before_text = " ".join(text(item.get("text")) for item in before_blocks)
-            after_text = text(block.get("text"))
+            before_text = "\n".join(content_text(item.get("text")) for item in before_blocks)
+            after_text = content_text(block.get("text"))
             experience_id = text(block.get("experience_id"))
             customized = bool(block.get("customized"))
 
@@ -431,7 +440,9 @@ def run_semantic_lint(
                 for other_id, tokens in distinctive.items():
                     if other_id == experience_id:
                         continue
-                    borrowed = (tokens & after_words) - own
+                    # The baseline is already approved.  A wording edit may
+                    # retain a legitimate reference to another organisation.
+                    borrowed = (tokens & after_words) - own - content_words(before_text)
                     if borrowed:
                         findings.append(_finding(
                             "cross_employer_attribution", material, block_id,
@@ -475,7 +486,11 @@ def _counted_noun(value: str, token: str) -> set[str]:
     """
 
     heads: set[str] = set()
-    for sentence in re.split(r"[.;:!?\n]", str(value or "")):
+    # Older frozen baselines may already contain fused soft-break boundaries.
+    # Treat a lower-case→capital boundary as a clause boundary for this parser
+    # only; never rewrite the candidate's outbound text or hide real noun drift.
+    parsed = re.sub(r"(?<=[a-z])(?=[A-Z][a-z])", "; ", str(value or ""))
+    for sentence in re.split(r"[.;:!?|\n]", parsed):
         tokens = [match.group(0) for match in _TOKEN_RE.finditer(sentence)]
         normalized = {
             index

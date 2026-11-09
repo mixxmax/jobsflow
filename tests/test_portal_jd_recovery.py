@@ -1798,6 +1798,27 @@ def test_success_cache_precedes_open_circuit_in_enrich(monkeypatch, tmp_path):
     assert "Full cached JD" in text
 
 
+def test_cdp_batch_accepts_heading_free_short_jd():
+    """Exercise the real CDP extraction -> semantic admission boundary."""
+    body = (
+        "Previous working experience supporting operational projects is preferred.\n\n"
+        "Coordinate assigned requests, maintain accurate records, and communicate "
+        "clearly with colleagues.\n\n"
+        "The position follows a five-day schedule in a collaborative environment "
+        "and includes ownership of documentation and regular progress updates."
+    )
+    assert browser.MIN_BODY_CHARS <= len(body) < 400
+    page = _FakePage(title="Project Coordinator - Example", html="<html></html>",
+                     selectors={'[data-automation="jobAdDetails"]': body})
+    session = _approve_cdp_fixture(
+        browser.JobsdbCdpBatchSession(None, None, _FakeContext(page=page))
+    )
+    result = session.fetch_once("https://hk.jobsdb.com/job/310")
+    assert result.ok is True
+    assert result.content_validated is True
+    assert result.text == body
+
+
 def test_cdp_batch_goto_timeout_reports_timeout_never_success():
     """A goto TimeoutError inside the CDP batch session is fail-closed."""
 

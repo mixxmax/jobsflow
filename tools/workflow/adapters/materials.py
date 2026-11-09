@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from time import perf_counter
 
 from tools.workflow.contracts import result
 # The large pre-vNext adapter body below is deliberately left in place as
@@ -55,6 +56,39 @@ def _automatic_audit(package: Path, task: dict[str, Any], *, timeout: int = 900)
 
 
 def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = None, dry_run: bool = False) -> dict[str, Any]:
+    started = perf_counter()
+    payload = payload or {}
+    stage = str(payload.get("stage") or payload.get("materials_cmd") or "plan").casefold()
+    from tools.workflow.materials_preparation_metrics import read_preparation
+
+    before = read_preparation(workspace, str(payload.get("job_id") or "")) if workspace else {}
+    out = _handle(payload, workspace=workspace, dry_run=dry_run)
+    if workspace is not None and stage in {"plan", "company-research"} and not (dry_run or payload.get("dry_run")):
+        from tools.workflow.materials_preparation_metrics import record_preparation
+        from tools.workflow.package_context import _find_package
+        from tools.workflow.materials_vnext.store import load_run, save_run, package_lock
+
+        try:
+            job_id = str(payload.get("job_id") or "")
+            nested = read_preparation(workspace, job_id)
+            nested_ms = int(nested.get("host_duration_ms", 0)) - int(before.get("host_duration_ms", 0))
+            record = record_preparation(workspace, job_id, stage=stage,
+                                        duration_ms=max(0, int((perf_counter() - started) * 1000) - nested_ms), out=out)
+            package = _find_package(Path(workspace), job_id)
+            if package and record:
+                # Never save the snapshot loaded before another stage's
+                # transition. Observability must not roll back a live phase.
+                with package_lock(package):
+                    run = load_run(package)
+                    if run:
+                        run["preparation"] = read_preparation(workspace, job_id)
+                        save_run(package, run)
+        except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+            pass  # Telemetry is observational, not an alternative admission path.
+    return out
+
+
+def _handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = None, dry_run: bool = False) -> dict[str, Any]:
     payload = payload or {}
     if str(payload.get("materials_engine") or "").casefold() == "vnext":
         from tools.workflow.materials_vnext import MaterialsEngine
@@ -62,6 +96,13 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
         if workspace is None:
             return result(status="blocked", rule_ids=["MAT-VNEXT-001"], blockers=["workspace_required"])
         stage = str(payload.get("stage") or payload.get("materials_cmd") or "").casefold()
+        if payload.get("confirm_jd_complete") and stage != "prepare":
+            return result(status="blocked", blockers=["jd_completeness_requires_prepare"],
+                          next_action="use materials prepare --confirm-jd-complete only after explicit completeness confirmation")
+        if stage == "company-research":
+            from tools.workflow.materials_recovery import submit_company_research
+
+            return submit_company_research(Path(workspace), payload, dry_run=dry_run)
         if stage == "batch" or payload.get("materials_cmd") == "batch":
             from tools.workflow.materials_batch import run_batch
 
@@ -115,7 +156,9 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
                     blockers = list(prepared.get("blockers") or [])
                     if has_prepare_blocker(blockers) and not prepared.get("next_action"):
                         prepared["next_action"] = prepare_command(job_id)
-                    return prepared
+                    from tools.workflow.materials_recovery import add_company_recovery
+
+                    return add_company_recovery(prepared, workspace=Path(workspace), job_id=job_id)
                 prepare_note = {
                     "status": prepared.get("status"),
                     "noop": bool(prepared.get("noop")),
@@ -133,7 +176,9 @@ def handle(payload: dict[str, Any] | None = None, *, workspace: Path | None = No
 
             if has_prepare_blocker(blockers) and not out.get("next_action"):
                 out["next_action"] = prepare_command(str(payload.get("job_id") or ""))
-        return out
+        from tools.workflow.materials_recovery import add_company_recovery
+
+        return add_company_recovery(out, workspace=Path(workspace), job_id=str(payload.get("job_id") or ""))
     # Frozen compatibility body below is intentionally unreachable from the
     # product gateway.  It remains in this module only so historical private
     # packages can be inspected or recovered by an explicitly maintained

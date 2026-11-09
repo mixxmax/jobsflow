@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.io_utils import atomic_write_text
+from tools.jd_quality import assess_jd, header_evidence, jd_body
 from tools.job_materials.paths import jds_dir
 from tools.job_materials.url_normalize import normalize_job_url
 
@@ -25,6 +26,7 @@ def write_jd(
     *,
     url: str = "",
     source: str = "user_paste",
+    completeness: dict[str, str] | None = None,
 ) -> Path:
     pid = package_id_from_path(package)
     # package-local copy for agent/human
@@ -35,7 +37,10 @@ def write_jd(
         header += f"- url: {canon}\n"
         if canon != url:
             header += f"- url_raw: {url}\n"
-    header += f"- source: {source}\n\n---\n\n"
+    header += f"- source: {source}\n"
+    if completeness and assess_jd(text, completeness)["completeness"] == "confirmed_complete":
+        header += f"- jd_complete_basis: {completeness['basis']}\n- jd_body_sha256: {completeness['body_sha256']}\n"
+    header += "\n---\n\n"
     body = text.strip() + "\n"
     atomic_write_text(local, header + body)
 
@@ -58,7 +63,7 @@ _SNAPSHOT_PLACEHOLDERS = (
 
 
 def _full_jd_min_chars() -> int:
-    from tools.workflow.adapters.intake import FULL_JD_MIN_CHARS
+    from tools.jd_quality import FULL_JD_MIN_CHARS
 
     return int(FULL_JD_MIN_CHARS)
 
@@ -92,9 +97,7 @@ def read_jd(package: Path, root: Path | None = None) -> str:
     local = package / "jd_full.md"
     if local.exists():
         raw = local.read_text(encoding="utf-8", errors="replace")
-        if "\n---\n" in raw:
-            return raw.split("\n---\n", 1)[-1].strip()
-        return raw.strip()
+        return jd_body(raw)
     snapshot = package / "job_snapshot.md"
     if snapshot.exists():
         explicit = _explicit_snapshot_jd(snapshot.read_text(encoding="utf-8", errors="replace"))
@@ -104,9 +107,7 @@ def read_jd(package: Path, root: Path | None = None) -> str:
     m = jds_dir(root) / f"{pid}.md"
     if m.exists():
         raw = m.read_text(encoding="utf-8")
-        if "\n---\n" in raw:
-            return raw.split("\n---\n", 1)[-1].strip()
-        return raw.strip()
+        return jd_body(raw)
     return ""
 
 
@@ -128,8 +129,12 @@ def jd_meta(package: Path, root: Path | None = None) -> dict[str, Any]:
     source = ""
     url = ""
     body = read_jd(package, root)
-    if local.exists():
-        head = local.read_text(encoding="utf-8", errors="replace").split("\n---\n", 1)[0]
+    evidence = {}
+    metadata_path = local if local.exists() else jds_dir(root) / f"{package_id_from_path(package)}.md"
+    if metadata_path.exists():
+        raw = metadata_path.read_text(encoding="utf-8", errors="replace")
+        evidence = header_evidence(raw)
+        head = raw.split("\n---\n", 1)[0]
         m = re.search(r"- source:\s*(.+)", head)
         if m:
             source = m.group(1).strip()
@@ -148,7 +153,10 @@ def jd_meta(package: Path, root: Path | None = None) -> dict[str, Any]:
         or "structured_only" in src_l
         or "url_only" in src_l
     )
-    if n < 40:
+    quality = assess_jd(body, evidence)
+    if quality["completeness"] == "confirmed_complete" and not stubby:
+        depth = "ok"
+    elif n < 40:
         depth = "missing"
     elif stubby or n < 150:
         if "structured" in src_l:
@@ -157,6 +165,8 @@ def jd_meta(package: Path, root: Path | None = None) -> dict[str, Any]:
             depth = "stub"
         else:
             depth = "shallow"
+    elif not quality["eligible"]:
+        depth = "shallow"
     elif "linkedin" in src_l or n >= 400:
         depth = "deep" if ("linkedin" in src_l or n >= 800) else "ok"
     else:
@@ -168,4 +178,5 @@ def jd_meta(package: Path, root: Path | None = None) -> dict[str, Any]:
         "chars": n,
         "depth": depth,
         "is_shallow": depth in {"missing", "stub", "shallow", "structured"},
+        "completeness": quality["completeness"],
     }

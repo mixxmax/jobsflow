@@ -27,18 +27,13 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-09-26 · A large round of stability fixes
+## 🆕 Latest update · 2026-11-09 · More reliable entry, JDs and materials
 
-We walked one job all the way from search to application materials and fixed the bugs that surfaced along the way. The work went through an independent QA pass and the full test suite (964 tests, all passing). Highlights:
+- **Confirm tracker entry once.** After formal `push/intake` confirmation, the gateway redeems the proposal-bound ticket. Retrying the same proposal after a timeout resumes its sync operation and IDs. Sheets fast append checks the new rows by reading back just the batch.
+- **Complete short JDs need no padding.** Verified full bodies and user-confirmed short JDs carry body-bound completeness evidence through the cache and mirror. Re-saving a snippet does not turn it into verified full text.
+- **Less materials rework.** Baseline line breaks and item boundaries survive tailoring, audit and rendering. Punctuation-only changes no longer trigger the known false positive about what a number refers to. Open independent findings still require re-review, and authorization cannot carry across material generations.
 
-- **The materials chain works end to end.** A job entered into the tracker can go straight to materials. The new `materials prepare` fills in the full JD, the matching assessment and the application preflight, and `materials produce` now runs the whole generation chain on one authorization instead of needing a hand-off at every step.
-- **Jobs no longer disappear quietly.** Cards with a low first-pass score stay visible as low-priority review items and can be selected for deep review in `/push`. "Show me first, then dig deeper" has a proper switch, `intent review-first`, and a job reposted under a new ID is flagged.
-- **Jobs you find yourself can get their full JD.** `/intake` can fetch the JobsDB full text through the gateway. Only real `https` JobsDB job URLs are opened, each rebuilt from its job ID, so lookalike links are refused.
-- **Enough time to approve Chrome.** The attach wait now defaults to 30 seconds and is configurable; `doctor` shows the effective value.
-- **Less fuss over résumé wording.** The baseline wording is copied first; a reasonable change within your role passes, and only an inflated verb needs your confirmation, which applies to that one job (`materials confirm-claim`).
-- **Also:** several silent failures while revising or re-running now report clearly, a read-only `reconcile packages` check was added, and the test suite can no longer touch your real browser.
-
-The full record is in the [fix handbook](docs/JobsFlow_岗位全流程缺陷修复技术手册_2026-09-25.md) and the [rework list](docs/JobsFlow_岗位全流程缺陷修复_返工清单_2026-09-25.md) (Chinese). The previous update, optional TypeSafe / Jev advisory judgments, now lives under Quick start below.
+An entry receipt traces the formal confirmation callback. The host must still obtain the user's actual choice; the receipt does not independently verify human presence.
 
 ---
 
@@ -80,7 +75,7 @@ CV + intent → setup/intent → scan (cache → route → deep JD → score →
 ```
 
 The baseline-first material strategy is the main cost control: the main model
-submits only `rewrite / reorder / merge / add` operations, the host retains every
+submits only `replace / reorder / append_after` operations, the host retains every
 unmentioned baseline block, and the child auditor focuses on the delta before one
 compact full-document sweep. This avoids rebuilding a résumé from scratch for
 every posting while keeping output quality bounded for less capable models.
@@ -392,6 +387,8 @@ another fit analysis.
 
 ## Materials
 
+For a job already in the tracker, `materials prepare` fills in the JD, match assessment and application preflight; `materials produce` advances the generation pipeline. Ordinary stages share authorization for the same job and generation. Wording starts from the baseline; claims that exceed the evidence require confirmation, and `materials confirm-claim` applies only to that job. Revisions and retries report blockers explicitly.
+
 Materials use fact-checked direction bases (A–F, with an optional G capability
 lane), the full-JD cache, and a source-aware company brief. CV emphasis changes
 with the JD capability themes and company context. Cover letters can replace the
@@ -476,6 +473,8 @@ omit unlisted qualifications rather than volunteering negative disclosures such 
 
 ## Sources
 
+For JobsDB URLs you find yourself, `/intake` can fetch the full JD through the gateway. Only HTTPS JobsDB job URLs rebuilt from the job ID are opened. The configurable Chrome attachment wait defaults to 30 seconds; `doctor` shows the effective setting. Offline tests do not attach to your actual browser.
+
 Supported sources are LinkedIn, JobsDB, CTgoodjobs and FreeHire. Browser automation is a last fallback after structured APIs and cache.
 
 | Source | Search | Deep JD | Materials note |
@@ -532,6 +531,8 @@ runtime enables the user-Chrome handoff. JobsDB never auto-generates materials, 
 the tracker, or submits an application.
 
 ## Folder + tracker: a portable application workspace
+
+Low first-pass scores remain visible as review items and can be selected for deep review with `/push`. Use `intent review-first` to see candidates before fetching details; reposts under a new ID are flagged. Use `reconcile packages` for a read-only check of tracker and materials package bindings.
 
 JobsFlow uses two layers: **folders hold materials and evidence; CSV or Google
 Sheets holds job metadata and status**. This keeps the application record portable
@@ -646,6 +647,8 @@ the workflow, SOP Control, materials pipeline and reliability work are
 maintained in this repository.
 
 ## Version
+
+The 2026-09-26 end-to-end stability work is recorded in the [fix handbook](docs/JobsFlow_岗位全流程缺陷修复技术手册_2026-09-25.md) and [rework list](docs/JobsFlow_岗位全流程缺陷修复_返工清单_2026-09-25.md) (Chinese).
 
 **1.2** — governed SOP gateway and state machine, locked lane/confirmed entry,
 baseline-anchored bounded material tailoring, independent CV/CL content audit,

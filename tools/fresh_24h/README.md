@@ -95,6 +95,13 @@ labeled as a full JD.
 
 ### Reliable detail fetch
 
+DOM-based JD admission requires a trusted description container, the existing
+minimum body length, no WAF/challenge markers, and **at least one** job-related
+semantic marker (not two). Direct eligibility wording such as "working
+experience" counts even without section headings. Length alone, an empty page,
+or an untrusted container still cannot pass. This content check does not change
+the independent scoring or tracker-entry threshold.
+
 The Playwright detail fallback never auto-retries `challenge`/`waf`/429
 failures and never overwrites a saved valid session on them; only `timeout`
 retries (`--retry`, default 2; `--retry-delay`). Two consecutive JobsDB
