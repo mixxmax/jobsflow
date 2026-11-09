@@ -924,6 +924,8 @@ def admit(request: Any, *, entity: Any, workspace: Path) -> dict[str, Any] | Non
         "task_authorization_relayed": task_relayed and not blockers,
         "entry_ticket_at_write_boundary": bool(entry_boundary and writing and not blockers),
     }
+    if task_relayed and not blockers:
+        report["relayed_ticket_id"] = ticket_id
     if issued_ticket is not None:
         report["capability_ticket_id"] = issued_ticket["ticket_id"]
         report["capability_ticket_secret"] = issued_ticket["secret"]

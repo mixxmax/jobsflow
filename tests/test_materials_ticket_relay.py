@@ -187,6 +187,9 @@ def test_produce_relays_tickets_across_later_stages(enforce_root, tmp_path, monk
     ticket_ids = [item["ticket_id"] for entry in relay_log for item in entry.get("ticket_relay") or []]
     assert len(ticket_ids) == len(set(ticket_ids)) == 3
     assert first["capability_ticket_id"] not in ticket_ids
+    from sopcontrol.tickets import _load_ticket
+
+    assert all(_load_ticket(enforce_root, ticket_id).consumed_at is not None for ticket_id in ticket_ids)
 
     handoff_dir = enforce_root / ".sopcontrol-local" / "capability_handoff"
     leftover = list(handoff_dir.glob("*.json")) if handoff_dir.is_dir() else []
