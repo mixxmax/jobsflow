@@ -27,13 +27,12 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-11-09 · More reliable entry, JDs and materials
+## 🆕 Latest update · 2026-11-14 · Temporary browser fallback for JobsDB listing search
 
-- **Confirm tracker entry once.** After formal `push/intake` confirmation, the gateway redeems the proposal-bound ticket. Retrying the same proposal after a timeout resumes its sync operation and IDs. Sheets fast append checks the new rows by reading back just the batch.
-- **Complete short JDs need no padding.** Verified full bodies and user-confirmed short JDs carry body-bound completeness evidence through the cache and mirror. Re-saving a snippet does not turn it into verified full text.
-- **Less materials rework.** Baseline line breaks and item boundaries survive tailoring, audit and rendering. Punctuation-only changes no longer trigger the known false positive about what a number refers to. Open independent findings still require re-review, and authorization cannot carry across material generations.
-
-An entry receipt traces the formal confirmation callback. The host must still obtain the user's actual choice; the receipt does not independently verify human presence.
+- **What happened.** Since mid-November 2026, JobsDB's Cloudflare WAF returns 403 for every non-browser request (curl, Bun, even same-origin fetches inside a verified page), so the listing-API channel is down end to end. LinkedIn and CTgoodjobs are unaffected.
+- **The fallback.** Blocked listing queries are retried by reading the rendered search-results page DOM inside the **validated primary-Chrome CDP context**. It only triggers in the private workspace after you personally pass one Cloudflare challenge, retries only the failed requests, and reports per-request errors.
+- **This is temporary.** It depends on JobsDB frontend attributes (`data-testid="job-card"` and friends); a frontend redesign silently breaks it, and each query costs one page navigation — an order of magnitude slower than the API. `JOBSFLOW_JOBSDB_SERP_FALLBACK=0` disables it with no code change (back to the legacy CLI retry), and the whole fallback should be removed once the listing API accepts non-browser requests again.
+- **Honest status.** Live end-to-end verification against real JobsDB is pending; do not treat the JobsDB channel as restored until one real scan round-trips through the fallback. Details: [technical note](docs/JobsDB_列表检索SERP浏览器回退_技术说明_2026-11-14.md).
 
 ---
 
@@ -387,7 +386,7 @@ another fit analysis.
 
 ## Materials
 
-For a job already in the tracker, `materials prepare` fills in the JD, match assessment and application preflight; `materials produce` advances the generation pipeline. Ordinary stages share authorization for the same job and generation. Wording starts from the baseline; claims that exceed the evidence require confirmation, and `materials confirm-claim` applies only to that job. Revisions and retries report blockers explicitly.
+For a job already in the tracker, `materials prepare` fills in the JD, match assessment and application preflight; `materials produce` advances the generation pipeline. Ordinary stages share authorization for the same job and generation. Wording starts from the baseline; claims that exceed the evidence require confirmation, and `materials confirm-claim` applies only to that job. Revisions and retries report blockers explicitly. Verified full JD bodies and user-confirmed short JDs carry body-bound completeness evidence into materials preparation, preserved through the cache and mirror; re-saving a snippet does not turn it into verified full text. Baseline line breaks and item boundaries survive tailoring, audit and rendering, and punctuation-only changes no longer trigger the known false positive about what a number refers to. Open independent findings still require re-review, and authorization cannot carry across material generations.
 
 Materials use fact-checked direction bases (A–F, with an optional G capability
 lane), the full-JD cache, and a source-aware company brief. CV emphasis changes
@@ -532,7 +531,7 @@ the tracker, or submits an application.
 
 ## Folder + tracker: a portable application workspace
 
-Low first-pass scores remain visible as review items and can be selected for deep review with `/push`. Use `intent review-first` to see candidates before fetching details; reposts under a new ID are flagged. Use `reconcile packages` for a read-only check of tracker and materials package bindings.
+Low first-pass scores remain visible as review items and can be selected for deep review with `/push`. Use `intent review-first` to see candidates before fetching details; reposts under a new ID are flagged. Use `reconcile packages` for a read-only check of tracker and materials package bindings. Tracker entry is confirmed once: after formal `push`/`intake` confirmation the gateway redeems the proposal-bound ticket, retrying the same proposal after a timeout resumes its sync operation and IDs, and Sheets fast append reads back the batch it just wrote. An entry receipt traces the formal confirmation callback; the host must still obtain the user's actual choice, and the receipt does not independently verify human presence.
 
 JobsFlow uses two layers: **folders hold materials and evidence; CSV or Google
 Sheets holds job metadata and status**. This keeps the application record portable
