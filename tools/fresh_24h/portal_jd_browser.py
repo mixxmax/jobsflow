@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse, urlunsplit
+from urllib.parse import urlencode, urlparse, urlunsplit
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -2306,6 +2306,13 @@ class JobsdbHumanVerificationRecovery:
             self._cdp_session.close()
         self._cdp_session = None
         self._validated_session = None
+        validated_page = getattr(self, "_validated_page", None)
+        if validated_page is not None:
+            try:
+                validated_page.close()
+            except Exception:
+                pass
+        self._validated_page = None
 
     @staticmethod
     def _failure(
@@ -2682,6 +2689,11 @@ class JobsdbHumanVerificationRecovery:
             if _write_jobsdb_cookie_header(context, root) is None:
                 return self._failure(probe_url, "cdp_cookie_capture_failed")
             self._validated_session = session
+            # Keep the challenge-cleared page alive for the listing-search
+            # fallback: a fresh navigation would face a new Cloudflare
+            # challenge, while this page has already passed verification.
+            self._validated_page = page
+            page = None
             if self.on_validated_session is not None:
                 try:
                     self.on_validated_session(session)
@@ -2754,6 +2766,29 @@ class JobsdbHumanVerificationRecovery:
         self.status = "succeeded"
         return result
 
+    def search_batch(
+        self,
+        requests: list[dict[str, Any]],
+        *,
+        delay_seconds: float = 1.0,
+    ) -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] | None:
+        """Retry failed listing queries inside the validated browser context.
+
+        Returns ``None`` when no validated CDP session is retained, so the
+        caller can fall back to the CLI worker retry; otherwise returns
+        per-request ``(request, results, error)`` rows like the worker does.
+        """
+        if not _workflow_gateway_active():
+            return None
+        if getattr(self, "_validated_session", None) is None:
+            return None
+        return browser_search_batch(
+            self._validated_session,
+            requests,
+            delay_seconds=delay_seconds,
+            page=getattr(self, "_validated_page", None),
+        )
+
     def recover(
         self,
         url: str,
@@ -2808,6 +2843,154 @@ class JobsdbHumanVerificationRecovery:
         result.detail_reason = "manual_recovery_cdp_user_chrome"
         self.status = "succeeded"
         return result
+
+
+JOBSDB_SERP_URL = "https://hk.jobsdb.com/jobs"
+JOBSDB_JOB_URL_PREFIX = "https://hk.jobsdb.com/job/"
+
+
+def jobsdb_jobage_daterange(days: int) -> str | None:
+    """Map a job-age in days to JobsDB's daterange param (CLI parity)."""
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        return None
+    if days <= 0 or days >= 9999:
+        return None
+    if days <= 7:
+        return "7"
+    if days <= 14:
+        return "14"
+    if days <= 30:
+        return "30"
+    return None
+
+
+_JOBSDB_SERP_EXTRACT_JS = """
+() => {
+  const cards = Array.from(document.querySelectorAll('article[data-testid="job-card"]'));
+  return cards.map(card => ({
+    id: card.getAttribute('data-job-id') || '',
+    title: ((card.querySelector('[data-automation="jobTitle"]') || {}).textContent
+            || card.getAttribute('aria-label') || '').trim(),
+    company: ((card.querySelector('[data-automation="jobCompany"]') || {}).textContent || '').trim() || null,
+    location: ((card.querySelector('[data-automation="jobCardLocation"], [data-automation="jobLocation"]') || {}).textContent || '').trim() || null,
+    salary: ((card.querySelector('[data-automation="jobCardSalary"], [data-automation="jobSalary"]') || {}).textContent || '').trim() || null,
+    teaser: ((card.querySelector('[data-automation="jobShortDescription"]') || {}).textContent || '').trim() || null,
+    date: ((card.querySelector('[data-automation="jobListingDate"]') || {}).textContent || '').trim() || null,
+  })).filter(j => j.id);
+}
+"""
+
+
+def _jobsdb_serp_url(*, query: str | None, jobage: int, page: int, limit: int) -> str:
+    """Build the human search-results URL the user's Chrome renders fine."""
+    from urllib.parse import urlencode
+    params: dict[str, str] = {"page": str(max(1, page))}
+    if query:
+        params["keywords"] = query
+    dr = jobsdb_jobage_daterange(jobage)
+    if dr:
+        params["daterange"] = dr
+        params["sortmode"] = "ListedDate"
+    return f"{JOBSDB_SERP_URL}?{urlencode(params)}"
+
+
+def browser_search_batch(
+    session: Any,
+    requests: list[dict[str, Any]],
+    *,
+    delay_seconds: float = 1.0,
+    page: Any = None,
+) -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]:
+    """Retry failed JobsDB listing queries by scraping the search-results page.
+
+    TEMPORARY (2026-11-14): stop-gap for JobsDB's Cloudflare WAF blocking
+    every non-browser listing request.  Remove once the listing API accepts
+    non-browser requests again; disable at runtime with
+    ``JOBSFLOW_JOBSDB_SERP_FALLBACK=0``.
+
+    The listing API sits behind a Cloudflare WAF that returns 403 for every
+    non-browser request (curl, Bun fetch and even in-page ``fetch`` from the
+    verified context), while the human search-results page renders normally
+    in the user's primary Chrome.  This fallback therefore navigates the
+    validated CDP context to the same SERP the user sees and reads the
+    rendered job cards from the DOM.  It is a bounded, serial fallback for
+    the failed requests only; it never raises, and every failure is reported
+    per request like the worker does.  A caller-supplied page is never
+    closed here — the caller owns its lifecycle.
+    """
+    output: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] = []
+    if session is None:
+        return [(request, [], "browser_search_batch: no validated session") for request in requests]
+    context = getattr(session, "context", None)
+    if context is None:
+        return [(request, [], "browser_search_batch: cdp context missing") for request in requests]
+    owned_page = page is None
+    page_opened_here = None
+    try:
+        if page is not None:
+            try:
+                current = page.url or ""
+            except Exception:
+                current = ""
+            if "hk.jobsdb.com" not in current:
+                page.goto(JOBSDB_SERP_URL, wait_until="domcontentloaded", timeout=45000)
+        else:
+            page_opened_here = context.new_page()
+            page_opened_here.goto(JOBSDB_SERP_URL, wait_until="domcontentloaded", timeout=45000)
+            page = page_opened_here
+        for index, request in enumerate(requests):
+            if index > 0 and delay_seconds > 0:
+                time.sleep(delay_seconds)
+            serp_url = _jobsdb_serp_url(
+                query=str(request.get("term") or "") or None,
+                jobage=int(request.get("jobage", 9999) or 9999),
+                page=int(request.get("page", 1) or 1),
+                limit=int(request.get("limit", 15) or 15),
+            )
+            try:
+                page.goto(serp_url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    page.wait_for_selector(
+                        'article[data-testid="job-card"]', timeout=15000
+                    )
+                except Exception:
+                    title, body_text, _sel = _observe_cdp(page)
+                    if _looks_challenged_cdp(title, body_text, page):
+                        output.append((request, [], "JobsDB challenge present on SERP"))
+                    else:
+                        output.append((request, [], "no job cards rendered on SERP"))
+                    continue
+                cards = page.evaluate(_JOBSDB_SERP_EXTRACT_JS)
+                if not isinstance(cards, list):
+                    output.append((request, [], "SERP extraction did not return a list"))
+                    continue
+                limit = int(request.get("limit", 15) or 15)
+                results = []
+                for card in cards:
+                    if not isinstance(card, dict) or not card.get("id"):
+                        continue
+                    # The SERP DOM has no absolute URL; rebuild it from the
+                    # job id exactly like the worker protocol does.
+                    card["url"] = f"{JOBSDB_JOB_URL_PREFIX}{card['id']}"
+                    results.append(card)
+                output.append((request, results[: max(1, limit)], None))
+            except Exception as exc:
+                output.append((request, [], f"browser SERP scrape failed: {str(exc)[:160]}"))
+    except Exception as exc:
+        # Page-level failure: report every remaining request without losing
+        # the responses already collected above.
+        done = len(output)
+        for request in requests[done:]:
+            output.append((request, [], f"browser search page failed: {str(exc)[:160]}"))
+    finally:
+        if owned_page and page_opened_here is not None:
+            try:
+                page_opened_here.close()
+            except Exception:
+                pass
+    return output
 
 
 def _observe_cdp(page) -> tuple[str, str, str]:

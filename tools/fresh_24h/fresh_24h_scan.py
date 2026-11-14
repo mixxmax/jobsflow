@@ -597,13 +597,15 @@ def run_portal_requests(
     return output
 
 
-def recover_jobsdb_search_session(repo: Path) -> dict[str, Any]:
+def recover_jobsdb_search_session(repo: Path) -> tuple[dict[str, Any], Any]:
     """Open the user's Chrome once when the JobsDB search worker is blocked.
 
     The search API itself is not a browser, so deep-JD recovery alone cannot
     help when the listing worker returns no rows.  This seam deliberately
     keeps the browser handoff portal-local and bounded; callers may retry only
-    the failed JobsDB requests after a successful validation.
+    the failed JobsDB requests after a successful validation.  Returns the
+    recovery metadata plus the recovery object so the caller can reuse the
+    validated browser context for the actual retries.
     """
     try:
         from portal_jd_browser import (  # type: ignore
@@ -637,33 +639,125 @@ def recover_jobsdb_search_session(repo: Path) -> dict[str, Any]:
     recovery = JobsdbHumanVerificationRecovery()
     try:
         result = recovery.recover_search(circuit=circuit, cache_root=repo)
-        return {
-            "status": recovery.status,
-            "ok": bool(getattr(result, "ok", False)),
-            "entrypoint": "workflow_gateway",
-            "detail_transport": "primary_chrome_cdp_only",
-            "cookie_scope": "search_api_only",
-            "requires_user_action": bool(getattr(result, "requires_user_action", False)),
-            "detail_reason": getattr(result, "detail_reason", None),
-            "manual_hint": getattr(result, "manual_hint", None),
-            "manual_command": getattr(result, "manual_command", None),
-            "navigation_count": int(getattr(recovery, "navigation_count", 0) or 0),
-            # This is deliberately named with its narrow scope.  It is only
-            # an HTTP listing-API compatibility bridge; JobsDB detail pages
-            # never receive this cookie and continue in the live CDP context.
-            "search_api_cookie_bridge": bool(getattr(result, "ok", False)),
-            "session_mode": getattr(result, "session_mode", None),
-            "headless": getattr(result, "headless", None),
-            "browser_channel": getattr(result, "browser_channel", None),
-        }
-    finally:
-        # ``recover_search`` is a short-lived listing handoff.  Detach the
-        # local Playwright transport before the scan retries the API; this
-        # never closes the user's visible Chrome process or its session.
+    except Exception:
+        # Never leak the local CDP transport on an unexpected recovery error.
         try:
             recovery.close()
         except Exception:
             pass
+        recovery = None
+        result = None
+    meta = {
+        "status": getattr(recovery, "status", "failed") if recovery else "failed",
+        "ok": bool(getattr(result, "ok", False)),
+        "entrypoint": "workflow_gateway",
+        "detail_transport": "primary_chrome_cdp_only",
+        "cookie_scope": "search_api_only",
+        "requires_user_action": bool(getattr(result, "requires_user_action", False)),
+        "detail_reason": getattr(result, "detail_reason", None),
+        "manual_hint": getattr(result, "manual_hint", None),
+        "manual_command": getattr(result, "manual_command", None),
+        "navigation_count": int(getattr(recovery, "navigation_count", 0) or 0),
+        # This is deliberately named with its narrow scope.  It is only
+        # an HTTP listing-API compatibility bridge; JobsDB detail pages
+        # never receive this cookie and continue in the live CDP context.
+        "search_api_cookie_bridge": bool(getattr(result, "ok", False)),
+        "session_mode": getattr(result, "session_mode", None),
+        "headless": getattr(result, "headless", None),
+        "browser_channel": getattr(result, "browser_channel", None),
+    }
+    if not meta.get("ok"):
+        # A failed handoff is not a reusable session; release the transport
+        # so a later scan can attach cleanly.  This never closes the user's
+        # visible Chrome process or its session.
+        if recovery is not None:
+            try:
+                recovery.close()
+            except Exception:
+                pass
+        return meta, None
+    # A validated session is retained on the recovery object so the caller
+    # can retry the failed listing queries inside the browser context; the
+    # caller owns closing it afterwards.
+    return meta, recovery
+
+
+def _merge_jobsdb_browser_retry(
+    *,
+    repo: Path,
+    recovery_meta: dict[str, Any],
+    jobsdb_rows: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]],
+    failed_requests: list[dict[str, Any]],
+    work_by_portal: dict[str, list[dict[str, Any]]],
+    portal_cli: str,
+    delay_seconds: float,
+    recovery_obj: Any = None,
+) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]], str | None]], dict[str, Any]]:
+    """Retry failed JobsDB queries, preferring the validated browser context.
+
+    The listing API sits behind a Cloudflare WAF that rejects non-browser
+    traffic (403 regardless of cookie, UA or IP), so when a validated
+    primary-Chrome session exists the failed queries are re-run by reading
+    the rendered SERP DOM inside it.  Only when no such session was retained
+    does the caller fall back to the CLI worker retry.  Returns the merged
+    per-request rows and the recovery metadata annotated with the retry
+    transport actually used.
+
+    TEMPORARY (2026-11-14): the browser-context SERP scrape is a stop-gap for
+    JobsDB's Cloudflare WAF blocking every non-browser listing request (403
+    regardless of cookie, UA or IP).  It reads rendered ``data-testid`` /
+    ``data-automation`` attributes that JobsDB can change without notice, and
+    it is an order of magnitude slower than the API worker.  Set
+    ``JOBSFLOW_JOBSDB_SERP_FALLBACK=0`` to disable it without a code change,
+    and remove it once the listing API accepts non-browser requests again.
+    """
+    retry_transport = "cli"
+    browser_rows: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] | None = None
+    serp_fallback_enabled = os.environ.get("JOBSFLOW_JOBSDB_SERP_FALLBACK", "1").strip().casefold() not in {
+        "0", "false", "no", "off", "否", "关闭",
+    }
+    if recovery_obj is not None and serp_fallback_enabled:
+        try:
+            browser_rows = recovery_obj.search_batch(
+                failed_requests,
+                delay_seconds=max(0.0, float(delay_seconds)),
+            )
+        except Exception as exc:
+            browser_rows = [
+                (request, [], f"browser search retry failed: {str(exc)[:160]}")
+                for request in failed_requests
+            ]
+    if browser_rows is not None:
+        retry_transport = "browser_context"
+        retry_rows = browser_rows
+    else:
+        retry_rows = run_portal_requests(
+            repo,
+            portal_cli,
+            failed_requests,
+            portal="jobsdb",
+            delay_seconds=delay_seconds,
+        )
+    recovery_meta = {**recovery_meta, "retry_transport": retry_transport}
+    first_by_id = {
+        str(request["request_id"]): (request, results, error)
+        for request, results, error in jobsdb_rows
+    }
+    for request, results, error in retry_rows:
+        key = str(request["request_id"])
+        # Prefer a successful post-verification response.  Preserve
+        # the original error if the retry is also unsuccessful so the
+        # report remains truthful and actionable.  (tuple[2] is the error;
+        # the legacy check read tuple[1], the always-empty results slot,
+        # which let failed retries overwrite the original error.)
+        if not error or not first_by_id.get(key, (None, [], None))[2]:
+            first_by_id[key] = (request, results, error)
+    merged = [
+        first_by_id[str(request["request_id"])]
+        for request in work_by_portal.get("jobsdb", [])
+        if str(request["request_id"]) in first_by_id
+    ]
+    return merged, recovery_meta
 
 
 def jobsdb_human_handoff_enabled(repo: Path) -> bool:
@@ -1356,7 +1450,7 @@ def main(argv: list[str] | None = None) -> int:
     ]
     if jobsdb_failed_requests and jobsdb_human_handoff_enabled(repo):
         try:
-            recovery_meta = recover_jobsdb_search_session(repo)
+            recovery_meta, recovery_obj = recover_jobsdb_search_session(repo)
         except Exception as exc:
             recovery_meta = {
                 "status": "unavailable",
@@ -1368,30 +1462,28 @@ def main(argv: list[str] | None = None) -> int:
                 "detail_reason": "recovery_error",
                 "error": str(exc)[:200],
             }
+            recovery_obj = None
+        retry_transport = "cli"
         if recovery_meta.get("ok"):
-            retry_rows = run_portal_requests(
-                repo,
-                portal_cfg_by_name["jobsdb"]["cli"],
-                jobsdb_failed_requests,
-                portal="jobsdb",
+            worker_results["jobsdb"], recovery_meta = _merge_jobsdb_browser_retry(
+                repo=repo,
+                recovery_meta=recovery_meta,
+                jobsdb_rows=jobsdb_rows,
+                failed_requests=jobsdb_failed_requests,
+                work_by_portal=work_by_portal,
+                portal_cli=portal_cfg_by_name["jobsdb"]["cli"],
                 delay_seconds=args.sleep,
+                recovery_obj=recovery_obj,
             )
-            first_by_id = {
-                str(request["request_id"]): (request, results, error)
-                for request, results, error in jobsdb_rows
-            }
-            for request, results, error in retry_rows:
-                key = str(request["request_id"])
-                # Prefer a successful post-verification response.  Preserve
-                # the original error if the retry is also unsuccessful so the
-                # report remains truthful and actionable.
-                if not error or not first_by_id.get(key, (None, [], None))[1]:
-                    first_by_id[key] = (request, results, error)
-            worker_results["jobsdb"] = [
-                first_by_id[str(request["request_id"])]
-                for request in work_by_portal.get("jobsdb", [])
-                if str(request["request_id"]) in first_by_id
-            ]
+        if recovery_obj is not None:
+            # The retained validated session is only needed for the retries
+            # above; detach the local transport afterwards.  This never
+            # closes the user's visible Chrome process or its session.
+            try:
+                recovery_obj.close()
+            except Exception:
+                pass
+            recovery_obj = None
     elif jobsdb_failed_requests:
         # A public/product workspace must not unexpectedly take control of a
         # user's personal browser.  Keep the failed portal visible in the run
