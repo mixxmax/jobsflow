@@ -36,6 +36,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 REPO_DEFAULT = Path(__file__).resolve().parents[2]
@@ -692,6 +693,7 @@ def _merge_jobsdb_browser_retry(
     portal_cli: str,
     delay_seconds: float,
     recovery_obj: Any = None,
+    serp_checkpoint: Path | None = None,
 ) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]], str | None]], dict[str, Any]]:
     """Retry failed JobsDB queries, preferring the validated browser context.
 
@@ -710,6 +712,8 @@ def _merge_jobsdb_browser_retry(
     it is an order of magnitude slower than the API worker.  Set
     ``JOBSFLOW_JOBSDB_SERP_FALLBACK=0`` to disable it without a code change,
     and remove it once the listing API accepts non-browser requests again.
+    ``serp_checkpoint`` (when given) makes the fallback append every finished
+    batch as JSONL so a killed process keeps what it scraped for ``--resume``.
     """
     retry_transport = "cli"
     browser_rows: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] | None = None
@@ -721,6 +725,7 @@ def _merge_jobsdb_browser_retry(
             browser_rows = recovery_obj.search_batch(
                 failed_requests,
                 delay_seconds=max(0.0, float(delay_seconds)),
+                serp_checkpoint=serp_checkpoint,
             )
         except Exception as exc:
             browser_rows = [
@@ -1161,6 +1166,242 @@ def parse_page_budget(raw: str) -> dict[str, int]:
     return out
 
 
+def scan_checkpoint_dir(repo: Path, run_id: str) -> Path:
+    """Per-run checkpoint directory for bucket/SERP crash-safety artifacts.
+
+    TEMPORARY (2026-11-14): these checkpoints exist only because the JobsDB
+    SERP fallback is slow enough that a mid-run crash must not lose the work
+    already done.  They live under the private runtime workspace and never
+    enter the product repository.
+    """
+    workspace = repo if repo.name == "JobSearch_2026" else repo / "JobSearch_2026"
+    return workspace / "02_Tracker" / "portal_state" / f"scan_{run_id}"
+
+
+def latest_scan_checkpoint_dir(repo: Path, day: str) -> Path | None:
+    """Newest ``scan_*`` checkpoint directory written for ``day`` (or any day)."""
+    workspace = repo if repo.name == "JobSearch_2026" else repo / "JobSearch_2026"
+    root = workspace / "02_Tracker" / "portal_state"
+    if not root.is_dir():
+        return None
+    candidates = [
+        path
+        for path in root.glob("scan_*")
+        if path.is_dir() and any(path.glob("buckets.jsonl"))
+    ]
+    if not candidates:
+        return None
+    # Prefer directories whose bucket rows reference ``day``; fall back to the
+    # most recently modified directory so a same-day resume still works when
+    # the clock crosses midnight mid-run.
+    dated = []
+    for path in candidates:
+        for line in (path / "buckets.jsonl").read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                record = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if str(record.get("day") or "") == day:
+                dated.append(path)
+                break
+    pool = dated or candidates
+    return max(pool, key=lambda p: p.stat().st_mtime)
+
+
+def read_bucket_checkpoints(checkpoint_dir: Path) -> list[dict[str, Any]]:
+    """Read every bucket checkpoint line, oldest first."""
+    path = Path(checkpoint_dir) / "buckets.jsonl"
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def write_bucket_checkpoint(
+    checkpoint_dir: Path,
+    *,
+    run_id: str,
+    day: str,
+    bucket: str,
+    track_hint: str,
+    rows: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]],
+) -> None:
+    """Append one bucket's worker rows as JSONL (crash-safe, order-preserving).
+
+    TEMPORARY (2026-11-14): parallel artifact to the in-memory results; the
+    final CSV is still assembled from memory at the end of a successful run.
+    These lines exist so ``--resume`` can skip buckets a crashed run finished.
+    """
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "day": day,
+        "bucket": bucket,
+        "track_hint": track_hint,
+        "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "hit_count": sum(len(results) for _request, results, _error in rows),
+        "sources": sorted({str(request.get("portal") or "") for request, _r, _e in rows}),
+        "rows": [
+            {
+                "request_id": str(request.get("request_id")),
+                "portal": str(request.get("portal") or ""),
+                "query_id": str(request.get("query_id") or ""),
+                "track_hint": str(request.get("track_hint") or ""),
+                "results": results,
+                "error": error,
+            }
+            for request, results, error in rows
+        ],
+    }
+    with (checkpoint_dir / "buckets.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def read_serp_batch_checkpoints(checkpoint_dir: Path) -> list[dict[str, Any]]:
+    """Read every SERP batch checkpoint line, oldest first."""
+    path = Path(checkpoint_dir) / "jobsdb_serp_batches.jsonl"
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def build_resume_state(
+    *,
+    request_by_id: dict[str, dict[str, Any]],
+    previous_dir: Path | None,
+    day: str,
+    bucket_order: list[str],
+    work_by_bucket: dict[str, dict[str, list[dict[str, Any]]]],
+) -> tuple[dict[str, Any] | None, dict[str, tuple[list[dict[str, Any]], str | None]], set[str]]:
+    """Build the ``--resume`` replay plan from a previous run's checkpoints.
+
+    TEMPORARY (2026-11-14): returns ``(resume_info, replayed,
+    skipped_buckets)``.  ``replayed`` maps request id to the last
+    checkpointed ``(results, error)`` state — bucket rows first, then SERP
+    batch successes override them — so the final assembly sees exactly what
+    the crashed run had already secured.  Returns ``(None, {}, set())`` when
+    there is no previous checkpoint directory to resume from.
+    """
+    if previous_dir is None:
+        return None, {}, set()
+    previous_run_id = Path(previous_dir).name[len("scan_") :]
+    bucket_records = read_bucket_checkpoints(previous_dir)
+    completed_buckets = {
+        str(record.get("bucket")) for record in bucket_records if record.get("bucket")
+    }
+    replayed: dict[str, tuple[list[dict[str, Any]], str | None]] = {}
+    for record in bucket_records:
+        for row in record.get("rows") or []:
+            rid = str(row.get("request_id") or "")
+            if rid not in request_by_id:
+                continue
+            replayed[rid] = (list(row.get("results") or []), row.get("error"))
+    serp_records = read_serp_batch_checkpoints(previous_dir)
+    serp_replayed = 0
+    for record in serp_records:
+        for item in record.get("results") or []:
+            rid = str(item.get("request_id") or "")
+            if rid in request_by_id and item.get("error") is None:
+                replayed[rid] = (list(item.get("results") or []), None)
+                serp_replayed += 1
+    skipped_buckets = {bucket for bucket in completed_buckets if bucket in work_by_bucket}
+    resume_info: dict[str, Any] = {
+        "resumed": True,
+        "from_run_id": previous_run_id,
+        "checkpoint_dir": str(previous_dir),
+        "skipped_buckets": sorted(skipped_buckets),
+        "rerun_buckets": [b for b in bucket_order if b not in skipped_buckets],
+        "bucket_rows_replayed": sum(1 for rid in replayed if rid in request_by_id),
+        "serp_batches_replayed": len(serp_records),
+        "serp_results_replayed": serp_replayed,
+    }
+    return resume_info, replayed, skipped_buckets
+
+
+def run_bucket_plan(
+    *,
+    repo: Path,
+    bucket_order: list[str],
+    work_by_bucket: dict[str, dict[str, list[dict[str, Any]]]],
+    bucket_track_hint: dict[str, str],
+    portal_cfg_by_name: dict[str, dict[str, Any]],
+    checkpoint_dir: Path,
+    run_id: str,
+    day: str,
+    sleep: float,
+    skipped_buckets: set[str] | None = None,
+) -> dict[str, list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]]:
+    """Run the bucket-major portal plan, checkpointing each completed bucket.
+
+    TEMPORARY (2026-11-14): buckets run in query order; inside a bucket the
+    portals run concurrently and each portal worker stays strictly serial.
+    Every finished bucket is appended to ``buckets.jsonl`` immediately, so a
+    crash right after a bucket keeps its results for ``--resume``.  Skipped
+    buckets are not fetched here; their checkpointed rows are replayed by the
+    caller.
+    """
+    skipped = skipped_buckets or set()
+    worker_results: dict[str, list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]] = {}
+    for bucket in bucket_order:
+        if bucket in skipped:
+            continue
+        portals_here = work_by_bucket.get(bucket) or {}
+        bucket_rows: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] = []
+        if portals_here:
+            with ThreadPoolExecutor(
+                max_workers=len(portals_here),
+                thread_name_prefix=f"jobsflow-{bucket[:14]}",
+            ) as executor:
+                futures = {
+                    portal: executor.submit(
+                        run_portal_requests,
+                        repo,
+                        portal_cfg_by_name[portal]["cli"],
+                        requests,
+                        portal=portal,
+                        delay_seconds=sleep,
+                    )
+                    for portal, requests in portals_here.items()
+                }
+                for portal, future in futures.items():
+                    try:
+                        rows = future.result()
+                    except Exception as exc:  # defensive: one worker must not hide others
+                        error = f"portal worker crashed: {exc}"
+                        rows = [(request, [], error) for request in portals_here[portal]]
+                    worker_results.setdefault(portal, []).extend(rows)
+                    bucket_rows.extend(rows)
+        # Append-only bucket checkpoint: a crash right after this line keeps
+        # everything this bucket produced.  Checkpoint failure is never fatal.
+        try:
+            write_bucket_checkpoint(
+                checkpoint_dir,
+                run_id=run_id,
+                day=day,
+                bucket=bucket,
+                track_hint=bucket_track_hint.get(bucket, "F"),
+                rows=bucket_rows,
+            )
+        except Exception:
+            pass
+    return worker_results
+
+
 def main(argv: list[str] | None = None) -> int:
     import os
 
@@ -1201,6 +1442,16 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=None,
         help="Max age in hours (default: 24 for daily; for temp auto from last refresh)",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help=(
+            "Resume today's latest scan from its bucket/SERP checkpoints: "
+            "already-completed buckets are replayed from disk (not re-fetched), "
+            "and only the gaps are re-run.  Hits merge into the same-day CSV."
+        ),
     )
     ap.add_argument(
         "--state",
@@ -1354,10 +1605,16 @@ def main(argv: list[str] | None = None) -> int:
     seen_ct: set[str] = set()
 
     # Build the same query/portal work list as the old nested loop, then group
-    # it by portal.  Workers run concurrently across portals, but each grouped
+    # it by bucket and portal.  TEMPORARY (2026-11-14): the outer loop is
+    # bucket-major (queries carry ``bucket``) so a completed bucket can be
+    # checkpointed to disk immediately for crash-safety and ``--resume``.
+    # Inside a bucket the portals still run concurrently, and each grouped
     # list remains strictly serial inside its own worker.  `_sequence` lets us
     # merge responses in the original order so dedupe decisions stay stable.
     work_items: list[dict[str, Any]] = []
+    work_by_bucket: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    bucket_order: list[str] = []
+    bucket_track_hint: dict[str, str] = {}
     work_by_portal: dict[str, list[dict[str, Any]]] = {}
     portal_cfg_by_name: dict[str, dict[str, Any]] = {}
     request_keys: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -1366,6 +1623,11 @@ def main(argv: list[str] | None = None) -> int:
     for q in cfg.get("queries") or []:
         qid = q.get("id") or "q"
         track_hint = q.get("track_hint") or "F"
+        bucket = str(q.get("bucket") or "unbucketed")
+        if bucket not in work_by_bucket:
+            work_by_bucket[bucket] = {}
+            bucket_order.append(bucket)
+            bucket_track_hint[bucket] = str(track_hint)
         terms = q.get("terms") or {}
 
         for portal, pcfg in portals_cfg.items():
@@ -1394,6 +1656,7 @@ def main(argv: list[str] | None = None) -> int:
                     "portal": portal,
                     "query_id": qid,
                     "track_hint": track_hint,
+                    "bucket": bucket,
                     "term": term,
                     "jobage": hours_to_jobage(scan_hours, portal),
                     "location": location if portal == "linkedin" else None,
@@ -1406,43 +1669,76 @@ def main(argv: list[str] | None = None) -> int:
                     request["_network_request_id"] = canonical_request["request_id"]
                 else:
                     request_keys[request_key] = request
+                    work_by_bucket[bucket].setdefault(portal, []).append(request)
                     work_by_portal.setdefault(portal, []).append(request)
                 work_items.append(request)
             portal_cfg_by_name[portal] = pcfg
 
-    worker_results: dict[str, list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]] = {}
+    request_by_id = {str(request["request_id"]): request for request in work_items}
+    run_id = f"scan-{uuid4().hex[:8]}"
+    checkpoint_dir = scan_checkpoint_dir(repo, run_id)
+
+    # --resume (TEMPORARY, 2026-11-14): replay the previous same-day run's
+    # completed buckets and SERP batches from their JSONL checkpoints instead
+    # of re-fetching them.  A crashed run leaves no run record and no CSV, so
+    # the raw worker results are replayed into the final assembly; only the
+    # gaps (buckets without a checkpoint, and JobsDB requests whose last
+    # checkpointed state is still an error) are re-run.
+    resume_info, replayed, skipped_buckets = build_resume_state(
+        request_by_id=request_by_id,
+        previous_dir=(latest_scan_checkpoint_dir(repo, day) if args.resume else None),
+        day=day,
+        bucket_order=bucket_order,
+        work_by_bucket=work_by_bucket,
+    )
+    if resume_info:
+        print(
+            f"[resume] from {resume_info.get('from_run_id')}: skipping "
+            f"{len(skipped_buckets)} completed bucket(s), replaying "
+            f"{len(replayed)} checkpointed response(s); "
+            f"{len(bucket_order) - len(skipped_buckets)} bucket(s) to re-run",
+            file=sys.stderr,
+        )
+
     recovery_meta: dict[str, Any] | None = None
-    if work_by_portal:
-        with ThreadPoolExecutor(
-            max_workers=len(work_by_portal),
-            thread_name_prefix="jobsflow-portal",
-        ) as executor:
-            futures = {
-                portal: executor.submit(
-                    run_portal_requests,
-                    repo,
-                    portal_cfg_by_name[portal]["cli"],
-                    requests,
-                    portal=portal,
-                    delay_seconds=args.sleep,
-                )
-                for portal, requests in work_by_portal.items()
-            }
-            for portal, future in futures.items():
-                try:
-                    worker_results[portal] = future.result()
-                except Exception as exc:  # defensive: one worker must not hide others
-                    error = f"portal worker crashed: {exc}"
-                    worker_results[portal] = [
-                        (request, [], error) for request in work_by_portal[portal]
-                    ]
+    worker_results = run_bucket_plan(
+        repo=repo,
+        bucket_order=bucket_order,
+        work_by_bucket=work_by_bucket,
+        bucket_track_hint=bucket_track_hint,
+        portal_cfg_by_name=portal_cfg_by_name,
+        checkpoint_dir=checkpoint_dir,
+        run_id=run_id,
+        day=day,
+        sleep=args.sleep,
+        skipped_buckets=skipped_buckets,
+    )
+
+    # Replay the checkpointed responses for skipped buckets (and for SERP
+    # batches the previous run already finished) into the worker results so
+    # the final assembly sees them exactly like fresh responses.
+    if replayed:
+        for rid, (results, error) in replayed.items():
+            request = request_by_id.get(rid)
+            if request is None:
+                continue
+            portal = str(request.get("portal") or "")
+            worker_results.setdefault(portal, []).append((request, results, error))
 
     # A JobsDB listing failure must not terminate the other portals.  If the
     # worker returned an error, make one explicit handoff to the user's main
     # Chrome, capture the portal-scoped session bridge, and retry only the
     # failed JobsDB requests.  A failed handoff remains a degraded portal and
     # never raises an exception or advances the refresh cursor by itself.
-    jobsdb_rows = worker_results.get("jobsdb") or []
+    # TEMPORARY (2026-11-14): rows are collapsed last-wins per request so a
+    # replayed SERP success (from --resume) overrides the original bucket
+    # error, and only the requests still in error are retried.
+    jobsdb_rows = list(
+        {
+            str(row[0].get("request_id")): row
+            for row in (worker_results.get("jobsdb") or [])
+        }.values()
+    )
     jobsdb_failed_requests = [
         request
         for request, _results, error in jobsdb_rows
@@ -1474,6 +1770,7 @@ def main(argv: list[str] | None = None) -> int:
                 portal_cli=portal_cfg_by_name["jobsdb"]["cli"],
                 delay_seconds=args.sleep,
                 recovery_obj=recovery_obj,
+                serp_checkpoint=checkpoint_dir / "jobsdb_serp_batches.jsonl",
             )
         if recovery_obj is not None:
             # The retained validated session is only needed for the retries
@@ -1659,6 +1956,12 @@ def main(argv: list[str] | None = None) -> int:
     dedupe_keys = list(dict.fromkeys(dedupe_keys))[-500:]
     summary = {
         "ran_at": iso_now(),
+        "run_id": run_id,
+        "checkpoint_dir": str(checkpoint_dir),
+        # Resume is never silent: when this run continued a previous same-day
+        # scan, the record says so and lists exactly which buckets were
+        # replayed from disk and which gaps were re-run (TEMPORARY 2026-11-14).
+        "resume": resume_info,
         "day": day,
         "mode": window["mode"],
         "hours": scan_hours,

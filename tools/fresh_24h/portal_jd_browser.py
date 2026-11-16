@@ -1651,6 +1651,16 @@ def jobsdb_cdp_status(endpoint: str | None = None) -> dict[str, Any]:
         )
         return result
 
+    # Mode detection is HTTP/TCP only; doctor never opens a WebSocket.  A
+    # Chrome started with --remote-debugging-port answers HTTP discovery
+    # (flag mode, no per-connection approval), while the Chrome 136+ toggle
+    # mode hides HTTP discovery and prompts for every WebSocket handshake.
+    debug_mode = _cdp_debug_mode(configured)
+    result["cdp_mode"] = debug_mode
+    result["per_connection_approval"] = debug_mode != "flag"
+    if debug_mode != "flag":
+        result["chrome_debug_launch"] = JOBSDB_SERP_LAUNCH_COMMAND
+
     payload = _read_cdp_version(configured)
     if payload is None:
         # Do not open a WebSocket from ``doctor``.  Chrome's new toggle may
@@ -1659,6 +1669,11 @@ def jobsdb_cdp_status(endpoint: str | None = None) -> dict[str, Any]:
         # here to report that the WS-only transport is available/pending.
         if not _cdp_local_port_available(configured):
             result["requires_user_action"] = True
+            result["manual_hint"] = (
+                "主 Chrome 的 CDP 端口未监听。推荐用持久调试端口启动（先完全退出 "
+                "Chrome 再执行），扫描 attach 就不会再弹逐连接批准框：\n"
+                f"  {JOBSDB_SERP_LAUNCH_COMMAND}"
+            )
             return result
         result.update(
             {
@@ -1669,8 +1684,11 @@ def jobsdb_cdp_status(endpoint: str | None = None) -> dict[str, Any]:
                 "requires_user_action": False,
                 "recommended_action": "run_gateway_scan_for_cdp_attestation",
                 "manual_hint": (
-                    "主 Chrome 的 WS-only CDP 端口已监听；首次 scan 会进行唯一一次"
+                    "主 Chrome 的 WS-only CDP 端口已监听（toggle 模式，每次 attach 都会弹"
+                    "逐连接批准）；首次 scan 会进行唯一一次"
                     "连接并验证 Browser.getVersion，不要重复运行 doctor 或手动启动第二个浏览器。"
+                    "若想消除逐连接批准框，可改用持久调试端口启动 Chrome：\n"
+                    f"  {JOBSDB_SERP_LAUNCH_COMMAND}"
                 ),
             }
         )
@@ -1689,12 +1707,21 @@ def jobsdb_cdp_status(endpoint: str | None = None) -> dict[str, Any]:
         )
         return result
 
+    # flag mode: HTTP discovery answered with the primary Chrome identity, so
+    # the gateway's attach needs no per-connection approval.  Do not send the
+    # user to the chrome://inspect toggle here — that is the toggle-mode
+    # instruction and would be misleading in flag mode.
     result.update(
         {
             "ready": True,
             "status": "reachable",
             "requires_user_action": False,
             "recommended_action": "none",
+            "manual_command": None,
+            "manual_hint": (
+                "主 Chrome 已以 --remote-debugging-port 持久模式运行（flag 模式），"
+                "扫描 attach 不会弹逐连接批准框。"
+            ),
         }
     )
     return result
@@ -2010,9 +2037,12 @@ class JobsdbCdpBatchSession:
         # Playwright's stop detaches from a CDP browser.  Do not call
         # ``Browser.close``/``remote.close``: that could terminate the user's
         # visible Chrome session on some Chromium versions.
+        # ``stop`` itself is bounded: on a transport that already died it can
+        # block forever, so a watchdog force-closes the local pipe and the
+        # scan's shutdown path never hangs.
         try:
             if self._playwright is not None:
-                self._playwright.stop()
+                _stop_playwright_bounded(self._playwright, timeout_s=10.0)
         except Exception:
             pass
         self._playwright = None
@@ -2397,7 +2427,7 @@ class JobsdbHumanVerificationRecovery:
         return _cdp_endpoint_owned_by_retired_profile(self.cdp_endpoint)
 
     def _manual_cdp_command(self, url: str) -> str:
-        """Return the primary-Chrome handoff command.
+        """Return the primary-Chrome handoff command, branched by CDP mode.
 
         Chrome 136+ may keep the ordinary profile alive while refusing a new
         ``--remote-debugging-port`` launch.  Starting another profile would
@@ -2407,8 +2437,20 @@ class JobsdbHumanVerificationRecovery:
         once, then reruns the same gateway command; the next run attaches to
         that exact Chrome context.  The target URL is deliberately omitted so
         this command never puts a job URL or credential into a shell snippet.
+
+        Mode branching (TEMPORARY, 2026-11-14): when the endpoint is down we
+        recommend launching Chrome with the persistent debug port instead of
+        the chrome://inspect toggle, because the toggle's approval is
+        per-connection and is not remembered.  When the endpoint already runs
+        in flag mode there is nothing to enable, so the hint says so instead
+        of sending the user to the toggle settings page.
         """
         del url
+        mode = _cdp_debug_mode(self.cdp_endpoint)
+        if mode == "flag":
+            return "echo \"Chrome already runs with --remote-debugging-port; nothing to enable\""
+        if mode == "unavailable":
+            return JOBSDB_SERP_LAUNCH_COMMAND
         return 'open -a "Google Chrome" "chrome://inspect/#remote-debugging"'
 
     @staticmethod
@@ -2771,12 +2813,15 @@ class JobsdbHumanVerificationRecovery:
         requests: list[dict[str, Any]],
         *,
         delay_seconds: float = 1.0,
+        serp_checkpoint: Path | None = None,
     ) -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] | None:
         """Retry failed listing queries inside the validated browser context.
 
         Returns ``None`` when no validated CDP session is retained, so the
         caller can fall back to the CLI worker retry; otherwise returns
         per-request ``(request, results, error)`` rows like the worker does.
+        ``serp_checkpoint`` (TEMPORARY, 2026-11-14) forwards the JSONL batch
+        sink so scraped batches survive a mid-run crash for ``--resume``.
         """
         if not _workflow_gateway_active():
             return None
@@ -2787,6 +2832,7 @@ class JobsdbHumanVerificationRecovery:
             requests,
             delay_seconds=delay_seconds,
             page=getattr(self, "_validated_page", None),
+            checkpoint=serp_checkpoint,
         )
 
     def recover(
@@ -2896,12 +2942,240 @@ def _jobsdb_serp_url(*, query: str | None, jobage: int, page: int, limit: int) -
     return f"{JOBSDB_SERP_URL}?{urlencode(params)}"
 
 
+JOBSDB_SERP_LAUNCH_COMMAND = (
+    'open -a "Google Chrome" --args --remote-debugging-port=9222'
+)
+
+
+def _cdp_debug_mode(endpoint: str) -> str:
+    """Classify the local Chrome DevTools endpoint, HTTP-only.
+
+    Returns ``"flag"`` when Chrome was started with
+    ``--remote-debugging-port`` (HTTP discovery answers with the primary
+    Chrome identity, so no per-connection approval is needed), ``"toggle"``
+    when only the WS-only toggle mode is listening (HTTP discovery is 404 and
+    every WebSocket handshake prompts for approval), ``"other_browser"`` when
+    HTTP discovery answers with a non-primary browser, and ``"unavailable"``
+    when nothing listens on the port.  Never opens a WebSocket, and never
+    falls back to a TCP probe when HTTP discovery already answered: this is a
+    diagnostic surface only.
+    """
+    payload = _read_cdp_version(endpoint)
+    if payload is not None:
+        return "flag" if _is_primary_chrome_version(payload) else "other_browser"
+    if _cdp_local_port_available(endpoint):
+        return "toggle"
+    return "unavailable"
+
+
+class _TransportLost(RuntimeError):
+    """Raised after the watchdog closed the local Playwright transport."""
+
+
+def _serp_deadline_seconds(override: float | None = None) -> float:
+    """Overall budget for one SERP fallback batch (default 1200s).
+
+    An explicit override of ``0`` means "already expired" (the loop reports
+    every request as ``deadline_exceeded`` without navigating); a negative or
+    non-finite override falls back to the environment/default budget so a
+    caller bug cannot silently disable the deadline.
+    """
+    if override is not None:
+        try:
+            value = float(override)
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and math.isfinite(value):
+            return max(0.0, value)
+    raw = os.environ.get("JOBSFLOW_JOBSDB_SERP_DEADLINE_SECONDS", "").strip()
+    if not raw:
+        return 1200.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1200.0
+    if not math.isfinite(value) or value <= 0:
+        return 1200.0
+    return value
+
+
+def _serp_batch_size(override: int | None = None) -> int:
+    """SERP results written per JSONL batch (default 10, minimum 1)."""
+    if override is not None:
+        try:
+            value = int(override)
+        except (TypeError, ValueError):
+            value = 0
+        if value >= 1:
+            return value
+    raw = os.environ.get("JOBSFLOW_JOBSDB_SERP_BATCH_SIZE", "").strip()
+    if not raw:
+        return 10
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 10
+    return value if value >= 1 else 10
+
+
+def _force_close_playwright_transport(playwright: Any) -> bool:
+    """Close the local Playwright driver transport, never the browser.
+
+    ``connect_over_cdp`` keeps the CDP WebSocket inside the Playwright driver
+    process; the Python client only owns the stdio pipe.  Closing the pipe
+    unblocks any sync call that is stuck on a dead transport.  The user's
+    Chrome process is untouched: we never send a ``Browser.close`` command
+    and the remote endpoint is not touched here.
+    """
+    impl = getattr(playwright, "_impl_obj", None)
+    conn = getattr(impl, "_connection", None)
+    transport = getattr(conn, "_transport", None)
+    dispose = getattr(transport, "dispose", None)
+    if not callable(dispose):
+        return False
+    try:
+        dispose()
+        return True
+    except Exception:
+        return False
+
+
+def _stop_playwright_bounded(playwright: Any, *, timeout_s: float = 10.0) -> bool:
+    """Stop the local Playwright transport with a hard deadline.
+
+    ``stop`` on a dead transport can block forever (observed deadlocks: the
+    main thread polls a transport that will never answer).  Run it on a
+    helper thread; when it does not return within ``timeout_s``, force-close
+    the transport so the stuck call raises and the thread can unwind.  The
+    caller never blocks past roughly ``2 * timeout_s`` and the user's Chrome
+    process is never touched.
+    """
+    if playwright is None:
+        return True
+    done = threading.Event()
+
+    def _stop() -> None:
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_stop, name="jobsflow-pw-stop", daemon=True)
+    worker.start()
+    if done.wait(timeout_s):
+        return True
+    _force_close_playwright_transport(playwright)
+    return done.wait(timeout_s)
+
+
+def _serp_call_with_watchdog(
+    session: Any,
+    remaining: float,
+    fn: Callable[[], tuple[dict[str, Any], list[dict[str, Any]], str | None]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+    """Run one SERP fetch under the batch deadline watchdog.
+
+    If the deadline passes while a sync page call is still stuck, the
+    watchdog force-closes the local Playwright transport so the call raises
+    instead of blocking forever; the exception is converted to
+    ``_TransportLost`` so the caller can return everything collected so far.
+    """
+    killed = threading.Event()
+    timer: threading.Timer | None = None
+
+    def _kill() -> None:
+        _force_close_playwright_transport(getattr(session, "_playwright", None))
+        killed.set()
+
+    try:
+        timer = threading.Timer(max(0.0, remaining), _kill)
+        timer.daemon = True
+        timer.start()
+        return fn()
+    except Exception as exc:
+        if killed.is_set():
+            raise _TransportLost(str(exc)) from exc
+        raise
+    finally:
+        if timer is not None:
+            timer.cancel()
+
+
+def _serp_fetch_request(page: Any, request: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+    """One SERP navigation + DOM extraction; returns the worker-shaped row."""
+    serp_url = _jobsdb_serp_url(
+        query=str(request.get("term") or "") or None,
+        jobage=int(request.get("jobage", 9999) or 9999),
+        page=int(request.get("page", 1) or 1),
+        limit=int(request.get("limit", 15) or 15),
+    )
+    page.goto(serp_url, wait_until="domcontentloaded", timeout=45000)
+    try:
+        page.wait_for_selector('article[data-testid="job-card"]', timeout=15000)
+    except Exception:
+        title, body_text, _sel = _observe_cdp(page)
+        if _looks_challenged_cdp(title, body_text, page):
+            return request, [], "JobsDB challenge present on SERP"
+        return request, [], "no job cards rendered on SERP"
+    cards = page.evaluate(_JOBSDB_SERP_EXTRACT_JS)
+    if not isinstance(cards, list):
+        return request, [], "SERP extraction did not return a list"
+    limit = int(request.get("limit", 15) or 15)
+    results: list[dict[str, Any]] = []
+    for card in cards:
+        if not isinstance(card, dict) or not card.get("id"):
+            continue
+        # The SERP DOM has no absolute URL; rebuild it from the
+        # job id exactly like the worker protocol does.
+        card["url"] = f"{JOBSDB_JOB_URL_PREFIX}{card['id']}"
+        results.append(card)
+    return request, results[: max(1, limit)], None
+
+
+class _SerpBatchCheckpoint:
+    """Append-only JSONL sink for SERP batch results (crash-safety only).
+
+    TEMPORARY (2026-11-14): the SERP fallback itself is a stop-gap; this
+    checkpoint exists because the fallback is slow enough that a mid-run
+    crash must not lose the already-scraped batches.  Each batch is appended
+    the moment it completes, so a later ``--resume`` can replay it.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, batch_index: int, rows: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]) -> None:
+        payload = {
+            "batch_index": batch_index,
+            "request_ids": [str(row[0].get("request_id")) for row in rows],
+            "results": [
+                {
+                    "request_id": str(row[0].get("request_id")),
+                    "query_id": str(row[0].get("query_id") or ""),
+                    "results": row[1],
+                    "error": row[2],
+                }
+                for row in rows
+            ],
+            "errors": [str(row[2]) for row in rows if row[2]],
+            "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        with self._path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 def browser_search_batch(
     session: Any,
     requests: list[dict[str, Any]],
     *,
     delay_seconds: float = 1.0,
     page: Any = None,
+    deadline_seconds: float | None = None,
+    checkpoint: Path | None = None,
+    batch_size: int | None = None,
 ) -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]:
     """Retry failed JobsDB listing queries by scraping the search-results page.
 
@@ -2919,6 +3193,17 @@ def browser_search_batch(
     the failed requests only; it never raises, and every failure is reported
     per request like the worker does.  A caller-supplied page is never
     closed here — the caller owns its lifecycle.
+
+    Crash-safety (TEMPORARY, same stop-gap): the batch runs under one overall
+    deadline (``JOBSFLOW_JOBSDB_SERP_DEADLINE_SECONDS``, default 1200s) so a
+    stuck page call cannot wedge the scan forever; when the deadline expires
+    the collecting part is returned and every unfinished request reports
+    ``deadline_exceeded`` explicitly.  When a sync call is still stuck at the
+    deadline, a watchdog force-closes the local Playwright transport so the
+    call raises and everything collected so far survives.  When a
+    ``checkpoint`` path is given, results are appended per batch
+    (default 10 requests, ``JOBSFLOW_JOBSDB_SERP_BATCH_SIZE``) as JSONL, so a
+    killed process keeps the batches it already finished for ``--resume``.
     """
     output: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] = []
     if session is None:
@@ -2926,8 +3211,25 @@ def browser_search_batch(
     context = getattr(session, "context", None)
     if context is None:
         return [(request, [], "browser_search_batch: cdp context missing") for request in requests]
+    deadline = time.monotonic() + _serp_deadline_seconds(deadline_seconds)
+    sink = _SerpBatchCheckpoint(checkpoint) if checkpoint is not None else None
+    size = _serp_batch_size(batch_size)
     owned_page = page is None
     page_opened_here = None
+    batch_index = 0
+    pending_batch: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] = []
+
+    def _flush_batch(final: bool = False) -> None:
+        nonlocal batch_index, pending_batch
+        if pending_batch and (final or len(pending_batch) >= size):
+            if sink is not None:
+                try:
+                    sink.write(batch_index, pending_batch)
+                except Exception:
+                    pass
+            batch_index += 1
+            pending_batch = []
+
     try:
         if page is not None:
             try:
@@ -2940,50 +3242,47 @@ def browser_search_batch(
             page_opened_here = context.new_page()
             page_opened_here.goto(JOBSDB_SERP_URL, wait_until="domcontentloaded", timeout=45000)
             page = page_opened_here
-        for index, request in enumerate(requests):
-            if index > 0 and delay_seconds > 0:
-                time.sleep(delay_seconds)
-            serp_url = _jobsdb_serp_url(
-                query=str(request.get("term") or "") or None,
-                jobage=int(request.get("jobage", 9999) or 9999),
-                page=int(request.get("page", 1) or 1),
-                limit=int(request.get("limit", 15) or 15),
-            )
+        for request in requests:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Deadline already expired between requests: stop the loop and
+                # report every remaining request explicitly.
+                output.append((request, [], "browser_search_batch: deadline_exceeded"))
+                continue
+            if output and delay_seconds > 0:
+                time.sleep(min(delay_seconds, max(0.0, remaining)))
             try:
-                page.goto(serp_url, wait_until="domcontentloaded", timeout=45000)
-                try:
-                    page.wait_for_selector(
-                        'article[data-testid="job-card"]', timeout=15000
-                    )
-                except Exception:
-                    title, body_text, _sel = _observe_cdp(page)
-                    if _looks_challenged_cdp(title, body_text, page):
-                        output.append((request, [], "JobsDB challenge present on SERP"))
-                    else:
-                        output.append((request, [], "no job cards rendered on SERP"))
-                    continue
-                cards = page.evaluate(_JOBSDB_SERP_EXTRACT_JS)
-                if not isinstance(cards, list):
-                    output.append((request, [], "SERP extraction did not return a list"))
-                    continue
-                limit = int(request.get("limit", 15) or 15)
-                results = []
-                for card in cards:
-                    if not isinstance(card, dict) or not card.get("id"):
-                        continue
-                    # The SERP DOM has no absolute URL; rebuild it from the
-                    # job id exactly like the worker protocol does.
-                    card["url"] = f"{JOBSDB_JOB_URL_PREFIX}{card['id']}"
-                    results.append(card)
-                output.append((request, results[: max(1, limit)], None))
+                row = _serp_call_with_watchdog(
+                    session, remaining, lambda req=request: _serp_fetch_request(page, req)
+                )
+                output.append(row)
+                pending_batch.append(row)
+            except _TransportLost as exc:
+                # The watchdog gave the stuck call its chance to raise; keep
+                # what we have and mark the rest as transport-lost rather than
+                # waiting on a connection that will never answer.
+                output.append((request, [], f"browser_search_batch: transport lost ({str(exc)[:120]})"))
+                done_ids = {id(row[0]) for row in output}
+                for rest in requests:
+                    if id(rest) not in done_ids and rest is not request:
+                        output.append((rest, [], "browser_search_batch: transport lost (deadline_exceeded)"))
+                break
             except Exception as exc:
                 output.append((request, [], f"browser SERP scrape failed: {str(exc)[:160]}"))
+            _flush_batch()
+        # A deadline-exceeded run still reaches here; flush whatever was
+        # collected before the deadline so the checkpoint mirrors reality.
+        for request in requests:
+            if not any(row[0] is request for row in output):
+                output.append((request, [], "browser_search_batch: deadline_exceeded"))
+        _flush_batch(final=True)
     except Exception as exc:
         # Page-level failure: report every remaining request without losing
         # the responses already collected above.
-        done = len(output)
-        for request in requests[done:]:
-            output.append((request, [], f"browser search page failed: {str(exc)[:160]}"))
+        for request in requests:
+            if not any(row[0] is request for row in output):
+                output.append((request, [], f"browser search page failed: {str(exc)[:160]}"))
+        _flush_batch(final=True)
     finally:
         if owned_page and page_opened_here is not None:
             try:

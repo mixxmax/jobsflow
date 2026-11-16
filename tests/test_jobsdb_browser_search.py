@@ -328,7 +328,7 @@ def test_browser_search_batch_used_by_scanner_retry(monkeypatch, tmp_path):
                 browser_channel="user-chrome-cdp",
             )
 
-        def search_batch(self, requests, *, delay_seconds=1.0):
+        def search_batch(self, requests, *, delay_seconds=1.0, serp_checkpoint=None):
             calls["search_batch"] += 1
             captured["requests"] = [r.get("request_id") for r in requests]
             return [
