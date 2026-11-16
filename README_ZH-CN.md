@@ -768,3 +768,8 @@ JobsFlow 是独立维护的产品线，保留了源自 [ai-job-search](https://g
 ## 许可
 
 MIT - 见 [LICENSE](LICENSE)。
+
+## 联系方式
+
+- 邮箱：sunyanlonglaw@outlook.com
+- 微信：sunstoic
