@@ -6,6 +6,22 @@ from tools.fresh_24h import portal_jd_browser as browser
 from tools.fresh_24h.jd_cache import jd_cache_path, load_jd_cache
 
 
+@pytest.fixture(autouse=True)
+def _pin_cdp_debug_mode(monkeypatch):
+    """The recovery hint is mode-branched and probes the CDP endpoint.
+
+    Pin the mode so every test in this file resolves the hint without probing
+    the operator's real Chrome (the conftest tripwire forbids those probes
+    unless a suite mocks the seam explicitly).
+    """
+    monkeypatch.setattr(browser, "_cdp_debug_mode", lambda _endpoint: "toggle")
+    import sys
+
+    short = sys.modules.get("portal_jd_browser")
+    if short is not None and short is not browser:
+        monkeypatch.setattr(short, "_cdp_debug_mode", lambda _endpoint: "toggle")
+
+
 def _failure(reason="waf"):
     return browser.JdFetchResult(
         ok=False,

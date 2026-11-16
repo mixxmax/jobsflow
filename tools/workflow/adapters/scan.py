@@ -273,6 +273,10 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
     hours = payload.get("hours")
     if hours:
         scan_cmd.extend(["--hours", str(hours)])
+    if payload.get("resume"):
+        # TEMPORARY (2026-11-14): resume today's scan from its bucket/SERP
+        # checkpoints instead of re-fetching the completed buckets.
+        scan_cmd.append("--resume")
     queries = workspace / "00_Profile" / "queries.json"
     if queries.is_file():
         scan_cmd.extend(["--queries", str(queries)])

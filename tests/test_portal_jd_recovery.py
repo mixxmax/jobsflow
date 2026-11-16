@@ -629,6 +629,9 @@ def test_recovery_endpoint_handoff_is_persisted_and_resumable(tmp_path):
 
 
 def test_cdp_manual_command_targets_primary_chrome_settings(tmp_path, monkeypatch):
+    # The command is mode-branched; assume the classic toggle endpoint so no
+    # live CDP probe is needed (the Chrome tripwire requires the seam mocked).
+    monkeypatch.setattr(browser, "_cdp_debug_mode", lambda _endpoint: "toggle")
     recovery = browser.JobsdbHumanVerificationRecovery(
         profile_dir=tmp_path / "legacy-profile", debug_port=9333
     )
@@ -1444,6 +1447,12 @@ def _fake_score_result(score):
 def test_two_pass_circuit_stops_third_url_and_cache_still_wins(monkeypatch, tmp_path):
     from tools.fresh_24h.jd_cache import save_jd_cache
 
+    # Pin the CDP mode so the recovery hint path performs no live probe.
+    # two_pass_score imports the short module name; patch both instances.
+    monkeypatch.setattr(browser, "_cdp_debug_mode", lambda _endpoint: "toggle")
+    import portal_jd_browser as _short_browser  # noqa: E402
+    monkeypatch.setattr(_short_browser, "_cdp_debug_mode", lambda _endpoint: "toggle")
+
     # two_pass_score imports the short module name first; patch that instance.
     import portal_jd_browser as short_browser  # noqa: E402  (sys.path set by two_pass_score)
 
@@ -1699,6 +1708,12 @@ def test_two_pass_budget_stop_navigates_zero_times(monkeypatch, tmp_path):
     """A budget-capped row contributes zero detail requests and one degraded."""
     import portal_jd_browser as short_browser  # noqa: E402
 
+    # Pin the CDP mode so the recovery hint path performs no live probe.
+    # two_pass_score imports the short module name; patch both instances.
+    monkeypatch.setattr(browser, "_cdp_debug_mode", lambda _endpoint: "toggle")
+    import portal_jd_browser as _short_browser  # noqa: E402
+    monkeypatch.setattr(_short_browser, "_cdp_debug_mode", lambda _endpoint: "toggle")
+
     monkeypatch.setattr(short_browser.BrowserSessionPool, "session_for", lambda self, url: None)
     monkeypatch.setenv("PORTAL_JD_MAX_REQUESTS_PER_SCAN", "1")
     short_browser.reset_portal_budget("jobsdb")
@@ -1747,6 +1762,12 @@ def test_two_pass_budget_stop_navigates_zero_times(monkeypatch, tmp_path):
 
 def test_jobsdb_policy_stop_precedes_legacy_failure_cache(monkeypatch, tmp_path):
     """A cache entry cannot authorize a headless JobsDB detail fetch."""
+    # Pin the CDP mode so the recovery hint path performs no live probe.
+    # two_pass_score imports the short module name; patch both instances.
+    monkeypatch.setattr(browser, "_cdp_debug_mode", lambda _endpoint: "toggle")
+    import portal_jd_browser as _short_browser  # noqa: E402
+
+    monkeypatch.setattr(_short_browser, "_cdp_debug_mode", lambda _endpoint: "toggle")
     url = "https://hk.jobsdb.com/job/303"
     browser._save_failure(url, "challenge", tmp_path)
 
@@ -1840,6 +1861,9 @@ def test_cdp_batch_goto_timeout_reports_timeout_never_success():
 def test_cdp_verify_search_accepts_dom_replacement_without_second_response(monkeypatch, tmp_path):
     """Cloudflare may clear in place: challenged DOM replaced, no new document response."""
 
+    # The recovery hint is mode-branched; pin the mode so no live CDP probe
+    # happens (the Chrome tripwire requires the seam mocked).
+    monkeypatch.setattr(browser, "_cdp_debug_mode", lambda _endpoint: "toggle")
     body = _long_jd_body()
     challenge_state = {
         "title": "Just a moment...",

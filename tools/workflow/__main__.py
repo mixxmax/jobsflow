@@ -139,6 +139,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Reuse the run_id returned by a prior capability-ticket challenge",
     )
+    scan.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help=(
+            "Resume today's latest scan from its bucket/SERP checkpoints: "
+            "completed buckets are replayed from disk, only gaps are re-run"
+        ),
+    )
     scan.add_argument("--fixture", type=Path)
 
     base = sub.add_parser("base", parents=[common], help="Build and activate lane CV/CL masters")
@@ -715,6 +724,8 @@ def main(argv: list[str] | None = None) -> int:
             payload["hours"] = args.hours
         if args.gate:
             payload["gate"] = args.gate
+        if getattr(args, "resume", False):
+            payload["resume"] = True
         if args.fixture:
             payload["fixture"] = json.loads(Path(args.fixture).read_text(encoding="utf-8"))
     elif action == "push":
