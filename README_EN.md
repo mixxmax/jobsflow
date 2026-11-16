@@ -654,3 +654,8 @@ baseline-anchored bounded material tailoring, independent CV/CL content audit,
 fixed lane-master DOCX/PDF rendering, cached JD retrieval, controlled JobsDB
 recovery, and the optional TypeSafe / Jev read-only advisory side channel (on
 automatically when `TYPESAFE_API_KEY` is present).
+
+## Contact
+
+- Email: sunyanlonglaw@outlook.com
+- WeChat: sunstoic
