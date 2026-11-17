@@ -1,6 +1,6 @@
 # JobsDB 列表检索 SERP 浏览器回退（临时措施）技术说明
 
-日期：2026-11-14（2026-11-17 更新：持久调试端口、分批落盘与断点续跑）
+日期：2026-11-14（2026-11-17 更新：Chrome 157 端口修正、分批落盘、断点续跑与有界工作线程死锁修复）
 分支：`codex/entry-jd-materials-2026-11-09`
 状态：**临时措施（TEMPORARY）** —— live E2E pending，见文末
 
@@ -71,43 +71,42 @@ CTgoodjobs 走同一网络路径完全正常（本轮扫描 154/154、77/77 成�
    挑战；挑战页出现时逐请求如实报告 `JobsDB challenge present on SERP`。
 4. **仅列表检索**：详情 JD 深取本就走 CDP 详情页通道，不在本回退范围内。
 
-## 5. 消除逐连接批准：主 Chrome 持久调试端口
+## 5. 主 Chrome 调试端口：toggle 模式是唯一可靠路径（Chrome 157 修正）
 
 **问题**：Chrome 136+ 的 `Allow remote debugging` 开关是**逐连接批准且不
 记忆**的——每次扫描都是新 Python 进程、新 CDP 连接，于是每次都弹一次批准
-框。用 `--remote-debugging-port=<port>` flag 启动的 Chrome 不走 toggle
-模式、不弹逐连接批准。
+框。原计划用 `--remote-debugging-port=<port>` flag 启动 Chrome 来绕过。
 
-**推荐启动方式**（不写任何系统文件；先**完全退出 Chrome** 再执行，否则
-`open` 只会聚焦已有实例、flag 不生效）：
+**Chrome 157 实测推翻了该方案**（2026-11-17，Chrome 157.0.8103.80）：
+用 flag 启动主 Chrome 后，进程参数里确实带上了 `--remote-debugging-port=9222`，
+但**端口从不绑定**（`DevToolsActivePort` 文件停留在旧状态，`lsof` 无监听），
+`chrome://inspect` 页面也卡在 "starting…"。也就是说 flag 路径在 157 上
+**失效且有误导性**——用户会以为开了持久端口，实际上 attach 仍走 toggle。
 
-```bash
-open -a "Google Chrome" --args --remote-debugging-port=9222
-```
-
-此后日常扫描 attach 不再弹任何批准框。（launchd 自启方案可行但需写
-`~/Library/LaunchAgents/`，本次不采用；如需安装必须由用户确认。）
-
-**模式检测**（`workflow doctor`，只做 HTTP/TCP 探测，不建立 WebSocket）：
+**当前推荐**：只用 toggle 模式。doctor 与恢复流程的手工提示统一指向
+`chrome://inspect/#remote-debugging`，不再广播 flag 启动命令：
 
 | 模式 | 判定 | 含义 |
 |---|---|---|
-| `flag` | HTTP `/json/version` 返回主 Chrome 标识 | 持久端口，attach **无逐连接批准**；doctor 不再提示去开 toggle |
-| `toggle` | 端口在监听但 HTTP 发现被关闭（404） | 每次 attach 弹批准；doctor 同时给出上面的 flag 启动命令 |
-| `unavailable` | 端口未监听 | doctor 直接建议用 flag 启动命令 |
+| `flag` | HTTP `/json/version` 返回主 Chrome 标识 | 持久端口（老版本 Chrome 上可能仍有效），attach 无逐连接批准 |
+| `toggle` | 端口在监听但 HTTP 发现被关闭（404） | 157 上的**正常**工作模式；每次 attach 弹批准 |
+| `unavailable` | 端口未监听 | doctor 指引打开 `chrome://inspect` 开 toggle |
 
-恢复流程的 `manual_hint`/`manual_command` 按同一模式分流：flag 模式下不再
-让用户去 `chrome://inspect` 开 toggle。
+模式检测（`workflow doctor`）只做 HTTP/TCP 探测，不建立 WebSocket；
+`manual_hint`/`manual_command` 按同一模式分流。若 doctor 在 flag 模式下
+看到主 Chrome，只说明该版本 Chrome 的 flag 路径仍然有效，不做额外建议。
 
-**可重复的验证步骤**：以 flag 启动主 Chrome 后，执行
+**可重复的验证步骤**：在主 Chrome 打开 `chrome://inspect/#remote-debugging`
+并启用 `Allow remote debugging` 后，执行
 
 ```bash
 curl -s http://127.0.0.1:9222/json/version
 ```
 
-返回 200 且 `Browser` 字段为 `Chrome/…`（非 headless）即证明 flag 持久模式
-生效、attach 不会再弹批准框；`workflow doctor` 的 `jobsdb_detail_transport`
-应显示 `cdp_mode: "flag"`、`per_connection_approval: false`。
+返回 200 且 `Browser` 字段为 `Chrome/…`（非 headless）即证明端口可用；
+toggle 模式下该 HTTP 发现路径可能 404（这是 Chrome 136+ 的开关模式特征，
+端口仍在监听），此时以 `workflow doctor` 的 `jobsdb_detail_transport`
+（`cdp_mode: "toggle"`）与一次真实 scan 的 CDP attach 为准。
 
 ## 6. 分批落盘：bucket 检查点与 SERP 批级 JSONL
 
@@ -150,21 +149,35 @@ curl -s http://127.0.0.1:9222/json/version
 
 已观测到的死锁：主线程在 `select.poll` 上无限等待（Playwright 同步调用在
 已断开的 CDP 传输上没有传输级超时；`recovery.close()` 内的
-`playwright.stop()` 在死传输上同样可能永不返回）。修复：
+`playwright.stop()` 在死传输上同样可能永不返回）。
+
+**关键发现（2026-11-17 活体试验）**：原先的"看门狗在主线程关管道"方案
+不可行——关闭 stdio 管道后，Playwright 基于 greenlet 的同步调度器并不抛
+异常，而是在 `green_switch` 里**空转**（主线程 98% CPU 死循环）。也就是说
+在主线程内无法可靠解锁同步调用。修复因此改为**有界工作线程**：
 
 1. **整体 deadline**：`browser_search_batch()` 有一个总预算
    （`JOBSFLOW_JOBSDB_SERP_DEADLINE_SECONDS`，默认 1200 秒）。到期停止
-   循环，已抓部分正常返回，未完成请求逐条报
-   `deadline_exceeded`。
-2. **看门狗强制解锁**：deadline 到期若同步调用仍卡住，一个看门狗线程
-   **关闭底层 Playwright 传输管道**（`connect_over_cdp` 的 CDP websocket
-   归 Node 驱动进程持有，Python 侧只拥有 stdio 管道；关闭管道使被卡调用
-   抛异常），捕获后按「transport lost，返回已收集部分」处理。该模式已用
-   fake 挂死 page 验证确实能解开死锁。**用户的主 Chrome 进程不受影响**：
-   我们从不发送 `Browser.close`。
-3. **`close()` 超时**：`JobsdbCdpBatchSession.close()`（即 `recovery.close()`
+   调度新请求，已抓部分正常返回，未完成请求逐条报
+   `deadline_exceeded`；请求中的 Playwright 调用另有各自超时
+   （goto 45s / 选择器等待 15s）。
+2. **整个批跑在专用工作线程**：`_run_search_batch_bounded()` 把
+   `search_batch` 整体放到一个 daemon 工作线程（Playwright 同步 API 有
+   线程亲和性，但可以完整地跑在单一专用线程上），主线程以
+   `deadline + 60s` 有界 join。
+3. **超时后的放弃流程**：join 超时 → `force_close_recovery_transport()`
+   关闭本地 stdio 管道 → 再给 10 秒宽限；仍不返回就**放弃该 daemon 线程**，
+   从盘上的 SERP 批级 JSONL 重建已落盘的行，未覆盖的请求逐条报
+   "worker thread hung after transport close"。用户的主 Chrome 进程不受
+   影响：我们从不发送 `Browser.close`。被放弃的线程随进程退出而回收，
+   检查点数据完整保留供 `--resume`。
+4. **`close()` 超时**：`JobsdbCdpBatchSession.close()`（即 `recovery.close()`
    的底层路径）里的 `playwright.stop()` 包在 10 秒有界等待里；超时则强制
    释放本端资源并返回，绝不让扫描的关停环节卡死。
+
+该模式已用 fake 挂死 page / 挂死 recovery 验证：工作线程永不返回时，主
+线程在预算内拿到部分结果并正常退出，不依赖"关管道必然 raise"这一被
+推翻的假设。
 
 ## 9. 验证状态（如实声明）
 

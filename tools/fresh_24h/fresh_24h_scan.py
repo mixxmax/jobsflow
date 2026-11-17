@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -683,6 +684,116 @@ def recover_jobsdb_search_session(repo: Path) -> tuple[dict[str, Any], Any]:
     return meta, recovery
 
 
+# Slack (seconds) the bounded SERP runner waits on top of the batch deadline
+# before abandoning a hung worker thread, and again after force-closing the
+# local Playwright transport.  Room for the final batch flush plus Playwright's
+# per-call timeouts; tests shrink it so a hung fake worker does not block them.
+_SERP_BATCH_GRACE_SECONDS = 60.0
+
+
+def _run_search_batch_bounded(
+    recovery_obj: Any,
+    failed_requests: list[dict[str, Any]],
+    *,
+    delay_seconds: float,
+    serp_checkpoint: Path | None,
+    grace_seconds: float | None = None,
+) -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]:
+    """Run one SERP fallback batch on a dedicated worker thread, bounded.
+
+    Playwright's sync API has thread affinity but can live entirely on one
+    dedicated thread, so the whole ``search_batch`` executes there and the
+    main thread only waits with a bounded join.
+
+    Why the thread is required (observed live, 2026-11-17): force-closing the
+    local Playwright stdio pipe from the main thread does NOT unblock a hung
+    sync call -- Playwright's greenlet-based dispatcher spins in
+    ``green_switch`` instead of raising, so the hang is in-process and
+    unkillable without a separate thread.  Running the batch on a worker
+    thread turns that spin into a bounded hang the main thread can abandon:
+    after the join budget expires the transport is force-closed, the worker
+    gets a short grace period, and if it still does not return the daemon
+    thread is abandoned and whatever the batch already flushed to the SERP
+    checkpoint JSONL is rebuilt from disk.  The user's Chrome is untouched
+    (no ``Browser.close`` is ever sent).
+
+    ``grace_seconds`` (default ``_SERP_BATCH_GRACE_SECONDS``) is the slack on
+    top of the batch deadline before the worker is abandoned, and again after
+    the transport is force-closed; tests shrink it so a hung fake worker does
+    not block the suite.
+
+    TEMPORARY (2026-11-14, watchdog redesigned 2026-11-17): part of the
+    JobsDB Cloudflare-WAF stop-gap; removed together with
+    ``_merge_jobsdb_browser_retry`` once the listing API accepts
+    non-browser requests again.
+    """
+    try:
+        from portal_jd_browser import (  # type: ignore
+            _serp_deadline_seconds,
+            force_close_recovery_transport,
+            read_serp_batches_as_rows,
+        )
+    except ImportError:
+        from tools.fresh_24h.portal_jd_browser import (  # type: ignore
+            _serp_deadline_seconds,
+            force_close_recovery_transport,
+            read_serp_batches_as_rows,
+        )
+
+    grace = _SERP_BATCH_GRACE_SECONDS if grace_seconds is None else grace_seconds
+    outcome: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            outcome["rows"] = recovery_obj.search_batch(
+                failed_requests,
+                delay_seconds=delay_seconds,
+                serp_checkpoint=serp_checkpoint,
+            )
+        except BaseException as exc:  # reported per request, never re-raised
+            outcome["error"] = exc
+
+    def _rows_or_error() -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]:
+        if "error" in outcome:
+            message = str(outcome["error"])[:160]
+            return [
+                (request, [], f"browser search retry failed: {message}")
+                for request in failed_requests
+            ]
+        return list(outcome.get("rows") or [])
+
+    worker = threading.Thread(target=_run, name="jobsflow-serp-batch", daemon=True)
+    worker.start()
+    # The batch's own deadline bounds the scrape; the grace adds room for the
+    # final batch flush plus Playwright's per-call timeouts.
+    worker.join(_serp_deadline_seconds() + grace)
+    if not worker.is_alive():
+        return _rows_or_error()
+    # The worker is stuck: force-close the local Playwright transport (the CDP
+    # websocket belongs to the Node driver; Python only owns the stdio pipe)
+    # and give the worker a grace period to notice and unwind.
+    force_close_recovery_transport(recovery_obj)
+    worker.join(grace)
+    if not worker.is_alive():
+        return _rows_or_error()
+    # The worker still spins (the greenlet dispatcher never raises after the
+    # pipe is closed).  Abandon the daemon thread and rebuild the rows the
+    # batch already flushed to the SERP checkpoint; anything not covered is
+    # reported as an explicit abandonment, never silently dropped.
+    rows = read_serp_batches_as_rows(serp_checkpoint, failed_requests)
+    covered = {str(row[0].get("request_id")) for row in rows}
+    rows.extend(
+        (
+            request,
+            [],
+            "browser search batch abandoned: worker thread hung after transport close",
+        )
+        for request in failed_requests
+        if str(request.get("request_id")) not in covered
+    )
+    return rows
+
+
 def _merge_jobsdb_browser_retry(
     *,
     repo: Path,
@@ -721,17 +832,12 @@ def _merge_jobsdb_browser_retry(
         "0", "false", "no", "off", "否", "关闭",
     }
     if recovery_obj is not None and serp_fallback_enabled:
-        try:
-            browser_rows = recovery_obj.search_batch(
-                failed_requests,
-                delay_seconds=max(0.0, float(delay_seconds)),
-                serp_checkpoint=serp_checkpoint,
-            )
-        except Exception as exc:
-            browser_rows = [
-                (request, [], f"browser search retry failed: {str(exc)[:160]}")
-                for request in failed_requests
-            ]
+        browser_rows = _run_search_batch_bounded(
+            recovery_obj,
+            failed_requests,
+            delay_seconds=max(0.0, float(delay_seconds)),
+            serp_checkpoint=serp_checkpoint,
+        )
     if browser_rows is not None:
         retry_transport = "browser_context"
         retry_rows = browser_rows
