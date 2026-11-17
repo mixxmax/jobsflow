@@ -27,12 +27,21 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-11-14 · Temporary browser fallback for JobsDB listing search
+## 🆕 Latest update · 2026-11-17 · Crash-safety for the JobsDB fallback, and a Chrome 157 correction
+
+- **Checkpoints + resumable scans.** Scanning is now scheduled query-group by query-group (bucket); every finished group is appended to a checkpoint under `02_Tracker/portal_state/scan_<run_id>/`, and SERP scraping is flushed per batch. If the process is killed or the connection drops, `scan --resume` replays the completed groups and SERP batches straight from disk, fills only the gaps, and merges the continuation into the same-day CSV.
+- **Deadlock fix (watchdog redesign).** The live trial disproved the old assumption: force-closing the Playwright pipe does not unblock a stuck sync call — the greenlet dispatcher spins instead of raising. The whole SERP batch now runs on a dedicated worker thread that the main thread waits for with a bounded timeout; on timeout the thread is abandoned and the flushed batches are rebuilt from disk, so a scan can no longer hang forever.
+- **Chrome 157 correction.** Measured on Chrome 157: launching with `--remote-debugging-port=9222` never binds the port (the “persistent debug port” advice was dead and misleading). `doctor` and the recovery hints now recommend only the `Allow remote debugging` toggle in `chrome://inspect`.
+- **Honest status.** Two live end-to-end rounds have passed (a first real scan, then a `--resume` continuation that replayed 456 result rows and 12 SERP batches), but the JobsDB WAF is not lifted, so the fallback remains the only usable listing channel. Details: [technical note](docs/JobsDB_列表检索SERP浏览器回退_技术说明_2026-11-14.md).
+
+---
+
+## 📌 Previous update · 2026-11-14 · Temporary browser fallback for JobsDB listing search
 
 - **What happened.** Since mid-November 2026, JobsDB's Cloudflare WAF returns 403 for every non-browser request (curl, Bun, even same-origin fetches inside a verified page), so the listing-API channel is down end to end. LinkedIn and CTgoodjobs are unaffected.
 - **The fallback.** Blocked listing queries are retried by reading the rendered search-results page DOM inside the **validated primary-Chrome CDP context**. It only triggers in the private workspace after you personally pass one Cloudflare challenge, retries only the failed requests, and reports per-request errors.
 - **This is temporary.** It depends on JobsDB frontend attributes (`data-testid="job-card"` and friends); a frontend redesign silently breaks it, and each query costs one page navigation — an order of magnitude slower than the API. `JOBSFLOW_JOBSDB_SERP_FALLBACK=0` disables it with no code change (back to the legacy CLI retry), and the whole fallback should be removed once the listing API accepts non-browser requests again.
-- **Honest status.** Live end-to-end verification against real JobsDB is pending; do not treat the JobsDB channel as restored until one real scan round-trips through the fallback. Details: [technical note](docs/JobsDB_列表检索SERP浏览器回退_技术说明_2026-11-14.md).
+- **Honest status.** Two live end-to-end rounds passed on 2026-11-17 (see the update above); the JobsDB WAF is not lifted, so the fallback remains the only usable listing channel. Details: [technical note](docs/JobsDB_列表检索SERP浏览器回退_技术说明_2026-11-14.md).
 
 ---
 
