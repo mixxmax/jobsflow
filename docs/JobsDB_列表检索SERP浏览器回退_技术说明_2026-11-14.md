@@ -2,7 +2,7 @@
 
 日期：2026-11-14（2026-11-17 更新：Chrome 157 端口修正、分批落盘、断点续跑与有界工作线程死锁修复）
 分支：`codex/entry-jd-materials-2026-11-09`
-状态：**临时措施（TEMPORARY）** —— live E2E pending，见文末
+状态：**临时措施（TEMPORARY）** —— 两轮 live E2E 已通过，仍待 WAF 解除后移除，见文末
 
 ---
 
@@ -181,10 +181,23 @@ toggle 模式下该 HTTP 发现路径可能 404（这是 Chrome 136+ 的开关�
 
 ## 9. 验证状态（如实声明）
 
-- **全量产品测试**：`.venv/bin/python -m pytest tests/ -q`（数字以提交时
-  实测为准，见 PR）。`tests/test_jobsdb_browser_search.py` 单独复跑全部
-  通过；新增的 bucket 检查点 / resume / deadline-看门狗 / 模式检测用例
-  全部使用 fake page/context/endpoint，不触真实网络。
-- **live E2E pending**：尚未对真实 JobsDB 跑一轮完整扫描确认回退通道
-  实际恢复供数。在完成一轮真实扫描验证之前，不应认为 JobsDB 渠道已恢复。
-- `sopctl gate`：通过（提交前复跑）。
+- **全量产品测试**：`.venv/bin/python -m pytest tests/ -q` → 1092 passed /
+  7 skipped（真实浏览器 fixture 套件按 `RUN_BROWSER_FIXTURE=1` opt-in 跳过）/
+  42 deselected。新增/重写的 bucket 检查点、resume、deadline、有界工作
+  线程、模式检测用例全部使用 fake page/context/recovery/endpoint，不触
+  真实网络。`sopctl gate`：通过。
+- **live E2E（两轮，均已通过）**：
+  1. 首轮活体扫描（toggle 模式，run `scan-00ca7594`）：4 个 bucket 检查点
+     按序落盘；SERP 在主 Chrome 内串行抓取，期间用户通过一次 Cloudflare
+     挑战；119 条 JobsDB 请求拆成 12 个批全部写入
+     `jobsdb_serp_batches.jsonl`（98 成功 / 20 "no job cards" / 1 挑战）。
+     该轮末尾触发了一次真实死锁（Playwright greenlet 空转，主线程 98%
+     CPU），进程被杀后检查点完整保留——死锁复现并促成第 8 节的重设计。
+  2. `--resume` 续跑（run `scan-b76ed289`，从 `scan-00ca7594` 续）：4 个
+     bucket 全部跳过、0 重跑，从盘上重放 456 行 bucket 结果 + 12 个 SERP
+     批次（98 条结果），全程无重抓、无 CDP 人工干预，几分钟内完成并入
+     当日同一 CSV。
+- **仍存在的限制**：JobsDB WAF 尚未解除，SERP 回退仍是唯一可用通道；
+  最后仍为错误的请求（如 "no job cards"）在续跑中会再经 SERP/CLI 重试，
+  无已验证浏览器会话时退回 CLI 并如实报 403。在 WAF 解除前不应认为
+  JobsDB 渠道已自动恢复。
