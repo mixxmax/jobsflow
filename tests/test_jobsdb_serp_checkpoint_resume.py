@@ -12,6 +12,7 @@ endpoints; no test touches the real network or a real browser.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -397,6 +398,7 @@ def test_bounded_runner_abandons_spinning_worker_and_rebuilds_from_checkpoint(
         requests,
         delay_seconds=0.0,
         serp_checkpoint=checkpoint,
+        runner=scan._BoundedCdpRunner(),
         grace_seconds=0.2,
     )
     elapsed = time.monotonic() - started
@@ -425,12 +427,67 @@ def test_bounded_runner_returns_rows_when_worker_finishes(tmp_path: Path):
         requests,
         delay_seconds=0.0,
         serp_checkpoint=None,
+        runner=scan._BoundedCdpRunner(),
         grace_seconds=60.0,
     )
     assert [(row[0]["request_id"], row[2]) for row in rows] == [
         ("jobsdb:1:0", None),
         ("jobsdb:1:1", None),
     ]
+
+
+def test_bounded_runner_returns_none_when_session_missing(tmp_path: Path):
+    """search_batch's None contract must surface so the CLI fallback runs."""
+
+    class _NoSessionRecovery(SimpleNamespace):
+        def search_batch(self, requests, *, delay_seconds=1.0, serp_checkpoint=None):
+            return None  # no validated session: caller must fall back to CLI
+
+    rows = scan._run_search_batch_bounded(
+        _NoSessionRecovery(),
+        [_request("jobsdb:1:0")],
+        delay_seconds=0.0,
+        serp_checkpoint=None,
+        runner=scan._BoundedCdpRunner(),
+        grace_seconds=60.0,
+    )
+    assert rows is None
+
+
+def test_cdp_runner_runs_recovery_and_batch_on_one_thread(tmp_path: Path, monkeypatch):
+    """Regression (live 2026-11-18): Playwright's dispatcher is thread-bound.
+
+    The recovery creates the CDP session; the SERP batch then uses it.  If
+    they run on different threads every dispatch fails with "cannot switch
+    to a different thread".  The shared runner must run both on the same
+    (non-main) thread.
+    """
+    threads: dict[str, str] = {}
+
+    class _AffineRecovery(SimpleNamespace):
+        def search_batch(self, requests, *, delay_seconds=1.0, serp_checkpoint=None):
+            threads["search_batch"] = threading.current_thread().name
+            return [(request, [], None) for request in requests]
+
+    def _affine_recovery(repo):
+        threads["recovery"] = threading.current_thread().name
+        return {"status": "succeeded", "ok": True}, _AffineRecovery()
+
+    monkeypatch.setattr(scan, "recover_jobsdb_search_session", _affine_recovery)
+    runner = scan._BoundedCdpRunner()
+    meta, recovery_obj = scan._run_recovery_bounded(tmp_path, runner=runner, deadline_seconds=60.0)
+    assert meta["ok"] is True
+    rows = scan._run_search_batch_bounded(
+        recovery_obj,
+        [_request("jobsdb:1:0")],
+        delay_seconds=0.0,
+        serp_checkpoint=None,
+        runner=runner,
+        grace_seconds=60.0,
+    )
+    assert rows is not None
+    assert threads["recovery"] == threads["search_batch"]
+    assert threads["recovery"] != threading.main_thread().name
 
 
 def test_bounded_runner_reports_worker_exception_per_request(tmp_path: Path):
@@ -444,11 +501,111 @@ def test_bounded_runner_reports_worker_exception_per_request(tmp_path: Path):
         requests,
         delay_seconds=0.0,
         serp_checkpoint=None,
+        runner=scan._BoundedCdpRunner(),
         grace_seconds=60.0,
     )
     assert rows[0][1] == []
     assert "browser search retry failed" in rows[0][2]
     assert "cdp connection reset" in rows[0][2]
+
+
+# --------------------------------------------------------------------------
+# bounded recovery runner: the CDP handoff itself must not wedge the scan
+# --------------------------------------------------------------------------
+
+
+class _HungRecoverySession:
+    """Fake recover_jobsdb_search_session that spins forever.
+
+    Reproduces the second live failure site (2026-11-18): the recovery's CDP
+    connect / challenge-wait runs on the main thread, and once the transport
+    dies the Playwright dispatcher spins in ``green_switch`` instead of
+    raising.  The scan must abandon the worker and degrade to CLI retries.
+    """
+
+    def __init__(self, release):
+        self.release = release
+
+    def __call__(self, repo):
+        self.release.wait(timeout=30)
+        raise AssertionError("hung recovery worker unexpectedly resumed")
+
+
+def test_bounded_recovery_abandons_spinning_worker(tmp_path: Path, monkeypatch):
+    import threading as _threading
+
+    release = _threading.Event()
+    monkeypatch.setattr(scan, "recover_jobsdb_search_session", _HungRecoverySession(release))
+    monkeypatch.setenv("JOBSFLOW_JOBSDB_RECOVERY_DEADLINE_SECONDS", "0.25")
+
+    started = time.monotonic()
+    meta, recovery_obj = scan._run_recovery_bounded(
+        tmp_path, runner=scan._BoundedCdpRunner()
+    )
+    elapsed = time.monotonic() - started
+    release.set()  # let the abandoned daemon thread finish its fake hang
+
+    assert elapsed < 10
+    # The scan degrades to the CLI retry path with an explicit reason.
+    assert recovery_obj is None
+    assert meta["ok"] is False
+    assert meta["detail_reason"] == "recovery_deadline_exceeded"
+    assert "chrome://inspect" in meta["manual_hint"]
+
+
+def test_bounded_recovery_returns_session_when_worker_finishes(tmp_path: Path, monkeypatch):
+    sentinel_meta = {"status": "succeeded", "ok": True}
+    sentinel_recovery = object()
+
+    def _fast_recovery(repo):
+        return sentinel_meta, sentinel_recovery
+
+    monkeypatch.setattr(scan, "recover_jobsdb_search_session", _fast_recovery)
+    meta, recovery_obj = scan._run_recovery_bounded(
+        tmp_path, runner=scan._BoundedCdpRunner(), deadline_seconds=60.0
+    )
+    assert meta is sentinel_meta
+    assert recovery_obj is sentinel_recovery
+
+
+def test_bounded_recovery_reports_worker_exception(tmp_path: Path, monkeypatch):
+    def _broken_recovery(repo):
+        raise RuntimeError("sync_playwright crashed")
+
+    monkeypatch.setattr(scan, "recover_jobsdb_search_session", _broken_recovery)
+    meta, recovery_obj = scan._run_recovery_bounded(
+        tmp_path, runner=scan._BoundedCdpRunner(), deadline_seconds=60.0
+    )
+    assert recovery_obj is None
+    assert meta["ok"] is False
+    assert meta["detail_reason"] == "recovery_error"
+    assert "sync_playwright crashed" in meta["error"]
+
+
+def test_cdp_runner_closes_session_on_home_thread(tmp_path: Path, monkeypatch):
+    """recovery.close() runs on the session's home thread (thread affinity).
+
+    A helper-thread ``stop()`` would fail with "cannot switch to a different
+    thread" and leak the Playwright driver pipe; routing close() through the
+    same runner keeps every dispatch on its home thread.
+    """
+    threads: dict[str, str] = {}
+
+    class _CloseRecovery(SimpleNamespace):
+        def close(self):
+            threads["close"] = threading.current_thread().name
+
+    def _recovery(repo):
+        threads["recovery"] = threading.current_thread().name
+        return {"status": "succeeded", "ok": True}, _CloseRecovery()
+
+    monkeypatch.setattr(scan, "recover_jobsdb_search_session", _recovery)
+    runner = scan._BoundedCdpRunner()
+    meta, recovery_obj = scan._run_recovery_bounded(tmp_path, runner=runner, deadline_seconds=60.0)
+    status, _value = runner.call(recovery_obj.close, timeout=30.0)
+    assert status == "ok"
+    assert threads["recovery"] == threads["close"]
+    assert threads["close"] != threading.main_thread().name
 
 
 # --------------------------------------------------------------------------

@@ -148,6 +148,13 @@ def build_parser() -> argparse.ArgumentParser:
             "completed buckets are replayed from disk, only gaps are re-run"
         ),
     )
+    scan.add_argument(
+        "--skip-portal",
+        action="append",
+        default=[],
+        choices=["linkedin", "jobsdb", "ctgoodjobs"],
+        help="Portal to skip, repeatable. The scan still uses the gateway.",
+    )
     scan.add_argument("--fixture", type=Path)
 
     base = sub.add_parser("base", parents=[common], help="Build and activate lane CV/CL masters")
@@ -726,6 +733,9 @@ def main(argv: list[str] | None = None) -> int:
             payload["gate"] = args.gate
         if getattr(args, "resume", False):
             payload["resume"] = True
+        skipped = [str(name) for name in (getattr(args, "skip_portal", None) or []) if str(name)]
+        if skipped:
+            payload["skip_portal"] = skipped
         if args.fixture:
             payload["fixture"] = json.loads(Path(args.fixture).read_text(encoding="utf-8"))
     elif action == "push":

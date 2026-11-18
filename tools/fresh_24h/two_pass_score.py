@@ -907,6 +907,7 @@ def deep_enrich_hit(
             "jobsdb_cdp_session_required",
             "jobsdb_cdp_rejects_storage_state",
             "cdp_endpoint_unavailable",
+            "cdp_attach_timeout",
             "cdp_endpoint_retired_profile",
             "cdp_connect_failed",
             "cdp_non_primary_browser",

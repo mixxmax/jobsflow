@@ -924,6 +924,7 @@ def test_cdp_batch_connects_to_ws_only_chrome_and_attests_product(monkeypatch):
     monkeypatch.setattr(browser, "_cdp_endpoint_owned_by_retired_profile", lambda _e: False)
     monkeypatch.setattr(browser, "_read_cdp_version", lambda _e: None)
     monkeypatch.setattr(browser, "_cdp_local_port_available", lambda _e: True)
+    monkeypatch.setattr(browser, "_start_cdp_plain_bridge", lambda url: (None, url))
 
     session = browser.JobsdbCdpBatchSession.connect(
         cdp_endpoint="http://127.0.0.1:9333"
@@ -2042,6 +2043,7 @@ def test_connect_uses_configured_attach_budget(monkeypatch):
     monkeypatch.setattr(
         browser, "_JobsdbCdpLease", lambda: SimpleNamespace(acquire=lambda: None)
     )
+    monkeypatch.setattr(browser, "_start_cdp_plain_bridge", lambda url: (None, url))
 
     session = browser.JobsdbCdpBatchSession.connect(
         9222,

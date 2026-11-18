@@ -26,7 +26,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -684,10 +686,154 @@ def recover_jobsdb_search_session(repo: Path) -> tuple[dict[str, Any], Any]:
     return meta, recovery
 
 
+def _recovery_deadline_seconds() -> float:
+    """Overall budget for one bounded JobsDB recovery attempt (default 900s).
+
+    Covers the CDP connect, the interactive Cloudflare-challenge window
+    (the recovery itself waits up to 600s for a manual click) and the
+    post-challenge validation.  An env override only exists for test
+    isolation; a non-positive or non-finite value falls back to the default
+    so a bad setting cannot silently disable the bound.
+    """
+    raw = os.environ.get("JOBSFLOW_JOBSDB_RECOVERY_DEADLINE_SECONDS", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 900.0
+        if math.isfinite(value) and value > 0:
+            return value
+    return 900.0
+
+
+class _BoundedCdpRunner:
+    """One dedicated thread running every Playwright sync call of a scan.
+
+    Two live failure modes force this exact shape:
+
+    1. **Thread affinity.**  Playwright's sync dispatcher is thread-bound: a
+       session created on one thread fails on another with "cannot switch to
+       a different thread" (observed live 2026-11-18: the recovery ran on one
+       worker thread and the SERP batch on another, so all 228 SERP requests
+       failed instantly).  Recovery and SERP batch must therefore share ONE
+       thread.
+    2. **Greenlet spin.**  Once the CDP transport dies, a hung sync call
+       makes the dispatcher spin in ``green_switch`` instead of raising, so
+       an unbounded join wedges the scan forever (observed live
+       2026-11-17/18).  The main thread therefore only joins with a deadline
+       and abandons the worker on timeout.
+
+    The runner is created lazily per scan (only when the JobsDB fallback is
+    actually needed); its thread is a daemon and dies with the process.
+
+    TEMPORARY (2026-11-14): part of the JobsDB Cloudflare-WAF stop-gap;
+    removed together with ``_merge_jobsdb_browser_retry`` once the listing
+    API accepts non-browser requests again.
+    """
+
+    def __init__(self, *, name: str = "jobsflow-cdp-worker") -> None:
+        self._inbox: "queue.SimpleQueue[tuple[Any, dict[str, Any], threading.Event]]" = (
+            queue.SimpleQueue()
+        )
+        self._dead = False
+        self._thread = threading.Thread(target=self._serve, name=name, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            fn, holder, event = self._inbox.get()
+            try:
+                holder["result"] = fn()
+            except BaseException as exc:  # surfaced by the caller, never raised
+                holder["error"] = exc
+            event.set()
+
+    def call(self, fn: Any, *, timeout: float) -> tuple[str, Any]:
+        """Run ``fn`` on the worker thread; return ``(status, value)``.
+
+        ``status`` is ``ok`` (value: what ``fn`` returned), ``error`` (value:
+        the exception) or ``timeout`` (value: None -- the worker is stuck and
+        the runner is dead for the rest of the scan; later calls return
+        ``timeout`` immediately).
+        """
+        if self._dead:
+            return "timeout", None
+        holder: dict[str, Any] = {}
+        event = threading.Event()
+        self._inbox.put((fn, holder, event))
+        if event.wait(timeout):
+            if "error" in holder:
+                return "error", holder["error"]
+            return "ok", holder["result"]
+        self._dead = True
+        return "timeout", None
+
+
+def _run_recovery_bounded(
+    repo: Path,
+    *,
+    runner: _BoundedCdpRunner,
+    deadline_seconds: float | None = None,
+) -> tuple[dict[str, Any], Any]:
+    """Run the JobsDB human-verification recovery on the shared CDP thread.
+
+    Bounded for the greenlet-spin disease (found live 2026-11-18): the
+    recovery's CDP connect / challenge-wait can spin forever once the
+    transport dies.  On timeout the worker is abandoned (there is no
+    recovery object to force-close yet; the thread dies with the process),
+    the caller degrades to the CLI retry path with an explicit
+    ``recovery_deadline_exceeded`` reason, and the shared runner is dead so
+    the SERP batch below never runs -- exactly the intended degradation.
+
+    TEMPORARY (2026-11-14): part of the JobsDB Cloudflare-WAF stop-gap.
+    """
+    deadline = _recovery_deadline_seconds() if deadline_seconds is None else deadline_seconds
+    status, value = runner.call(lambda: recover_jobsdb_search_session(repo), timeout=deadline)
+    if status == "ok":
+        meta, recovery = value
+        return (meta or {}, recovery)
+    if status == "error":
+        return (
+            {
+                "status": "failed",
+                "ok": False,
+                "entrypoint": "workflow_gateway",
+                "detail_transport": "primary_chrome_cdp",
+                "cookie_scope": "search_api_only",
+                "requires_user_action": False,
+                "detail_reason": "recovery_error",
+                "error": str(value)[:160],
+            },
+            None,
+        )
+    print(
+        f"[recovery] JobsDB 人工验证超过 {int(deadline)}s 上限，"
+        "已放弃该工作线程；本次扫描的 JobsDB 请求将退回 CLI 重试并如实报错。",
+        file=sys.stderr,
+    )
+    return (
+        {
+            "status": "failed",
+            "ok": False,
+            "entrypoint": "workflow_gateway",
+            "detail_transport": "primary_chrome_cdp",
+            "cookie_scope": "search_api_only",
+            "requires_user_action": False,
+            "detail_reason": "recovery_deadline_exceeded",
+            "recommended_action": "retry_after_primary_chrome_cdp",
+            "manual_hint": (
+                "JobsDB 人工验证超时（可能 CDP 握手中断）。请确认主 Chrome 的 "
+                "chrome://inspect/#remote-debugging 已启用 Allow remote "
+                "debugging 且端口可连接后重试扫描。"
+            ),
+        },
+        None,
+    )
+
+
 # Slack (seconds) the bounded SERP runner waits on top of the batch deadline
-# before abandoning a hung worker thread, and again after force-closing the
-# local Playwright transport.  Room for the final batch flush plus Playwright's
-# per-call timeouts; tests shrink it so a hung fake worker does not block them.
+# before abandoning a hung worker; tests shrink it so a hung fake worker does
+# not block the suite.
 _SERP_BATCH_GRACE_SECONDS = 60.0
 
 
@@ -697,35 +843,27 @@ def _run_search_batch_bounded(
     *,
     delay_seconds: float,
     serp_checkpoint: Path | None,
+    runner: _BoundedCdpRunner,
     grace_seconds: float | None = None,
-) -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]:
-    """Run one SERP fallback batch on a dedicated worker thread, bounded.
+) -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] | None:
+    """Run one SERP fallback batch on the shared CDP thread, bounded.
 
-    Playwright's sync API has thread affinity but can live entirely on one
-    dedicated thread, so the whole ``search_batch`` executes there and the
-    main thread only waits with a bounded join.
-
-    Why the thread is required (observed live, 2026-11-17): force-closing the
-    local Playwright stdio pipe from the main thread does NOT unblock a hung
-    sync call -- Playwright's greenlet-based dispatcher spins in
-    ``green_switch`` instead of raising, so the hang is in-process and
-    unkillable without a separate thread.  Running the batch on a worker
-    thread turns that spin into a bounded hang the main thread can abandon:
-    after the join budget expires the transport is force-closed, the worker
-    gets a short grace period, and if it still does not return the daemon
-    thread is abandoned and whatever the batch already flushed to the SERP
-    checkpoint JSONL is rebuilt from disk.  The user's Chrome is untouched
+    Runs on the SAME worker thread as the recovery so Playwright's
+    thread-bound dispatcher sees all objects on their home thread.  The main
+    thread joins with the batch deadline plus grace; on timeout the local
+    transport is force-closed, a short grace lets a final batch flush land,
+    and whatever the batch already appended to the SERP checkpoint JSONL is
+    rebuilt from disk.  Anything not covered is reported as an explicit
+    abandonment, never silently dropped.  The user's Chrome is untouched
     (no ``Browser.close`` is ever sent).
 
-    ``grace_seconds`` (default ``_SERP_BATCH_GRACE_SECONDS``) is the slack on
-    top of the batch deadline before the worker is abandoned, and again after
-    the transport is force-closed; tests shrink it so a hung fake worker does
-    not block the suite.
+    Contract: ``search_batch`` returns ``None`` when no validated session
+    was retained; that is surfaced as ``None`` here so the caller falls
+    back to the CLI worker retry (converting it to ``[]`` would silently
+    skip the fallback and mislabel the transport).
 
-    TEMPORARY (2026-11-14, watchdog redesigned 2026-11-17): part of the
-    JobsDB Cloudflare-WAF stop-gap; removed together with
-    ``_merge_jobsdb_browser_retry`` once the listing API accepts
-    non-browser requests again.
+    TEMPORARY (2026-11-14, redesigned 2026-11-17/18): part of the JobsDB
+    Cloudflare-WAF stop-gap.
     """
     try:
         from portal_jd_browser import (  # type: ignore
@@ -741,45 +879,30 @@ def _run_search_batch_bounded(
         )
 
     grace = _SERP_BATCH_GRACE_SECONDS if grace_seconds is None else grace_seconds
-    outcome: dict[str, Any] = {}
-
-    def _run() -> None:
-        try:
-            outcome["rows"] = recovery_obj.search_batch(
-                failed_requests,
-                delay_seconds=delay_seconds,
-                serp_checkpoint=serp_checkpoint,
-            )
-        except BaseException as exc:  # reported per request, never re-raised
-            outcome["error"] = exc
-
-    def _rows_or_error() -> list[tuple[dict[str, Any], list[dict[str, Any]], str | None]]:
-        if "error" in outcome:
-            message = str(outcome["error"])[:160]
-            return [
-                (request, [], f"browser search retry failed: {message}")
-                for request in failed_requests
-            ]
-        return list(outcome.get("rows") or [])
-
-    worker = threading.Thread(target=_run, name="jobsflow-serp-batch", daemon=True)
-    worker.start()
-    # The batch's own deadline bounds the scrape; the grace adds room for the
-    # final batch flush plus Playwright's per-call timeouts.
-    worker.join(_serp_deadline_seconds() + grace)
-    if not worker.is_alive():
-        return _rows_or_error()
-    # The worker is stuck: force-close the local Playwright transport (the CDP
-    # websocket belongs to the Node driver; Python only owns the stdio pipe)
-    # and give the worker a grace period to notice and unwind.
+    status, value = runner.call(
+        lambda: recovery_obj.search_batch(
+            failed_requests,
+            delay_seconds=delay_seconds,
+            serp_checkpoint=serp_checkpoint,
+        ),
+        timeout=_serp_deadline_seconds() + grace,
+    )
+    if status == "ok":
+        if value is None:
+            return None
+        return list(value)
+    if status == "error":
+        message = str(value)[:160]
+        return [
+            (request, [], f"browser search retry failed: {message}")
+            for request in failed_requests
+        ]
+    # Timeout: the worker is spinning.  Force-close the local Playwright
+    # transport (the CDP websocket belongs to the Node driver; Python only
+    # owns the stdio pipe), give the batch a short grace to flush its last
+    # checkpoint, then rebuild from disk whatever was already written.
     force_close_recovery_transport(recovery_obj)
-    worker.join(grace)
-    if not worker.is_alive():
-        return _rows_or_error()
-    # The worker still spins (the greenlet dispatcher never raises after the
-    # pipe is closed).  Abandon the daemon thread and rebuild the rows the
-    # batch already flushed to the SERP checkpoint; anything not covered is
-    # reported as an explicit abandonment, never silently dropped.
+    time.sleep(min(5.0, max(0.0, grace)))
     rows = read_serp_batches_as_rows(serp_checkpoint, failed_requests)
     covered = {str(row[0].get("request_id")) for row in rows}
     rows.extend(
@@ -805,6 +928,7 @@ def _merge_jobsdb_browser_retry(
     delay_seconds: float,
     recovery_obj: Any = None,
     serp_checkpoint: Path | None = None,
+    cdp_runner: _BoundedCdpRunner | None = None,
 ) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]], str | None]], dict[str, Any]]:
     """Retry failed JobsDB queries, preferring the validated browser context.
 
@@ -831,12 +955,13 @@ def _merge_jobsdb_browser_retry(
     serp_fallback_enabled = os.environ.get("JOBSFLOW_JOBSDB_SERP_FALLBACK", "1").strip().casefold() not in {
         "0", "false", "no", "off", "否", "关闭",
     }
-    if recovery_obj is not None and serp_fallback_enabled:
+    if recovery_obj is not None and serp_fallback_enabled and cdp_runner is not None:
         browser_rows = _run_search_batch_bounded(
             recovery_obj,
             failed_requests,
             delay_seconds=max(0.0, float(delay_seconds)),
             serp_checkpoint=serp_checkpoint,
+            runner=cdp_runner,
         )
     if browser_rows is not None:
         retry_transport = "browser_context"
@@ -1851,8 +1976,13 @@ def main(argv: list[str] | None = None) -> int:
         if error
     ]
     if jobsdb_failed_requests and jobsdb_human_handoff_enabled(repo):
+        # One dedicated thread for every Playwright sync call of this scan:
+        # the recovery and the SERP batch must run on the same thread
+        # (Playwright's dispatcher is thread-bound) while the main thread
+        # stays bounded (a dead transport spins instead of raising).
+        cdp_runner = _BoundedCdpRunner()
         try:
-            recovery_meta, recovery_obj = recover_jobsdb_search_session(repo)
+            recovery_meta, recovery_obj = _run_recovery_bounded(repo, runner=cdp_runner)
         except Exception as exc:
             recovery_meta = {
                 "status": "unavailable",
@@ -1877,15 +2007,16 @@ def main(argv: list[str] | None = None) -> int:
                 delay_seconds=args.sleep,
                 recovery_obj=recovery_obj,
                 serp_checkpoint=checkpoint_dir / "jobsdb_serp_batches.jsonl",
+                cdp_runner=cdp_runner,
             )
         if recovery_obj is not None:
             # The retained validated session is only needed for the retries
             # above; detach the local transport afterwards.  This never
-            # closes the user's visible Chrome process or its session.
-            try:
-                recovery_obj.close()
-            except Exception:
-                pass
+            # closes the user's visible Chrome process or its session.  The
+            # close runs on the same CDP thread that owns the session; when
+            # the runner is already dead (spun worker) the transport is
+            # simply leaked until process exit instead of wedging anything.
+            cdp_runner.call(recovery_obj.close, timeout=30)
             recovery_obj = None
     elif jobsdb_failed_requests:
         # A public/product workspace must not unexpectedly take control of a

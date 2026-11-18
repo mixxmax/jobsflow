@@ -179,6 +179,34 @@ toggle 模式下该 HTTP 发现路径可能 404（这是 Chrome 136+ 的开关�
 线程在预算内拿到部分结果并正常退出，不依赖"关管道必然 raise"这一被
 推翻的假设。
 
+**第二个病灶（2026-11-18 活体复跑发现）**：人工验证 `recover()` 里的
+CDP 握手（`sync_playwright().start()` / `connect_over_cdp` / 挑战等待循环
+里的 `_observe_cdp`）同样跑在主线程上，握手中断后同样空转（86% CPU、
+与 9222 无 TCP 连接、Chrome 上残留 Allow 提示框）。
+
+**线程亲和性（同一天发现的第三个问题）**：Playwright 的同步调度器是
+**线程绑定**的——在一个线程创建的会话，从另一个线程调度会立即报
+`cannot switch to a different thread`（活体复跑中 228 条 SERP 请求全部
+因此静默失败，且因为 runner 把 `None` 误当空列表，CLI 回退也被跳过，
+retry_transport 还谎报 `browser_context`）。
+
+**最终设计（2026-11-18）**：一次扫描中所有 Playwright 同步调用由
+**同一个** `_BoundedCdpRunner` 专用 daemon 线程执行——recovery、SERP
+批次、会话 close 全部提交到这条线程（亲和性天然满足），主线程只做有界
+join：
+
+- recovery：`_run_recovery_bounded()`，预算
+  `JOBSFLOW_JOBSDB_RECOVERY_DEADLINE_SECONDS`（默认 900s，覆盖 600s 挑战
+  等待 + 连接超时）；超时即放弃该线程、本次 JobsDB 请求退回 CLI 重试并
+  如实报 `recovery_deadline_exceeded`。
+- SERP 批次：`_run_search_batch_bounded()`，预算批次 deadline + grace；
+  超时则强制关闭本地管道、最多等 5 秒最后一批落盘、再从检查点重建，
+  未覆盖请求如实报 abandonment。`search_batch` 返回 `None` 的契约（无会话
+  → 调用方回退 CLI）被严格保留。
+- close：`JobsdbCdpBatchSession` 记录归属线程，`close()` 在归属线程上
+  内联调 `stop()`（helper 线程会撞亲和性泄漏管道），由主线程 30 秒有界
+  join 兜底。
+
 ## 9. 验证状态（如实声明）
 
 - **全量产品测试**：`.venv/bin/python -m pytest tests/ -q` → 1092 passed /
@@ -201,3 +229,14 @@ toggle 模式下该 HTTP 发现路径可能 404（这是 Chrome 136+ 的开关�
   最后仍为错误的请求（如 "no job cards"）在续跑中会再经 SERP/CLI 重试，
   无已验证浏览器会话时退回 CLI 并如实报 403。在 WAF 解除前不应认为
   JobsDB 渠道已自动恢复。
+- **2026-11-18 复跑**：第三轮活体扫描在人工验证阶段复现了 greenlet 空转
+  （第二个病灶），已按上文修复并补 fake-挂死测试。该轮 4 个 bucket
+  检查点（263/223/101/1031 命中）完好保留，可用 `--resume` 续跑。
+- **同一天的 attach 实因**：不带 `permessage-deflate` 的客户端对
+  `Browser.getVersion` 约 2.5 秒返回 `Chrome/157.0.8103.80`；Playwright 1.60
+  总会协商该扩展，Chrome 接受后第一个 CDP 命令无回应。压缩去掉后，
+  `connect_over_cdp` 仍会等每个已打开标签回答 `Page.getFrameTree`。
+  `tools/fresh_24h/cdp_plain_bridge.cjs` 接受 Playwright，以不压缩套接字连
+  主 Chrome，并在 3.5 秒后替未回应的子会话命令补空结果。实机
+  `JobsdbCdpBatchSession.connect()` 8.14 秒成功；随后只跑 JobsDB 的临时检索
+  从 SERP 读出职位卡片。超时原因改为 `cdp_attach_timeout`，不再标成端口不存在。
