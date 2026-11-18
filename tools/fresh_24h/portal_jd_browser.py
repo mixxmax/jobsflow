@@ -1583,6 +1583,82 @@ def _cdp_connect_timeout_ms() -> int:
     return int(seconds * 1000)
 
 
+def _cdp_connect_runtime_error(exc: BaseException) -> RuntimeError:
+    """Map a Playwright attach failure onto a stable reason.
+
+    A listening port is not a finished attach.  ``connect_over_cdp`` reports
+    ``TimeoutError`` after ``<ws connected>`` when Chrome accepts the socket
+    and then does not answer ``Browser.getVersion``.  That used to be labeled
+    ``cdp_endpoint_unavailable``, which sent the operator to reopen a port
+    that was already open.
+    """
+    text = str(exc)
+    name = type(exc).__name__
+    if name == "TimeoutError" or ("Timeout" in text and "exceeded" in text):
+        return RuntimeError("cdp_attach_timeout")
+    refused = ("ECONNREFUSED" in text) or ("Connection refused" in text)
+    if refused or "cdp_endpoint_unavailable" in text:
+        return RuntimeError("cdp_endpoint_unavailable")
+    return RuntimeError("cdp_connect_failed")
+
+
+def _playwright_driver_node() -> Path:
+    import playwright
+
+    node = Path(playwright.__file__).resolve().parent / "driver" / "node"
+    if not node.is_file():
+        raise RuntimeError("cdp_bridge_node_missing")
+    return node
+
+
+def _start_cdp_plain_bridge(upstream_ws: str) -> tuple[subprocess.Popen[str], str]:
+    """Accept Playwright's client and talk to Chrome without compression.
+
+    Chrome 157's toggle-mode DevTools server negotiates ``permessage-deflate``
+    and then never answers ``Browser.getVersion``.  The same socket with the
+    extension disabled answers.  Playwright 1.60 always offers the extension
+    and exposes no switch, so attach goes through this localhost bridge.  The
+    bridge also answers a child-session command that Chrome leaves hanging, so
+    one wedged tab cannot block ``connect_over_cdp``.  It does not launch Chrome.
+    """
+    node = _playwright_driver_node()
+    bundle = node.parent / "package" / "lib" / "utilsBundle.js"
+    script = Path(__file__).resolve().parent / "cdp_plain_bridge.cjs"
+    if not bundle.is_file() or not script.is_file():
+        raise RuntimeError("cdp_bridge_missing")
+    proc = subprocess.Popen(
+        [str(node), str(script), str(bundle), upstream_ws],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    box: dict[str, str] = {}
+
+    def _read_listen() -> None:
+        if proc.stdout is None:
+            return
+        box["line"] = proc.stdout.readline()
+
+    reader = threading.Thread(target=_read_listen, name="cdp-bridge-listen", daemon=True)
+    reader.start()
+    reader.join(5.0)
+    line = box.get("line", "")
+    if not line.startswith("LISTEN ws://127.0.0.1:"):
+        _stop_cdp_bridge(proc)
+        raise RuntimeError("cdp_bridge_start_failed")
+    return proc, line.removeprefix("LISTEN ").strip()
+
+
+def _stop_cdp_bridge(proc: subprocess.Popen[str] | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 def _connect_over_cdp(chromium: Any, endpoint: str, *, timeout_ms: int) -> Any:
     """Attach with a bounded timeout while tolerating tiny test doubles."""
     connect = getattr(chromium, "connect_over_cdp")
@@ -1943,6 +2019,11 @@ class JobsdbCdpBatchSession:
         self._playwright = playwright
         self._remote = remote
         self.context = context
+        # Playwright's sync dispatcher is thread-bound, so the session can
+        # only be driven from the thread that created it (the scan's shared
+        # CDP worker).  close() uses this to decide whether ``stop()`` may
+        # be called inline instead of on a helper thread.
+        self._home_thread = threading.current_thread()
         self._lease = lease
         self.browser_version: str | None = None
         self._closed = False
@@ -1952,6 +2033,7 @@ class JobsdbCdpBatchSession:
         # approved detail transport by the workflow gate.
         self._jobsflow_approved_cdp_session = False
         self._jobsflow_cdp_attestation: object | None = None
+        self._cdp_bridge: subprocess.Popen[str] | None = None
 
     @classmethod
     def connect(
@@ -1975,6 +2057,7 @@ class JobsdbCdpBatchSession:
             raise RuntimeError("cdp_endpoint_unavailable")
         lease = _JobsdbCdpLease().acquire()
         playwright = None
+        bridge_proc: subprocess.Popen[str] | None = None
         try:
             playwright = sync_playwright().start()
             connection_url = (
@@ -1982,6 +2065,8 @@ class JobsdbCdpBatchSession:
                 if ws_only
                 else _cdp_connection_url(endpoint)
             )
+            if connection_url.startswith(("ws://", "wss://")):
+                bridge_proc, connection_url = _start_cdp_plain_bridge(connection_url)
             try:
                 remote = _connect_over_cdp(
                     playwright.chromium,
@@ -1991,7 +2076,7 @@ class JobsdbCdpBatchSession:
             except RuntimeError:
                 raise
             except Exception as exc:
-                raise RuntimeError("cdp_endpoint_unavailable") from exc
+                raise _cdp_connect_runtime_error(exc) from exc
             contexts = list(remote.contexts)
             if not contexts:
                 raise RuntimeError("cdp_no_context")
@@ -2019,16 +2104,22 @@ class JobsdbCdpBatchSession:
             session.browser_version = browser_version or None
             session._jobsflow_approved_cdp_session = True
             session._jobsflow_cdp_attestation = _CDP_SESSION_ATTESTATION
+            session._cdp_bridge = bridge_proc
+            bridge_proc = None
             return session
         except Exception:
             # ``stop`` disconnects the local transport.  We intentionally do
             # not call ``remote.close`` here because a remote browser belongs
-            # to the user's Chrome process, not to this scan.
+            # to the user's Chrome process, not to this scan.  ``stop`` itself
+            # is bounded (same watchdog as ``close()``): on a transport that
+            # already died it can block forever, so the connect failure path
+            # must never wedge the scan either.
             try:
                 if playwright is not None:
-                    playwright.stop()
+                    _stop_playwright_bounded(playwright, timeout_s=10.0)
             except Exception:
                 pass
+            _stop_cdp_bridge(bridge_proc)
             lease.release()
             raise
 
@@ -2044,15 +2135,25 @@ class JobsdbCdpBatchSession:
         # visible Chrome session on some Chromium versions.
         # ``stop`` itself is bounded: on a transport that already died it can
         # block forever, so a watchdog force-closes the local pipe and the
-        # scan's shutdown path never hangs.
+        # scan's shutdown path never hangs.  When close() runs on the
+        # session's home thread (the scan's shared CDP worker), ``stop``
+        # must be called inline -- a helper thread would violate Playwright's
+        # thread affinity and leak the driver pipe.
         try:
             if self._playwright is not None:
-                _stop_playwright_bounded(self._playwright, timeout_s=10.0)
+                home = getattr(self, "_home_thread", None)
+                _stop_playwright_bounded(
+                    self._playwright,
+                    timeout_s=10.0,
+                    inline=home is not None and home is threading.current_thread(),
+                )
         except Exception:
             pass
         self._playwright = None
         self._remote = None
         self.context = None
+        _stop_cdp_bridge(getattr(self, "_cdp_bridge", None))
+        self._cdp_bridge = None
         # A detached transport is never a valid detail credential.  Clearing
         # the attestation also makes accidental reuse fail at the policy gate
         # instead of being reported as a live CDP session.
@@ -2568,6 +2669,7 @@ class JobsdbHumanVerificationRecovery:
                 if reason
                 in {
                     "cdp_endpoint_unavailable",
+                    "cdp_attach_timeout",
                     "cdp_non_primary_browser",
                     "cdp_session_busy",
                     "cdp_session_lease_unavailable",
@@ -2575,7 +2677,11 @@ class JobsdbHumanVerificationRecovery:
                 else "cdp_connect_failed",
                 recommended_action="retry_after_primary_chrome_cdp",
                 manual_hint=(
-                    "确认主 Chrome 已允许远程调试且本地 CDP 端点可连接后重试。"
+                    "调试端口在听，但 Chrome 没有回应这次连接的第一个 CDP 命令。"
+                    "请到 chrome://inspect/#remote-debugging 把 Allow remote debugging "
+                    "关掉再打开，或完全退出 Chrome 后重开，然后重试扫描。"
+                    if reason == "cdp_attach_timeout"
+                    else "确认主 Chrome 已允许远程调试且本地 CDP 端点可连接后重试。"
                 ),
                 manual_command=manual_hint,
             )
@@ -2654,6 +2760,7 @@ class JobsdbHumanVerificationRecovery:
                 if reason
                 in {
                     "cdp_endpoint_unavailable",
+                    "cdp_attach_timeout",
                     "cdp_non_primary_browser",
                     "cdp_session_busy",
                     "cdp_session_lease_unavailable",
@@ -2661,7 +2768,11 @@ class JobsdbHumanVerificationRecovery:
                 else "cdp_connect_failed",
                 recommended_action="retry_after_primary_chrome_cdp",
                 manual_hint=(
-                    "确认主 Chrome 已允许远程调试且本地 CDP 端点可连接后重试。"
+                    "调试端口在听，但 Chrome 没有回应这次连接的第一个 CDP 命令。"
+                    "请到 chrome://inspect/#remote-debugging 把 Allow remote debugging "
+                    "关掉再打开，或完全退出 Chrome 后重开，然后重试扫描。"
+                    if reason == "cdp_attach_timeout"
+                    else "确认主 Chrome 已允许远程调试且本地 CDP 端点可连接后重试。"
                 ),
                 manual_command=manual_hint,
             )
@@ -3038,7 +3149,7 @@ def _force_close_playwright_transport(playwright: Any) -> bool:
         return False
 
 
-def _stop_playwright_bounded(playwright: Any, *, timeout_s: float = 10.0) -> bool:
+def _stop_playwright_bounded(playwright: Any, *, timeout_s: float = 10.0, inline: bool = False) -> bool:
     """Stop the local Playwright transport with a hard deadline.
 
     ``stop`` on a dead transport can block forever (observed deadlocks: the
@@ -3047,8 +3158,22 @@ def _stop_playwright_bounded(playwright: Any, *, timeout_s: float = 10.0) -> boo
     the transport so the stuck call raises and the thread can unwind.  The
     caller never blocks past roughly ``2 * timeout_s`` and the user's Chrome
     process is never touched.
+
+    ``inline=True`` calls ``stop()`` on the current thread and skips the
+    helper thread.  Playwright's dispatcher is thread-bound, so this is the
+    ONLY correct mode when the caller already sits on the session's home
+    thread -- the helper thread would fail with "cannot switch to a
+    different thread" and leak the driver pipe.  A spinning inline ``stop``
+    is still bounded, by the caller's own deadline (the shared CDP runner
+    join).
     """
     if playwright is None:
+        return True
+    if inline:
+        try:
+            playwright.stop()
+        except Exception:
+            pass
         return True
     done = threading.Event()
 

@@ -277,6 +277,10 @@ def default_scan_runner(payload: dict[str, Any], workspace: Path) -> dict[str, A
         # TEMPORARY (2026-11-14): resume today's scan from its bucket/SERP
         # checkpoints instead of re-fetching the completed buckets.
         scan_cmd.append("--resume")
+    for portal in payload.get("skip_portal") or []:
+        name = str(portal or "").strip().lower()
+        if name in {"linkedin", "jobsdb", "ctgoodjobs"}:
+            scan_cmd.extend(["--skip-portal", name])
     queries = workspace / "00_Profile" / "queries.json"
     if queries.is_file():
         scan_cmd.extend(["--queries", str(queries)])

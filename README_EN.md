@@ -27,7 +27,16 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 🆕 Latest update · 2026-11-17 · Crash-safety for the JobsDB fallback, and a Chrome 157 correction
+## 🆕 Latest update · 2026-11-18 · Bounded protection for the human-verification phase too
+
+- **Second deadlock site.** A live re-run showed the JobsDB human verification (CDP handshake + Cloudflare challenge wait) also runs on the main thread, and a dropped handshake makes the greenlet dispatcher spin there too — the scan hangs (86% CPU, unresponsive, with a stale Allow prompt left in Chrome).
+- **Fix.** The whole recovery now also runs on a dedicated worker thread that the main thread waits for with a 900-second bound; on timeout the thread is abandoned, JobsDB requests fall back to the CLI retry with an explicit `recovery_deadline_exceeded` error, and the scan still completes with its bucket checkpoints intact.
+- **Verification.** Full test suite re-run green (including new hung-fake cases); the interrupted scan's four bucket checkpoints survived, and the run can be continued with `scan --resume`. The JobsDB WAF is still not lifted, so the SERP fallback remains the only usable listing channel.
+- **Chrome 157 compression handshake.** Playwright negotiates `permessage-deflate`. Chrome 157's toggle mode accepts the extension and then never answers `Browser.getVersion`; the log stops at `<ws connected>`. Attach now goes through a localhost bridge that speaks uncompressed CDP to the primary Chrome. A tab that does not answer a child-session command within 3.5 seconds no longer blocks the whole attach. A live temporary scan on 2026-11-18 read JobsDB cards through this path.
+
+---
+
+## 📌 Previous update · 2026-11-17 · Crash-safety for the JobsDB fallback, and a Chrome 157 correction
 
 - **Checkpoints + resumable scans.** Scanning is now scheduled query-group by query-group (bucket); every finished group is appended to a checkpoint under `02_Tracker/portal_state/scan_<run_id>/`, and SERP scraping is flushed per batch. If the process is killed or the connection drops, `scan --resume` replays the completed groups and SERP batches straight from disk, fills only the gaps, and merges the continuation into the same-day CSV.
 - **Deadlock fix (watchdog redesign).** The live trial disproved the old assumption: force-closing the Playwright pipe does not unblock a stuck sync call — the greenlet dispatcher spins instead of raising. The whole SERP batch now runs on a dedicated worker thread that the main thread waits for with a bounded timeout; on timeout the thread is abandoned and the flushed batches are rebuilt from disk, so a scan can no longer hang forever.
@@ -36,7 +45,7 @@ and how to tailor the application without giving up final control.
 
 ---
 
-## 📌 Previous update · 2026-11-14 · Temporary browser fallback for JobsDB listing search
+## 📌 Earlier update · 2026-11-14 · Temporary browser fallback for JobsDB listing search
 
 - **What happened.** Since mid-November 2026, JobsDB's Cloudflare WAF returns 403 for every non-browser request (curl, Bun, even same-origin fetches inside a verified page), so the listing-API channel is down end to end. LinkedIn and CTgoodjobs are unaffected.
 - **The fallback.** Blocked listing queries are retried by reading the rendered search-results page DOM inside the **validated primary-Chrome CDP context**. It only triggers in the private workspace after you personally pass one Cloudflare challenge, retries only the failed requests, and reports per-request errors.

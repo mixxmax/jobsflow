@@ -360,6 +360,7 @@ def test_browser_search_batch_used_by_scanner_retry(monkeypatch, tmp_path):
         portal_cli="unused",
         delay_seconds=0.0,
         recovery_obj=FakeRecovery(),
+        cdp_runner=scan._BoundedCdpRunner(),
     )
     assert calls["search_batch"] == 1
     assert calls["cli_retry"] == 0
