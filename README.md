@@ -41,32 +41,18 @@ JobsFlow 不是“幫你寫一份簡歷”的工具，而是一個**幫你搜崗
 
 ---
 
-## 🆕 最新更新 · 2026-11-18 · 人工驗證階段同樣加上有界保護
-
-- **第二個病灶**：活體復跑發現，JobsDB 人工驗證（CDP 握手 + Cloudflare 挑戰等待）也跑在主線程上，握手中斷後同樣會 greenlet 空轉、掃描掛死（現象：86% CPU 無響應、Chrome 上殘留 Allow 提示框）。
-- **修復**：整個恢復過程現在同樣跑在專用工作線程上，主線程按 900 秒上限有界等待；超時即放棄該線程，JobsDB 請求退回 CLI 重試並如實報 `recovery_deadline_exceeded`，掃描繼續完成、bucket 檢查點不丟。
-- **驗證**：全量測試重跑通過（含新增的掛死 fake 用例）；此前那輪被中斷的掃描 4 個 bucket 檢查點完好，可用 `scan --resume` 續跑。JobsDB WAF 尚未解除，SERP 回退仍是唯一可用通道。
-- **Chrome 157 壓縮握手**：Playwright 會協商 `permessage-deflate`。Chrome 157 的 toggle 模式接受這個擴展後不回應 `Browser.getVersion`，日誌停在 `<ws connected>`。連接改經本地橋，橋用不壓縮的套接字連主 Chrome；一個舊標籤若 3.5 秒不回答子會話命令，不再擋住整次 attach。2026-11-18 的實機臨時檢索已用這條路徑讀出 JobsDB 卡片。
-
----
-
-## 📌 前一項更新 · 2026-11-17 · JobsDB 回退的崩潰安全與 Chrome 157 修正
-
-- **分批落盤 + 斷點續跑**：掃描改按查詢分組（bucket）順序調度，每完成一組立刻把結果追加寫入檢查點（`02_Tracker/portal_state/scan_<run_id>/`）；SERP 抓取也逐批落盤。進程被殺或斷線後，`scan --resume` 直接從盤上重放已完成的分組與 SERP 批次，只補缺口，續跑結果併入當日同一個 CSV。
-- **死鎖修復（看門狗重設計）**：活體試驗發現，強制關閉 Playwright 管道並不會喚醒卡住的同步調用——greenlet 調度器會空轉而不是拋異常。現在整個 SERP 批次跑在專用工作線程上，主線程有界等待；超時即放棄該線程，已落盤的批次從盤上重建，不再出現掃描掛死。
-- **Chrome 157 修正**：實測 Chrome 157 用 `--remote-debugging-port=9222` 啟動時端口**從不綁定**（「持久調試端口」建議已失效且有誤導性）。`doctor` 與恢復提示統一改為只推薦 `chrome://inspect` 的 `Allow remote debugging` 開關。
-- **如實聲明**：兩輪 live E2E 已通過（首輪真實掃描 + 一輪 `--resume` 續跑，重放 456 行結果與 12 個 SERP 批次），但 JobsDB WAF 尚未解除，回退仍是唯一可用通道。詳見[技術說明](docs/JobsDB_列表检索SERP浏览器回退_技术说明_2026-11-14.md)。
-
----
-
-## 📌 更早的更新 · 2026-11-14 · JobsDB 列表檢索的臨時瀏覽器回退
+## 🆕 最新更新 · 2026-11-18 · JobsDB 列表改走主 Chrome 的搜索結果頁
 
 - **問題**：2026-11 中旬起，JobsDB 的 Cloudflare WAF 把所有非瀏覽器請求一律 403（curl、Bun、乃至已驗證頁面內的同源 fetch），列表 API 通道整體失效；LinkedIn 與 CTgoodjobs 不受影響。
 - **回退**：被攔的列表查詢改為在**已驗證的主 Chrome CDP 上下文**裡讀取渲染後的搜索結果頁 DOM。僅在私人工作區、且你親自通過一次 Cloudflare 驗證後觸發；只重試失敗的請求，逐請求報錯。
 - **臨時措施**：依賴 JobsDB 前端頁面屬性（`data-testid="job-card"` 等），前端改版即失效；每條查詢一次頁面導航，比 API 慢一個量級。`JOBSFLOW_JOBSDB_SERP_FALLBACK=0` 可不改代碼直接禁用（回到原有 CLI 重試）；listing API 恢復接受非瀏覽器請求時應整體移除。
-- **如實聲明**：兩輪 live E2E 已於 2026-11-17 跑通（見上方更新）；JobsDB WAF 尚未解除，回退仍是唯一可用通道。詳見[技術說明](docs/JobsDB_列表检索SERP浏览器回退_技术说明_2026-11-14.md)。
+- **分批落盤 + 斷點續跑**：掃描改按查詢分組（bucket）順序調度，每完成一組立刻把結果追加寫入檢查點（`02_Tracker/portal_state/scan_<run_id>/`）；SERP 抓取也逐批落盤。進程被殺或斷線後，`scan --resume` 直接從盤上重放已完成的分組與 SERP 批次，只補缺口，續跑結果併入當日同一個 CSV。
+- **不再掛死**：強制關閉 Playwright 管道並不會喚醒卡住的同步調用，greenlet 調度器會空轉。一次掃描裡的人工驗證、SERP 批次和會話關閉都放在同一條專用工作線程上。主線程有界等待：恢復默認 900 秒，超時則放棄該線程，JobsDB 請求退回 CLI 並如實報 `recovery_deadline_exceeded`；SERP 批次超時則從已落盤的檢查點重建。全量測試已通過，含掛死 fake 用例；中斷掃描的 bucket 檢查點可用 `scan --resume` 續跑。
+- **Chrome 157**：用 `--remote-debugging-port=9222` 啟動時端口從不綁定，「持久調試端口」已失效。`doctor` 與恢復提示只推薦 `chrome://inspect` 的 `Allow remote debugging`。Playwright 還會協商 `permessage-deflate`，Chrome 接受擴展後不回應 `Browser.getVersion`，日誌停在 `<ws connected>`。連接改經本地橋，橋用不壓縮的套接字連主 Chrome；一個舊標籤若 3.5 秒不回答子會話命令，不再擋住整次 attach。
+- **如實聲明**：兩輪 live E2E 已通過（首輪真實掃描 + 一輪 `--resume` 續跑，重放 456 行結果與 12 個 SERP 批次）。2026-11-18 的實機臨時檢索已用這條路徑讀出 JobsDB 卡片。WAF 尚未解除，回退仍是唯一可用通道。詳見[技術說明](docs/JobsDB_列表检索SERP浏览器回退_技术说明_2026-11-14.md)。
 
 ---
+
 ## 🎯 解決什麼問題？
 
 求職難，往往不是「找不到連結」，而是**整條鏈路運營不起來**：
